@@ -142,6 +142,11 @@ impl fmt::Display for TransitionError {
 
 pub const MAX_ATTEMPTS: u32 = 3;
 
+/// Test/adapter convenience clock.
+pub fn now() -> chrono::DateTime<Utc> {
+    Utc::now()
+}
+
 #[derive(Debug, Clone)]
 pub struct Order {
     pub id: String,
