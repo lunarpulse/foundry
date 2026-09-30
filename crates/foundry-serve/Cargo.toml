@@ -1,0 +1,11 @@
+[package]
+name = "foundry-serve"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+foundry-domain = { path = "../foundry-domain" }
+foundry-ledger = { path = "../foundry-ledger" }
+tokio.workspace = true
+thiserror.workspace = true

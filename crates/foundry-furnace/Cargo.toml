@@ -1,0 +1,10 @@
+[package]
+name = "foundry-furnace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+foundry-domain = { path = "../foundry-domain" }
+thiserror.workspace = true
+chrono.workspace = true

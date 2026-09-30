@@ -1,0 +1,11 @@
+[package]
+name = "foundry-blueprint"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+foundry-domain = { path = "../foundry-domain" }
+serde.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "foundry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "foundry"
+path = "src/main.rs"
+
+[dependencies]
+foundry-domain = { path = "../foundry-domain" }
+foundry-line = { path = "../foundry-line" }
+foundry-blueprint = { path = "../foundry-blueprint" }
+foundry-ledger = { path = "../foundry-ledger" }
+clap.workspace = true
+tokio.workspace = true

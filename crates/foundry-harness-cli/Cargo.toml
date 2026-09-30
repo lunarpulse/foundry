@@ -1,0 +1,11 @@
+[package]
+name = "foundry-harness-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+foundry-domain = { path = "../foundry-domain" }
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
