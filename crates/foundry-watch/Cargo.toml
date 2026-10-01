@@ -1,20 +1,21 @@
 [package]
-name = "foundry"
+name = "foundry-watch"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[[bin]]
-name = "foundry"
-path = "src/main.rs"
-
 [dependencies]
 foundry-domain = { path = "../foundry-domain" }
 foundry-line = { path = "../foundry-line" }
-foundry-blueprint = { path = "../foundry-blueprint" }
 foundry-ledger = { path = "../foundry-ledger" }
 foundry-harness-cli = { path = "../foundry-harness-cli" }
-foundry-watch = { path = "../foundry-watch" }
-chrono.workspace = true
-clap.workspace = true
+reqwest = { workspace = true, features = ["json", "rustls-tls"], default-features = false }
+serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

@@ -58,6 +58,21 @@ enum Cmd {
         #[arg(long, default_value = "~/.foundry/ledger.db")]
         db: String,
     },
+    /// Run the watch daemon (single-writer lease holder).
+    Watch {
+        /// One tick then exit (for cron-driven mode)
+        #[arg(long, default_value_t = false)]
+        once: bool,
+        /// Tick interval seconds
+        #[arg(long, default_value_t = 300)]
+        every: u64,
+        /// GitHub repo "owner/name" to poll for foundry:make issues
+        #[arg(long, default_value = "lunarpulse/contextmesh-rs")]
+        repo: String,
+        /// Die binary path (empty = fake harness)
+        #[arg(long, default_value = "")]
+        die: String,
+    },
     /// Show order state + journal tail.
     Show {
         #[arg(long)]
@@ -121,6 +136,7 @@ async fn main() {
         Cmd::Validate { path } => validate(&path),
         Cmd::Run { id, task, die, blueprint } => run(id, task, die, &blueprint).await,
         Cmd::Approve { order, intent, db } => approve(order, intent, &expand(&db)).await,
+        Cmd::Watch { once, every, repo, die } => watch_cmd(once, every, repo, die).await,
         Cmd::Show { order, db } => show(order, &expand(&db)).await,
     };
     std::process::exit(code);
@@ -317,6 +333,73 @@ async fn show(order_id: String, db: &str) -> i32 {
         Err(e) => {
             eprintln!("✗ {e:?}");
             1
+        }
+    }
+}
+
+async fn watch_cmd(once: bool, every: u64, repo: String, die: String) -> i32 {
+    let (owner, name) = repo.split_once('/').unwrap_or((repo.as_str(), "contextmesh-rs"));
+    let cfg = foundry_watch::WatchConfig {
+        tick_secs: every,
+        owner: owner.into(),
+        repo: name.into(),
+        die_bin: (!die.is_empty()).then_some(die.clone()),
+        ledger_path: expand("~/.foundry/ledger.db").into(),
+    };
+    let ledger = match foundry_ledger::SqliteLedger::open(std::path::Path::new(&cfg.ledger_path)) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("✗ ledger: {e:?}");
+            return 1;
+        }
+    };
+    // The blocking client spins its own runtime — build it OFF the async
+    // context or its drop panics inside tokio (T9 실측 버그 #3).
+    let icfg = foundry_watch::IntakeConfig {
+        owner: cfg.owner.clone(),
+        repo: cfg.repo.clone(),
+        poll_secs: cfg.tick_secs,
+    };
+    let intake = match tokio::task::spawn_blocking(move || {
+        foundry_watch::GithubLabelIntake::new(icfg)
+    })
+    .await
+    {
+        Ok(Ok(i)) => i,
+        Ok(Err(e)) => {
+            eprintln!("✗ intake: {e:?}");
+            return 1;
+        }
+        Err(e) => {
+            eprintln!("✗ intake join: {e}");
+            return 1;
+        }
+    };
+    let line = build_line(&die, ledger);
+    if once {
+        let actor = foundry_domain::ActorId {
+            kind: foundry_domain::ActorKind::Agent,
+            source: "watch".into(),
+            id: "foundry-watch".into(),
+        };
+        let intake = std::sync::Arc::new(tokio::sync::Mutex::new(intake));
+        match foundry_watch::tick(&line, intake, &actor).await {
+            Ok(n) => {
+                println!("tick: {n} new order(s)");
+                0
+            }
+            Err(e) => {
+                eprintln!("✗ tick: {e}");
+                1
+            }
+        }
+    } else {
+        match foundry_watch::run(&line, intake, cfg).await {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("✗ watch: {e}");
+                1
+            }
         }
     }
 }

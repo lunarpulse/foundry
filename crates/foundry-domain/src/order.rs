@@ -35,6 +35,15 @@ impl ExternalRef {
             dedup_key: format!("cron:{job}:{target}:{}", Utc::now().format("%Y-%m-%d")),
         }
     }
+
+    /// GitHub intake: repo "owner/name", issue number, stable dedup key.
+    pub fn github(repo: &str, issue: &str, dedup: String) -> Self {
+        Self {
+            source: Source::GitHub,
+            external_id: format!("{repo}#{issue}"),
+            dedup_key: dedup,
+        }
+    }
 }
 
 /// Kanban column == OrderState (1:1, plan §9).
