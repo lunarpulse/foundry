@@ -13,5 +13,7 @@ foundry-domain = { path = "../foundry-domain" }
 foundry-line = { path = "../foundry-line" }
 foundry-blueprint = { path = "../foundry-blueprint" }
 foundry-ledger = { path = "../foundry-ledger" }
+foundry-harness-cli = { path = "../foundry-harness-cli" }
+chrono.workspace = true
 clap.workspace = true
 tokio.workspace = true
