@@ -1,0 +1,1041 @@
+//! FR44 sealed-export: deterministic bundle serialization, Ed25519 signing,
+//! and in-tree verification.
+//!
+//! Uses `ed25519-dalek` + `sha2` — NOT `ring` and NOT `maos-kernel-core`.
+
+use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
+use hkdf::Hkdf;
+use super::maos_region::Region;
+use super::maos_team::TeamId;
+use sha2::{Digest, Sha256};
+
+// ─── Story 9.4b AC-5 — region-bound TL signing-key derivation ────────────────
+
+/// HKDF-SHA256 salt domain-separator for region-bound TL signing-key derivation.
+const REGION_TL_SIGNING_SALT: &[u8] = b"maos.region.tl-signing.v1";
+/// HKDF `info` prefix binding the frozen region encoding id (AC-12 `ascii-v1`)
+/// into the derivation context.  Two spellings of one region canonicalize to the
+/// same bytes (see [`Region`]) and therefore derive the same key — by design.
+const REGION_INFO_PREFIX: &[u8] = b"maos.region.ascii-v1:";
+
+/// Derive a region-bound Ed25519 signing seed from a base seed (AC-5 / AC-12).
+///
+/// `region` is already-canonical (`ascii-v1`) by virtue of the [`Region`] type,
+/// so this derivation is stable and unambiguous.  A bundle signed under one
+/// region cannot be verified under another region's derived key (R-RG1), which
+/// is the cryptographic root of region pinning at the export/TL layer.
+pub fn derive_region_signing_seed(base_seed: &[u8; 32], region: &Region) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(Some(REGION_TL_SIGNING_SALT), base_seed);
+    let mut info = Vec::with_capacity(REGION_INFO_PREFIX.len() + region.as_bytes().len());
+    info.extend_from_slice(REGION_INFO_PREFIX);
+    info.extend_from_slice(region.as_bytes());
+    let mut okm = [0u8; 32];
+    hk.expand(&info, &mut okm)
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    okm
+}
+
+/// Derive the region-bound Ed25519 *public* key — the expected attester key for
+/// verifying a bundle pinned to `region` (the verify-side companion of
+/// [`derive_region_signing_seed`]).
+pub fn derive_region_pubkey(base_seed: &[u8; 32], region: &Region) -> [u8; 32] {
+    derive_pubkey(&derive_region_signing_seed(base_seed, region))
+}
+
+// ─── Story 13.2 AC-1 — per-team TL signing-key weld (2nd HKDF stage) ──────────
+
+/// HKDF-SHA256 salt domain-separator for the per-team TL signing-key weld.
+///
+/// Pinned — never change without an ADR; changing it irreversibly re-keys every
+/// in-flight team bundle.
+const TEAM_TL_SIGNING_SALT: &[u8] = b"maos.team.tl-signing.v1";
+/// HKDF `info` prefix binding the frozen team `ascii-v1` encoding into the
+/// derivation context. Unlike [`Region`], [`TeamId`] REJECTS non-canonical
+/// input and never normalizes, so two spellings of one team can never reach a
+/// single key — the "one key per team" property (AC-12 analogue) is enforced by
+/// rejection at the `TeamId` boundary, NOT by folding inside this derivation.
+///
+/// Pinned — never change without an ADR; changing it irreversibly re-keys every
+/// in-flight team bundle.
+const TEAM_INFO_PREFIX: &[u8] = b"maos.team.ascii-v1:";
+
+/// Derive a per-team Ed25519 signing seed as a SECOND HKDF-SHA256 stage whose
+/// IKM is the region-bound signing seed (Story 13.2 / Fork-4 / ADV-055-1). The
+/// team weld welds directly over [`derive_region_signing_seed`]'s output, so a
+/// bundle signed under one `(region, team)` cannot verify under another team's
+/// derived key — the cryptographic tenant boundary.
+///
+/// ⚠ Blast radius: welding over the region seed means region-seed compromise is
+/// **team-wide** — an attacker who recovers the region signing seed can derive
+/// every team key in that region. Acceptable (region compromise is already
+/// region-wide) but documented (`loom-threat-model.md` T1 blast-radius note).
+pub fn derive_team_signing_seed(base_seed: &[u8; 32], region: &Region, team: &TeamId) -> [u8; 32] {
+    let region_seed = derive_region_signing_seed(base_seed, region);
+    let hk = Hkdf::<Sha256>::new(Some(TEAM_TL_SIGNING_SALT), &region_seed);
+    let mut info = Vec::with_capacity(TEAM_INFO_PREFIX.len() + team.as_str().len());
+    info.extend_from_slice(TEAM_INFO_PREFIX);
+    info.extend_from_slice(team.as_str().as_bytes());
+    let mut okm = [0u8; 32];
+    hk.expand(&info, &mut okm)
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    okm
+}
+
+/// Derive the per-team Ed25519 *public* key — the expected attester key for
+/// verifying a cross-team bundle claiming `(region, team)` (the verify-side
+/// companion of [`derive_team_signing_seed`]). The verifier derives this from
+/// the bundle's *claimed* identity, never from a key the bundle carries (R-RG1).
+pub fn derive_team_pubkey(base_seed: &[u8; 32], region: &Region, team: &TeamId) -> [u8; 32] {
+    derive_pubkey(&derive_team_signing_seed(base_seed, region, team))
+}
+
+// ─── Bundle types ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AuditBundle {
+    pub schema_version: String,
+    pub entries: Vec<crate::AuditEntry>,
+    pub i12_digest_refs: Vec<String>,
+    pub i11_distilled_content: Vec<I11Content>,
+    pub freshness: FreshnessMetadata,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub applied_redaction: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub redaction_policy: String,
+    /// Story 9.4b AC-5 — canonical (`ascii-v1`) jurisdiction tag this bundle is
+    /// region-pinned to.  `None` for pre-region (v2) bundles — omitted from the
+    /// canonical bytes so region-less exports stay byte-identical (AC-11 /
+    /// R-SCH compat).  When `Some`, the signing key is HKDF-derived from this
+    /// tag, so tampering it breaks verification (R-RG4′).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    /// `j1-crosshost-2c` AC2.1 — the host discriminator. Additive and covered by
+    /// the signature, exactly as `region` behaves and as `source_team` was added
+    /// to `CrossRegionReplicationBundle`: `None` is omitted from the canonical
+    /// bytes so every pre-2c bundle stays byte-identical.
+    ///
+    /// This is an ANTI-FORGERY control, not a label. `2b` writes the *same*
+    /// `frame_id` into both hosts' logs, so the two halves of a two-host run are
+    /// otherwise indistinguishable: `region` cannot separate two hosts in one
+    /// jurisdiction (same derived key), `boot_nonce` is per-boot and one
+    /// `--range 1d` export swept eight, and `attester_pubkey` is bundle-supplied
+    /// so R-RG1 forbids trusting it. Without this field one host can produce
+    /// BOTH halves of a "two-host" bundle.
+    ///
+    /// Bounded honestly: it proves [`TWO_HOST_CLAIM_SCOPE`] and nothing more.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    pub signature_block: SignatureBlock,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct I11Content {
+    pub source_log_ref: Vec<String>,
+    pub distillation_depth: u32,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FreshnessMetadata {
+    pub export_timestamp_ns: u64,
+    pub covered_window: CoveredWindow,
+    pub export_seq: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CoveredWindow {
+    pub since_ns: u64,
+    pub until_ns: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SignatureBlock {
+    pub algorithm: String,
+    pub attester_pubkey: String,
+    pub signature: String,
+}
+
+/// Unsigned bundle — all fields except `signature_block`.
+/// Used as the intermediate form for canonical serialization + signing.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BundleForSigning {
+    pub schema_version: String,
+    pub entries: Vec<crate::AuditEntry>,
+    pub i12_digest_refs: Vec<String>,
+    pub i11_distilled_content: Vec<I11Content>,
+    pub freshness: FreshnessMetadata,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub applied_redaction: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub redaction_policy: String,
+    /// Story 9.4b AC-5 — region tag covered by the signature.  `None` is omitted
+    /// from canonical bytes (byte-identity preserved); `Some` is signed, so a
+    /// post-sign tamper of the region field fails verification (R-RG4′).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    /// `j1-crosshost-2c` AC2.1 — host tag covered by the signature. `None` is
+    /// omitted from canonical bytes; `Some` is signed, so a post-sign tamper of
+    /// the host field fails verification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+impl BundleForSigning {
+    /// Region-pin this bundle to `region` (Story 9.4b AC-5).  The region is
+    /// covered by the canonical bytes AND drives HKDF derivation of the signing
+    /// key in [`sign_bundle`].
+    pub fn with_region(mut self, region: &Region) -> Self {
+        self.region = Some(region.as_str().to_string());
+        self
+    }
+
+    /// Stamp the host discriminator (`j1-crosshost-2c` AC2.1). Unlike
+    /// [`with_region`](Self::with_region) it does NOT change the signing key —
+    /// the two hosts of a run hold independent roots (AC2.4), so the host tag is
+    /// bound by the signature rather than folded into the derivation.
+    pub fn with_host(mut self, host: &str) -> Self {
+        self.host = Some(host.to_string());
+        self
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SealedExportError {
+    #[error("signing error: {0}")]
+    Signing(#[from] ed25519_dalek::SignatureError),
+    #[error("invalid seed length: expected 32 bytes, got {0}")]
+    InvalidSeedLen(usize),
+    #[error("invalid public key: {0}")]
+    InvalidPubkey(String),
+    #[error("invalid signature: {0}")]
+    InvalidSignature(String),
+    #[error("canonical serialization error: {0}")]
+    Serialization(String),
+    #[error("signature verification failed")]
+    VerificationFailed,
+    #[error(
+        "both halves were attested by the SAME root — one seed holder cannot attest two identities"
+    )]
+    SharedAttesterRoot,
+    #[error("bundle carries no host claim, so it cannot be half of a two-host run")]
+    MissingHostClaim,
+    #[error("both halves claim host '{0}' — identical host claims are one host")]
+    DuplicateHostClaim(String),
+    #[error("the two logs share no frame_id, so they did not witness one run")]
+    NoSharedFrames,
+    #[error(
+        "receipt schema '{0}' is not the ratified two-host receipt schema — a \
+         future schema must be verified by its own verifier, not re-signed into this one"
+    )]
+    UnsupportedReceiptSchema(String),
+    #[error(
+        "receipt claims scope '{0}' — a receipt may carry only the ratified two-host \
+         claim scope; the signature proves authorship of the words, not bounds on them"
+    )]
+    UnratifiedClaimScope(String),
+}
+
+// ─── Core functions ────────────────────────────────────────────────────────
+
+/// Build a `BundleForSigning` from the raw components.
+///
+/// Used for the 9.1 `maos.audit-bundle.v1` surface. Redaction fields are left
+/// at their default values so they are omitted from the canonical bytes,
+/// preserving the 9.1 byte-identity contract.
+pub fn build_bundle(
+    entries: Vec<crate::AuditEntry>,
+    i12_refs: Vec<String>,
+    i11_content: Vec<I11Content>,
+    freshness: FreshnessMetadata,
+) -> BundleForSigning {
+    BundleForSigning {
+        schema_version: "maos.audit-bundle.v1".to_string(),
+        entries,
+        i12_digest_refs: i12_refs,
+        i11_distilled_content: i11_content,
+        freshness,
+        applied_redaction: false,
+        redaction_policy: String::new(),
+        region: None,
+        host: None,
+    }
+}
+
+/// Build a `BundleForSigning` for a `maos.trajectory.v1` export.
+///
+/// Unlike [`build_bundle`], this populates `applied_redaction` and
+/// `redaction_policy` so they are covered by the Ed25519 signature.
+pub fn build_trajectory_bundle(
+    entries: Vec<crate::AuditEntry>,
+    i12_refs: Vec<String>,
+    i11_content: Vec<I11Content>,
+    freshness: FreshnessMetadata,
+    applied_redaction: bool,
+    redaction_policy: String,
+) -> BundleForSigning {
+    BundleForSigning {
+        schema_version: "maos.trajectory.v1".to_string(),
+        entries,
+        i12_digest_refs: i12_refs,
+        i11_distilled_content: i11_content,
+        freshness,
+        applied_redaction,
+        redaction_policy,
+        region: None,
+        host: None,
+    }
+}
+
+/// Sign the canonical bundle bytes with Ed25519.
+///
+/// Computes sha256(canonical_bytes), signs with the given seed,
+/// and returns the complete signed `AuditBundle`.
+pub fn sign_bundle(
+    bundle_for_signing: BundleForSigning,
+    seed: &[u8; 32],
+) -> Result<AuditBundle, SealedExportError> {
+    let canonical = canonicalize(&bundle_for_signing)?;
+    let digest = Sha256::digest(&canonical);
+
+    // AC-5: when region-pinned, sign with the HKDF-derived region key so the
+    // bundle only verifies under that region's derived attester key (R-RG1).
+    let effective_seed = match &bundle_for_signing.region {
+        Some(tag) => {
+            let region = Region::canonicalize(tag).map_err(|e| {
+                SealedExportError::Serialization(format!("invalid region tag: {e}"))
+            })?;
+            derive_region_signing_seed(seed, &region)
+        }
+        None => *seed,
+    };
+    let signing_key = SigningKey::from_bytes(&effective_seed);
+    let signature = signing_key.sign(&digest);
+    let pubkey_bytes = signing_key.verifying_key().to_bytes();
+
+    Ok(AuditBundle {
+        schema_version: bundle_for_signing.schema_version,
+        entries: bundle_for_signing.entries,
+        i12_digest_refs: bundle_for_signing.i12_digest_refs,
+        i11_distilled_content: bundle_for_signing.i11_distilled_content,
+        freshness: bundle_for_signing.freshness,
+        applied_redaction: bundle_for_signing.applied_redaction,
+        redaction_policy: bundle_for_signing.redaction_policy,
+        region: bundle_for_signing.region,
+        host: bundle_for_signing.host,
+        signature_block: SignatureBlock {
+            algorithm: "Ed25519".to_string(),
+            attester_pubkey: hex::encode(pubkey_bytes),
+            signature: hex::encode(signature.to_bytes()),
+        },
+    })
+}
+
+pub fn verify_bundle(
+    bundle: &AuditBundle,
+    pubkey_bytes: &[u8; 32],
+) -> Result<(), SealedExportError> {
+    let verifying_key = VerifyingKey::from_bytes(pubkey_bytes)
+        .map_err(|e| SealedExportError::InvalidPubkey(format!("{e}")))?;
+
+    let unsigned = BundleForSigning {
+        schema_version: bundle.schema_version.clone(),
+        entries: bundle.entries.clone(),
+        i12_digest_refs: bundle.i12_digest_refs.clone(),
+        i11_distilled_content: bundle.i11_distilled_content.clone(),
+        freshness: bundle.freshness.clone(),
+        applied_redaction: bundle.applied_redaction,
+        redaction_policy: bundle.redaction_policy.clone(),
+        // AC-5/R-RG4′: region is covered by the signature — a post-sign tamper
+        // changes the recomputed digest and verification fails. `j1-crosshost-2c`
+        // AC2.1: the host tag is bound the same way, so a forger cannot relabel
+        // a half of a two-host run.
+        region: bundle.region.clone(),
+        host: bundle.host.clone(),
+    };
+
+    let canonical = canonicalize(&unsigned)?;
+    let digest = Sha256::digest(&canonical);
+
+    let sig_bytes: [u8; 64] = hex::decode(&bundle.signature_block.signature)
+        .map_err(|e| SealedExportError::InvalidSignature(format!("signature hex: {e}")))?
+        .try_into()
+        .map_err(|v: Vec<u8>| {
+            SealedExportError::InvalidSignature(format!(
+                "signature must be 64 bytes, got {}",
+                v.len()
+            ))
+        })?;
+    let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+
+    verifying_key
+        .verify(&digest, &signature)
+        .map_err(|_| SealedExportError::VerificationFailed)
+}
+
+// ─── j1-crosshost-2c AC2.2/AC2.3 — two-host reconciliation ─────────────────
+//
+// PORTED, not invented: this is `maos-loom-lite`'s
+// `verify_replication_bundle` / `build_reattestation_receipt` /
+// `verify_reattestation_receipt` shape (`replication/bundle.rs:536`, `:982`,
+// `:1011`) — "source X's bundle landed at dest Y" is exactly the two-host claim.
+//
+// HOSTED HERE, natively, on purpose: `maos-loom-lite` already depends on
+// `maos-audit`, so a `maos-audit -> maos-loom-lite` edge would close a
+// dependency CYCLE. The alternative — calling loom-lite's verbs from
+// `maos-cli`, which depends on both — would make two-TL reconciliation a
+// feature of our binary rather than of the artifact format. Reimplementing the
+// pattern here adds ZERO dependency edges.
+
+/// Schema id for the signed two-host run receipt.
+pub const TWO_HOST_RECEIPT_SCHEMA: &str = "maos.two-host-run-receipt.v1";
+
+/// Ed25519 signing-domain separator for [`TwoHostRunReceipt`]. Pinned — changing
+/// it invalidates every receipt ever issued.
+const TWO_HOST_RECEIPT_DOMAIN: &[u8] = b"maos.two-host-run-receipt.v1";
+
+/// **The exact reach of the two-host claim.** Reproduced verbatim into every
+/// receipt so the artifact carries its own bound rather than deferring it to a
+/// story file nobody reads.
+///
+/// The host field defeats a forger who does not hold the other host's key. It
+/// does NOT prove physical separation, and under a shared base seed it proves
+/// nothing at all — which is why [`reconcile_two_host_bundles`] refuses a shared
+/// root outright.
+pub const TWO_HOST_CLAIM_SCOPE: &str =
+    "two keyed identities signed; not two machines, two processes, or two operators";
+
+/// The reconciled join of two independently-signed halves of one run.
+///
+/// The join key is `frame_id_hex`: `2b` writes the *received* frame's id, so both
+/// Transparency Logs carry the same sixteen bytes — proven by an executed CI test
+/// (`two_host_delegation_2b.rs:533-535`). `correlation_id` is NOT the join key and
+/// is deliberately not projected.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TwoHostJoin {
+    pub host_a: String,
+    pub host_b: String,
+    /// Hex attester keys the halves were verified AGAINST — the caller-supplied,
+    /// separately published keys, never `signature_block.attester_pubkey`.
+    pub attester_a: String,
+    pub attester_b: String,
+    /// `frame_id`s present in BOTH logs, sorted. This is the crossing.
+    pub shared_frame_ids: Vec<String>,
+    /// Present only in host A's log — work A recorded that B never saw.
+    pub host_a_only: Vec<String>,
+    /// Present only in host B's log.
+    pub host_b_only: Vec<String>,
+}
+
+/// Signed attestation over a [`TwoHostJoin`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TwoHostRunReceipt {
+    pub schema_version: String,
+    pub host_a: String,
+    pub host_b: String,
+    pub attester_a: String,
+    pub attester_b: String,
+    pub shared_frame_ids: Vec<String>,
+    pub timestamp_ns: u64,
+    /// The bound this receipt is allowed to assert ([`TWO_HOST_CLAIM_SCOPE`]).
+    pub claim_scope: String,
+    pub signature: String,
+}
+
+/// Verify both halves of a two-host run and join their logs on `frame_id`.
+///
+/// Each half is verified against **the key supplied for that half** — which the
+/// caller derived from the half's CLAIMED identity, mirroring
+/// `verify_replication_bundle`'s derive-from-claimed-identity rule. Neither the
+/// half's own `attester_pubkey` nor anything else the artifact carries is ever
+/// trusted (R-RG1).
+///
+/// Refuses, in order: an unverifiable half; a half with no host claim; two halves
+/// claiming one host; **two halves attested by one root** (AC2.4 — one seed holder
+/// producing both halves of a "two-host" bundle is the exact attack the host field
+/// exists to stop, and a shared root makes the field prove nothing); and logs that
+/// share no frame at all.
+pub fn reconcile_two_host_bundles(
+    host_a: &AuditBundle,
+    key_a: &[u8; 32],
+    host_b: &AuditBundle,
+    key_b: &[u8; 32],
+) -> Result<TwoHostJoin, SealedExportError> {
+    if key_a == key_b {
+        return Err(SealedExportError::SharedAttesterRoot);
+    }
+    verify_bundle(host_a, key_a)?;
+    verify_bundle(host_b, key_b)?;
+
+    let a_host = host_a
+        .host
+        .as_deref()
+        .ok_or(SealedExportError::MissingHostClaim)?;
+    let b_host = host_b
+        .host
+        .as_deref()
+        .ok_or(SealedExportError::MissingHostClaim)?;
+    // §A6 review 2026-08-18 (P16): a blank claim is no claim. The CLI producer
+    // trims and refuses whitespace-only `--host`, but reconciliation reads the
+    // artifact, and a hand-forged `Some("")` must not count as a discriminator.
+    for host in [a_host, b_host] {
+        if host.trim().is_empty() {
+            return Err(SealedExportError::MissingHostClaim);
+        }
+    }
+    if a_host == b_host {
+        return Err(SealedExportError::DuplicateHostClaim(a_host.to_string()));
+    }
+
+    let a_ids: std::collections::BTreeSet<&str> = host_a
+        .entries
+        .iter()
+        .map(|e| e.frame_id_hex.as_str())
+        .collect();
+    let b_ids: std::collections::BTreeSet<&str> = host_b
+        .entries
+        .iter()
+        .map(|e| e.frame_id_hex.as_str())
+        .collect();
+    let shared_frame_ids: Vec<String> = a_ids.intersection(&b_ids).map(|s| s.to_string()).collect();
+    if shared_frame_ids.is_empty() {
+        return Err(SealedExportError::NoSharedFrames);
+    }
+
+    Ok(TwoHostJoin {
+        host_a: a_host.to_string(),
+        host_b: b_host.to_string(),
+        attester_a: hex::encode(key_a),
+        attester_b: hex::encode(key_b),
+        shared_frame_ids,
+        host_a_only: a_ids.difference(&b_ids).map(|s| s.to_string()).collect(),
+        host_b_only: b_ids.difference(&a_ids).map(|s| s.to_string()).collect(),
+    })
+}
+
+/// Canonical signing payload for a two-host receipt — every claimed field, length-
+/// delimited so no two distinct joins can collide.
+fn two_host_receipt_payload(
+    schema_version: &str,
+    host_a: &str,
+    host_b: &str,
+    attester_a: &str,
+    attester_b: &str,
+    shared_frame_ids: &[String],
+    timestamp_ns: u64,
+    claim_scope: &str,
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(TWO_HOST_RECEIPT_DOMAIN);
+    for field in [
+        schema_version,
+        host_a,
+        host_b,
+        attester_a,
+        attester_b,
+        claim_scope,
+    ] {
+        payload.extend_from_slice(&(field.len() as u64).to_be_bytes());
+        payload.extend_from_slice(field.as_bytes());
+    }
+    payload.extend_from_slice(&(shared_frame_ids.len() as u64).to_be_bytes());
+    for id in shared_frame_ids {
+        payload.extend_from_slice(&(id.len() as u64).to_be_bytes());
+        payload.extend_from_slice(id.as_bytes());
+    }
+    payload.extend_from_slice(&timestamp_ns.to_be_bytes());
+    payload
+}
+
+/// Sign a [`TwoHostJoin`] with the operator/control-plane seed.
+pub fn build_two_host_receipt(
+    operator_seed: &[u8; 32],
+    join: &TwoHostJoin,
+    timestamp_ns: u64,
+) -> TwoHostRunReceipt {
+    let payload = two_host_receipt_payload(
+        TWO_HOST_RECEIPT_SCHEMA,
+        &join.host_a,
+        &join.host_b,
+        &join.attester_a,
+        &join.attester_b,
+        &join.shared_frame_ids,
+        timestamp_ns,
+        TWO_HOST_CLAIM_SCOPE,
+    );
+    let signature = SigningKey::from_bytes(operator_seed).sign(&payload);
+    TwoHostRunReceipt {
+        schema_version: TWO_HOST_RECEIPT_SCHEMA.to_string(),
+        host_a: join.host_a.clone(),
+        host_b: join.host_b.clone(),
+        attester_a: join.attester_a.clone(),
+        attester_b: join.attester_b.clone(),
+        shared_frame_ids: join.shared_frame_ids.clone(),
+        timestamp_ns,
+        claim_scope: TWO_HOST_CLAIM_SCOPE.to_string(),
+        signature: hex::encode(signature.to_bytes()),
+    }
+}
+
+/// Verify a two-host receipt against the operator's published public key.
+pub fn verify_two_host_receipt(
+    receipt: &TwoHostRunReceipt,
+    operator_pubkey: &[u8; 32],
+) -> Result<(), SealedExportError> {
+    let verifying_key = VerifyingKey::from_bytes(operator_pubkey)
+        .map_err(|e| SealedExportError::InvalidPubkey(format!("{e}")))?;
+    // §A6 review 2026-08-18 (P5): the payload was rebuilt from RECEIPT-SUPPLIED
+    // `schema_version`/`claim_scope`, so a receipt re-signed with a widened scope
+    // verified — the signature proved authorship of the words, not bounds on
+    // them. Pin both against the constants the producer stamps; a divergent
+    // receipt is refused before any signature is even parsed.
+    if receipt.schema_version != TWO_HOST_RECEIPT_SCHEMA {
+        return Err(SealedExportError::UnsupportedReceiptSchema(
+            receipt.schema_version.clone(),
+        ));
+    }
+    if receipt.claim_scope != TWO_HOST_CLAIM_SCOPE {
+        return Err(SealedExportError::UnratifiedClaimScope(
+            receipt.claim_scope.clone(),
+        ));
+    }
+    let payload = two_host_receipt_payload(
+        &receipt.schema_version,
+        &receipt.host_a,
+        &receipt.host_b,
+        &receipt.attester_a,
+        &receipt.attester_b,
+        &receipt.shared_frame_ids,
+        receipt.timestamp_ns,
+        &receipt.claim_scope,
+    );
+    let sig_bytes: [u8; 64] = hex::decode(&receipt.signature)
+        .map_err(|e| SealedExportError::InvalidSignature(format!("signature hex: {e}")))?
+        .try_into()
+        .map_err(|v: Vec<u8>| {
+            SealedExportError::InvalidSignature(format!(
+                "signature must be 64 bytes, got {}",
+                v.len()
+            ))
+        })?;
+    verifying_key
+        .verify(&payload, &ed25519_dalek::Signature::from_bytes(&sig_bytes))
+        .map_err(|_| SealedExportError::VerificationFailed)
+}
+
+/// Serialize any serializable value to canonical bytes (sorted keys, no whitespace).
+///
+/// Public so that `replay::runner` and `maosctl audit replay` can reuse the same
+/// canonicalizer — ADR-028 D5b (one canonicalizer, not three).
+pub fn canonicalize_value<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, SealedExportError> {
+    let value =
+        serde_json::to_value(value).map_err(|e| SealedExportError::Serialization(e.to_string()))?;
+    let sorted = sort_value(value);
+    serde_json::to_string(&sorted)
+        .map_err(|e| SealedExportError::Serialization(e.to_string()))
+        .map(|s| s.into_bytes())
+}
+
+/// Deterministic canonical serialization: sorted keys, no insignificant whitespace.
+///
+/// Serializes to `serde_json::Value`, recursively sorts all object keys via
+/// `BTreeMap` ordering, then outputs compact JSON. Ensures byte-identical
+/// output regardless of struct field declaration order.
+pub fn canonicalize(bundle: &BundleForSigning) -> Result<Vec<u8>, SealedExportError> {
+    canonicalize_value(bundle)
+}
+
+/// Recursively sort all JSON object keys using BTreeMap for deterministic order.
+///
+/// Public so that callers can canonicalize arbitrary `serde_json::Value` shapes
+/// with the same ordering rules (e.g., `maosctl audit replay` over an untrusted
+/// bundle read from disk).
+pub fn sort_value(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let sorted: serde_json::Map<String, serde_json::Value> = {
+                let mut entries: Vec<(String, serde_json::Value)> = map.into_iter().collect();
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                serde_json::Map::from_iter(entries)
+            };
+            let sorted_inner: serde_json::Map<String, serde_json::Value> = sorted
+                .into_iter()
+                .map(|(k, v)| (k, sort_value(v)))
+                .collect();
+            serde_json::Value::Object(sorted_inner)
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.into_iter().map(sort_value).collect())
+        }
+        other => other,
+    }
+}
+
+/// Derive the Ed25519 public key from a seed.
+pub fn derive_pubkey(seed: &[u8; 32]) -> [u8; 32] {
+    let signing_key = SigningKey::from_bytes(seed);
+    signing_key.verifying_key().to_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::AuditEntry;
+
+    // ─── Story 13.2 AC-1 — per-team weld ─────────────────────────────────────
+
+    #[test]
+    fn team_encoding_ids_are_frozen() {
+        // Tripwire (mirrors region.rs::encoding_id_is_frozen): changing either
+        // constant is an intentional irreversible re-key of every in-flight team
+        // bundle. Editing this assert mandates an ADR (AC-1 frozen grammar).
+        assert_eq!(TEAM_TL_SIGNING_SALT, b"maos.team.tl-signing.v1");
+        assert_eq!(TEAM_INFO_PREFIX, b"maos.team.ascii-v1:");
+    }
+
+    #[test]
+    fn team_weld_is_deterministic_and_second_stage() {
+        let base = [0x42u8; 32];
+        let region = Region::canonicalize("us-east-1").unwrap();
+        let team = TeamId::new("security").unwrap();
+        // Deterministic.
+        assert_eq!(
+            derive_team_signing_seed(&base, &region, &team),
+            derive_team_signing_seed(&base, &region, &team)
+        );
+        // The team seed is a SECOND stage over the region seed — it must differ
+        // from the region seed it is welded over (not a passthrough).
+        assert_ne!(
+            derive_team_signing_seed(&base, &region, &team),
+            derive_region_signing_seed(&base, &region)
+        );
+        // The team pubkey differs from the region pubkey (distinct keys).
+        assert_ne!(
+            derive_team_pubkey(&base, &region, &team),
+            derive_region_pubkey(&base, &region)
+        );
+    }
+
+    #[test]
+    fn team_weld_separates_teams_and_regions() {
+        let base = [0x42u8; 32];
+        let region_a = Region::canonicalize("us-east-1").unwrap();
+        let region_b = Region::canonicalize("eu-west-1").unwrap();
+        let team_x = TeamId::new("security").unwrap();
+        let team_y = TeamId::new("support").unwrap();
+        let kxa = derive_team_pubkey(&base, &region_a, &team_x);
+        // Different team, same region → different key (the tenant boundary).
+        assert_ne!(kxa, derive_team_pubkey(&base, &region_a, &team_y));
+        // Same team, different region → different key.
+        assert_ne!(kxa, derive_team_pubkey(&base, &region_b, &team_x));
+        // Different base seed → different key.
+        assert_ne!(kxa, derive_team_pubkey(&[0x43u8; 32], &region_a, &team_x));
+    }
+
+    #[test]
+    fn team_weld_signs_and_verifies_ed25519() {
+        // Positive control: a signature under the derived team seed verifies
+        // under the independently-derived team pubkey (real crypto, no stub).
+        let base = [0x42u8; 32];
+        let region = Region::canonicalize("us-east-1").unwrap();
+        let team = TeamId::new("security").unwrap();
+        let seed = derive_team_signing_seed(&base, &region, &team);
+        let signing_key = SigningKey::from_bytes(&seed);
+        let msg = b"team-bound attestation payload";
+        let sig = signing_key.sign(msg);
+        let pk = VerifyingKey::from_bytes(&derive_team_pubkey(&base, &region, &team)).unwrap();
+        assert!(pk.verify(msg, &sig).is_ok());
+        // Negative: another team's pubkey must reject the signature.
+        let other = TeamId::new("support").unwrap();
+        let pk_other =
+            VerifyingKey::from_bytes(&derive_team_pubkey(&base, &region, &other)).unwrap();
+        assert!(pk_other.verify(msg, &sig).is_err());
+    }
+
+    fn make_test_entries() -> Vec<AuditEntry> {
+        vec![AuditEntry {
+            frame_id_hex: "deadbeef".to_string(),
+            timestamp_ns: 1000,
+            spirit_pid: 1,
+            boot_nonce: 42,
+            capability_token_hex: None,
+            kind: "test.kind".to_string(),
+            intent: "test.intent".to_string(),
+            payload: String::new(),
+            redaction: None,
+        }]
+    }
+
+    fn make_freshness() -> FreshnessMetadata {
+        FreshnessMetadata {
+            export_timestamp_ns: 2000,
+            covered_window: CoveredWindow {
+                since_ns: 0,
+                until_ns: 2000,
+            },
+            export_seq: 1,
+        }
+    }
+
+    // ─── Story 9.4b AC-5 region-binding gates ──────────────────────────────
+
+    fn region(tag: &str) -> Region {
+        Region::canonicalize(tag).unwrap()
+    }
+
+    /// R-RG1 (MERGE-BLOCKING) — same-input-opposite-verdict: a bundle pinned to
+    /// the home region verifies under the home-derived attester key; the SAME
+    /// bundle is rejected under a foreign region's derived key.
+    #[test]
+    fn r_rg1_home_allow_foreign_region_violation() {
+        let seed = [7u8; 32];
+        let unsigned = build_bundle(make_test_entries(), vec![], vec![], make_freshness())
+            .with_region(&region("eu"));
+        let signed = sign_bundle(unsigned, &seed).unwrap();
+
+        // home (eu) attester key -> ALLOW
+        let eu_pub = derive_region_pubkey(&seed, &region("eu"));
+        assert!(
+            verify_bundle(&signed, &eu_pub).is_ok(),
+            "home region must verify"
+        );
+
+        // foreign (us) attester key -> region violation (verification fails)
+        let us_pub = derive_region_pubkey(&seed, &region("us"));
+        assert!(
+            matches!(
+                verify_bundle(&signed, &us_pub),
+                Err(SealedExportError::VerificationFailed)
+            ),
+            "foreign-region key must fail verification (R-RG1)"
+        );
+    }
+
+    /// R-RG4′ (MERGE-BLOCKING) — cryptographic-binding bite: tampering the
+    /// region tag in a signed bundle breaks verification (the region is covered
+    /// by the signed digest), NOT merely a region-field string check.
+    #[test]
+    fn r_rg4_prime_region_tamper_breaks_verification() {
+        let seed = [7u8; 32];
+        let unsigned = build_bundle(make_test_entries(), vec![], vec![], make_freshness())
+            .with_region(&region("eu"));
+        let mut signed = sign_bundle(unsigned, &seed).unwrap();
+        let eu_pub = derive_region_pubkey(&seed, &region("eu"));
+        assert!(verify_bundle(&signed, &eu_pub).is_ok());
+
+        // Attacker rewrites the region field post-seal.
+        signed.region = Some("us".to_string());
+        assert!(
+            verify_bundle(&signed, &eu_pub).is_err(),
+            "region tamper must fail verification (R-RG4′)"
+        );
+        // ...and it does not verify under the tampered region's key either.
+        let us_pub = derive_region_pubkey(&seed, &region("us"));
+        assert!(verify_bundle(&signed, &us_pub).is_err());
+    }
+
+    /// AC-11 / R-SCH — byte-identity preserved: a region-less (`None`) bundle
+    /// serializes WITHOUT a `region` key, so pre-region exports stay byte-for-
+    /// byte identical (9.2b HARD byte-identity replay not disturbed).
+    #[test]
+    fn r_sch_region_none_omitted_from_canonical_bytes() {
+        let unsigned = build_bundle(make_test_entries(), vec![], vec![], make_freshness());
+        assert!(unsigned.region.is_none());
+        let canonical = String::from_utf8(canonicalize(&unsigned).unwrap()).unwrap();
+        assert!(
+            !canonical.contains("region"),
+            "region-less bundle must not emit a region key: {canonical}"
+        );
+    }
+
+    /// AC-11 / R-SCH3 — backward compat: a v2 bundle JSON with NO region field
+    /// deserializes (region = None) and verifies under the raw (non-derived)
+    /// seed, exactly as before this story.
+    #[test]
+    fn r_sch3_v2_no_region_field_verifies_with_raw_seed() {
+        let seed = [3u8; 32];
+        // Sign with NO region -> raw seed path (the pre-9.4b behavior).
+        let unsigned = build_bundle(make_test_entries(), vec![], vec![], make_freshness());
+        let signed = sign_bundle(unsigned, &seed).unwrap();
+        // Round-trip through JSON (a "v2 on disk" bundle has no region key).
+        let json = serde_json::to_string(&signed).unwrap();
+        assert!(!json.contains("\"region\""), "v2 bundle must omit region");
+        let reparsed: AuditBundle = serde_json::from_str(&json).unwrap();
+        assert!(reparsed.region.is_none());
+        let raw_pub = derive_pubkey(&seed);
+        assert!(verify_bundle(&reparsed, &raw_pub).is_ok());
+    }
+
+    /// AC-12 — two spellings of one region derive the IDENTICAL signing key
+    /// (the irreversible failure class this story guards against).
+    #[test]
+    fn ac12_two_spellings_derive_identical_key() {
+        let seed = [9u8; 32];
+        let a = derive_region_signing_seed(&seed, &region("US-EAST-1"));
+        let b = derive_region_signing_seed(&seed, &region("us-east-1"));
+        assert_eq!(a, b);
+        // Different regions derive different keys.
+        let c = derive_region_signing_seed(&seed, &region("eu-west-1"));
+        assert_ne!(a, c);
+    }
+
+    /// R-SCH2 — round-trip: a region-pinned bundle survives serialize/
+    /// deserialize WITHOUT dropping the region tag, and still verifies.
+    #[test]
+    fn r_sch2_region_bundle_roundtrip_no_field_drop() {
+        let seed = [5u8; 32];
+        let unsigned = build_bundle(make_test_entries(), vec![], vec![], make_freshness())
+            .with_region(&region("ap-northeast-1"));
+        let signed = sign_bundle(unsigned, &seed).unwrap();
+        let json = serde_json::to_string(&signed).unwrap();
+        let reparsed: AuditBundle = serde_json::from_str(&json).unwrap();
+        assert_eq!(reparsed.region.as_deref(), Some("ap-northeast-1"));
+        let pubkey = derive_region_pubkey(&seed, &region("ap-northeast-1"));
+        assert!(verify_bundle(&reparsed, &pubkey).is_ok());
+    }
+
+    #[test]
+    fn sign_verify_roundtrip() {
+        let seed = [7u8; 32];
+        let entries = make_test_entries();
+        let freshness = make_freshness();
+        let i11 = vec![I11Content {
+            source_log_ref: vec!["ref1".to_string()],
+            distillation_depth: 0,
+        }];
+
+        let unsigned = build_bundle(entries, vec!["i12ref".to_string()], i11, freshness);
+        let signed = sign_bundle(unsigned, &seed).expect("signing should succeed");
+
+        assert_eq!(signed.schema_version, "maos.audit-bundle.v1");
+        assert_eq!(signed.signature_block.algorithm, "Ed25519");
+        assert_eq!(signed.entries.len(), 1);
+        assert_eq!(signed.i12_digest_refs.len(), 1);
+
+        let pubkey = derive_pubkey(&seed);
+        verify_bundle(&signed, &pubkey).expect("verification should succeed");
+    }
+
+    #[test]
+    fn wrong_key_fails_verification() {
+        let seed = [7u8; 32];
+        let wrong_seed = [99u8; 32];
+
+        let unsigned = build_bundle(make_test_entries(), vec![], vec![], make_freshness());
+        let signed = sign_bundle(unsigned, &seed).unwrap();
+
+        let wrong_pubkey = derive_pubkey(&wrong_seed);
+        assert!(verify_bundle(&signed, &wrong_pubkey).is_err());
+    }
+
+    #[test]
+    fn canonical_deterministic() {
+        let unsigned = build_bundle(
+            make_test_entries(),
+            vec!["a".to_string()],
+            vec![],
+            make_freshness(),
+        );
+        let bytes1 = canonicalize(&unsigned).unwrap();
+        let bytes2 = canonicalize(&unsigned).unwrap();
+        assert_eq!(
+            bytes1, bytes2,
+            "canonical serialization must be deterministic"
+        );
+    }
+
+    #[test]
+    fn canonical_sorted_keys() {
+        let unsigned = build_bundle(make_test_entries(), vec![], vec![], make_freshness());
+        let bytes = canonicalize(&unsigned).unwrap();
+        let json_str = String::from_utf8(bytes).unwrap();
+
+        // The top-level keys must appear in sorted order:
+        // entries, freshness, i11_distilled_content, i12_digest_refs, schema_version
+        let entries_pos = json_str.find("\"entries\"").unwrap();
+        let freshness_pos = json_str.find("\"freshness\"").unwrap();
+        let i11_pos = json_str.find("\"i11_distilled_content\"").unwrap();
+        let i12_pos = json_str.find("\"i12_digest_refs\"").unwrap();
+        let schema_pos = json_str.find("\"schema_version\"").unwrap();
+
+        assert!(
+            entries_pos < freshness_pos,
+            "entries must come before freshness"
+        );
+        assert!(freshness_pos < i11_pos, "freshness must come before i11");
+        assert!(i11_pos < i12_pos, "i11 must come before i12");
+        assert!(i12_pos < schema_pos, "i12 must come before schema_version");
+    }
+
+    #[test]
+    fn tamper_i11_content_fails_verification() {
+        let seed = [7u8; 32];
+        let entries = make_test_entries();
+        let freshness = make_freshness();
+        let i11 = vec![I11Content {
+            source_log_ref: vec!["original_ref".to_string()],
+            distillation_depth: 0,
+        }];
+
+        let unsigned = build_bundle(entries, vec!["i12ref".to_string()], i11, freshness);
+        let mut signed = sign_bundle(unsigned, &seed).expect("signing should succeed");
+
+        // Tamper: change the first source_log_ref string
+        signed.i11_distilled_content[0].source_log_ref[0] = "TAMPERED".to_string();
+
+        let pubkey = derive_pubkey(&seed);
+        assert!(
+            verify_bundle(&signed, &pubkey).is_err(),
+            "tampered i11 content must fail verification"
+        );
+    }
+
+    #[test]
+    fn tamper_i12_digest_ref_fails_verification() {
+        let seed = [7u8; 32];
+        let entries = make_test_entries();
+        let freshness = make_freshness();
+
+        let unsigned = build_bundle(
+            entries,
+            vec!["original_digest_ref".to_string()],
+            vec![],
+            freshness,
+        );
+        let mut signed = sign_bundle(unsigned, &seed).expect("signing should succeed");
+
+        // Tamper: modify one character of the first i12 digest ref
+        signed.i12_digest_refs[0] = "tampered_digest_ref".to_string();
+
+        let pubkey = derive_pubkey(&seed);
+        assert!(
+            verify_bundle(&signed, &pubkey).is_err(),
+            "tampered i12 digest ref must fail verification"
+        );
+    }
+
+    #[test]
+    fn replay_metadata_present() {
+        let seed = [7u8; 32];
+        let entries = make_test_entries();
+        let freshness = make_freshness();
+
+        let unsigned = build_bundle(entries, vec![], vec![], freshness);
+        let signed = sign_bundle(unsigned, &seed).expect("signing should succeed");
+
+        // Verify freshness metadata fields are populated
+        assert!(
+            signed.freshness.export_timestamp_ns > 0,
+            "export_timestamp_ns must be > 0"
+        );
+        // covered_window has since/until
+        let _since = signed.freshness.covered_window.since_ns;
+        let _until = signed.freshness.covered_window.until_ns;
+        let _export_seq = signed.freshness.export_seq;
+        // Also verify the bundle passes verification
+        let pubkey = derive_pubkey(&seed);
+        verify_bundle(&signed, &pubkey).expect("signed bundle must verify");
+    }
+}

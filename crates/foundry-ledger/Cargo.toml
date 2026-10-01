@@ -7,6 +7,9 @@ license.workspace = true
 [dependencies]
 foundry-domain = { path = "../foundry-domain" }
 rusqlite.workspace = true
+sha2 = "0.10"
+hex = "0.4"
 thiserror.workspace = true
 chrono.workspace = true
+serde.workspace = true
 serde_json.workspace = true

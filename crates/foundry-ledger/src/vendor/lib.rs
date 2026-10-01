@@ -1,0 +1,3417 @@
+#![forbid(unsafe_code)]
+
+//! `maos-audit` — read-side SQLite query adapter for Transparency Log
+//! + Approval Decision Log.
+//!
+//! This crate is read-only by design — it opens the SQLite file produced
+//! by `maos-kernel-core::iac::transparency_log` with a read-only
+//! connection (`SQLITE_OPEN_READ_ONLY` flag) and exposes query + NDJSON
+//! export. The Story 1a.4 decoupling rule (`maos-cli` MUST NOT depend on
+//! `maos-kernel-core`) is preserved by routing the CLI through this
+//! separate crate; the kernel-core's write surface stays isolated.
+//!
+//! Story 9.1 extends this crate with subject-access, posture-delta, and
+//! sealed-export functions.
+
+pub mod erasure;
+pub mod fr4_classifier;
+pub use fr4_classifier::{classify_fr4_row, Fr4RowDisposition, WriterShapeEntry};
+pub mod log_composition;
+pub mod replay;
+
+pub mod backup;
+pub mod release_verify;
+pub mod sealed_export;
+
+use std::io::Write;
+use std::path::Path;
+
+use rusqlite::OpenFlags;
+
+/// Typed audit-read error.
+#[derive(Debug, thiserror::Error)]
+pub enum AuditError {
+    #[error("sqlite open failed: {0}")]
+    Open(rusqlite::Error),
+    #[error("sqlite read failed: {0}")]
+    Read(rusqlite::Error),
+    #[error("sqlite query failed: {0}")]
+    Query(rusqlite::Error),
+    #[error("sqlite row decode failed: {0}")]
+    Row(String),
+    #[error("ndjson encode failed: {0}")]
+    Encode(#[from] serde_json::Error),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+    /// FR4 schema-projection rejected an entry. Surface side stops emitting
+    /// on the first violation (AC2: fail fast; no silent pass on partial coverage).
+    #[error("FR4 schema violation at line {line}: missing field '{missing_field}'")]
+    Fr4SchemaViolation {
+        line: usize,
+        missing_field: &'static str,
+    },
+    /// A u64 value exceeded i64 range when converting for SQLite binding.
+    #[error("value overflow: {field} ({value}) exceeds i64 range")]
+    ValueOverflow { field: &'static str, value: u64 },
+    /// Empty capability filter string provided.
+    #[error("empty capability filter string")]
+    EmptyCapabilityFilter,
+    /// A `kind` filter string does not map to a known frame kind.
+    #[error("unknown frame kind filter '{0}'")]
+    UnknownKind(String),
+}
+
+/// FR4-projection error returned by [`project_to_fr4`]. Lifted into
+/// [`AuditError::Fr4SchemaViolation`] by [`to_fr4_ndjson`].
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum Fr4SchemaError {
+    /// `capability_token` was `NULL` — mandatory under FR4's 100% mediation rule.
+    #[error("missing capability_token")]
+    MissingCapabilityToken,
+    /// `kind` discriminator decoded to `unknown(N)` — projection refuses to
+    /// emit a row whose call_type the read side does not understand.
+    #[error("unknown call_type '{0}'")]
+    UnknownCallType(String),
+}
+
+impl Fr4SchemaError {
+    /// Stable, short string naming the missing field (used in diagnostics
+    /// and in [`AuditError::Fr4SchemaViolation::missing_field`]).
+    pub fn missing_field(&self) -> &'static str {
+        match self {
+            Fr4SchemaError::MissingCapabilityToken => "capability_token",
+            Fr4SchemaError::UnknownCallType(_) => "call_type",
+        }
+    }
+}
+
+/// One audit entry from the Transparency Log. Mirrors the kernel-side
+/// `TransparencyLogEntry` shape but is independently defined to keep
+/// the dep direction clean (maos-audit depends on maos-domain only,
+/// NOT on maos-kernel-core).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AuditEntry {
+    /// 32-char hex of the 16-byte frame_id.
+    #[serde(rename = "frame_id")]
+    pub frame_id_hex: String,
+    /// Monotonic wall-time nanoseconds.
+    pub timestamp_ns: u64,
+    /// Spirit process ID.
+    pub spirit_pid: u32,
+    /// Boot nonce of the kernel that wrote this entry.
+    pub boot_nonce: u64,
+    /// 64-char hex of the 32-byte Ed25519 capability token, if present.
+    #[serde(rename = "capability_token", skip_serializing_if = "Option::is_none")]
+    pub capability_token_hex: Option<String>,
+    /// Frame kind as a dot-separated string (e.g. "task.assign").
+    pub kind: String,
+
+    /// Intent string from the frame.
+    pub intent: String,
+    /// Redacted payload bytes decoded as UTF-8.  Empty for frames that do not
+    /// carry a payload (e.g. lifecycle intents).  Used by read-time consumers
+    /// such as cost-reconcile to parse structured frames.
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    pub payload: String,
+    /// Per-frame redaction metadata. Populated ONLY by `query_with_redaction()`.
+    /// Mirrors the `capability_token_hex` serde-skip pattern (F1 A-prime).
+    #[serde(rename = "redaction", skip_serializing_if = "Option::is_none", default)]
+    pub redaction: Option<RedactionMeta>,
+}
+
+/// Redaction metadata for a single frame (Story 9.2b, F1 A-prime).
+///
+/// Carries the redaction class + **bucketed** original payload byte length
+/// (power-of-two bucket, NOT exact byte count).  No content hash — see
+/// ADR-028 D3 (F5: confirmation-oracle risk on low-entropy fields).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RedactionMeta {
+    /// Redaction class derived from frame metadata (e.g. "payload", "intent").
+    pub class: String,
+    /// Bucketed original payload byte length (power-of-two bucket).
+    pub original_len_bucket: u64,
+}
+
+/// Filter for the read-side query — same shape as the kernel-side
+/// `FrameFilter` but isolated in this crate.
+#[derive(Debug, Clone, Default)]
+pub struct AuditFilter {
+    pub spirit_pid: Option<u32>,
+    pub boot_nonce: Option<u64>,
+    pub kind: Option<String>,
+    pub since_ns: Option<u64>,
+    pub until_ns: Option<u64>,
+    pub limit: Option<usize>,
+    /// FR41 — exact-match on capability_token BLOB (hex-encoded input).
+    pub capability_token: Option<String>,
+    /// FR41 — param-bound substring match on intent column.
+    pub intent_contains: Option<String>,
+}
+
+/// Resolve the `kind` filter string to a concrete list of `i64` discriminators.
+///
+/// Supports:
+/// - single category names (`"governance"`, `"cost"`) via `kind_category_to_kinds`
+/// - comma-separated categories/kinds (`"governance,cost"`)
+/// - single kind names (`"TaskAssign"`, `"task.assign"`) via `kind_from_string`
+///
+/// Returns `None` only when none of the comma-separated tokens resolve
+/// (callers should surface `AuditError::UnknownKind`).
+fn resolve_kind_filter(kind_str: &str) -> Option<Vec<i64>> {
+    let mut result = Vec::new();
+    let mut any_recognized = false;
+    for token in kind_str.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(kinds) = kind_category_to_kinds(token) {
+            result.extend(kinds);
+            any_recognized = true;
+        } else if let Some(kind) = kind_from_string(token) {
+            result.push(kind);
+            any_recognized = true;
+        }
+    }
+    if any_recognized {
+        // Preserve stable order and remove duplicates without changing the
+        // SQL `kind IN (...)` semantics.
+        let mut deduped = result;
+        deduped.sort_unstable();
+        deduped.dedup();
+        Some(deduped)
+    } else {
+        None
+    }
+}
+
+/// Open the per-Host SQLite file read-only and return matching entries.
+
+pub fn query(db_path: &Path, filter: AuditFilter) -> Result<Vec<AuditEntry>, AuditError> {
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(AuditError::Open)?;
+
+    let mut sql = String::from(
+        "SELECT frame_id, timestamp_ns, spirit_pid, boot_nonce,
+                capability_token, kind, intent, payload_redacted
+         FROM transparency_log",
+    );
+    let mut where_clauses: Vec<String> = Vec::new();
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+    if let Some(pid) = filter.spirit_pid {
+        where_clauses.push("spirit_pid = ?".to_string());
+        let pid_i64 = i64::try_from(pid).map_err(|_| AuditError::ValueOverflow {
+            field: "spirit_pid",
+            value: pid.into(),
+        })?;
+        params.push(Box::new(pid_i64));
+    }
+    if let Some(boot) = filter.boot_nonce {
+        where_clauses.push("boot_nonce = ?".to_string());
+        let boot_i64 = i64::try_from(boot).map_err(|_| AuditError::ValueOverflow {
+            field: "boot_nonce",
+            value: boot,
+        })?;
+        params.push(Box::new(boot_i64));
+    }
+    if let Some(since) = filter.since_ns {
+        where_clauses.push("timestamp_ns >= ?".to_string());
+        let since_i64 = i64::try_from(since).map_err(|_| AuditError::ValueOverflow {
+            field: "since_ns",
+            value: since,
+        })?;
+        params.push(Box::new(since_i64));
+    }
+    if let Some(until) = filter.until_ns {
+        where_clauses.push("timestamp_ns <= ?".to_string());
+        let until_i64 = i64::try_from(until).map_err(|_| AuditError::ValueOverflow {
+            field: "until_ns",
+            value: until,
+        })?;
+        params.push(Box::new(until_i64));
+    }
+    if let Some(kind_str) = &filter.kind {
+        match resolve_kind_filter(kind_str) {
+            Some(kinds) => {
+                if kinds.len() == 1 {
+                    where_clauses.push("kind = ?".to_string());
+                    params.push(Box::new(kinds[0]));
+                } else {
+                    let placeholders: Vec<String> = kinds
+                        .iter()
+                        .enumerate()
+                        .map(|(i, _)| format!("?{}", params.len() + i + 1))
+                        .collect();
+                    where_clauses.push(format!("kind IN ({})", placeholders.join(",")));
+                    for k in &kinds {
+                        params.push(Box::new(*k));
+                    }
+                }
+            }
+            None => return Err(AuditError::UnknownKind(kind_str.clone())),
+        }
+    }
+    // FR41 — capability_token: hex input → blob comparison (param-bound).
+    if let Some(hex_str) = &filter.capability_token {
+        if hex_str.is_empty() {
+            return Err(AuditError::EmptyCapabilityFilter);
+        }
+        let blob = hex::decode(hex_str)
+            .map_err(|e| AuditError::Read(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))?;
+        where_clauses.push("capability_token = ?".to_string());
+        params.push(Box::new(blob));
+    }
+    // FR41 — intent_contains: param-bound LIKE, never string-interpolated (SQLi-safe).
+    if let Some(sub) = &filter.intent_contains {
+        where_clauses.push("intent LIKE '%' || ? || '%'".to_string());
+        params.push(Box::new(sub.clone()));
+    }
+
+    if !where_clauses.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&where_clauses.join(" AND "));
+    }
+    sql.push_str(" ORDER BY timestamp_ns ASC, frame_id ASC");
+    if let Some(limit) = filter.limit {
+        let limit_i64 = i64::try_from(limit).map_err(|_| AuditError::ValueOverflow {
+            field: "limit",
+            value: limit as u64,
+        })?;
+        params.push(Box::new(limit_i64));
+        sql.push_str(" LIMIT ?");
+    }
+
+    let mut stmt = conn.prepare(&sql).map_err(AuditError::Read)?;
+    let params_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let rows = stmt
+        .query_map(params_refs.as_slice(), |row| {
+            let frame_id_blob: Vec<u8> = row.get(0)?;
+            let cap_blob: Option<Vec<u8>> = row.get(4)?;
+            let payload_blob: Vec<u8> = row.get(7)?;
+            Ok(AuditEntry {
+                frame_id_hex: hex_encode(&frame_id_blob),
+                timestamp_ns: row.get::<_, i64>(1)? as u64,
+                spirit_pid: row.get::<_, i64>(2)? as u32,
+                boot_nonce: row.get::<_, i64>(3)? as u64,
+                capability_token_hex: cap_blob.as_ref().map(|b| hex_encode(b)),
+                kind: kind_to_string(row.get::<_, i64>(5)?),
+                intent: row.get(6)?,
+                payload: String::from_utf8_lossy(&payload_blob).into_owned(),
+                redaction: None,
+            })
+        })
+        .map_err(AuditError::Read)?;
+
+    let mut entries = Vec::new();
+    for row in rows {
+        entries.push(row.map_err(AuditError::Read)?);
+    }
+    Ok(entries)
+}
+
+/// Bucket a byte length to a privacy-safe size bucket.
+///
+/// Used by `query_with_redaction()` to produce length buckets for redacted
+/// payloads (ADR-028 D3 — no exact byte length, no content hash).
+///
+/// To avoid a confirmation oracle on low-entropy fields (e.g. a boolean),
+/// values below 8 bytes are rounded up to the 8-byte bucket so that many
+/// distinct small lengths collide. Zero-length payloads bucket to 0.
+pub fn bucket_len(len: usize) -> u64 {
+    if len == 0 {
+        return 0;
+    }
+    std::cmp::max((len as u64).next_power_of_two(), 8)
+}
+
+/// Query the Transparency Log with redaction metadata populated.
+///
+/// Same as [`query`] but additionally reads `payload_redacted`. For rows where
+/// the column is non-empty, it derives a privacy-safe `RedactionMeta`; rows
+/// with an empty `payload_redacted` keep `AuditEntry::redaction = None`. This
+/// is the **ONLY** sanctioned populator of `AuditEntry::redaction` — see
+/// ADR-028 D4 and the call-path oracle test
+/// `redaction_field_is_none_for_all_non_replay_callers`.
+///
+/// Requires the same read-only SQLite connection as `query()`.
+pub fn query_with_redaction(
+    db_path: &Path,
+    filter: AuditFilter,
+) -> Result<Vec<AuditEntry>, AuditError> {
+    // ADR-028 D6: replay determinism requires a quiesced / WAL-checkpointed DB.
+    // If a SQLite WAL file is present, the DB may still have uncheckpointed
+    // writes from an open writer, making replay non-deterministic.
+    let wal_path = db_path.with_extension("sqlite-wal");
+    if wal_path.exists() {
+        return Err(AuditError::Open(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ffi::ErrorCode::DatabaseBusy,
+                extended_code: 0,
+            },
+            Some(format!(
+                "Transparency Log has an active WAL ({}). \
+                 Quiesce/checkpoint the kernel before deterministic replay/export.",
+                wal_path.display()
+            )),
+        )));
+    }
+
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(AuditError::Open)?;
+    let mut sql = String::from(
+        "SELECT frame_id, timestamp_ns, spirit_pid, boot_nonce,
+                capability_token, kind, intent, payload_redacted
+         FROM transparency_log",
+    );
+    let mut where_clauses: Vec<String> = Vec::new();
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+    if let Some(pid) = filter.spirit_pid {
+        where_clauses.push("spirit_pid = ?".to_string());
+        let pid_i64 = i64::try_from(pid).map_err(|_| AuditError::ValueOverflow {
+            field: "spirit_pid",
+            value: pid.into(),
+        })?;
+        params.push(Box::new(pid_i64));
+    }
+    if let Some(boot) = filter.boot_nonce {
+        where_clauses.push("boot_nonce = ?".to_string());
+        let boot_i64 = i64::try_from(boot).map_err(|_| AuditError::ValueOverflow {
+            field: "boot_nonce",
+            value: boot,
+        })?;
+        params.push(Box::new(boot_i64));
+    }
+    if let Some(since) = filter.since_ns {
+        where_clauses.push("timestamp_ns >= ?".to_string());
+        let since_i64 = i64::try_from(since).map_err(|_| AuditError::ValueOverflow {
+            field: "since_ns",
+            value: since,
+        })?;
+        params.push(Box::new(since_i64));
+    }
+    if let Some(until) = filter.until_ns {
+        where_clauses.push("timestamp_ns <= ?".to_string());
+        let until_i64 = i64::try_from(until).map_err(|_| AuditError::ValueOverflow {
+            field: "until_ns",
+            value: until,
+        })?;
+        params.push(Box::new(until_i64));
+    }
+    if let Some(kind_str) = &filter.kind {
+        match resolve_kind_filter(kind_str) {
+            Some(kinds) => {
+                if kinds.len() == 1 {
+                    where_clauses.push("kind = ?".to_string());
+                    params.push(Box::new(kinds[0]));
+                } else {
+                    let placeholders: Vec<String> = kinds
+                        .iter()
+                        .enumerate()
+                        .map(|(i, _)| format!("?{}", params.len() + i + 1))
+                        .collect();
+                    where_clauses.push(format!("kind IN ({})", placeholders.join(",")));
+                    for k in &kinds {
+                        params.push(Box::new(*k));
+                    }
+                }
+            }
+            None => return Err(AuditError::UnknownKind(kind_str.clone())),
+        }
+    }
+    if let Some(hex_str) = &filter.capability_token {
+        if hex_str.is_empty() {
+            return Err(AuditError::EmptyCapabilityFilter);
+        }
+        let blob = hex::decode(hex_str)
+            .map_err(|e| AuditError::Read(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))?;
+        where_clauses.push("capability_token = ?".to_string());
+        params.push(Box::new(blob));
+    }
+    if let Some(limit) = filter.limit {
+        let limit_i64 = i64::try_from(limit).map_err(|_| AuditError::ValueOverflow {
+            field: "limit",
+            value: limit as u64,
+        })?;
+        params.push(Box::new(limit_i64));
+        sql.push_str(" LIMIT ?");
+    }
+    if let Some(sub) = &filter.intent_contains {
+        where_clauses.push("intent LIKE '%' || ? || '%'".to_string());
+        params.push(Box::new(sub.clone()));
+    }
+
+    if !where_clauses.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&where_clauses.join(" AND "));
+    }
+    sql.push_str(" ORDER BY timestamp_ns ASC, frame_id ASC");
+    let mut stmt = conn.prepare(&sql).map_err(AuditError::Read)?;
+    let params_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let rows = stmt
+        .query_map(params_refs.as_slice(), |row| {
+            let frame_id_blob: Vec<u8> = row.get(0)?;
+            let cap_blob: Option<Vec<u8>> = row.get(4)?;
+            let payload_blob: Vec<u8> = row.get(7)?;
+            let kind_int: i64 = row.get(5)?;
+            let kind_str = kind_to_string(kind_int);
+
+            let redaction = if payload_blob.is_empty() {
+                None
+            } else {
+                Some(RedactionMeta {
+                    class: kind_str.clone(),
+                    original_len_bucket: bucket_len(payload_blob.len()),
+                })
+            };
+            Ok(AuditEntry {
+                frame_id_hex: hex_encode(&frame_id_blob),
+                timestamp_ns: row.get::<_, i64>(1)? as u64,
+                spirit_pid: row.get::<_, i64>(2)? as u32,
+                boot_nonce: row.get::<_, i64>(3)? as u64,
+                capability_token_hex: cap_blob.as_ref().map(|b| hex_encode(b)),
+                kind: kind_str,
+                intent: row.get(6)?,
+                payload: String::from_utf8_lossy(&payload_blob).into_owned(),
+                redaction,
+            })
+        })
+        .map_err(AuditError::Read)?;
+
+    let mut entries = Vec::new();
+    for row in rows {
+        entries.push(row.map_err(AuditError::Read)?);
+    }
+    Ok(entries)
+}
+
+/// Write entries to an NDJSON stream. One JSON object per line.
+///
+/// This is the raw audit-entry surface preserved for Story 9.1 (subject-access /
+/// posture-delta / sealed-export). For the FR4 mechanical-verification surface
+/// see [`to_fr4_ndjson`].
+pub fn to_ndjson<W: Write>(
+    entries: impl IntoIterator<Item = AuditEntry>,
+    mut out: W,
+) -> Result<(), AuditError> {
+    for entry in entries {
+        let line = serde_json::to_string(&entry)?;
+        writeln!(out, "{line}")?;
+    }
+    Ok(())
+}
+/// One ratification frame read from the Transparency Log.
+///
+/// Used by the `xtask check-abi-ratification` gate to verify that
+/// ratified ABI-extension proposals exist as journaled governance events
+/// and strictly precede the ABI delta they cover (ADR-045 §4 / R1).
+#[derive(Debug, Clone)]
+pub struct RatificationFrame {
+    pub proposal_id: String,
+    pub seq: i64,
+}
+
+/// Load ratification frames from the Transparency Log.
+///
+/// Searches for `FrameKind::GovernanceEvent` frames whose payload is an
+/// `AbiExtensionProposal` with `status == Ratified`.
+/// Returns them sorted by ascending `seq`.
+pub fn load_ratification_frames(db_path: &Path) -> Result<Vec<RatificationFrame>, AuditError> {
+    use super::governance::{
+        GovernanceEventKind, GovernanceEventPayload, RatificationStatus,
+    };
+
+    // FrameKind::GovernanceEvent discriminator is pinned at 28 (wire-stable
+    // since Story 1b.1; see maos-iac::adapter::transparency_log::FrameKind).
+    const GOVERNANCE_EVENT_KIND: i64 = 28;
+
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(AuditError::Open)?;
+
+    let mut stmt = conn
+        .prepare("SELECT seq, payload FROM transparency_log WHERE kind = ? ORDER BY seq ASC")
+        .map_err(AuditError::Query)?;
+
+    let rows = stmt
+        .query_map([GOVERNANCE_EVENT_KIND], |row| {
+            let seq: i64 = row.get(0)?;
+            let payload: Vec<u8> = row.get(1)?;
+            Ok((seq, payload))
+        })
+        .map_err(AuditError::Query)?;
+
+    let mut frames = Vec::new();
+    for row in rows {
+        let (seq, payload) = row.map_err(AuditError::Query)?;
+        let payload: GovernanceEventPayload = serde_json::from_slice(&payload)
+            .map_err(|e| AuditError::Row(format!("frame seq {seq}: {e}")))?;
+        if let GovernanceEventKind::AbiExtension(proposal) = payload.event {
+            if proposal.status == RatificationStatus::Ratified {
+                frames.push(RatificationFrame {
+                    proposal_id: proposal.proposal_id,
+                    seq,
+                });
+            }
+        }
+    }
+    Ok(frames)
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// FR4 projection (Story 1b.5b, AC1)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// FR4 NDJSON projection of a Transparency-Log row.
+///
+/// Per AC1, every entry surfaced by `maosctl audit query --spirit <name>` must
+/// carry exactly these six keys and all five **mandatory** fields
+/// (`capability_token`, `spirit_pid`, `boot_nonce`, `call_type`, `timestamp_ns`)
+/// must be non-null. A missing or null mandatory field is a schema violation
+/// that fails the command with exit code 2 — see [`to_fr4_ndjson`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct Fr4Entry {
+    /// 32-char hex of the 16-byte frame_id (always present — PRIMARY KEY in schema).
+    pub call_id: String,
+    /// 64-char hex of the 32-byte Ed25519 capability token.
+    /// Mandatory — `None` upstream becomes [`Fr4SchemaError::MissingCapabilityToken`].
+    pub capability_token: String,
+    /// Spirit process ID at the time of the call. Mandatory.
+    pub spirit_pid: u32,
+    /// Boot nonce of the kernel that wrote this row. Mandatory.
+    pub boot_nonce: u64,
+    /// Dot-separated kind string (e.g. `"capability.invocation"`,
+    /// `"inference.call"`). Mandatory; `unknown(N)` is rejected.
+    pub call_type: String,
+    /// Wall-clock timestamp in nanoseconds. Mandatory.
+    pub timestamp_ns: u64,
+}
+
+/// Project a raw [`AuditEntry`] to the FR4 schema. Returns
+/// [`Fr4SchemaError::MissingCapabilityToken`] when the source row has
+/// `capability_token = NULL`, and [`Fr4SchemaError::UnknownCallType`] when
+/// `kind` decoded to `unknown(N)`.
+pub fn project_to_fr4(entry: &AuditEntry) -> Result<Fr4Entry, Fr4SchemaError> {
+    let capability_token = entry
+        .capability_token_hex
+        .clone()
+        .ok_or(Fr4SchemaError::MissingCapabilityToken)?;
+    if entry.kind.starts_with("unknown(") {
+        return Err(Fr4SchemaError::UnknownCallType(entry.kind.clone()));
+    }
+    Ok(Fr4Entry {
+        call_id: entry.frame_id_hex.clone(),
+        capability_token,
+        spirit_pid: entry.spirit_pid,
+        boot_nonce: entry.boot_nonce,
+        call_type: entry.kind.clone(),
+        timestamp_ns: entry.timestamp_ns,
+    })
+}
+
+/// Write entries as FR4 NDJSON — one CALL [`Fr4Entry`] per line.
+///
+/// Story 16-2 / D-16-2-G: rows the classifier marks non-call kernel events
+/// are OMITTED from the feed (its per-line schema requires a token; emitting
+/// `capability_token: null` would break every line consumer) and counted on
+/// stderr, naming each omitted kind. Call rows keep the exact AC1+AC2
+/// contract: the first projection failure aborts with
+/// [`AuditError::Fr4SchemaViolation`] naming the offending 1-indexed INPUT
+/// ROW — the row index [`to_fr4_plain`] reports, never an output line —
+/// and the missing field; output is buffered so no partial line is written.
+pub fn to_fr4_ndjson<W: Write>(
+    entries: impl IntoIterator<Item = AuditEntry>,
+    mut out: W,
+) -> Result<(), AuditError> {
+    let mut buf = Vec::new();
+    let mut omitted: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut line_no = 0usize;
+    for mut entry in entries.into_iter() {
+        line_no += 1;
+        if classify_fr4_row(&entry) == Fr4RowDisposition::NonCallKernelEvent {
+            let kind = std::mem::take(&mut entry.kind);
+            *omitted.entry(kind).or_insert(0) += 1;
+            continue;
+        }
+        let projected = project_to_fr4(&entry).map_err(|e| AuditError::Fr4SchemaViolation {
+            line: line_no,
+            missing_field: e.missing_field(),
+        })?;
+        let line = serde_json::to_string(&projected)?;
+        writeln!(buf, "{line}")?;
+    }
+    out.write_all(&buf)?;
+    if !omitted.is_empty() {
+        let summary: Vec<String> = omitted
+            .iter()
+            .map(|(kind, n)| format!("{kind}×{n}"))
+            .collect();
+        eprintln!(
+            "maos: FR4 feed omitted {} non-call kernel row(s): {}",
+            omitted.values().sum::<usize>(),
+            summary.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Truncate a string display to `max_len` characters.
+/// Respects Unicode character boundaries — never splits a multi-byte code point.
+fn truncate(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        let mut end = max_len;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s[..end].to_string()
+    }
+}
+
+/// Hex-encode a byte slice.
+fn hex_encode(bytes: &[u8]) -> String {
+    hex::encode(bytes)
+}
+
+/// Convert a kind integer to a human-readable dot-case string.
+/// Stable format used by `maosctl audit query --format plain`.
+fn kind_to_string(kind: i64) -> String {
+    match kind {
+        0 => "task.assign",
+        1 => "task.complete",
+        2 => "decision.dispatch",
+        3 => "epistemic.halt",
+        4 => "telemetry.event",
+        5 => "consent.request",
+        6 => "retract",
+        7 => "capability.invocation",
+        8 => "sandbox.block",
+        9 => "inference.call",
+        10 => "decision",
+        11 => "distillate",
+        // Story 16-2 / D-16-2-G — symmetric names for the budget/stall kinds
+        // (set (a) of the FR4 non-call classification needs them; they
+        // rendered `unknown` before, which the classifier would have had to
+        // special-case).
+        12 => "budget.warning",
+        13 => "budget.exceeded",
+        15 => "task.stalled",
+        16 => "silent.failure.suspect",
+        17 => "spirit.revoked",
+        19 => "spirit.admitted",
+        22 => "consent.rupture",
+        28 => "governance.event",
+        29 => "cost.attribution",
+        30 => "identity.asserted",
+        // j1-crosshost-1a AC3.11 — `CliSubprocessOutput` was a real
+        // `FrameKind` variant (`maos-spirit-abi::identity::FrameKind = 21`) that
+        // this mapping never listed, so every Worker-output row rendered
+        // `unknown` on read — 159 of the 247 entries in the signed J1 Tier-2
+        // bundle. The frame-borne completion this story journals CITES those rows
+        // as its evidence, and a legible verdict citing illegible evidence is not
+        // evidence. Kept symmetric with `kind_from_string` below.
+        21 => "cli.subprocess.output",
+        // J1 Tier-2 — a human-authored signed-run capture attestation, written
+        // at the bin/CLI boundary as a raw kind int (like `identity.asserted`
+        // above) so it renders here on read WITHOUT a kernel `FrameKind` variant
+        // (ZERO kernel delta). Journaled by `maosctl audit record-capture` so a
+        // subsequent `sealed-export` signature covers the capture as an audit row.
+        31 => "run.capture",
+        _ => "unknown",
+    }
+    .to_string()
+}
+
+/// Convert a kind string to its integer discriminator.
+/// Accepts both dot-case (`"task.assign"`) and PascalCase (`"TaskAssign"`) for backward compat.
+fn kind_from_string(s: &str) -> Option<i64> {
+    match s {
+        "task.assign" | "TaskAssign" => Some(0),
+        "task.complete" | "TaskComplete" => Some(1),
+        "decision.dispatch" | "DecisionDispatch" => Some(2),
+        "epistemic.halt" | "EpistemicHalt" => Some(3),
+        "telemetry.event" | "TelemetryEvent" => Some(4),
+        "consent.request" | "ConsentRequest" => Some(5),
+        "retract" | "Retract" => Some(6),
+        "capability.invocation" | "CapabilityInvocation" => Some(7),
+        "sandbox.block" | "SandboxBlock" => Some(8),
+        "inference.call" | "InferenceCall" => Some(9),
+        "decision" | "Decision" => Some(10),
+        "distillate" | "Distillate" => Some(11),
+        "budget.warning" | "BudgetWarning" => Some(12),
+        "budget.exceeded" | "BudgetExceeded" => Some(13),
+        "task.stalled" | "TaskStalled" => Some(15),
+        "silent.failure.suspect" | "SilentFailureSuspect" => Some(16),
+        "spirit.revoked" | "SpiritRevoked" => Some(17),
+        "spirit.admitted" | "SpiritAdmitted" => Some(19),
+        // j1-crosshost-1a AC3.11 — the reverse arm. Every other kind in this table
+        // is symmetric; a one-way mapping would render kind 21 but leave
+        // `maosctl audit query --kind cli.subprocess.output` unable to select it,
+        // which is the same defect in the other direction.
+        "cli.subprocess.output" | "CliSubprocessOutput" => Some(21),
+        "consent.rupture" | "ConsentRupture" => Some(22),
+        "governance.event" | "GovernanceEvent" => Some(28),
+        "cost.attribution" | "CostAttribution" => Some(29),
+        "identity.asserted" | "IdentityAsserted" => Some(30),
+        "run.capture" | "RunCapture" => Some(31),
+        _ => None,
+    }
+}
+
+/// Story 9.3b (F7) — resolve a category name to the set of FrameKind
+/// discriminators it covers.  Used by `maosctl audit query --kind governance`.
+///
+/// Categories: `"governance"` → FrameKind::GovernanceEvent (28);
+/// `"cost"` → FrameKind::CostAttribution (29, added in Task 3).
+/// Returns None for unrecognized categories.
+pub fn kind_category_to_kinds(category: &str) -> Option<Vec<i64>> {
+    let kinds = match category {
+        "governance" => vec![28],
+        "cost" => vec![29],
+        _ => return None,
+    };
+    if kinds.is_empty() {
+        None
+    } else {
+        Some(kinds)
+    }
+}
+
+/// Audit-category classification for a FrameKind discriminator.
+///
+/// This is the INVERSE of `kind_category_to_kinds` — maps a single kind
+/// i64 to its category.  The R9 completeness check in xtask asserts
+/// these two round-trip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditCategory {
+    Governance,
+    Cost,
+    /// Operational kinds (0–27 except governance/cost) — NOT a catch-all
+    /// `Other` (no `_ => Other` arm per AC3).
+    Operational,
+}
+
+/// Classify a single FrameKind i64 into its audit category.
+///
+/// Per R9: uses explicit arms, NOT a catch-all `_ => Other`.
+/// The EXCLUDED set documents pre-existing kinds that are not
+/// governance or cost.  A new kind FORCES a classification decision.
+pub fn kind_to_category(kind: i64) -> Option<AuditCategory> {
+    match kind {
+        // Governance
+        28 => Some(AuditCategory::Governance),
+        29 => Some(AuditCategory::Cost),
+        // Operational (pre-existing kinds 0–27)
+        0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19
+        | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 => Some(AuditCategory::Operational),
+        // Unknown kind — forces a classification decision on introduction
+        _ => None,
+    }
+}
+
+/// Write entries as human-readable tabular text. Never emits ANSI escapes
+/// (no `colored` crate, no `\x1b` bytes). Used by `maosctl audit query
+/// --format plain` and engaged automatically when the NFR-Ops-5 cascade
+/// disables color (`--plain` / `NO_COLOR=1` / `TERM=dumb`).
+///
+/// Rows missing a `capability_token` are rendered as `<missing>` in the
+/// token column rather than skipped — the operator sees the gap directly.
+pub fn to_plain<W: Write>(
+    entries: impl IntoIterator<Item = AuditEntry>,
+    mut out: W,
+) -> Result<(), AuditError> {
+    // Story 16-2 / D-16-2-H — trailing `intent` column (last, so every
+    // existing fixed-width column keeps its offset).
+    writeln!(
+        out,
+        "{:<32}  {:<16}  {:<10}  {:<22}  {:<20}  {}  {}",
+        "call_id",
+        "boot_nonce",
+        "spirit_pid",
+        "call_type",
+        "timestamp_ns",
+        "capability_token",
+        "intent",
+    )?;
+    for entry in entries {
+        let token = entry.capability_token_hex.as_deref().unwrap_or("<missing>");
+        writeln!(
+            out,
+            "{:<32}  {:016x}  {:<10}  {:<22}  {:<20}  {}  {}",
+            truncate(&entry.frame_id_hex, 32),
+            entry.boot_nonce,
+            entry.spirit_pid,
+            truncate(&entry.kind, 22),
+            entry.timestamp_ns,
+            token,
+            truncate(&entry.intent, 64),
+        )?;
+    }
+    Ok(())
+}
+
+/// Write entries as FR4-validated human-readable tabular text. Same as
+/// [`to_plain`] but validates the FR4 mandatory-field contract first and
+/// aborts with [`AuditError::Fr4SchemaViolation`] on the first violation.
+/// Used when `--spirit` is active and `--format plain` is selected so that
+/// both formats enforce the same exit-code-2 contract per AC1.
+pub fn to_fr4_plain<W: Write>(
+    entries: impl IntoIterator<Item = AuditEntry>,
+    mut out: W,
+) -> Result<(), AuditError> {
+    // Story 16-2 / D-16-2-G/H — classify before validating: non-call kernel
+    // events render in the SAME table (which has no token column, so a
+    // non-call row cannot be read as a mediated call); only Call rows must
+    // satisfy the FR4 mandatory-field contract. The trailing `intent`
+    // column makes the halt row and the operator completion row legible.
+    writeln!(
+        out,
+        "{:<32}  {:<16}  {:<10}  {:<22}  {:<20}  {}",
+        "call_id", "boot_nonce", "spirit_pid", "call_type", "timestamp_ns", "intent",
+    )?;
+    let mut line_no = 0usize;
+    for entry in entries.into_iter() {
+        line_no += 1;
+        if classify_fr4_row(&entry) == Fr4RowDisposition::NonCallKernelEvent {
+            writeln!(
+                out,
+                "{:<32}  {:016x}  {:<10}  {:<22}  {:<20}  {}",
+                truncate(&entry.frame_id_hex, 32),
+                entry.boot_nonce,
+                entry.spirit_pid,
+                truncate(&entry.kind, 22),
+                entry.timestamp_ns,
+                truncate(&entry.intent, 64),
+            )?;
+            continue;
+        }
+        let projected = project_to_fr4(&entry).map_err(|e| AuditError::Fr4SchemaViolation {
+            line: line_no,
+            missing_field: e.missing_field(),
+        })?;
+        writeln!(
+            out,
+            "{:<32}  {:016x}  {:<10}  {:<22}  {:<20}  {}",
+            truncate(&projected.call_id, 32),
+            projected.boot_nonce,
+            projected.spirit_pid,
+            truncate(&projected.call_type, 22),
+            projected.timestamp_ns,
+            truncate(&entry.intent, 64),
+        )?;
+    }
+    Ok(())
+}
+
+/// Resolve the default Transparency Log SQLite path.
+///
+/// Shared by `maos-bin` (write side) and `maos-cli` (read side) so both
+/// binaries always agree on the same location. Extracted here rather than
+/// duplicated across crates to prevent silent path-drift data loss.
+///
+/// Precedence (highest → lowest):
+///   1. `MAOS_HOME` env var (Story 8.14a FORK 5 — init'd home).
+///      If set, path = `$MAOS_HOME/audit/transparency.sqlite`.
+///   2. `MAOS_AUDIT_DB` env var (explicit override; used by tests and ops).
+///      Empty-string is rejected — callers should exit with a diagnostic.
+///   3. `$XDG_DATA_HOME/maos/audit/transparency.sqlite`
+///   4. `$HOME/.local/share/maos/audit/transparency.sqlite`
+///   5. `/var/lib/maos/audit/transparency.sqlite` (last-resort fallback)
+pub fn default_transparency_log_path() -> std::path::PathBuf {
+    use std::path::PathBuf;
+    if let Ok(home) = std::env::var("MAOS_HOME") {
+        if !home.is_empty() {
+            return PathBuf::from(home)
+                .join("audit")
+                .join("transparency.sqlite");
+        }
+    }
+    if let Ok(p) = std::env::var("MAOS_AUDIT_DB") {
+        if p.is_empty() {
+            eprintln!("maos: MAOS_AUDIT_DB is set but empty — unset it or provide a path");
+            std::process::exit(2);
+        }
+        return PathBuf::from(p);
+    }
+    let data_home = std::env::var("XDG_DATA_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .filter(|h| !h.is_empty())
+                .map(|h| PathBuf::from(h).join(".local").join("share"))
+        })
+        .unwrap_or_else(|| PathBuf::from("/var/lib"));
+    data_home
+        .join("maos")
+        .join("audit")
+        .join("transparency.sqlite")
+}
+
+/// Resolve the physical Transparency Log artifact for one canonical team.
+///
+/// The default path remains the untenanted/global artifact. Tenant logs retain
+/// its file name but live under `teams/<team>/`, so an explicit
+/// `MAOS_AUDIT_DB` override still controls the storage root without collapsing
+/// multiple teams into one SQLite file.
+pub fn transparency_log_path_for_team(team: &super::maos_team::TeamId) -> std::path::PathBuf {
+    let default = default_transparency_log_path();
+    let file_name = default
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("transparency.sqlite"));
+    default
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("teams")
+        .join(team.as_str())
+        .join(file_name)
+}
+
+/// Resolve the runtime Transparency Log path from explicit tenancy inputs.
+///
+/// A team becomes a routing operand only when the collective tier is active.
+/// Missing or empty team input preserves the byte-identical global path; a
+/// present but non-canonical team fails closed.
+pub fn transparency_log_path_for_tenant_mode(
+    collective_configured: bool,
+    home_team: Option<&str>,
+) -> Result<std::path::PathBuf, super::maos_team::TeamIdError> {
+    let Some(home_team) = home_team.filter(|value| !value.trim().is_empty()) else {
+        return Ok(default_transparency_log_path());
+    };
+    if !collective_configured {
+        return Ok(default_transparency_log_path());
+    }
+    let team = super::maos_team::TeamId::new(home_team)?;
+    Ok(transparency_log_path_for_team(&team))
+}
+
+/// Reject a Transparency Log path whose file or any existing ancestor is a
+/// symbolic link.
+///
+/// Physical file-per-team isolation is not preserved if `teams/<team>` aliases
+/// another team's directory. Missing components are valid before first boot;
+/// callers may create them only after this check succeeds.
+pub fn validate_transparency_log_path(path: &std::path::Path) -> std::io::Result<()> {
+    for candidate in path.ancestors() {
+        match std::fs::symlink_metadata(candidate) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "Transparency Log path contains symbolic link: {}",
+                        candidate.display()
+                    ),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// Sidecar carrying the manifest-validated team bound to one physical TL.
+pub fn transparency_log_team_binding_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut binding = path.as_os_str().to_os_string();
+    binding.push(".team");
+    binding.into()
+}
+
+/// Validate a previously bound team artifact without mutating it.
+pub fn validate_transparency_log_team_binding(
+    path: &std::path::Path,
+    expected_team: &super::maos_team::TeamId,
+) -> std::io::Result<()> {
+    let binding_path = transparency_log_team_binding_path(path);
+    validate_transparency_log_path(&binding_path)?;
+    let raw = std::fs::read_to_string(&binding_path)?;
+    let actual = super::maos_team::TeamId::new(raw.trim()).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "Transparency Log team binding {} is invalid: {error}",
+                binding_path.display()
+            ),
+        )
+    })?;
+    if &actual != expected_team {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "Transparency Log artifact team mismatch: expected {}, found {}",
+                expected_team, actual
+            ),
+        ));
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Story 13.5g — in-artifact tenant binding (defense-in-depth Stage-2).
+//
+// The `.team` sidecar is a label *beside* the artifact: it is separable from
+// the file and detects nothing (13.5e D2/D4). This section moves the binding
+// to a single row *inside* the artifact and factors the verdict logic into
+// pure, hermetic functions so the control leg stays blocking while only the
+// live-Postgres wiring (`current_database()`) is substrate-bound. An adversary
+// who can write to the audit directory can rewrite this row exactly as they
+// can rewrite the sidecar — this detects misconfiguration, mis-restore and
+// accidental substitution, not an adversary (ADR-055 §13.5e).
+// ─────────────────────────────────────────────────────────────────────────
+
+/// DDL for the in-artifact tenant binding row (Story 13.5g AC1).
+///
+/// A single-row table (`CHECK (id = 1)`) carrying the canonical team the
+/// artifact is bound to, the persisted `datname` recorded on the first tenant
+/// boot, and the bind timestamp. Created lazily by [`write_tenant_binding`];
+/// read by [`read_tenant_artifact`] through a read-only NOFOLLOW connection.
+/// It lives in `maos-audit`, not `maos-iac`: the read side cannot depend on
+/// `maos-iac` (see `backup.rs`), and keeping it here leaves `maos-iac` at zero
+/// delta.
+const TENANT_BINDING_SCHEMA: &str = "\
+CREATE TABLE IF NOT EXISTS tenant_binding (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    team_id     TEXT    NOT NULL,
+    datname     TEXT,
+    bound_at_ns INTEGER NOT NULL
+);";
+
+/// Typed error for the in-artifact tenant binding read/write helpers.
+#[derive(Debug, thiserror::Error)]
+pub enum TenantBindingError {
+    #[error("tenant binding io error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("tenant binding sqlite error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+    /// The artifact already carries a binding for a *different* team. Raised by
+    /// [`write_tenant_binding`]'s compare-and-set when a second boot races the
+    /// Phase A `NeedsWrite` window (two daemons pointed at one team directory —
+    /// a config typo, not an adversary). Fail closed rather than overwrite.
+    #[error(
+        "tenant binding conflict: artifact is already bound to team {existing}, \
+         refusing to overwrite with {attempted}"
+    )]
+    BindingConflict {
+        /// `tenant_binding.team_id` already persisted in the artifact.
+        existing: String,
+        /// The team this boot attempted to bind.
+        attempted: String,
+    },
+}
+
+/// Read-only snapshot of a Transparency Log artifact used by the Phase A
+/// verdict ([`decide_phase_a`]) and the Phase B datname check
+/// ([`verify_datname_binding`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TenantArtifactRead {
+    /// `tenant_binding.team_id`, raw and unparsed. `None` when the table or the
+    /// single row is absent — the pure verdict parses it so a non-canonical
+    /// value is refused rather than silently normalized (Trap 5).
+    pub binding_team: Option<String>,
+    /// `tenant_binding.datname`. `None` on the first tenant boot; `Some(d)` on
+    /// every boot after Phase B recorded the live datname.
+    pub binding_datname: Option<String>,
+    /// Row count of `transparency_log` (0 when the table is absent). Distinguishes
+    /// a fresh artifact from one carrying foreign history (AC3 rows 3–5).
+    pub transparency_log_rows: u64,
+}
+
+/// Read the in-artifact tenant binding + transparency_log row count through a
+/// **read-only** NOFOLLOW connection (Story 13.5g AC2).
+///
+/// A missing file, or a file without a `tenant_binding` table, reads as
+/// `None`/0 rather than an error, so a refused boot never mutates the other
+/// team's artifact (D-4). The `team_id` is returned raw — canonicality is
+/// enforced by the pure verdict, not here.
+/// Open a **read-only** NOFOLLOW connection to a tenant Transparency Log artifact
+/// (Story 13.6d P2 — single-connection foreign read).
+///
+/// Returns `Ok(None)` when the file is absent, mirroring [`read_tenant_artifact`]'s
+/// "absent reads as default" contract so a refused boot never mutates another
+/// team's artifact (D-4). The returned connection is the *sole* handle a
+/// cross-wall reader holds: the binding is verified AND the rows are served
+/// through it, so a file replacement between the two can no longer attest one
+/// artifact while disclosing another (the binding-vs-rows TOCTOU).
+pub fn open_tenant_artifact_readonly(
+    path: &Path,
+) -> Result<Option<rusqlite::Connection>, TenantBindingError> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(TenantBindingError::Io(error)),
+        Ok(_) => {}
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    Ok(Some(conn))
+}
+
+/// Read the in-artifact tenant binding + `transparency_log` row count through a
+/// caller-supplied connection (Story 13.6d P2).
+///
+/// Pair with [`open_tenant_artifact_readonly`] so the cross-wall reader verifies
+/// the binding and serves rows on the **same** connection. The `team_id` is
+/// returned raw; canonicality is enforced by the caller (the pure verdict, not
+/// here).
+pub fn read_tenant_artifact_on(
+    conn: &rusqlite::Connection,
+) -> Result<TenantArtifactRead, TenantBindingError> {
+    let binding_team;
+    let binding_datname;
+    match read_binding_row(conn)? {
+        Some((team, datname)) => {
+            binding_team = Some(team);
+            binding_datname = datname;
+        }
+        None => {
+            binding_team = None;
+            binding_datname = None;
+        }
+    }
+    let transparency_log_rows = count_transparency_log_rows(conn)?;
+    Ok(TenantArtifactRead {
+        binding_team,
+        binding_datname,
+        transparency_log_rows,
+    })
+}
+
+/// Read the in-artifact tenant binding + transparency_log row count through a
+/// **read-only** NOFOLLOW connection (Story 13.5g AC2).
+///
+/// A missing file, or a file without a `tenant_binding` table, reads as
+/// `None`/0 rather than an error, so a refused boot never mutates the other
+/// team's artifact (D-4). The `team_id` is returned raw — canonicality is
+/// enforced by the pure verdict, not here.
+///
+/// Thin wrapper over [`open_tenant_artifact_readonly`] + [`read_tenant_artifact_on`];
+/// kept for the Phase A verdict and Phase B datname check, which read the binding
+/// and then discard the connection.
+pub fn read_tenant_artifact(path: &Path) -> Result<TenantArtifactRead, TenantBindingError> {
+    match open_tenant_artifact_readonly(path)? {
+        None => Ok(TenantArtifactRead::default()),
+        Some(conn) => read_tenant_artifact_on(&conn),
+    }
+}
+
+/// Persist the single tenant binding row, or update the `datname` of an
+/// existing binding **for the same team** (Story 13.5g AC1).
+///
+/// Opens read-write with NOFOLLOW and runs `CREATE TABLE IF NOT EXISTS`, so the
+/// first call after a successful TL open materializes the row. `datname = None`
+/// is the first-boot state Phase B later fills with the live database name.
+///
+/// **Compare-and-set.** The upsert updates only when the persisted `team_id`
+/// equals the one being written; a binding belonging to another team yields
+/// [`TenantBindingError::BindingConflict`] instead of being overwritten. Phase A
+/// only returns `NeedsWrite` for an artifact that had no binding *at read time*,
+/// so this closes the window in which a second concurrent boot binds the same
+/// artifact first and would otherwise be silently clobbered. The whole
+/// create-and-upsert runs in one transaction so a competing writer observes
+/// either both statements or neither.
+pub fn write_tenant_binding(
+    path: &Path,
+    team_id: &super::maos_team::TeamId,
+    datname: Option<&str>,
+) -> Result<(), TenantBindingError> {
+    validate_transparency_log_path(path)?;
+    let mut conn = rusqlite::Connection::open_with_flags(
+        path,
+        OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    // The Transparency Log adapter holds its own WAL connection; this writer is
+    // a second connection, so honour the multi-writer busy_timeout contract
+    // (Story 9.7 R3) rather than failing immediately under a transient lock.
+    conn.busy_timeout(std::time::Duration::from_millis(5000))?;
+    let tx = conn.transaction()?;
+    tx.execute_batch(TENANT_BINDING_SCHEMA)?;
+    let bound_at_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0);
+    let updated = tx.execute(
+        "INSERT INTO tenant_binding (id, team_id, datname, bound_at_ns) \
+         VALUES (1, ?1, ?2, ?3) \
+         ON CONFLICT(id) DO UPDATE SET \
+            datname = excluded.datname, \
+            bound_at_ns = excluded.bound_at_ns \
+         WHERE tenant_binding.team_id = excluded.team_id",
+        rusqlite::params![team_id.as_str(), datname, bound_at_ns],
+    )?;
+    if updated == 0 {
+        // The conflict arm's predicate rejected the update: a row exists and it
+        // names another team. Report it rather than adopting the artifact.
+        let existing: String = tx.query_row(
+            "SELECT team_id FROM tenant_binding WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        return Err(TenantBindingError::BindingConflict {
+            existing,
+            attempted: team_id.as_str().to_string(),
+        });
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Whether `name` is a table in this database.
+///
+/// Errors propagate: a locked, corrupt or otherwise unreadable artifact MUST
+/// NOT be reported as "table absent", because every caller reads absence as
+/// "no binding / no history" and Phase A maps that to `NeedsWrite` — i.e. the
+/// boot would adopt and bind an artifact whose identity it could not establish.
+fn table_exists(conn: &rusqlite::Connection, name: &str) -> Result<bool, TenantBindingError> {
+    let exists = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        rusqlite::params![name],
+        |row| row.get::<_, bool>(0),
+    )?;
+    Ok(exists)
+}
+
+fn read_binding_row(
+    conn: &rusqlite::Connection,
+) -> Result<Option<(String, Option<String>)>, TenantBindingError> {
+    if !table_exists(conn, "tenant_binding")? {
+        return Ok(None);
+    }
+    match conn.query_row(
+        "SELECT team_id, datname FROM tenant_binding WHERE id = 1",
+        [],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+    ) {
+        Ok(pair) => Ok(Some(pair)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(TenantBindingError::Sqlite(error)),
+    }
+}
+
+/// Row count of `transparency_log`, or 0 when the table is genuinely absent.
+///
+/// Like [`table_exists`], a failed count is an error rather than 0: reading a
+/// busy or corrupt foreign shard as "empty" would re-open D-3 by routing it to
+/// the `NeedsWrite` (fresh) row of the AC3 table.
+fn count_transparency_log_rows(conn: &rusqlite::Connection) -> Result<u64, TenantBindingError> {
+    if !table_exists(conn, "transparency_log")? {
+        return Ok(0);
+    }
+    let rows = conn.query_row("SELECT COUNT(*) FROM transparency_log", [], |row| {
+        row.get::<_, i64>(0)
+    })?;
+    Ok(rows.max(0) as u64)
+}
+
+// ── Phase A verdict (AC3) ────────────────────────────────────────────────
+
+/// Phase A verdict for an in-artifact tenant binding (Story 13.5g AC3). Pure:
+/// no DB access, no env. Each variant is one row of the AC3 table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TenantBindingPhaseADecision {
+    /// In-artifact binding present and `== env` (AC3 row 1).
+    Proceed,
+    /// No in-artifact binding; a fresh or legacy-migrate artifact should have
+    /// its binding written after a successful open (AC3 rows 3 & 4).
+    NeedsWrite,
+    /// Refuse to serve the artifact under this env team (AC3 rows 2 & 5).
+    Refuse(TenantBindingPhaseARefusal),
+}
+
+/// Why Phase A refuses an artifact. Each variant is independently falsifiable
+/// (AC6), so each carries its own gate leg.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TenantBindingPhaseARefusal {
+    /// `tenant_binding.team_id` is bound to a different canonical team (AC3 row 2).
+    BoundToForeignTeam {
+        bound: String,
+        env: super::maos_team::TeamId,
+    },
+    /// No binding, but the artifact carries `transparency_log` history with no
+    /// matching `.team` sidecar — a file-copied foreign shard (AC3 row 5, D-3).
+    UnboundHistoryWithoutSidecar { env: super::maos_team::TeamId },
+    /// `tenant_binding.team_id` is not a canonical `TeamId` (Trap 5): read it,
+    /// parse it, refuse it — never normalize it into validity.
+    CorruptBinding {
+        raw: String,
+        env: super::maos_team::TeamId,
+    },
+}
+
+impl std::fmt::Display for TenantBindingPhaseARefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BoundToForeignTeam { bound, env } => write!(
+                f,
+                "artifact tenant_binding is bound to {bound}, but env team is {env}"
+            ),
+            Self::UnboundHistoryWithoutSidecar { env } => write!(
+                f,
+                "artifact has transparency_log history but no tenant_binding and no matching \
+                 .team sidecar for env team {env} (foreign shard, D-3)"
+            ),
+            Self::CorruptBinding { raw, env } => write!(
+                f,
+                "artifact tenant_binding team_id {raw:?} is not canonical for env team {env}"
+            ),
+        }
+    }
+}
+
+/// Decide Phase A from the read-only artifact snapshot + sidecar (AC3). Pure.
+///
+/// `binding_team` / `sidecar_team` are raw strings; canonicality is enforced
+/// here so a tampered persisted value is refused rather than trimmed into shape.
+pub fn decide_phase_a(
+    binding_team: Option<&str>,
+    env: &super::maos_team::TeamId,
+    transparency_log_rows: u64,
+    sidecar_team: Option<&str>,
+) -> TenantBindingPhaseADecision {
+    use TenantBindingPhaseADecision as D;
+    use TenantBindingPhaseARefusal as R;
+    match binding_team {
+        // Trap 5: parse the persisted value exactly as stored. `TeamId::new`
+        // rejects rather than normalizes, and a binding written by
+        // `write_tenant_binding` never carries surrounding whitespace, so any
+        // that is present means the row was not written by this code path.
+        Some(raw) => match super::maos_team::TeamId::new(raw) {
+            Ok(bound) if &bound == env => D::Proceed,
+            Ok(bound) => D::Refuse(R::BoundToForeignTeam {
+                bound: bound.as_str().to_string(),
+                env: env.clone(),
+            }),
+            Err(_) => D::Refuse(R::CorruptBinding {
+                raw: raw.to_string(),
+                env: env.clone(),
+            }),
+        },
+        None => {
+            if transparency_log_rows == 0 {
+                D::NeedsWrite
+            } else {
+                // The `.team` sidecar is trimmed because its on-disk format is
+                // team + "\n" (see `bind_tenant_audit_artifact` and the reader
+                // at `validate_transparency_log_team_binding`). That is a legacy
+                // file format, not a persisted identity, so trimming it here is
+                // format handling rather than the Trap 5 normalization above.
+                match sidecar_team.and_then(|s| super::maos_team::TeamId::new(s.trim()).ok()) {
+                    Some(side) if &side == env => D::NeedsWrite,
+                    _ => D::Refuse(R::UnboundHistoryWithoutSidecar { env: env.clone() }),
+                }
+            }
+        }
+    }
+}
+
+// ── Phase B verdict (AC4) ────────────────────────────────────────────────
+
+/// Phase B verdict for the persisted datname vs the live `current_database()`
+/// (Story 13.5g AC4). Pure. This is the real Stage-2: the persisted value
+/// comes from a *previous* boot, so it is NOT entailed by the same-boot
+/// `connection_assignment_guard`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DatnameBindingDecision {
+    /// Persisted `Some(d)`, `d == live` — proceed (second+ boot, no drift).
+    Proceed,
+    /// Persisted `None` — record the live datname on this (first) tenant boot.
+    RecordFirstDatname,
+    /// Persisted `Some(d)`, `d != live` — the team was re-pointed at a
+    /// different database; refuse to break audit continuity silently.
+    RefuseDatnameDrift { persisted: String, live: String },
+}
+
+/// Compare a persisted datname against the live database name (AC4). Pure.
+pub fn verify_datname_binding(persisted: Option<&str>, live: &str) -> DatnameBindingDecision {
+    use DatnameBindingDecision as D;
+    match persisted {
+        None => D::RecordFirstDatname,
+        Some(d) if d == live => D::Proceed,
+        Some(d) => D::RefuseDatnameDrift {
+            persisted: d.to_string(),
+            live: live.to_string(),
+        },
+    }
+}
+
+/// Resolve the default Lifecycle Journal NDJSON path.
+///
+/// Shared by `maos-bin` (write side — lifecycle verbs in the
+/// `MAOS_ONE_SHOT={start, stop, unload}` one-shot path, Story 1b.5c)
+/// and any reader (e.g. operator inspection, Story 5.x supervisor).
+/// Extracted here rather than duplicated across crates to prevent
+/// silent path-drift data loss — the same discipline established by
+/// [`default_transparency_log_path`] (Story 1b.5b D2).
+///
+/// Precedence (highest → lowest):
+///   1. `MAOS_HOME` env var (Story 8.14a FORK 5 — init'd home).
+///      If set, path = `$MAOS_HOME/journal/lifecycle.ndjson`.
+///   2. `MAOS_JOURNAL_PATH` env var (explicit override; used by tests
+///      and ops). Empty-string is rejected — callers exit 2 with a
+///      diagnostic (same shape as [`default_transparency_log_path`]).
+///   3. `$XDG_DATA_HOME/maos/journal/lifecycle.ndjson`
+///   4. `$HOME/.local/share/maos/journal/lifecycle.ndjson`
+///   5. `/var/lib/maos/journal/lifecycle.ndjson` (last-resort fallback)
+///
+/// File suffix is `.ndjson` to match the Journal's NDJSON-on-disk
+/// storage choice (Story 1b.1 / `journal/mod.rs` §"Storage choice").
+pub fn default_journal_path() -> std::path::PathBuf {
+    use std::path::PathBuf;
+    if let Ok(home) = std::env::var("MAOS_HOME") {
+        if !home.is_empty() {
+            return PathBuf::from(home).join("journal").join("lifecycle.ndjson");
+        }
+    }
+    if let Ok(p) = std::env::var("MAOS_JOURNAL_PATH") {
+        if p.is_empty() {
+            eprintln!("maos: MAOS_JOURNAL_PATH is set but empty — unset it or provide a path");
+            std::process::exit(2);
+        }
+        return PathBuf::from(p);
+    }
+    let data_home = std::env::var("XDG_DATA_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .filter(|h| !h.is_empty())
+                .map(|h| PathBuf::from(h).join(".local").join("share"))
+        })
+        .unwrap_or_else(|| PathBuf::from("/var/lib"));
+    data_home
+        .join("maos")
+        .join("journal")
+        .join("lifecycle.ndjson")
+}
+
+/// Resolve the default Memory Root directory.
+///
+/// Shared by `maos-bin` (write side) and any reader (e.g. operator
+/// inspection). Precedence (highest → lowest):
+///   1. `MAOS_MEMORY_ROOT` env var
+///   2. `$XDG_DATA_HOME/maos/memory`
+///   3. `$HOME/.local/share/maos/memory`
+///   4. `/var/lib/maos/memory` (last-resort fallback)
+pub fn default_memory_root() -> std::path::PathBuf {
+    use std::path::PathBuf;
+    if let Ok(p) = std::env::var("MAOS_MEMORY_ROOT") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+        // Empty env var treated as unset — fall through to next precedence.
+        eprintln!("maos: MAOS_MEMORY_ROOT is set but empty — falling through to default path");
+    }
+    let data_home = std::env::var("XDG_DATA_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .filter(|h| !h.is_empty())
+                .map(|h| PathBuf::from(h).join(".local").join("share"))
+        })
+        .unwrap_or_else(|| PathBuf::from("/var/lib"));
+    data_home.join("maos").join("memory")
+}
+
+/// Resolve the default Spirit Archive root directory (Story 5.2).
+///
+/// Precedence (highest → lowest):
+///   1. `MAOS_ARCHIVE_DIR` env var
+///   2. `$XDG_DATA_HOME/maos/spirit-archives`
+///   3. `$HOME/.local/share/maos/spirit-archives`
+///   4. `/var/lib/maos/spirit-archives`
+pub fn default_archive_dir() -> std::path::PathBuf {
+    use std::path::PathBuf;
+    if let Ok(p) = std::env::var("MAOS_ARCHIVE_DIR") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+        eprintln!("maos: MAOS_ARCHIVE_DIR is set but empty — falling through to default path");
+    }
+    let data_home = std::env::var("XDG_DATA_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .filter(|h| !h.is_empty())
+                .map(|h| PathBuf::from(h).join(".local").join("share"))
+        })
+        .unwrap_or_else(|| PathBuf::from("/var/lib"));
+    data_home.join("maos").join("spirit-archives")
+}
+/// Resolve the default erasure-proof retention directory (Story 9.2).
+///
+/// Precedence (highest → lowest):
+///   1. `MAOS_ERASURE_PROOFS_DIR` env var
+///   2. `$XDG_DATA_HOME/maos/erasure-proofs`
+///   3. `$HOME/.local/share/maos/erasure-proofs`
+///   4. `/var/lib/maos/erasure-proofs`
+pub fn default_erasure_proofs_dir() -> std::path::PathBuf {
+    use std::path::PathBuf;
+    if let Ok(p) = std::env::var("MAOS_ERASURE_PROOFS_DIR") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+        // P19: an empty MAOS_ERASURE_PROOFS_DIR silently falls through to the
+        // default path — a read-only library path-resolver must not perform
+        // side-effecting I/O on a recoverable misconfiguration.
+    }
+    let data_home = std::env::var("XDG_DATA_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .filter(|h| !h.is_empty())
+                .map(|h| PathBuf::from(h).join(".local").join("share"))
+        })
+        .unwrap_or_else(|| PathBuf::from("/var/lib"));
+    data_home.join("maos").join("erasure-proofs")
+}
+/// Resolve a Spirit name to one or more `(boot_nonce, spirit_pid)` pairs by
+/// scanning the Transparency Log for SpiritAdmitted (kind 19) and
+/// `lifecycle.load` (kind 7) frames.
+///
+/// D-16-1-K: `maos run` writes ONLY kind-7 `lifecycle.load` rows — the
+/// kind-19 `SpiritAdmitted` frame this resolver used to require never lands
+/// for a `maos run` Spirit, so every non-`hello-spirit` name resolved to
+/// "unknown" before any verb could run. The kind-7 rows carry the Spirit name
+/// in the redacted payload JSON (`spirit_id`), not in `intent`, so both
+/// columns are consulted.
+///
+/// Per Decision E: keyed on `(boot_nonce, spirit_pid)` to discriminate pid
+/// reuse across boots. "Latest boot" is the boot holding the GREATEST
+/// `timestamp_ns`: the previous `max(boot_nonce)` rule ordered boots by a
+/// RANDOM 64-bit value, so "latest boot" was "largest random number" and
+/// could silently switch incarnations across restarts. Set `all_boots = true`
+/// to union all incarnations.
+///
+/// Returns `Err` if no matching frames exist (unknown spirit name).
+pub fn resolve_spirit_name(
+    db_path: &Path,
+    name: &str,
+    all_boots: bool,
+) -> Result<Vec<(u64, u32)>, String> {
+    // Story 16-2 / D-16-2-F — the `hello-spirit → pid 0` wildcard is
+    // DELETED: it answered "every pid-0 kernel row of every boot", which is
+    // the defect `deferred-work.md:926` names. hello-spirit resolves through
+    // the identity rows like every Spirit (the one-shot evaluator run now
+    // writes one; the shell boots load it at a real pid).
+    if !db_path.exists() {
+        return Err(format!(
+            "unknown spirit '{name}' — no Transparency Log at {}",
+            db_path.display()
+        ));
+    }
+
+    let conn = open_transparency_log_readonly(db_path)?;
+
+    // D-16-1-K: kind 19 (SpiritAdmitted, name in `intent`) and kind 7
+    // (`lifecycle.load`, name in the payload's `spirit_id`). Timestamp-ordered
+    // so the LAST matching row below is the latest boot.
+    let sql = "SELECT boot_nonce, spirit_pid, kind, intent, payload_redacted, timestamp_ns
+               FROM transparency_log
+               WHERE kind IN (7, 19)
+               ORDER BY timestamp_ns ASC, frame_id ASC";
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|e| format!("prepare failed: {e}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            let boot: i64 = row.get(0)?;
+            let pid: i64 = row.get(1)?;
+            let kind: i64 = row.get(2)?;
+            let intent: String = row.get(3)?;
+            let payload: Vec<u8> = row.get(4)?;
+            let timestamp_ns: i64 = row.get(5)?;
+            Ok((
+                boot as u64,
+                pid as u32,
+                kind,
+                intent,
+                payload,
+                timestamp_ns as u64,
+            ))
+        })
+        .map_err(|e| format!("query failed: {e}"))?;
+
+    let mut matches: Vec<(u64, u32, u64)> = Vec::new(); // (boot, pid, timestamp_ns)
+    for row in rows {
+        let (boot, pid, kind, intent, payload, timestamp_ns) =
+            row.map_err(|e| format!("row error: {e}"))?;
+        let name_matches = match kind {
+            19 => intent == name,
+            // `lifecycle.load`: a valid payload is authoritative; use the
+            // legacy intent layout only when the payload has no Spirit id.
+            _ => match payload_spirit_id(&payload) {
+                Some(payload_id) => payload_id == name,
+                None => intent == name,
+            },
+        };
+        if name_matches {
+            matches.push((boot, pid, timestamp_ns));
+        }
+    }
+
+    if matches.is_empty() {
+        // Story 16-2 / D-16-2-F — fail-closed by name (never "every pid-0
+        // row"): no identity row names this Spirit in this Transparency Log.
+        // Pre-16-2 hello-spirit rows with no identity row stay reachable by
+        // `--boot <nonce>` and erasable by 16-4's `maos purge`.
+        return Err(format!(
+            "unknown spirit '{name}' — no admission or load row names it in this Transparency Log"
+        ));
+    }
+
+    let latest_boot = (!all_boots).then(|| matches.last().map(|(boot, _, _)| *boot).unwrap_or(0));
+    let mut resolved: Vec<(u64, u32)> = matches
+        .into_iter()
+        .filter(|(boot, _, _)| latest_boot.is_none_or(|latest| *boot == latest))
+        .map(|(boot, pid, _)| (boot, pid))
+        .collect();
+    resolved.sort_unstable();
+    resolved.dedup();
+    Ok(resolved)
+}
+
+/// The `spirit_id` field of a redacted lifecycle payload, when it parses as
+/// JSON and carries one.
+fn payload_spirit_id(payload: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(payload)
+        .ok()?
+        .get("spirit_id")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// The one read-only TL open shared by the CLI-side resolvers: `READ_ONLY`
+/// (never the write-capable adapter — a write-capable open can hold the
+/// sqlite lock past the daemon's `busy_timeout` and trip the TL's
+/// panic-on-write-error) plus `NOFOLLOW`.
+fn open_transparency_log_readonly(db_path: &Path) -> Result<rusqlite::Connection, String> {
+    rusqlite::Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|e| format!("failed to open TL: {e}"))
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Story 16-1 — read-only maosctl readers (D-16-1-A: the two durable lists)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// One active host-global legal hold, as `maosctl legal-hold list` renders it.
+/// Field-for-field the `maos-iac` adapter's persisted row, re-declared here
+/// because this reader exists precisely to avoid opening the write-capable
+/// adapter that owns the original type.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LegalHoldRow {
+    pub principal_id: String,
+    pub reason: String,
+    pub case_ref: Option<String>,
+    pub requested_at_ns: u64,
+}
+
+/// `maosctl legal-hold list`: read the `legal_holds` table READ-ONLY.
+///
+/// Trap 9 — the write-capable adapter can hold the sqlite lock past the
+/// daemon's `busy_timeout=5000` and trip its panic-on-write-error; a maosctl
+/// reader must never be the process holding that lock. A MISSING table is an
+/// EMPTY list, not an error: a TL written before Story 13.5b simply holds no
+/// holds. Ordering matches the adapter's `list_legal_holds`
+/// (`requested_at_ns, principal_id`).
+pub fn list_legal_holds_readonly(db_path: &Path) -> Result<Vec<LegalHoldRow>, AuditError> {
+    if !db_path.exists() {
+        return Ok(Vec::new());
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(AuditError::Open)?;
+    let present: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'legal_holds'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(AuditError::Read)?;
+    if present == 0 {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT principal_id, reason, case_ref, requested_at_ns
+             FROM legal_holds
+             ORDER BY requested_at_ns, principal_id",
+        )
+        .map_err(AuditError::Read)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(LegalHoldRow {
+                principal_id: row.get(0)?,
+                reason: row.get(1)?,
+                case_ref: row.get(2)?,
+                requested_at_ns: row.get::<_, i64>(3)? as u64,
+            })
+        })
+        .map_err(AuditError::Read)?;
+    let mut holds = Vec::new();
+    for row in rows {
+        holds.push(row.map_err(AuditError::Read)?);
+    }
+    Ok(holds)
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// FR42 — Subject-access query (principal_index reader)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// One row from the `principal_index` table. Independently defined to keep
+/// the dep direction clean (no maos-kernel-core import).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PrincipalIndexEntry {
+    pub principal_id: String,
+    pub writer_spirit_pid: u32,
+    pub schema: String,
+    pub key: String,
+    pub timestamp_ns: u64,
+}
+
+/// Query the `principal_index` table for all rows matching a given principal.
+/// Opens the same SQLite file as the TL (read-only).
+pub fn subject_access_query(
+    db_path: &Path,
+    principal_id: &str,
+) -> Result<Vec<PrincipalIndexEntry>, AuditError> {
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(AuditError::Open)?;
+
+    let sql = "SELECT principal_id, writer_spirit_pid, schema, key, timestamp_ns
+               FROM principal_index
+               WHERE principal_id = ?
+               ORDER BY timestamp_ns ASC";
+    let mut stmt = conn.prepare(sql).map_err(AuditError::Read)?;
+    let rows = stmt
+        .query_map(rusqlite::params![principal_id], |row| {
+            Ok(PrincipalIndexEntry {
+                principal_id: row.get(0)?,
+                writer_spirit_pid: row.get::<_, i64>(1)? as u32,
+                schema: row.get(2)?,
+                key: row.get(3)?,
+                timestamp_ns: row.get::<_, i64>(4)? as u64,
+            })
+        })
+        .map_err(AuditError::Read)?;
+
+    let mut entries = Vec::new();
+    for row in rows {
+        entries.push(row.map_err(AuditError::Read)?);
+    }
+    Ok(entries)
+}
+
+/// Count `shared_memory` rows whose NAMESPACE COLUMN is a `Principal` variant.
+///
+/// Story 13.5h. The Shared tier has no DELETE path at any visibility; it is
+/// discharged by the `reject_principal_outside_private` partition, which stops
+/// new principal rows from entering. A Host upgraded from a pre-partition
+/// build may still hold rows written before that guard existed — those are
+/// unreachable, NOT erased (13.5h Trap 4). This is the per-run check that
+/// tells the two apart, so a `VerifiedEmpty` attestation is EARNED rather than
+/// asserted. Asserting it unchecked would rebuild the null control that
+/// Story 13.5h exists to remove.
+///
+/// Filters on the namespace COLUMN, never the value blob: `MemoryNamespace` is
+/// serde externally tagged, so every `Principal` variant serialises with the
+/// anchored prefix `{"Principal":`. A missing `shared_memory` table means the
+/// Shared store was never opened on this artifact — zero rows, and `Ok(0)` is
+/// the honest answer.
+///
+/// Note this reads the MEMORY artifact, not the audit shard: `SharedMemoryStore`
+/// is opened on the Host-wide `memory_db_path`, which under active tenancy is a
+/// different file from the team-sharded transparency log.
+pub fn shared_tier_principal_row_count(memory_db_path: &Path) -> Result<u64, AuditError> {
+    let conn = rusqlite::Connection::open_with_flags(
+        memory_db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(AuditError::Open)?;
+
+    let table_present: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'shared_memory'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(AuditError::Read)?;
+    if table_present == 0 {
+        return Ok(0);
+    }
+
+    let count: i64 = conn
+        .query_row(
+            r#"SELECT COUNT(*) FROM shared_memory WHERE namespace LIKE '{"Principal":%'"#,
+            [],
+            |row| row.get(0),
+        )
+        .map_err(AuditError::Read)?;
+    Ok(u64::try_from(count).unwrap_or(0))
+}
+
+/// Count persisted Private-tier values stored under a `Principal` namespace.
+///
+/// The Private store lays values out as
+/// `<memory_root>/<spirit_pid>/<hex-encoded-namespace>/<key>.<kind>`. Missing
+/// roots and non-store files are zero; unreadable directories fail closed so
+/// an emptiness proof cannot be minted from a partial scan.
+pub fn private_tier_principal_row_count(memory_root: &Path) -> Result<u64, AuditError> {
+    if !memory_root.exists() {
+        return Ok(0);
+    }
+
+    let mut count = 0_u64;
+    for spirit_dir in std::fs::read_dir(memory_root)? {
+        let spirit_dir = spirit_dir?;
+        if !spirit_dir.file_type()?.is_dir() {
+            continue;
+        }
+        for namespace_dir in std::fs::read_dir(spirit_dir.path())? {
+            let namespace_dir = namespace_dir?;
+            if !namespace_dir.file_type()?.is_dir() {
+                continue;
+            }
+            let Ok(namespace_bytes) =
+                hex::decode(namespace_dir.file_name().to_string_lossy().as_bytes())
+            else {
+                continue;
+            };
+            let Ok(maos_domain::memory::MemoryNamespace::Principal { .. }) =
+                serde_json::from_slice::<maos_domain::memory::MemoryNamespace>(&namespace_bytes)
+            else {
+                continue;
+            };
+            for value in std::fs::read_dir(namespace_dir.path())? {
+                let value = value?;
+                if !value.file_type()?.is_file() {
+                    continue;
+                }
+                let name = value.file_name();
+                let name = name.to_string_lossy();
+                if [".json", ".md", ".bin", ".txt"]
+                    .iter()
+                    .any(|extension| name.ends_with(extension))
+                {
+                    count = count.checked_add(1).ok_or_else(|| {
+                        AuditError::Row("private-tier principal row count overflow".to_string())
+                    })?;
+                }
+            }
+        }
+    }
+    Ok(count)
+}
+
+/// Provenance type for subject-access enrichment (Decision D: Direct/Distilled).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "provenance_type")]
+pub enum Provenance {
+    Direct {
+        frame_ref: String,
+    },
+    Distilled {
+        effective_source_log_ref: Vec<String>,
+        distillation_depth: u32,
+    },
+}
+
+/// Enriched subject-access entry with provenance and spirit-name resolution.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SubjectAccessEntry {
+    pub principal_id: String,
+    pub writer_spirit_pid: u32,
+    pub writer_spirit_name: Option<String>,
+    pub boot_nonce: Option<u64>,
+    pub schema: String,
+    pub key: String,
+    pub timestamp_ns: u64,
+    pub provenance: Provenance,
+}
+
+/// Enrich a `PrincipalIndexEntry` with provenance by scanning the TL for
+/// Distillate frames whose `spirit_pid` matches the writer. Each Distillate
+/// frame carries `effective_source_log_ref` in `payload_redacted`.
+///
+/// Falls back to `Provenance::Direct` when no Distillate frame is found.
+pub fn enrich_subject_access(
+    db_path: &Path,
+    entries: Vec<PrincipalIndexEntry>,
+) -> Result<Vec<SubjectAccessEntry>, AuditError> {
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(AuditError::Open)?;
+
+    // Build a (spirit_pid, boot_nonce) → (name, admit_timestamp_ns) map from
+    // SpiritAdmitted frames (kind = 19). Keyed by (pid, boot) to handle pid
+    // reuse across boots; admission timestamp lets us pick the correct
+    // incarnation for each principal_index entry.
+    let mut spirit_names: std::collections::HashMap<(u32, u64), (String, u64)> =
+        std::collections::HashMap::new();
+    {
+        let sql = "SELECT spirit_pid, boot_nonce, intent, timestamp_ns
+                   FROM transparency_log
+                   WHERE kind = 19
+                   ORDER BY timestamp_ns ASC";
+        let mut stmt = conn.prepare(sql).map_err(AuditError::Read)?;
+        let rows = stmt
+            .query_map([], |row| {
+                let pid: i64 = row.get(0)?;
+                let boot: i64 = row.get(1)?;
+                let intent: String = row.get(2)?;
+                let admit_ts: i64 = row.get(3)?;
+                Ok((pid as u32, boot as u64, intent, admit_ts as u64))
+            })
+            .map_err(AuditError::Read)?;
+        for row in rows {
+            let (pid, boot, intent, admit_ts) = row.map_err(AuditError::Read)?;
+            spirit_names
+                .entry((pid, boot))
+                .or_insert((intent, admit_ts));
+        }
+    }
+    // Scan for Distillate frames to build provenance.
+    // Latest distillate for a given (pid, boot) wins; ordered by timestamp ASC.
+    let mut distillate_map: std::collections::HashMap<(u32, u64), (Vec<String>, u32)> =
+        std::collections::HashMap::new();
+    {
+        let sql = "SELECT spirit_pid, boot_nonce, frame_id, payload_redacted
+                   FROM transparency_log
+                   WHERE intent LIKE 'distillate%'
+                   ORDER BY timestamp_ns ASC";
+        let mut stmt = conn.prepare(sql).map_err(AuditError::Read)?;
+        let rows = stmt
+            .query_map([], |row| {
+                let pid: i64 = row.get(0)?;
+                let boot: i64 = row.get(1)?;
+                let frame_id: Vec<u8> = row.get(2)?;
+                let payload: Option<Vec<u8>> = row.get(3)?;
+                Ok((pid as u32, boot as u64, frame_id, payload))
+            })
+            .map_err(AuditError::Read)?;
+        for row in rows {
+            let (pid, boot, frame_id, payload) = row.map_err(AuditError::Read)?;
+            if let Some(ref payload_bytes) = payload {
+                if let Ok(val) = serde_json::from_slice::<serde_json::Value>(payload_bytes) {
+                    let refs = val
+                        .get("effective_source_log_ref")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.split(':').map(|r| r.to_string()).collect())
+                        .unwrap_or_else(|| vec![hex_encode(&frame_id)]);
+                    let depth = val
+                        .get("distillation_depth")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(1) as u32;
+                    // Latest distillate for this (pid, boot) wins — ordered by timestamp ASC.
+                    distillate_map.insert((pid, boot), (refs, depth));
+                }
+            }
+        }
+    }
+
+    let mut enriched = Vec::with_capacity(entries.len());
+    for entry in entries {
+        // Per-entry provenance: find the Spirit incarnation that was active
+        // when this entry was written. Admissions are keyed by (pid, boot);
+        // the latest admission whose timestamp is <= entry.timestamp_ns wins.
+        // This correctly attributes entries under pid reuse across boots.
+        let (name, boot_nonce) = {
+            let mut admissions: Vec<(u64, String)> = spirit_names
+                .iter()
+                .filter(|((pid, _), _)| *pid == entry.writer_spirit_pid)
+                .filter(|(_, (_, admit_ts))| *admit_ts <= entry.timestamp_ns)
+                .map(|((_, boot), (name, _))| (*boot, name.clone()))
+                .collect();
+            admissions.sort_by_key(|(boot, _)| *boot);
+            admissions
+                .last()
+                .map(|(boot, name)| (Some(name.clone()), Some(*boot)))
+                .unwrap_or((None, None))
+        };
+
+        let provenance = match boot_nonce {
+            Some(boot) => match distillate_map.get(&(entry.writer_spirit_pid, boot)) {
+                Some((refs, depth)) => Provenance::Distilled {
+                    effective_source_log_ref: refs.clone(),
+                    distillation_depth: *depth,
+                },
+                None => Provenance::Direct {
+                    frame_ref: format!("{}:{}", entry.schema, entry.key),
+                },
+            },
+            None => Provenance::Direct {
+                frame_ref: format!("{}:{}", entry.schema, entry.key),
+            },
+        };
+
+        enriched.push(SubjectAccessEntry {
+            principal_id: entry.principal_id,
+            writer_spirit_pid: entry.writer_spirit_pid,
+            writer_spirit_name: name,
+            boot_nonce,
+            schema: entry.schema,
+            key: entry.key,
+            timestamp_ns: entry.timestamp_ns,
+            provenance,
+        });
+    }
+    Ok(enriched)
+}
+
+/// Pure-function form of the precedence cascade — env values are passed in
+/// explicitly. Used by the inline tests on [`default_journal_path`] to drive
+/// every branch without mutating the process environment (forbidden under
+/// `#![forbid(unsafe_code)]` since Rust's env-mutation API became `unsafe`).
+#[cfg(test)]
+fn resolve_journal_path_from_env_internal(
+    maos_journal_path: Option<&str>,
+    xdg_data_home: Option<&str>,
+    home: Option<&str>,
+) -> std::path::PathBuf {
+    use std::path::PathBuf;
+    if let Some(p) = maos_journal_path {
+        if p.is_empty() {
+            panic!("empty MAOS_JOURNAL_PATH");
+        }
+        return PathBuf::from(p);
+    }
+    let data_home = xdg_data_home
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            home.filter(|h| !h.is_empty())
+                .map(|h| PathBuf::from(h).join(".local").join("share"))
+        })
+        .unwrap_or_else(|| PathBuf::from("/var/lib"));
+    data_home
+        .join("maos")
+        .join("journal")
+        .join("lifecycle.ndjson")
+}
+
+/// Pure-function form of the memory-root precedence cascade for testing.
+#[cfg(test)]
+fn resolve_memory_root_from_env_internal(
+    maos_memory_root: Option<&str>,
+    xdg_data_home: Option<&str>,
+    home: Option<&str>,
+) -> std::path::PathBuf {
+    use std::path::PathBuf;
+    if let Some(p) = maos_memory_root {
+        if p.is_empty() {
+            panic!("empty MAOS_MEMORY_ROOT");
+        }
+        return PathBuf::from(p);
+    }
+    let data_home = xdg_data_home
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            home.filter(|h| !h.is_empty())
+                .map(|h| PathBuf::from(h).join(".local").join("share"))
+        })
+        .unwrap_or_else(|| PathBuf::from("/var/lib"));
+    data_home.join("maos").join("memory")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn team_transparency_log_paths_are_physically_distinct() {
+        let security = super::maos_team::TeamId::new("security").unwrap();
+        let support = super::maos_team::TeamId::new("support").unwrap();
+        let default = default_transparency_log_path();
+        let security_path = transparency_log_path_for_team(&security);
+        let support_path = transparency_log_path_for_team(&support);
+
+        assert_ne!(security_path, support_path);
+        assert_ne!(security_path, default);
+        assert_eq!(security_path.file_name(), default.file_name());
+        assert!(security_path
+            .components()
+            .any(|component| component.as_os_str() == "security"));
+        assert!(support_path
+            .components()
+            .any(|component| component.as_os_str() == "support"));
+    }
+
+    #[test]
+    fn tenant_mode_path_shards_only_when_both_inputs_are_present() {
+        let default = default_transparency_log_path();
+        assert_eq!(
+            transparency_log_path_for_tenant_mode(false, Some("security")).unwrap(),
+            default
+        );
+        assert_eq!(
+            transparency_log_path_for_tenant_mode(true, None).unwrap(),
+            default
+        );
+        assert_eq!(
+            transparency_log_path_for_tenant_mode(true, Some("")).unwrap(),
+            default
+        );
+        assert_ne!(
+            transparency_log_path_for_tenant_mode(true, Some("security")).unwrap(),
+            default
+        );
+        assert!(transparency_log_path_for_tenant_mode(true, Some("SECURITY")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tenant_transparency_log_adversarial_paths_fail_closed() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let teams = dir.path().join("teams");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&teams).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, teams.join("security")).unwrap();
+        let aliased = teams.join("security/transparency.sqlite");
+
+        let error = validate_transparency_log_path(&aliased).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("symbolic link"));
+        assert!(validate_transparency_log_path(&teams.join("support/transparency.sqlite")).is_ok());
+        for invalid in ["../support", "Security", "sécurité", "security/../support"] {
+            assert!(
+                super::maos_team::TeamId::new(invalid).is_err(),
+                "non-canonical team {invalid:?} must not become a path component"
+            );
+        }
+        assert_eq!(
+            transparency_log_path_for_tenant_mode(false, Some("security")).unwrap(),
+            default_transparency_log_path(),
+            "a partial tenancy environment must not silently select a shard"
+        );
+
+        let renamed = teams.join("support/transparency.sqlite");
+        std::fs::create_dir_all(renamed.parent().unwrap()).unwrap();
+        std::fs::write(&renamed, b"sqlite-placeholder").unwrap();
+        std::fs::write(transparency_log_team_binding_path(&renamed), "security").unwrap();
+        let support = super::maos_team::TeamId::new("support").unwrap();
+        assert!(
+            validate_transparency_log_team_binding(&renamed, &support).is_err(),
+            "renaming a foreign shard into the expected path must refuse"
+        );
+    }
+
+    #[test]
+    fn tenant_binding_refuses_missing_or_foreign_artifacts() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("transparency.sqlite");
+        std::fs::write(&path, b"sqlite-placeholder").unwrap();
+        let security = super::maos_team::TeamId::new("security").unwrap();
+        let support = super::maos_team::TeamId::new("support").unwrap();
+
+        assert!(validate_transparency_log_team_binding(&path, &security).is_err());
+        std::fs::write(transparency_log_team_binding_path(&path), security.as_str()).unwrap();
+        validate_transparency_log_team_binding(&path, &security).unwrap();
+        assert!(validate_transparency_log_team_binding(&path, &support).is_err());
+    }
+
+    // ── Story 13.5g — in-artifact tenant binding (AC1/AC2/AC3/AC4) ────────
+
+    /// Create a TL artifact with `rows` transparency_log rows and an optional
+    /// in-artifact `tenant_binding` row + `.team` sidecar. Forces a checkpoint
+    /// + drop so the rows are durable before the read-only open (Trap 6: WAL).
+    fn make_13_5g_artifact(
+        path: &std::path::Path,
+        rows: usize,
+        binding_team: Option<&str>,
+        binding_datname: Option<&str>,
+        sidecar_team: Option<&str>,
+    ) {
+        // AC1: every open this story adds carries NOFOLLOW, fixtures included.
+        let conn = rusqlite::Connection::open_with_flags(
+            path,
+            OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS transparency_log (
+                frame_id BLOB NOT NULL PRIMARY KEY,
+                timestamp_ns INTEGER NOT NULL,
+                spirit_pid INTEGER NOT NULL,
+                from_spirit_id TEXT NOT NULL DEFAULT '',
+                to_spirit_id TEXT NOT NULL DEFAULT '',
+                boot_nonce INTEGER NOT NULL,
+                capability_token BLOB,
+                kind INTEGER NOT NULL,
+                intent TEXT NOT NULL,
+                correlation_id TEXT,
+                payload_redacted BLOB NOT NULL,
+                origin INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        for i in 0..rows {
+            let mut fid = [0u8; 16];
+            fid[0..8].copy_from_slice(&((i as u64).to_be_bytes()));
+            conn.execute(
+                "INSERT INTO transparency_log \
+                 (frame_id, timestamp_ns, spirit_pid, boot_nonce, kind, intent, payload_redacted, origin) \
+                 VALUES (?1, ?2, 1, 1, 1, 'seed', X'00', 0)",
+                rusqlite::params![&fid[..], (i as i64) + 1],
+            )
+            .unwrap();
+        }
+        if let Some(team) = binding_team {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS tenant_binding (\
+                    id INTEGER PRIMARY KEY CHECK (id = 1),\
+                    team_id TEXT NOT NULL,\
+                    datname TEXT,\
+                    bound_at_ns INTEGER NOT NULL\
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO tenant_binding (id, team_id, datname, bound_at_ns) \
+                 VALUES (1, ?1, ?2, 1)",
+                rusqlite::params![team, binding_datname],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        drop(conn);
+        if let Some(team) = sidecar_team {
+            std::fs::write(transparency_log_team_binding_path(path), team).unwrap();
+        }
+    }
+
+    #[test]
+    fn tl_tenant_binding_round_trip() {
+        // AC1 — the helpers persist + read the single-row binding, and a datname
+        // update (Phase B's first-boot record) replaces the row in place.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("transparency.sqlite");
+        let team = super::maos_team::TeamId::new("security").unwrap();
+
+        write_tenant_binding(&path, &team, None).unwrap();
+        let read = read_tenant_artifact(&path).unwrap();
+        assert_eq!(read.binding_team.as_deref(), Some("security"));
+        assert_eq!(read.binding_datname, None);
+
+        write_tenant_binding(&path, &team, Some("maos_security")).unwrap();
+        let read = read_tenant_artifact(&path).unwrap();
+        assert_eq!(read.binding_team.as_deref(), Some("security"));
+        assert_eq!(read.binding_datname.as_deref(), Some("maos_security"));
+    }
+
+    #[test]
+    fn tl_tenant_binding_read_is_read_only_and_missing_reads_none() {
+        // AC2 — a missing file reads as None/0, and a read of an artifact
+        // WITHOUT a tenant_binding table does not create one (read-only: D-4).
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("absent.sqlite");
+        let read = read_tenant_artifact(&path).unwrap();
+        assert_eq!(read.binding_team, None);
+        assert_eq!(read.binding_datname, None);
+        assert_eq!(read.transparency_log_rows, 0);
+
+        let path = dir.path().join("transparency.sqlite");
+        make_13_5g_artifact(&path, 3, None, None, None);
+        let read = read_tenant_artifact(&path).unwrap();
+        assert_eq!(
+            read.binding_team, None,
+            "no tenant_binding table reads as None"
+        );
+        assert_eq!(read.transparency_log_rows, 3);
+
+        // Reading must NOT have materialized the tenant_binding table.
+        let probe = rusqlite::Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .unwrap();
+        let has_table: bool = probe
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'tenant_binding')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!has_table, "read_tenant_artifact must be read-only (D-4)");
+    }
+
+    #[test]
+    fn tl_phase_a_verdict_bound_match_proceeds() {
+        // AC3 row 1 — in-artifact binding == env → Proceed.
+        let env = super::maos_team::TeamId::new("security").unwrap();
+        assert_eq!(
+            decide_phase_a(Some("security"), &env, 9, None),
+            TenantBindingPhaseADecision::Proceed
+        );
+    }
+
+    #[test]
+    fn tl_phase_a_verdict_bound_foreign_refuses() {
+        // AC3 row 2 — in-artifact binding != env → Refuse(BoundToForeignTeam).
+        let env = super::maos_team::TeamId::new("security").unwrap();
+        assert_eq!(
+            decide_phase_a(Some("support"), &env, 0, None),
+            TenantBindingPhaseADecision::Refuse(TenantBindingPhaseARefusal::BoundToForeignTeam {
+                bound: "support".to_string(),
+                env: env.clone(),
+            })
+        );
+    }
+
+    #[test]
+    fn tl_phase_a_verdict_corrupt_binding_refuses() {
+        // Trap 5 — a non-canonical persisted team_id is refused, not normalized.
+        let env = super::maos_team::TeamId::new("security").unwrap();
+        assert_eq!(
+            decide_phase_a(Some("Security!"), &env, 0, None),
+            TenantBindingPhaseADecision::Refuse(TenantBindingPhaseARefusal::CorruptBinding {
+                raw: "Security!".to_string(),
+                env: env.clone(),
+            })
+        );
+    }
+
+    #[test]
+    fn tl_phase_a_verdict_fresh_artifact_needs_write() {
+        // AC3 row 3 — no binding, 0 rows → NeedsWrite (fresh → write after open).
+        let env = super::maos_team::TeamId::new("security").unwrap();
+        assert_eq!(
+            decide_phase_a(None, &env, 0, None),
+            TenantBindingPhaseADecision::NeedsWrite
+        );
+    }
+
+    #[test]
+    fn tl_phase_a_verdict_legacy_sidecar_migrates() {
+        // AC3 row 4 — no binding, >0 rows, sidecar == env → NeedsWrite (migrate).
+        let env = super::maos_team::TeamId::new("security").unwrap();
+        assert_eq!(
+            decide_phase_a(None, &env, 5, Some("security")),
+            TenantBindingPhaseADecision::NeedsWrite
+        );
+    }
+
+    #[test]
+    fn tl_phase_a_verdict_foreign_history_without_sidecar_refuses() {
+        // AC3 row 5 — no binding, >0 rows, sidecar absent or != env → Refuse
+        // (closes D-3: a file-copied foreign shard with history and no sidecar).
+        let env = super::maos_team::TeamId::new("security").unwrap();
+        assert_eq!(
+            decide_phase_a(None, &env, 5, None),
+            TenantBindingPhaseADecision::Refuse(
+                TenantBindingPhaseARefusal::UnboundHistoryWithoutSidecar { env: env.clone() }
+            )
+        );
+        assert_eq!(
+            decide_phase_a(None, &env, 5, Some("support")),
+            TenantBindingPhaseADecision::Refuse(
+                TenantBindingPhaseARefusal::UnboundHistoryWithoutSidecar { env: env.clone() }
+            )
+        );
+    }
+
+    #[test]
+    fn tl_phase_b_datname_none_records() {
+        // AC4 — persisted None → RecordFirstDatname (first tenant boot).
+        assert_eq!(
+            verify_datname_binding(None, "maos_security"),
+            DatnameBindingDecision::RecordFirstDatname
+        );
+    }
+
+    #[test]
+    fn tl_phase_b_datname_match_proceeds() {
+        // AC4 — persisted Some(d), d == live → Proceed.
+        assert_eq!(
+            verify_datname_binding(Some("maos_security"), "maos_security"),
+            DatnameBindingDecision::Proceed
+        );
+    }
+
+    #[test]
+    fn tl_phase_b_datname_drift_refuses() {
+        // AC4 — persisted Some(d), d != live → RefuseDatnameDrift (re-pointed DB).
+        assert_eq!(
+            verify_datname_binding(Some("maos_security"), "maos_support"),
+            DatnameBindingDecision::RefuseDatnameDrift {
+                persisted: "maos_security".to_string(),
+                live: "maos_support".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn tl_phase_a_verdict_whitespace_binding_refuses() {
+        // Trap 5 — a persisted team_id that would only become canonical after
+        // trimming is REFUSED, not normalized into validity. `write_tenant_binding`
+        // never persists surrounding whitespace, so its presence means the row did
+        // not come from this code path.
+        let env = super::maos_team::TeamId::new("security").unwrap();
+        for raw in [" security", "security\n", " security ", "\tsecurity"] {
+            assert_eq!(
+                decide_phase_a(Some(raw), &env, 0, None),
+                TenantBindingPhaseADecision::Refuse(TenantBindingPhaseARefusal::CorruptBinding {
+                    raw: raw.to_string(),
+                    env: env.clone(),
+                }),
+                "a persisted team_id needing a trim to parse must be refused: {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tl_tenant_binding_write_refuses_foreign_binding_overwrite() {
+        // A second boot that races the Phase A NeedsWrite window must NOT clobber
+        // a binding another team already wrote. Reachable through a config typo
+        // (two daemons pointed at one team directory) — no privilege required.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("transparency.sqlite");
+        let first = super::maos_team::TeamId::new("security").unwrap();
+        let second = super::maos_team::TeamId::new("support").unwrap();
+
+        write_tenant_binding(&path, &first, None).unwrap();
+        let error = write_tenant_binding(&path, &second, None)
+            .expect_err("a foreign binding must not be overwritten");
+        assert!(
+            matches!(
+                &error,
+                TenantBindingError::BindingConflict { existing, attempted }
+                    if existing == "security" && attempted == "support"
+            ),
+            "expected BindingConflict, got {error:?}"
+        );
+
+        // The persisted binding is untouched by the refused write.
+        let read = read_tenant_artifact(&path).unwrap();
+        assert_eq!(read.binding_team.as_deref(), Some("security"));
+
+        // The owning team can still record its datname (same-team update).
+        write_tenant_binding(&path, &first, Some("maos_security")).unwrap();
+        let read = read_tenant_artifact(&path).unwrap();
+        assert_eq!(read.binding_datname.as_deref(), Some("maos_security"));
+    }
+
+    #[test]
+    fn tl_tenant_binding_refuses_symlinked_artifact() {
+        // AC1/AC2 — the NOFOLLOW policy is a security property, so it gets a
+        // negative control: deleting SQLITE_OPEN_NOFOLLOW must red a leg. A
+        // symlink pointing at another team's shard is refused on both the read
+        // and the write side.
+        let dir = tempfile::TempDir::new().unwrap();
+        let real = dir.path().join("foreign.sqlite");
+        make_13_5g_artifact(&real, 3, Some("support"), None, None);
+        let link = dir.path().join("transparency.sqlite");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let team = super::maos_team::TeamId::new("security").unwrap();
+
+        assert!(
+            read_tenant_artifact(&link).is_err(),
+            "a symlinked artifact must not be read through (NOFOLLOW)"
+        );
+        assert!(
+            write_tenant_binding(&link, &team, None).is_err(),
+            "a symlinked artifact must not be written through (NOFOLLOW)"
+        );
+
+        // The symlink target was neither read as ours nor rebound.
+        let read = read_tenant_artifact(&real).unwrap();
+        assert_eq!(read.binding_team.as_deref(), Some("support"));
+    }
+
+    #[test]
+    fn tl_tenant_binding_read_fails_closed_on_unreadable_artifact() {
+        // A file that exists but is not a SQLite database must surface an error,
+        // NOT read as (no binding, 0 rows) — that verdict is `NeedsWrite`, i.e.
+        // the boot would adopt and bind an artifact it could not identify.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("transparency.sqlite");
+        std::fs::write(&path, b"this is not a sqlite database, it is 40 bytes").unwrap();
+        let error = read_tenant_artifact(&path)
+            .expect_err("an unreadable artifact must fail closed, not read as fresh");
+        assert!(
+            matches!(error, TenantBindingError::Sqlite(_)),
+            "expected a propagated sqlite error, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn tenant_audit_tamper_residual_is_not_misreported_as_integrity() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("transparency.sqlite");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE transparency_log (
+                frame_id BLOB NOT NULL PRIMARY KEY,
+                timestamp_ns INTEGER NOT NULL,
+                spirit_pid INTEGER NOT NULL,
+                from_spirit_id TEXT NOT NULL DEFAULT '',
+                to_spirit_id TEXT NOT NULL DEFAULT '',
+                boot_nonce INTEGER NOT NULL,
+                capability_token BLOB,
+                kind INTEGER NOT NULL,
+                intent TEXT NOT NULL,
+                correlation_id TEXT,
+                payload_redacted BLOB NOT NULL,
+                origin INTEGER NOT NULL
+            );
+            INSERT INTO transparency_log VALUES (
+                X'01010101010101010101010101010101',
+                1, 7, '', '', 1, NULL, 0, 'original', NULL, X'00', 0
+            );
+            UPDATE transparency_log SET intent = 'tampered';",
+        )
+        .unwrap();
+        drop(conn);
+
+        let rows = query(&path, AuditFilter::default()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].intent, "tampered",
+            "Story 13.5e must report the open cryptographic integrity residual honestly"
+        );
+    }
+
+    #[test]
+    fn run_capture_kind_round_trips() {
+        // J1 Tier-2 — the human-authored `run.capture` attestation is written at
+        // the bin/CLI boundary as a raw kind int (31) so no kernel `FrameKind`
+        // variant is needed (ZERO kernel delta). It must render on read and be
+        // resolvable by name, exactly like `identity.asserted` (30).
+        assert_eq!(kind_to_string(31), "run.capture");
+        assert_eq!(kind_from_string("run.capture"), Some(31));
+        assert_eq!(kind_from_string("RunCapture"), Some(31));
+        // Kind ints are NOT part of the kernel FrameKind enum surface here; an
+        // unmapped int must still degrade gracefully, never panic.
+        assert_eq!(kind_to_string(9999), "unknown");
+    }
+
+    #[test]
+    fn query_empty_db_returns_empty() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let db_path = tmpdir.path().join("test.sqlite");
+
+        // Create the schema using a write connection
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS transparency_log (
+                frame_id BLOB NOT NULL PRIMARY KEY,
+                timestamp_ns INTEGER NOT NULL,
+                spirit_pid INTEGER NOT NULL,
+                boot_nonce INTEGER NOT NULL,
+                capability_token BLOB,
+                kind INTEGER NOT NULL,
+                intent TEXT NOT NULL,
+                payload_redacted BLOB NOT NULL,
+                origin INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let entries = query(&db_path, AuditFilter::default()).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn query_returns_seeded_entries() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let db_path = tmpdir.path().join("test.sqlite");
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS transparency_log (
+                frame_id BLOB NOT NULL PRIMARY KEY,
+                timestamp_ns INTEGER NOT NULL,
+                spirit_pid INTEGER NOT NULL,
+                boot_nonce INTEGER NOT NULL,
+                capability_token BLOB,
+                kind INTEGER NOT NULL,
+                intent TEXT NOT NULL,
+                payload_redacted BLOB NOT NULL,
+                origin INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO transparency_log (frame_id, timestamp_ns, spirit_pid, boot_nonce, capability_token, kind, intent, payload_redacted, origin)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                &[0xAAu8; 16] as &[u8],
+                1000i64,
+                7i64,
+                0xDEADBEEFi64,
+                &[0xBBu8; 32] as &[u8],
+                7i64, // CapabilityInvocation
+                "delegate",
+                b"redacted_payload" as &[u8],
+                0i64,
+            ],
+        ).unwrap();
+        drop(conn);
+
+        let entries = query(&db_path, AuditFilter::default()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].spirit_pid, 7);
+        assert_eq!(entries[0].boot_nonce, 0xDEADBEEF as u64);
+        assert_eq!(entries[0].kind, "capability.invocation");
+        assert!(entries[0].capability_token_hex.is_some());
+        assert_eq!(entries[0].intent, "delegate");
+    }
+
+    #[test]
+    fn to_ndjson_produces_valid_json() {
+        let entries = vec![AuditEntry {
+            frame_id_hex: "aa".repeat(16),
+            timestamp_ns: 1000,
+            spirit_pid: 7,
+            boot_nonce: 0xDEAD_BEEF,
+            capability_token_hex: Some("bb".repeat(32)),
+            kind: "capability.invocation".into(),
+            intent: "delegate".into(),
+            payload: String::new(),
+            redaction: None,
+        }];
+        let mut buf = Vec::new();
+        to_ndjson(entries, &mut buf).unwrap();
+        let line = String::from_utf8(buf).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert!(parsed.get("frame_id").is_some());
+    }
+
+    fn sample_entry() -> AuditEntry {
+        AuditEntry {
+            frame_id_hex: "aa".repeat(16),
+            timestamp_ns: 1_700_000_000_000_000_000,
+            spirit_pid: 7,
+            boot_nonce: 0xCAFE_F00D_DEAD_BEEF,
+            capability_token_hex: Some("bb".repeat(32)),
+            kind: "inference.call".into(),
+            intent: "claude-3-haiku".into(),
+            payload: String::new(),
+            redaction: None,
+        }
+    }
+
+    #[test]
+    fn project_to_fr4_keeps_five_mandatory_fields() {
+        let projected = project_to_fr4(&sample_entry()).unwrap();
+        assert_eq!(projected.call_id.len(), 32);
+        assert_eq!(projected.capability_token.len(), 64);
+        assert_eq!(projected.spirit_pid, 7);
+        assert_eq!(projected.boot_nonce, 0xCAFE_F00D_DEAD_BEEF);
+        assert_eq!(projected.call_type, "inference.call");
+        assert_eq!(projected.timestamp_ns, 1_700_000_000_000_000_000);
+    }
+
+    #[test]
+    fn project_to_fr4_rejects_null_capability_token() {
+        let mut entry = sample_entry();
+        entry.capability_token_hex = None;
+        let err = project_to_fr4(&entry).unwrap_err();
+        assert_eq!(err, Fr4SchemaError::MissingCapabilityToken);
+        assert_eq!(err.missing_field(), "capability_token");
+    }
+
+    #[test]
+    fn project_to_fr4_rejects_unknown_call_type() {
+        let mut entry = sample_entry();
+        entry.kind = "unknown(42)".into();
+        let err = project_to_fr4(&entry).unwrap_err();
+        assert!(matches!(err, Fr4SchemaError::UnknownCallType(_)));
+        assert_eq!(err.missing_field(), "call_type");
+    }
+
+    #[test]
+    fn to_fr4_ndjson_emits_exact_schema_keys() {
+        let mut buf = Vec::new();
+        to_fr4_ndjson(vec![sample_entry()], &mut buf).unwrap();
+        let line = String::from_utf8(buf).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        let obj = parsed.as_object().expect("object");
+        // Exactly the six keys, no extras (intent, payload_redacted excluded).
+        let mut keys: Vec<&str> = obj.keys().map(|s| s.as_str()).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "boot_nonce",
+                "call_id",
+                "call_type",
+                "capability_token",
+                "spirit_pid",
+                "timestamp_ns"
+            ]
+        );
+    }
+
+    #[test]
+    fn to_fr4_ndjson_stops_on_first_violation_with_line_number() {
+        let mut good = sample_entry();
+        good.frame_id_hex = "11".repeat(16);
+        let mut bad = sample_entry();
+        bad.frame_id_hex = "22".repeat(16);
+        bad.capability_token_hex = None;
+        let mut buf = Vec::new();
+        let err = to_fr4_ndjson(vec![good, bad], &mut buf).unwrap_err();
+        match err {
+            AuditError::Fr4SchemaViolation {
+                line,
+                missing_field,
+            } => {
+                assert_eq!(line, 2);
+                assert_eq!(missing_field, "capability_token");
+            }
+            _ => panic!("expected Fr4SchemaViolation"),
+        }
+        // Buffer is flushed only on success, so no lines are emitted on violation.
+        let written = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = written.lines().collect();
+        assert_eq!(lines.len(), 0, "no partial output on FR4 schema violation");
+    }
+
+    #[test]
+    fn to_plain_emits_zero_ansi_bytes() {
+        let mut buf = Vec::new();
+        to_plain(vec![sample_entry()], &mut buf).unwrap();
+        let esc_count = buf.iter().filter(|b| **b == 0x1b).count();
+        assert_eq!(esc_count, 0, "to_plain emitted ANSI escape bytes");
+        // Header + 1 data row.
+        let s = String::from_utf8(buf).unwrap();
+        assert_eq!(s.lines().count(), 2);
+        assert!(s.contains("call_id"));
+    }
+
+    #[test]
+    fn to_plain_renders_missing_capability_token_inline() {
+        let mut entry = sample_entry();
+        entry.capability_token_hex = None;
+        let mut buf = Vec::new();
+        to_plain(vec![entry], &mut buf).unwrap();
+        let esc_count = buf.iter().filter(|b| **b == 0x1b).count();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("<missing>"));
+        assert_eq!(esc_count, 0);
+    }
+
+    // ── default_journal_path tests (Story 1b.5c, Task 1) ────────────────
+    //
+    // The resolver reads `MAOS_JOURNAL_PATH`, `XDG_DATA_HOME`, `HOME` from
+    // the process environment. We can't mutate process env safely here —
+    // the crate `#![forbid(unsafe_code)]` rules out the (now `unsafe`)
+    // `std::env::set_var` / `remove_var` API. Instead we exercise the
+    // resolver's precedence by spawning a subprocess via `cargo test`'s
+    // injected binary harness — but that requires a binary crate, which
+    // `maos-audit` is not.
+    //
+    // Pragmatic path: split the resolution logic into an env-injected
+    // pure function and drive it from the three #[test]s. The exported
+    // `default_journal_path` is a thin wrapper that reads process env
+    // and delegates. This is the same discipline 1b.5b would have used
+    // had `default_transparency_log_path` been tested inline.
+
+    #[test]
+    fn default_journal_path_respects_env_override() {
+        let p = super::resolve_journal_path_from_env_internal(
+            Some("/tmp/maos-test-journal.ndjson"),
+            None,
+            None,
+        );
+        assert_eq!(p, std::path::PathBuf::from("/tmp/maos-test-journal.ndjson"));
+    }
+
+    #[test]
+    fn default_journal_path_falls_through_to_xdg() {
+        let p = super::resolve_journal_path_from_env_internal(None, Some("/tmp/xdgtest"), None);
+        assert_eq!(
+            p,
+            std::path::PathBuf::from("/tmp/xdgtest/maos/journal/lifecycle.ndjson")
+        );
+    }
+
+    #[test]
+    fn default_journal_path_falls_through_to_home_when_xdg_unset() {
+        let p = super::resolve_journal_path_from_env_internal(None, None, Some("/tmp/hometest"));
+        assert_eq!(
+            p,
+            std::path::PathBuf::from("/tmp/hometest/.local/share/maos/journal/lifecycle.ndjson")
+        );
+    }
+
+    #[test]
+    fn default_journal_path_last_resort_var_lib() {
+        // Both XDG and HOME unset → /var/lib fallback (the production
+        // path Story 5.x supervisors land on if XDG_DATA_HOME and HOME
+        // are both absent in the systemd unit's environment).
+        let p = super::resolve_journal_path_from_env_internal(None, None, None);
+        assert_eq!(
+            p,
+            std::path::PathBuf::from("/var/lib/maos/journal/lifecycle.ndjson")
+        );
+    }
+
+    // ── default_memory_root tests (Story 4.3) ────────────────────────
+
+    #[test]
+    fn default_memory_root_respects_env_override() {
+        let p =
+            super::resolve_memory_root_from_env_internal(Some("/tmp/maos-test-memory"), None, None);
+        assert_eq!(p, std::path::PathBuf::from("/tmp/maos-test-memory"));
+    }
+
+    #[test]
+    fn default_memory_root_falls_through_to_xdg() {
+        let p = super::resolve_memory_root_from_env_internal(None, Some("/tmp/xdgtest"), None);
+        assert_eq!(p, std::path::PathBuf::from("/tmp/xdgtest/maos/memory"));
+    }
+
+    #[test]
+    fn default_memory_root_falls_through_to_home_when_xdg_unset() {
+        let p = super::resolve_memory_root_from_env_internal(None, None, Some("/tmp/hometest"));
+        assert_eq!(
+            p,
+            std::path::PathBuf::from("/tmp/hometest/.local/share/maos/memory")
+        );
+    }
+
+    #[test]
+    fn default_memory_root_last_resort_var_lib() {
+        let p = super::resolve_memory_root_from_env_internal(None, None, None);
+        assert_eq!(p, std::path::PathBuf::from("/var/lib/maos/memory"));
+    }
+
+    // ── FR41 SQLi-inert test ─────────────────────────────────────────
+
+    /// Helper: create a test DB with one row whose intent is "delegate".
+    fn sqli_test_db() -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let db_path = tmpdir.path().join("test.sqlite");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS transparency_log (
+                frame_id BLOB NOT NULL PRIMARY KEY,
+                timestamp_ns INTEGER NOT NULL,
+                spirit_pid INTEGER NOT NULL,
+                boot_nonce INTEGER NOT NULL,
+                capability_token BLOB,
+                kind INTEGER NOT NULL,
+                intent TEXT NOT NULL,
+                payload_redacted BLOB NOT NULL,
+                origin INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO transparency_log (frame_id, timestamp_ns, spirit_pid, boot_nonce, capability_token, kind, intent, payload_redacted, origin)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                &[0xAAu8; 16] as &[u8],
+                1000i64,
+                7i64,
+                1i64,
+                &[0xBBu8; 32] as &[u8],
+                7i64,
+                "delegate",
+                b"redacted_payload" as &[u8],
+                0i64,
+            ],
+        ).unwrap();
+        drop(conn);
+        (tmpdir, db_path)
+    }
+
+    #[test]
+    fn intent_contains_sqli_is_inert() {
+        let (_tmpdir, db_path) = sqli_test_db();
+        // A SQLi attempt must NOT match anything — it's param-bound.
+        let sqli = "%' OR 1=1 --";
+        let mut filter = AuditFilter::default();
+        filter.intent_contains = Some(sqli.to_string());
+        let entries = query(&db_path, filter).unwrap();
+        // The DB has one row with intent="delegate". The SQLi string is
+        // treated as a literal substring — it does NOT appear in "delegate",
+        // so the result must be empty.
+        assert!(
+            entries.is_empty(),
+            "SQLi attempt must match literally, not inject SQL; got {} results",
+            entries.len()
+        );
+    }
+
+    #[test]
+    fn intent_contains_matches_substring() {
+        let (_tmpdir, db_path) = sqli_test_db();
+        let mut filter = AuditFilter::default();
+        filter.intent_contains = Some("deleg".to_string());
+        let entries = query(&db_path, filter).unwrap();
+        assert_eq!(entries.len(), 1, "substring 'deleg' must match 'delegate'");
+    }
+
+    #[test]
+    fn capability_token_filter_works() {
+        let (_tmpdir, db_path) = sqli_test_db();
+        let mut filter = AuditFilter::default();
+        filter.capability_token = Some("bb".repeat(32));
+        let entries = query(&db_path, filter).unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "matching capability_token must find the row"
+        );
+
+        // Non-matching token
+        let mut filter2 = AuditFilter::default();
+        filter2.capability_token = Some("cc".repeat(32));
+        let entries2 = query(&db_path, filter2).unwrap();
+        assert!(
+            entries2.is_empty(),
+            "non-matching capability_token must return empty"
+        );
+    }
+
+    #[test]
+    fn boot_nonce_filter_works() {
+        let (_tmpdir, db_path) = sqli_test_db();
+        let mut filter = AuditFilter::default();
+        filter.boot_nonce = Some(1);
+        let entries = query(&db_path, filter).unwrap();
+        assert_eq!(entries.len(), 1);
+
+        let mut filter2 = AuditFilter::default();
+        filter2.boot_nonce = Some(999);
+        let entries2 = query(&db_path, filter2).unwrap();
+        assert!(entries2.is_empty());
+    }
+
+    // ── FR42 subject_access_query tests ────────────────────────────────
+
+    #[test]
+    fn subject_access_query_returns_matching_rows() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let db_path = tmpdir.path().join("test.sqlite");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS principal_index (
+                principal_id TEXT NOT NULL,
+                writer_spirit_pid INTEGER NOT NULL,
+                schema TEXT NOT NULL,
+                key TEXT NOT NULL,
+                timestamp_ns INTEGER NOT NULL,
+                PRIMARY KEY (principal_id, writer_spirit_pid, schema, key)
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO principal_index (principal_id, writer_spirit_pid, schema, key, timestamp_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["user:alice", 7i64, "memory", "session-1", 1000i64],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO principal_index (principal_id, writer_spirit_pid, schema, key, timestamp_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["user:bob", 8i64, "memory", "session-2", 2000i64],
+        ).unwrap();
+        drop(conn);
+
+        let entries = subject_access_query(&db_path, "user:alice").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].principal_id, "user:alice");
+        assert_eq!(entries[0].writer_spirit_pid, 7);
+        assert_eq!(entries[0].schema, "memory");
+    }
+
+    #[test]
+    fn resolve_spirit_name_finds_admitted_spirit() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let db_path = tmpdir.path().join("test.sqlite");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS transparency_log (
+                frame_id BLOB NOT NULL PRIMARY KEY,
+                timestamp_ns INTEGER NOT NULL,
+                spirit_pid INTEGER NOT NULL,
+                boot_nonce INTEGER NOT NULL,
+                capability_token BLOB,
+                kind INTEGER NOT NULL,
+                intent TEXT NOT NULL,
+                payload_redacted BLOB NOT NULL,
+                origin INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        let payload = serde_json::to_vec(&serde_json::json!({"spirit_id": "researcher"})).unwrap();
+        conn.execute(
+            "INSERT INTO transparency_log (frame_id, timestamp_ns, spirit_pid, boot_nonce, capability_token, kind, intent, payload_redacted, origin)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                &[0x01u8; 16] as &[u8],
+                1000i64,
+                42i64,
+                5i64,
+                rusqlite::types::Null,
+                19i64,  // SpiritAdmitted
+                "researcher",
+                &payload as &[u8],
+                0i64,
+            ],
+        ).unwrap();
+        drop(conn);
+
+        let result = resolve_spirit_name(&db_path, "researcher", false).unwrap();
+        assert_eq!(result, vec![(5, 42)]);
+    }
+
+    #[test]
+    fn resolve_spirit_name_rejects_unknown() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let db_path = tmpdir.path().join("test.sqlite");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS transparency_log (
+                frame_id BLOB NOT NULL PRIMARY KEY,
+                timestamp_ns INTEGER NOT NULL,
+                spirit_pid INTEGER NOT NULL,
+                boot_nonce INTEGER NOT NULL,
+                capability_token BLOB,
+                kind INTEGER NOT NULL,
+                intent TEXT NOT NULL,
+                payload_redacted BLOB NOT NULL,
+                origin INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let err = resolve_spirit_name(&db_path, "nonexistent", false).unwrap_err();
+        assert!(err.contains("unknown spirit 'nonexistent'"));
+    }
+
+    // ── FR42 enrich_subject_access provenance tests ────────────────────
+
+    /// Helper: create a test SQLite file with both `transparency_log` and
+    /// `principal_index` tables. Returns `(tmpdir, db_path)` — the tmpdir
+    /// must stay alive for the file to exist.
+    fn create_test_db_with_principal_index() -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let db_path = tmpdir.path().join("test.sqlite");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS transparency_log (
+                frame_id BLOB NOT NULL PRIMARY KEY,
+                timestamp_ns INTEGER NOT NULL,
+                spirit_pid INTEGER NOT NULL,
+                boot_nonce INTEGER NOT NULL,
+                capability_token BLOB,
+                kind INTEGER NOT NULL,
+                intent TEXT NOT NULL,
+                payload_redacted BLOB NOT NULL,
+                origin INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS principal_index (
+                principal_id TEXT NOT NULL,
+                writer_spirit_pid INTEGER NOT NULL,
+                schema TEXT NOT NULL,
+                key TEXT NOT NULL,
+                timestamp_ns INTEGER NOT NULL,
+                PRIMARY KEY (principal_id, writer_spirit_pid, schema, key)
+            );",
+        )
+        .unwrap();
+        drop(conn);
+        (tmpdir, db_path)
+    }
+
+    #[test]
+    fn enrich_subject_access_direct_provenance() {
+        let (_tmpdir, db_path) = create_test_db_with_principal_index();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+
+        // principal_index row: alice written by spirit pid=42
+        conn.execute(
+            "INSERT INTO principal_index (principal_id, writer_spirit_pid, schema, key, timestamp_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["alice@example.org", 42i64, "memory", "session-1", 1000i64],
+        ).unwrap();
+
+        // TL: lifecycle.admit for spirit pid=42 so enrich can resolve the name
+        let admit_payload = serde_json::to_vec(&serde_json::json!({
+            "spirit_id": "researcher"
+        }))
+        .unwrap();
+        conn.execute(
+            "INSERT INTO transparency_log
+             (frame_id, timestamp_ns, spirit_pid, boot_nonce, capability_token, kind, intent, payload_redacted, origin)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                &[0x01u8; 16] as &[u8],
+                500i64,  // before the principal entry
+                42i64,
+                10i64,
+                rusqlite::types::Null,
+                19i64,  // SpiritAdmitted
+                "researcher",
+                &admit_payload as &[u8],
+                0i64,
+            ],
+        ).unwrap();
+
+        // NO Distillate frames for pid 42 — provenance must be Direct
+        drop(conn);
+
+        let entries = subject_access_query(&db_path, "alice@example.org").unwrap();
+        assert_eq!(entries.len(), 1);
+        let enriched = enrich_subject_access(&db_path, entries).unwrap();
+        assert_eq!(enriched.len(), 1);
+
+        // Must be Direct provenance since no Distillate frame exists
+        assert!(
+            matches!(&enriched[0].provenance, Provenance::Direct { frame_ref } if frame_ref == "memory:session-1"),
+            "expected Direct provenance with frame_ref 'memory:session-1', got {:?}",
+            enriched[0].provenance,
+        );
+        assert_eq!(
+            enriched[0].writer_spirit_name.as_deref(),
+            Some("researcher")
+        );
+        assert_eq!(enriched[0].boot_nonce, Some(10));
+    }
+
+    #[test]
+    fn enrich_subject_access_distilled_provenance() {
+        let (_tmpdir, db_path) = create_test_db_with_principal_index();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+
+        // principal_index row: bob written by spirit pid=99
+        conn.execute(
+            "INSERT INTO principal_index (principal_id, writer_spirit_pid, schema, key, timestamp_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["bob@example.org", 99i64, "preference", "theme", 2000i64],
+        ).unwrap();
+
+        // TL: lifecycle.admit for spirit pid=99
+        let admit_payload = serde_json::to_vec(&serde_json::json!({
+            "spirit_id": "butler"
+        }))
+        .unwrap();
+        conn.execute(
+            "INSERT INTO transparency_log
+             (frame_id, timestamp_ns, spirit_pid, boot_nonce, capability_token, kind, intent, payload_redacted, origin)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                &[0x01u8; 16] as &[u8],
+                500i64,
+                99i64,
+                20i64,  // boot_nonce
+                rusqlite::types::Null,
+                19i64,  // SpiritAdmitted
+                "butler",
+                &admit_payload as &[u8],
+                0i64,
+            ],
+        ).unwrap();
+
+        // TL: Distillate frame for pid=99, boot_nonce=20
+        let distillate_payload = serde_json::to_vec(&serde_json::json!({
+            "kind": "distillate",
+            "effective_source_log_ref": "ab:cd:ef:12:34",
+            "distillation_depth": 2
+        }))
+        .unwrap();
+        conn.execute(
+            "INSERT INTO transparency_log
+             (frame_id, timestamp_ns, spirit_pid, boot_nonce, capability_token, kind, intent, payload_redacted, origin)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                &[0x02u8; 16] as &[u8],
+                1000i64,
+                99i64,
+                20i64,  // same boot_nonce as lifecycle.admit
+                rusqlite::types::Null,
+                11i64,  // Distillate
+                "distillate.commit",
+                &distillate_payload as &[u8],
+                0i64,
+            ],
+        ).unwrap();
+
+        drop(conn);
+
+        let entries = subject_access_query(&db_path, "bob@example.org").unwrap();
+        assert_eq!(entries.len(), 1);
+        let enriched = enrich_subject_access(&db_path, entries).unwrap();
+        assert_eq!(enriched.len(), 1);
+
+        // Must be Distilled provenance with correct depth and refs
+        match &enriched[0].provenance {
+            Provenance::Distilled {
+                effective_source_log_ref,
+                distillation_depth,
+            } => {
+                assert_eq!(*distillation_depth, 2);
+                assert_eq!(
+                    effective_source_log_ref,
+                    &vec![
+                        "ab".to_string(),
+                        "cd".to_string(),
+                        "ef".to_string(),
+                        "12".to_string(),
+                        "34".to_string(),
+                    ]
+                );
+            }
+            other => panic!("expected Distilled provenance, got {:?}", other),
+        }
+        assert_eq!(enriched[0].writer_spirit_name.as_deref(), Some("butler"));
+        assert_eq!(enriched[0].boot_nonce, Some(20));
+    }
+
+    #[test]
+    fn pid_reuse_misattribution_test() {
+        let (_tmpdir, db_path) = create_test_db_with_principal_index();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+
+        // Spirit "researcher" admitted at pid=100, boot_nonce=1000
+        let researcher_payload = serde_json::to_vec(&serde_json::json!({
+            "spirit_id": "researcher"
+        }))
+        .unwrap();
+        conn.execute(
+            "INSERT INTO transparency_log
+             (frame_id, timestamp_ns, spirit_pid, boot_nonce, capability_token, kind, intent, payload_redacted, origin)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                &[0x01u8; 16] as &[u8],
+                1000i64,
+                100i64,
+                1000i64,  // boot_nonce for researcher
+                rusqlite::types::Null,
+                19i64,  // SpiritAdmitted
+                "researcher",
+                &researcher_payload as &[u8],
+                0i64,
+            ],
+        ).unwrap();
+
+        // Spirit "butler" reused pid=100, boot_nonce=2000
+        let butler_payload = serde_json::to_vec(&serde_json::json!({
+            "spirit_id": "butler"
+        }))
+        .unwrap();
+        conn.execute(
+            "INSERT INTO transparency_log
+             (frame_id, timestamp_ns, spirit_pid, boot_nonce, capability_token, kind, intent, payload_redacted, origin)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                &[0x02u8; 16] as &[u8],
+                2000i64,
+                100i64,  // SAME PID
+                2000i64,  // different boot_nonce
+                rusqlite::types::Null,
+                19i64,
+                "butler",
+                &butler_payload as &[u8],
+                0i64,
+            ],
+        ).unwrap();
+
+        // principal_index: alice's entries written by researcher (pid=100)
+        conn.execute(
+            "INSERT INTO principal_index (principal_id, writer_spirit_pid, schema, key, timestamp_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["alice@example.org", 100i64, "memory", "research-note-1", 1200i64],
+        ).unwrap();
+
+        // principal_index: bob's entries written by butler (pid=100, same pid)
+        conn.execute(
+            "INSERT INTO principal_index (principal_id, writer_spirit_pid, schema, key, timestamp_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["bob@example.org", 100i64, "preference", "theme", 2200i64],
+        ).unwrap();
+
+        drop(conn);
+
+        // Query alice's data — should get ONLY researcher's entry
+        let entries = subject_access_query(&db_path, "alice@example.org").unwrap();
+        assert_eq!(entries.len(), 1, "alice should have exactly one entry");
+        assert_eq!(entries[0].key, "research-note-1");
+
+        // Enrich: each entry is attributed to the incarnation active at its
+        // write timestamp. Alice wrote at ts=1200, between researcher (ts=1000)
+        // and butler (ts=2000), so she is attributed to researcher boot=1000.
+        let enriched = enrich_subject_access(&db_path, entries).unwrap();
+        assert_eq!(enriched.len(), 1);
+        assert_eq!(
+            enriched[0].writer_spirit_name.as_deref(),
+            Some("researcher")
+        );
+        assert_eq!(enriched[0].boot_nonce, Some(1000));
+
+        // Bob wrote at ts=2200, after butler's admission, so he is attributed
+        // to butler boot=2000 — the previous pid-only logic would have wrongly
+        // attributed him to researcher.
+        let bob_entries = subject_access_query(&db_path, "bob@example.org").unwrap();
+        assert_eq!(bob_entries.len(), 1);
+        assert_eq!(bob_entries[0].key, "theme");
+        let bob_enriched = enrich_subject_access(&db_path, bob_entries).unwrap();
+        assert_eq!(bob_enriched.len(), 1);
+        assert_eq!(
+            bob_enriched[0].writer_spirit_name.as_deref(),
+            Some("butler")
+        );
+        assert_eq!(bob_enriched[0].boot_nonce, Some(2000));
+    }
+}
