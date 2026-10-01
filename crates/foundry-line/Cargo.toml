@@ -12,3 +12,7 @@ foundry-harness-cli = { path = "../foundry-harness-cli" }
 tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

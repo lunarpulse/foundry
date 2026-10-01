@@ -329,6 +329,7 @@ dependencies = [
 name = "foundry-line"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "foundry-domain",
  "foundry-furnace",
  "foundry-harness-cli",
