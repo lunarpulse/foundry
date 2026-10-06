@@ -123,6 +123,17 @@ where
         self.orders.lock().await.get(id).cloned()
     }
 
+    /// All in-process order ids currently in `state` (M0 gate: autopilot drain).
+    pub async fn ids_in_state(&self, state: OrderState) -> Vec<String> {
+        self.orders
+            .lock()
+            .await
+            .values()
+            .filter(|o| o.state() == state)
+            .map(|o| o.id.clone())
+            .collect()
+    }
+
     // ---- core: atomic transition + journal ----
 
     async fn commit(

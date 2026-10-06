@@ -72,6 +72,10 @@ enum Cmd {
         /// Die binary path (empty = fake harness)
         #[arg(long, default_value = "")]
         die: String,
+        /// M0 gate: auto-approve every FurnaceHold with this recorded intent
+        /// (gate measurement only — approval is still journalled immutably).
+        #[arg(long, default_value = "")]
+        auto_approve: String,
     },
     /// Show order state + journal tail.
     Show {
@@ -123,7 +127,7 @@ fn expand(p: &str) -> String {
     p.to_string()
 }
 
-type AppLine = Line<DigestGate, AnyHarness, SqliteLedger, DryRunPublisher>;
+type AppLine = Line<DigestGate, AnyHarness, SqliteLedger, foundry_watch::GithubPublisher>;
 
 fn human() -> ActorId {
     ActorId { kind: ActorKind::Human, source: "local".into(), id: "lunarpulse".into() }
@@ -136,7 +140,9 @@ async fn main() {
         Cmd::Validate { path } => validate(&path),
         Cmd::Run { id, task, die, blueprint } => run(id, task, die, &blueprint).await,
         Cmd::Approve { order, intent, db } => approve(order, intent, &expand(&db)).await,
-        Cmd::Watch { once, every, repo, die } => watch_cmd(once, every, repo, die).await,
+        Cmd::Watch { once, every, repo, die, auto_approve } => {
+            watch_cmd(once, every, repo, die, auto_approve).await
+        }
         Cmd::Show { order, db } => show(order, &expand(&db)).await,
     };
     std::process::exit(code);
@@ -257,11 +263,17 @@ fn build_line(die: &str, ledger: SqliteLedger) -> Arc<AppLine> {
     } else {
         AnyHarness::Cli(CliHarness::new(die, "coding", 900))
     };
+    let publisher = foundry_watch::GithubPublisher {
+        owner: "lunarpulse".into(),
+        repo: "foundary-demo".into(),
+        token_path: expand("~/.foundry/gh_token").into(),
+        base: "main".into(),
+    };
     Arc::new(Line::new(
         Arc::new(DigestGate),
         Arc::new(harness),
         Arc::new(TMutex::new(ledger)),
-        Arc::new(DryRunPublisher),
+        Arc::new(publisher),
         Arc::new(LocalPolicy),
     ))
 }
@@ -337,7 +349,7 @@ async fn show(order_id: String, db: &str) -> i32 {
     }
 }
 
-async fn watch_cmd(once: bool, every: u64, repo: String, die: String) -> i32 {
+async fn watch_cmd(once: bool, every: u64, repo: String, die: String, auto_approve: String) -> i32 {
     let (owner, name) = repo.split_once('/').unwrap_or((repo.as_str(), "contextmesh-rs"));
     let cfg = foundry_watch::WatchConfig {
         tick_secs: every,
@@ -386,6 +398,34 @@ async fn watch_cmd(once: bool, every: u64, repo: String, die: String) -> i32 {
         match foundry_watch::tick(&line, intake, &actor).await {
             Ok(n) => {
                 println!("tick: {n} new order(s)");
+                // M0 gate autopilot: approve + publish every FurnaceHold order
+                // in-process. The Approved event (intent + digest) is journalled
+                // immutably, so the human-approval RECORD is never skipped.
+                if !auto_approve.is_empty() {
+                    let human = human();
+                    let holds = line.ids_in_state(foundry_domain::OrderState::FurnaceHold).await;
+                    for oid in holds {
+                        let digest = line
+                            .get(&oid)
+                            .await
+                            .and_then(|o| o.artifact_digest)
+                            .unwrap_or_default();
+                        let token = foundry_domain::ports::ApprovalToken {
+                            order_id: oid.clone(),
+                            intent: auto_approve.clone(),
+                            artifact_digest: digest.clone(),
+                            actor: human.clone(),
+                            granted_at: chrono::Utc::now(),
+                        };
+                        match line.approve(&oid, &token, &auto_approve, &human).await {
+                            Ok(_) => match line.publish(&oid, &human).await {
+                                Ok(st) => println!("{oid} → {st:?}"),
+                                Err(e) => eprintln!("✗ publish {oid}: {e:?}"),
+                            },
+                            Err(e) => eprintln!("✗ approve {oid}: {e:?}"),
+                        }
+                    }
+                }
                 0
             }
             Err(e) => {
