@@ -47,7 +47,21 @@ async fn die_env_is_allowlisted() {
     // Assert: FOUNDRY_* present, publish credentials absent.
     let dir = std::env::temp_dir().join(format!("foundry-h-env-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+
+    // 2026-10-07 contract: a Die exiting 0 with NO commit anywhere is a
+    // Permanent error (no silent no-ops). Seed dir/repo so this wrapper
+    // yields a HEAD — this also exercises the nested-repo HEAD resolution.
+    let g = |args: &[&str]| {
+        std::process::Command::new("git").args(args).current_dir(&repo).output().unwrap();
+    };
+    g(&["init", "-q"]);
+    g(&["config", "user.email", "t@t.local"]);
+    g(&["config", "user.name", "t"]);
+    std::fs::write(repo.join("f.txt"), "x").unwrap();
+    g(&["add", "-A"]);
+    g(&["commit", "-qm", "seed"]);
 
     let sh = dir.join("die.sh");
     std::fs::write(&sh, "#!/bin/sh\nexec /usr/bin/env\n").unwrap();
@@ -61,6 +75,10 @@ async fn die_env_is_allowlisted() {
     let o = order();
     let out = h.run(&o, 1, &dir).await.unwrap();
     assert_eq!(out.exit_code, 0, "wrapper must succeed");
+    assert!(
+        !out.result_commit.is_empty(),
+        "HEAD must be resolved from workdir/repo when workdir is not a repo"
+    );
     let log = std::fs::read_to_string(&out.log_path).unwrap_or_default();
 
     assert!(

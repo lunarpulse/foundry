@@ -97,10 +97,26 @@ impl Harness for CliHarness {
             let status = child?;
 
             let base = git_head(&workdir);
+            // The Die wrapper clones the gate repo into `workdir/repo`, so
+            // HEAD may live one level down (measured 2026-10-07: git_head on
+            // the bare workdir returned "" → empty digest → approval refused
+            // 20/20). Refuse EARLY instead of binding an empty digest.
+            let result_commit = {
+                let h = git_head(&workdir);
+                if h.is_empty() { git_head(&workdir.join("repo")) } else { h }
+            };
+            if result_commit.is_empty() {
+                return Err(PortError::Permanent(format!(
+                    "die produced no commit: no git HEAD in {} or {}/repo",
+                    workdir.display(),
+                    workdir.join("repo").display()
+                )));
+            }
+
             Ok(DieOutput {
                 attempt,
-                base_commit: base.clone(),
-                result_commit: git_head(&workdir),
+                base_commit: base,
+                result_commit,
                 log_path: log_path.display().to_string(),
                 exit_code: status.code().unwrap_or(-1),
             })
