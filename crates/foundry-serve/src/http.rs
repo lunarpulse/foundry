@@ -18,7 +18,16 @@ pub fn router(state: Arc<ServeState>) -> Router {
         .route("/api/orders/{id}", get(order_detail))
         .route("/api/audit/verify", get(verify))
         .route("/api/status", get(status))
+        // UI-0: single static board, no build step (plan T12)
+        .route("/", get(board))
         .with_state(state)
+}
+
+async fn board() -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        include_str!("../assets/index.html"),
+    )
 }
 
 #[derive(Deserialize)]
