@@ -97,6 +97,15 @@ enum Cmd {
     },
     /// M1 T15: mirror catch-up. DRY-RUN by default; --apply requires the
     /// single-writer lease (review #5: reconcile must not be a 2nd writer).
+    /// T20: benchmark over corpus — baseline snapshot / compare vs baseline.
+    Benchmark {
+        #[arg(long)]
+        baseline: Option<String>,
+        #[arg(long)]
+        compare: Option<String>,
+        #[arg(long, default_value = "~/.foundry/corpus")]
+        corpus: String,
+    },
     /// T18: derive corpus manifests from the journal (idempotent).
     Corpus {
         #[arg(long, default_value = "~/.foundry/ledger.db")]
@@ -194,6 +203,11 @@ async fn main() {
         Cmd::Show { order, db } => show(order, &expand(&db)).await,
         Cmd::Status { db } => status_cmd(&expand(&db)),
         Cmd::Doctor { db } => doctor_cmd(&expand(&db)),
+        Cmd::Benchmark {
+            baseline,
+            compare,
+            corpus,
+        } => benchmark_cmd(baseline, compare, &expand(&corpus)),
         Cmd::Corpus { db, out } => corpus_cmd(&expand(&db), &expand(&out)),
         Cmd::Reconcile { db, apply } => reconcile_cmd(&expand(&db), apply).await,
         Cmd::Serve { db, bind } => {
@@ -851,4 +865,74 @@ fn corpus_cmd(db: &str, out: &str) -> i32 {
     }
     println!("corpus: {n} manifest(s) -> {}", root.display());
     0
+}
+
+fn benchmark_cmd(baseline: Option<String>, compare: Option<String>, corpus_dir: &str) -> i32 {
+    use foundry_watch::benchmark;
+    use foundry_watch::corpus::CorpusManifest;
+    let corpus = match CorpusManifest::load_all(std::path::Path::new(corpus_dir)) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("✗ corpus load: {e}");
+            return 1;
+        }
+    };
+    if let Some(b) = &baseline {
+        let out = std::path::Path::new(b);
+        match benchmark::write_baseline(&corpus, out) {
+            Ok(()) => {
+                let m = benchmark::compute(&corpus);
+                println!(
+                    "baseline written: {} orders | shipped={} failed={} rejected(no-op)={}",
+                    m.cohort_size, m.shipped, m.failed, m.rejected_noop
+                );
+                println!(
+                    "  cost: in={:?} (known {}/{}), attempts={}",
+                    m.cost.input_tokens, m.cost.known_input, m.cohort_size, m.attempts_total
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("✗ baseline write: {e}");
+                1
+            }
+        }
+    } else if let Some(b) = &compare {
+        match benchmark::compare(&corpus, std::path::Path::new(b)) {
+            Ok(rep) => {
+                println!("compare vs {}:", b);
+                println!(
+                    "  shipped:  {} -> {} (delta {:+})",
+                    rep.baseline.shipped, rep.current.shipped, rep.shipped_delta
+                );
+                println!(
+                    "  failed:   {} -> {} (delta {:+})",
+                    rep.baseline.failed, rep.current.failed, rep.failed_delta
+                );
+                println!(
+                    "  rejected: {} -> {} (delta {:+})",
+                    rep.baseline.rejected_noop, rep.current.rejected_noop, rep.rejected_delta
+                );
+                0
+            }
+            Err(benchmark::CompareError::VersionMismatch {
+                baseline_mv,
+                current_mv,
+                baseline_schema,
+                current_schema,
+            }) => {
+                eprintln!(
+                    "✗ version mismatch: metric v{baseline_mv} vs v{current_mv}, schema v{baseline_schema} vs v{current_schema} — refusing to compare across definitions"
+                );
+                1
+            }
+            Err(e) => {
+                eprintln!("✗ compare: {e:?}");
+                1
+            }
+        }
+    } else {
+        eprintln!("specify --baseline <path> or --compare <path>");
+        1
+    }
 }

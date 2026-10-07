@@ -13,8 +13,8 @@
 //! write it.
 use crate::corpus::{CorpusManifest, CostFields};
 use foundry_domain::OrderState;
-use foundry_ledger::replay::ReplayedOrder;
 use foundry_ledger::LedgerRow;
+use foundry_ledger::replay::ReplayedOrder;
 
 pub fn manifest_for(roc: &ReplayedOrder, rows: &[LedgerRow]) -> CorpusManifest {
     let lifecycle_rows: Vec<&LedgerRow> = rows
@@ -75,10 +75,7 @@ mod tests {
 
     #[test]
     fn target_convention() {
-        assert_eq!(
-            target_of("o-137:2026-10-07T18:36:27Z"),
-            "github-issue#137"
-        );
+        assert_eq!(target_of("o-137:2026-10-07T18:36:27Z"), "github-issue#137");
         assert_eq!(target_of("o-nightly"), "cron:nightly");
     }
 }
