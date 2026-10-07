@@ -62,18 +62,29 @@ where
     for draft in drafts {
         let order_id = format!(
             "o-{}",
-            draft.external.dedup_key.split('#').next_back().unwrap_or("x")
+            draft
+                .external
+                .dedup_key
+                .split('#')
+                .next_back()
+                .unwrap_or("x")
         );
         let order = Order::new(order_id.clone(), draft.external.clone(), chrono::Utc::now());
         line.submit(order).await;
         match line.drive(&order_id).await {
             Ok(foundry_domain::OrderState::FurnaceHold) => {
                 tracing::info!(order = %order_id, "FurnaceHold — awaiting approval");
-                { let mut i = intake.lock().await; i.ack(&draft.draft_id).map_err(|e| format!("ack: {e:?}"))?; }
+                {
+                    let mut i = intake.lock().await;
+                    i.ack(&draft.draft_id).map_err(|e| format!("ack: {e:?}"))?;
+                }
             }
             Ok(other) => {
                 tracing::info!(order = %order_id, state = ?other, "driven");
-                { let mut i = intake.lock().await; i.ack(&draft.draft_id).map_err(|e| format!("ack: {e:?}"))?; }
+                {
+                    let mut i = intake.lock().await;
+                    i.ack(&draft.draft_id).map_err(|e| format!("ack: {e:?}"))?;
+                }
             }
             Err(e) => {
                 // Leave un-acked: at-least-once redelivery on next tick.

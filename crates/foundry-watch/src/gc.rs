@@ -56,10 +56,7 @@ pub enum SweepAction {
 #[cfg(target_os = "linux")]
 pub fn tmp_usage_pct() -> Option<u32> {
     use std::os::unix::ffi::OsStrExt;
-    let c_path = std::ffi::CString::new(
-        foundry_domain::WORKDIR_ROOT.as_bytes(),
-    )
-    .ok()?;
+    let c_path = std::ffi::CString::new(foundry_domain::WORKDIR_ROOT.as_bytes()).ok()?;
     let mut st: libc::statfs = unsafe { std::mem::zeroed() };
     let rc = unsafe { libc::statfs(c_path.as_ptr(), &mut st) };
     if rc != 0 {
@@ -83,8 +80,16 @@ pub fn guard_tripped(cfg: &GcConfig) -> bool {
 
 /// Promote minimal reproduction evidence from a workdir into the archive.
 /// Returns the archive dir if anything was promoted.
-pub fn promote_evidence(workdir: &Path, order: &str, attempt: u32, cfg: &GcConfig) -> std::io::Result<Option<PathBuf>> {
-    let dest = cfg.archive_root.join(format!("{order}")).join(format!("attempt-{attempt}"));
+pub fn promote_evidence(
+    workdir: &Path,
+    order: &str,
+    attempt: u32,
+    cfg: &GcConfig,
+) -> std::io::Result<Option<PathBuf>> {
+    let dest = cfg
+        .archive_root
+        .join(format!("{order}"))
+        .join(format!("attempt-{attempt}"));
     let repo = workdir.join("repo");
     let mut promoted = false;
 
@@ -119,8 +124,14 @@ pub fn promote_evidence(workdir: &Path, order: &str, attempt: u32, cfg: &GcConfi
 }
 
 fn run_git(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new("git").args(args).current_dir(dir).output().ok()?;
-    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
         .filter(|s| !s.trim().is_empty())
 }
 
@@ -136,7 +147,13 @@ pub fn sweep(
     tick: u32,
     now_ms: u64,
 ) -> std::io::Result<Vec<SweepAction>> {
-    sweep_with_root(cfg, terminal_failed, tick, now_ms, Path::new(foundry_domain::WORKDIR_ROOT))
+    sweep_with_root(
+        cfg,
+        terminal_failed,
+        tick,
+        now_ms,
+        Path::new(foundry_domain::WORKDIR_ROOT),
+    )
 }
 
 pub fn sweep_with_root(
@@ -151,10 +168,16 @@ pub fn sweep_with_root(
     for e in fs::read_dir(root)?.flatten() {
         let name = e.file_name();
         let name = name.to_string_lossy();
-        let Some(rest) = name.strip_prefix("foundry-die-") else { continue };
+        let Some(rest) = name.strip_prefix("foundry-die-") else {
+            continue;
+        };
         // order ids contain '-' and ':' themselves; split on the LAST '-<n>'
-        let Some((order, att)) = rest.rsplit_once('-') else { continue };
-        let Ok(attempt) = att.parse::<u32>() else { continue };
+        let Some((order, att)) = rest.rsplit_once('-') else {
+            continue;
+        };
+        let Ok(attempt) = att.parse::<u32>() else {
+            continue;
+        };
         let mtime = e
             .metadata()
             .and_then(|m| m.modified())
@@ -162,7 +185,10 @@ pub fn sweep_with_root(
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        orders.entry(order.to_string()).or_default().push((attempt, e.path(), mtime));
+        orders
+            .entry(order.to_string())
+            .or_default()
+            .push((attempt, e.path(), mtime));
     }
 
     let mut actions = Vec::new();
@@ -183,7 +209,9 @@ pub fn sweep_with_root(
             } else {
                 // first sweep seeing this failed order: grant grace
                 let sweep_interval_ms: u64 = std::env::var("FOUNDRY_GC_INTERVAL_MS")
-                    .ok().and_then(|v| v.parse().ok()).unwrap_or(60_000);
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(60_000);
                 let deadline = now_ms + cfg.failed_keep_ticks as u64 * sweep_interval_ms;
                 let _ = fs::write(&marker, deadline.to_string());
                 true
@@ -196,18 +224,30 @@ pub fn sweep_with_root(
         for (att, path, _) in attempts[..attempts.len() - 1].iter() {
             let _ = promote_evidence(path, &order, *att, cfg);
             let _ = fs::remove_dir_all(path);
-            actions.push(SweepAction::Collected { order: order.clone(), attempt: *att });
+            actions.push(SweepAction::Collected {
+                order: order.clone(),
+                attempt: *att,
+            });
         }
         if in_grace {
-            actions.push(SweepAction::KeptFailedGrace { order, attempt: latest_att });
+            actions.push(SweepAction::KeptFailedGrace {
+                order,
+                attempt: latest_att,
+            });
         } else if is_failed {
             // grace expired: promote + collect the last one too
             let _ = promote_evidence(&latest_path, &order, latest_att, cfg);
             let _ = fs::remove_dir_all(&latest_path);
-            actions.push(SweepAction::Collected { order, attempt: latest_att });
+            actions.push(SweepAction::Collected {
+                order,
+                attempt: latest_att,
+            });
         } else {
             let _ = latest_mtime;
-            actions.push(SweepAction::KeptLatest { order, attempt: latest_att });
+            actions.push(SweepAction::KeptLatest {
+                order,
+                attempt: latest_att,
+            });
         }
     }
     Ok(actions)
@@ -234,15 +274,24 @@ mod tests {
         let root = std::env::temp_dir().join(format!("gc-t-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
-        let cfg = GcConfig { archive_root: root.join("archive"), ..Default::default() };
+        let cfg = GcConfig {
+            archive_root: root.join("archive"),
+            ..Default::default()
+        };
         for att in [1u32, 2] {
             let d = root.join(format!("foundry-die-o-x-{att}"));
             fs::create_dir_all(d.join("repo")).unwrap();
             fs::write(d.join(format!("attempt-{att}.log")), "die log\n").unwrap();
         }
         let actions = sweep_with_root(&cfg, &[], 1, 0, &root).unwrap();
-        assert!(actions.contains(&SweepAction::Collected { order: "o-x".into(), attempt: 1 }));
-        assert!(actions.contains(&SweepAction::KeptLatest { order: "o-x".into(), attempt: 2 }));
+        assert!(actions.contains(&SweepAction::Collected {
+            order: "o-x".into(),
+            attempt: 1
+        }));
+        assert!(actions.contains(&SweepAction::KeptLatest {
+            order: "o-x".into(),
+            attempt: 2
+        }));
         assert!(!root.join("foundry-die-o-x-1").exists());
         assert!(root.join("foundry-die-o-x-2").exists());
         let _ = fs::remove_dir_all(&root);
@@ -253,16 +302,27 @@ mod tests {
         let root = std::env::temp_dir().join(format!("gc-f-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
-        let cfg = GcConfig { archive_root: root.join("archive"), failed_keep_ticks: 0, ..Default::default() };
+        let cfg = GcConfig {
+            archive_root: root.join("archive"),
+            failed_keep_ticks: 0,
+            ..Default::default()
+        };
         let d = root.join("foundry-die-o-fail-1");
         fs::create_dir_all(d.join("repo")).unwrap();
         fs::write(d.join("attempt-1.log"), "boom: reason\n").unwrap();
         // grace expired (deadline 0)
         fs::write(d.join(".foundry-gc-grace"), "0").unwrap();
         let actions = sweep_with_root(&cfg, &["o-fail".into()], 1, 1_000_000, &root).unwrap();
-        assert!(actions.contains(&SweepAction::Collected { order: "o-fail".into(), attempt: 1 }));
+        assert!(actions.contains(&SweepAction::Collected {
+            order: "o-fail".into(),
+            attempt: 1
+        }));
         let ev = root.join("archive/o-fail/attempt-1/attempt-1.log");
-        assert!(ev.exists(), "failed evidence must survive GC: {}", ev.display());
+        assert!(
+            ev.exists(),
+            "failed evidence must survive GC: {}",
+            ev.display()
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -271,14 +331,21 @@ mod tests {
         let root = std::env::temp_dir().join(format!("gc-g-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
-        let cfg = GcConfig { archive_root: root.join("archive"), failed_keep_ticks: 3, ..Default::default() };
+        let cfg = GcConfig {
+            archive_root: root.join("archive"),
+            failed_keep_ticks: 3,
+            ..Default::default()
+        };
         let d = root.join("foundry-die-o-g-1");
         fs::create_dir_all(&d).unwrap();
         // first sweep grants grace (deadline in future relative to now_ms=1000)
         let actions = sweep_with_root(&cfg, &["o-g".into()], 1, 1_000, &root).unwrap();
         assert_eq!(
             actions,
-            vec![SweepAction::KeptFailedGrace { order: "o-g".into(), attempt: 1 }]
+            vec![SweepAction::KeptFailedGrace {
+                order: "o-g".into(),
+                attempt: 1
+            }]
         );
         assert!(d.exists(), "grace must keep the failed workdir");
         let _ = fs::remove_dir_all(&root);

@@ -42,9 +42,12 @@ impl GithubLabelIntake {
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| PortError::Permanent(format!("http client: {e}")))?;
-        Ok(Self { cfg, client, seen: HashSet::new() })
+        Ok(Self {
+            cfg,
+            client,
+            seen: HashSet::new(),
+        })
     }
-
 }
 
 impl Intake for GithubLabelIntake {
@@ -75,7 +78,10 @@ impl Intake for GithubLabelIntake {
                 external: foundry_domain::ExternalRef::github(
                     &format!("{}/{}", self.cfg.owner, self.cfg.repo),
                     &issue.number.to_string(),
-                    format!("{}/{}#{}:{}", self.cfg.owner, self.cfg.repo, issue.number, issue.updated_at),
+                    format!(
+                        "{}/{}#{}:{}",
+                        self.cfg.owner, self.cfg.repo, issue.number, issue.updated_at
+                    ),
                 ),
                 task_kind: "dep-bump".into(), // M0 first task class
                 payload: issue.body.unwrap_or_default(),

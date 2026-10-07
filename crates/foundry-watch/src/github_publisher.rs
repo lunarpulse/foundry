@@ -6,8 +6,8 @@
 //! pushes a `foundry/<order>` branch, and opens a PR. Idempotency: an open
 //! PR with the same head short-circuits (operation_id safety net, critique #2).
 
-use foundry_domain::ports::{PortError, PortResult, PublishOutcome, Publisher};
 use foundry_domain::Order;
+use foundry_domain::ports::{PortError, PortResult, PublishOutcome, Publisher};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -63,7 +63,13 @@ impl Publisher for GithubPublisher {
 fn sanitize_branch(s: &str) -> String {
     let cleaned: String = s
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     format!("foundry/{}", cleaned.trim_matches('-'))
 }
@@ -109,8 +115,8 @@ impl GithubPublisher {
         }
 
         // Attestation binding: the published commit must be the approved one.
-        let head = git(&workdir, &["rev-parse", "HEAD"])
-            .map_err(|e| PortError::Permanent(scrub(e)))?;
+        let head =
+            git(&workdir, &["rev-parse", "HEAD"]).map_err(|e| PortError::Permanent(scrub(e)))?;
         if head != digest {
             return Err(PortError::Permanent(format!(
                 "digest mismatch: workdir HEAD {head} != approved {digest}"
@@ -122,15 +128,16 @@ impl GithubPublisher {
             "https://x-access-token:{token}@github.com/{}/{}.git",
             self.owner, self.repo
         );
-        git(&workdir, &["checkout", "-B", &branch])
-            .map_err(|e| PortError::Permanent(scrub(e)))?;
+        git(&workdir, &["checkout", "-B", &branch]).map_err(|e| PortError::Permanent(scrub(e)))?;
         if let Err(e) = git(&workdir, &["push", "-u", &remote, &branch]) {
             let msg = scrub(e);
-            return Err(if msg.contains("Could not resolve") || msg.contains("timed out") {
-                PortError::Retryable(msg)
-            } else {
-                PortError::Permanent(msg)
-            });
+            return Err(
+                if msg.contains("Could not resolve") || msg.contains("timed out") {
+                    PortError::Retryable(msg)
+                } else {
+                    PortError::Permanent(msg)
+                },
+            );
         }
 
         let client = reqwest::blocking::Client::builder()
@@ -138,7 +145,12 @@ impl GithubPublisher {
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| PortError::Permanent(format!("http client: {e}")))?;
-        let api = |p: &str| format!("https://api.github.com/repos/{}/{}/{}", self.owner, self.repo, p);
+        let api = |p: &str| {
+            format!(
+                "https://api.github.com/repos/{}/{}/{}",
+                self.owner, self.repo, p
+            )
+        };
         let head_label = format!("{}:{}", self.owner, branch);
 
         // Idempotency: open PR with this head already? → Confirmed (same PR).
@@ -177,7 +189,11 @@ impl GithubPublisher {
             .json()
             .map_err(|e| PortError::Permanent(scrub(format!("pr create json: {e}"))))?;
         if !status.is_success() {
-            let msg = format!("pr create {}: {}", status, body["message"].as_str().unwrap_or("?"));
+            let msg = format!(
+                "pr create {}: {}",
+                status,
+                body["message"].as_str().unwrap_or("?")
+            );
             return Err(if status.as_u16() >= 500 {
                 PortError::Retryable(scrub(msg))
             } else {

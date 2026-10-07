@@ -63,7 +63,9 @@ impl DiscordNotifier {
         match self
             .client
             .post(url)
-            .json(&WebhookBody { content: content.to_string() })
+            .json(&WebhookBody {
+                content: content.to_string(),
+            })
             .header("Content-Type", "application/json")
             .send()
         {
@@ -129,9 +131,16 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("nt2-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
-        std::fs::write(tmp.join("notifier.env"), "FOUNDRY_DISCORD_WEBHOOK=https://discord.com/api/webhooks/1/x\n").unwrap();
+        std::fs::write(
+            tmp.join("notifier.env"),
+            "FOUNDRY_DISCORD_WEBHOOK=https://discord.com/api/webhooks/1/x\n",
+        )
+        .unwrap();
         let n = DiscordNotifier::from_env_at(tmp.join("notifier.env"));
-        assert_eq!(n.webhook_url.as_deref(), Some("https://discord.com/api/webhooks/1/x"));
+        assert_eq!(
+            n.webhook_url.as_deref(),
+            Some("https://discord.com/api/webhooks/1/x")
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

@@ -97,6 +97,13 @@ enum Cmd {
     },
     /// M1 T15: mirror catch-up. DRY-RUN by default; --apply requires the
     /// single-writer lease (review #5: reconcile must not be a 2nd writer).
+    /// T18: derive corpus manifests from the journal (idempotent).
+    Corpus {
+        #[arg(long, default_value = "~/.foundry/ledger.db")]
+        db: String,
+        #[arg(long, default_value = "~/.foundry/corpus")]
+        out: String,
+    },
     Reconcile {
         #[arg(long, default_value = "~/.foundry/ledger.db")]
         db: String,
@@ -187,6 +194,7 @@ async fn main() {
         Cmd::Show { order, db } => show(order, &expand(&db)).await,
         Cmd::Status { db } => status_cmd(&expand(&db)),
         Cmd::Doctor { db } => doctor_cmd(&expand(&db)),
+        Cmd::Corpus { db, out } => corpus_cmd(&expand(&db), &expand(&out)),
         Cmd::Reconcile { db, apply } => reconcile_cmd(&expand(&db), apply).await,
         Cmd::Serve { db, bind } => {
             let state = std::sync::Arc::new(match foundry_serve::ServeState::new(&expand(&db)) {
@@ -801,4 +809,46 @@ async fn reconcile_cmd(db: &str, apply: bool) -> i32 {
             1
         }
     }
+}
+
+fn corpus_cmd(db: &str, out: &str) -> i32 {
+    let led = match open_ledger_ro(db) {
+        Some(l) => l,
+        None => return 1,
+    };
+    let rows = led.read_all().unwrap_or_default();
+    let replayed = match foundry_ledger::replay::replay(&rows, |rs| {
+        rs.iter()
+            .zip(rs.iter().skip(1))
+            .all(|(a, b)| b.prev_hash == a.hash)
+    }) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("✗ replay failed: {e:?}");
+            return 1;
+        }
+    };
+    let root = std::path::PathBuf::from(out);
+    let mut n = 0;
+    for roc in &replayed {
+        if foundry_watch::corpus::wants_manifest(roc.order.state()) {
+            let m = foundry_watch::corpus_emit::manifest_for(roc, &rows);
+            match m.save(&root) {
+                Ok(p) => {
+                    n += 1;
+                    println!(
+                        "{} {} [{}..{}]",
+                        m.terminal_state,
+                        m.order_id,
+                        m.ledger_row_range.unwrap().0,
+                        m.ledger_row_range.unwrap().1
+                    );
+                    let _ = p;
+                }
+                Err(e) => eprintln!("✗ write {}: {e}", m.order_id),
+            }
+        }
+    }
+    println!("corpus: {n} manifest(s) -> {}", root.display());
+    0
 }
