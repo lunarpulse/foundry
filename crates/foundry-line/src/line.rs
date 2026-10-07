@@ -15,7 +15,7 @@ use crate::error::LineError;
 use foundry_domain::ports::{
     Gate, Harness, Ledger, Policy, PortError, PublishOutcome, Publisher,
 };
-use foundry_domain::{ActorId, ActorKind, Order, OrderEvent, OrderState};
+use foundry_domain::{workdir_path, ActorId, ActorKind, Order, OrderEvent, OrderState};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -185,9 +185,7 @@ where
                 }
                 OrderState::Queued => {
                     let attempt = order.attempt().max(1);
-                    let workdir = std::path::PathBuf::from(format!(
-                        "/tmp/foundry-die-{order_id}-{attempt}"
-                    ));
+                    let workdir = workdir_path(order_id, attempt);
                     std::fs::create_dir_all(&workdir).map_err(|e| {
                         LineError::Port(order_id.to_string(), PortError::Permanent(e.to_string()))
                     })?;

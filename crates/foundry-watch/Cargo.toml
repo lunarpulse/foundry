@@ -19,3 +19,6 @@ chrono.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
+
+[target.x86_64-unknown-linux-gnu.dependencies]
+libc = "0.2.190"

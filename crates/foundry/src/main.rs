@@ -388,6 +388,26 @@ async fn watch_cmd(once: bool, every: u64, repo: String, die: String, auto_appro
         }
     };
     let line = build_line(&die, ledger);
+    // T10: workdir GC — sweep stale Die workdirs at tick start, and hold off
+    // new Dies when /tmp usage trips the guard (M0 defect #6: measured
+    // ENOSPC killed 10 publishes mid-run; better slow than dead).
+    let gc_cfg = foundry_watch::gc::GcConfig::default();
+    match foundry_watch::gc::sweep(
+        &gc_cfg,
+        &line.ids_in_state(foundry_domain::OrderState::Failed).await,
+        0,
+        chrono::Utc::now().timestamp_millis() as u64,
+    ) {
+        Ok(actions) if !actions.is_empty() => {
+            eprintln!("gc: {} action(s): {:?}", actions.len(), actions);
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("gc: sweep failed (non-fatal): {e}"),
+    }
+    if foundry_watch::gc::guard_tripped(&gc_cfg) {
+        let pct = foundry_watch::gc::tmp_usage_pct().unwrap_or(0);
+        eprintln!("gc: /tmp usage {pct}% ≥ guard {}% — holding new Dies this tick", gc_cfg.guard_pct);
+    }
     if once {
         let actor = foundry_domain::ActorId {
             kind: foundry_domain::ActorKind::Agent,

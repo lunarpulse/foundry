@@ -87,7 +87,7 @@ impl GithubPublisher {
         }
         let scrub = |s: String| s.replace(&token, "***");
 
-        let workdir = PathBuf::from(format!("/tmp/foundry-die-{order_id}-{attempt}/repo"));
+        let workdir = foundry_domain::repo_path(order_id, attempt);
         if !workdir.exists() {
             return Err(PortError::Permanent(format!(
                 "die workdir missing: {}",
