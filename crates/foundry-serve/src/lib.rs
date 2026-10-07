@@ -15,8 +15,18 @@ use std::sync::Arc;
 
 /// Order state names, exactly the kanban columns (T12 consumes 1:1).
 pub const STATE_NAMES: &[&str] = &[
-    "received", "queued", "working", "review", "waiting", "publishing",
-    "unknown", "shipped", "failed", "rejected", "canceling", "canceled",
+    "received",
+    "queued",
+    "working",
+    "review",
+    "waiting",
+    "publishing",
+    "unknown",
+    "shipped",
+    "failed",
+    "rejected",
+    "canceling",
+    "canceled",
 ];
 
 #[derive(serde::Serialize)]
@@ -62,35 +72,32 @@ pub struct VerifyResponse {
     pub chain_valid: bool,
 }
 
-/// Replay the journal into per-order cards (pure function — tested).
-pub fn replay(rows: &[LedgerRow]) -> HashMap<String, Card> {
+/// Replay the journal into per-order cards. T16: delegates to the SINGLE
+/// replay engine (foundry_ledger::replay) — the bespoke card parser was a
+/// duplicated decoder of the Debug repr (reserved defect). Cards are the
+/// LAST lifecycle of each order id (kanban semantics: what is it NOW).
+/// Chain verification runs through the ledger's own verifier.
+pub fn replay_cards(
+    rows: &[LedgerRow],
+    verify_chain: impl FnOnce(&[LedgerRow]) -> bool,
+) -> Result<HashMap<String, Card>, String> {
+    let replayed =
+        foundry_ledger::replay::replay(rows, verify_chain).map_err(|e| format!("{e:?}"))?;
     let mut cards: HashMap<String, Card> = HashMap::new();
-    for r in rows {
-        let card = cards.entry(r.order_id.clone()).or_insert_with(|| Card {
-            order_id: r.order_id.clone(),
-            state: r.to_state.clone(),
-            attempt: 0,
-            last_event: r.event.clone(),
-            at: r.at.clone(),
-        });
-        card.state = r.to_state.clone();
-        card.last_event = r.event.clone();
-        card.at = r.at.clone();
-        // attempts appear in DieStarted/DieSucceeded/DieFailed payloads; the
-        // ledger stores the Debug repr — parse "attempt: N" out of it (best
-        // effort; M2 moves payloads to structured JSON events).
-        if let Some(n) = parse_attempt(&r.event) {
-            card.attempt = n;
-        }
+    for ro in replayed {
+        // later lifecycles overwrite earlier ones (seq order is preserved)
+        cards.insert(
+            ro.order_id.clone(),
+            Card {
+                order_id: ro.order_id.clone(),
+                state: ro.order.state().to_string(),
+                attempt: ro.order.attempt(),
+                last_event: String::new(), // per-card event tail kept simple; detail view has the journal
+                at: String::new(),
+            },
+        );
     }
-    cards
-}
-
-fn parse_attempt(event_repr: &str) -> Option<u32> {
-    let idx = event_repr.find("attempt:")?;
-    let rest = event_repr[idx + "attempt:".len()..].trim_start();
-    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    digits.parse().ok()
+    Ok(cards)
 }
 
 pub struct ServeState {
@@ -99,15 +106,20 @@ pub struct ServeState {
 
 impl ServeState {
     pub fn new(ledger_path: impl Into<PathBuf>) -> Result<Self, String> {
-        let ledger = SqliteLedger::open(&ledger_path.into())
-            .map_err(|e| format!("open ledger: {e:?}"))?;
-        Ok(Self { ledger: Arc::new(ledger) })
+        let ledger =
+            SqliteLedger::open(&ledger_path.into()).map_err(|e| format!("open ledger: {e:?}"))?;
+        Ok(Self {
+            ledger: Arc::new(ledger),
+        })
     }
 
     fn snapshot_meta(&self, rows: &[LedgerRow]) -> SnapshotMeta {
         SnapshotMeta {
             height: rows.len() as i64,
-            head_hash: rows.last().map(|r| r.hash.clone()).unwrap_or_else(|| "GENESIS".into()),
+            head_hash: rows
+                .last()
+                .map(|r| r.hash.clone())
+                .unwrap_or_else(|| "GENESIS".into()),
             read_at: chrono::Utc::now().to_rfc3339(),
         }
     }
@@ -116,7 +128,12 @@ impl ServeState {
         // ONE consistent read: read_all is a single locked query pass.
         let rows = self.ledger.read_all().unwrap_or_default();
         let meta = self.snapshot_meta(&rows);
-        let cards = replay(&rows);
+        let cards = replay_cards(&rows, |rs| {
+            rs.iter()
+                .zip(rs.iter().skip(1))
+                .all(|(a, b)| b.prev_hash == a.hash)
+        })
+        .unwrap_or_default();
         let mut counts: HashMap<String, usize> = HashMap::new();
         for name in STATE_NAMES {
             counts.insert(name.to_string(), 0);
@@ -178,7 +195,11 @@ mod tests {
     use foundry_domain::{Order, OrderEvent};
 
     fn mk_order(id: &str) -> Order {
-        Order::new(id.into(), foundry_domain::ExternalRef::github("o/r", "1", "k".into()), chrono::Utc::now())
+        Order::new(
+            id.into(),
+            foundry_domain::ExternalRef::github("o/r", "1", "k".into()),
+            chrono::Utc::now(),
+        )
     }
 
     #[test]
@@ -192,11 +213,40 @@ mod tests {
             source: "t".into(),
             id: "t".into(),
         };
-        led.append("o-1", &OrderEvent::Queued, foundry_domain::OrderState::Received, foundry_domain::OrderState::Queued, &actor, chrono::Utc::now()).unwrap();
-        led.append("o-1", &OrderEvent::DieStarted, foundry_domain::OrderState::Queued, foundry_domain::OrderState::Working, &actor, chrono::Utc::now()).unwrap();
-        led.append("o-1", &OrderEvent::DieSucceeded { attempt: 1 }, foundry_domain::OrderState::Working, foundry_domain::OrderState::Inspecting, &actor, chrono::Utc::now()).unwrap();
+        led.append(
+            "o-1",
+            &OrderEvent::Queued,
+            foundry_domain::OrderState::Received,
+            foundry_domain::OrderState::Queued,
+            &actor,
+            chrono::Utc::now(),
+        )
+        .unwrap();
+        led.append(
+            "o-1",
+            &OrderEvent::DieStarted,
+            foundry_domain::OrderState::Queued,
+            foundry_domain::OrderState::Working,
+            &actor,
+            chrono::Utc::now(),
+        )
+        .unwrap();
+        led.append(
+            "o-1",
+            &OrderEvent::DieSucceeded { attempt: 1 },
+            foundry_domain::OrderState::Working,
+            foundry_domain::OrderState::Inspecting,
+            &actor,
+            chrono::Utc::now(),
+        )
+        .unwrap();
         let rows = led.read_all().unwrap();
-        let cards = replay(&rows);
+        let cards = replay_cards(&rows, |rs| {
+            rs.iter()
+                .zip(rs.iter().skip(1))
+                .all(|(a, b)| b.prev_hash == a.hash)
+        })
+        .unwrap_or_default();
         assert_eq!(cards["o-1"].state, "review");
         assert_eq!(cards["o-1"].attempt, 1);
         let _ = std::fs::remove_file(&db);
@@ -212,7 +262,15 @@ mod tests {
             source: "t".into(),
             id: "t".into(),
         };
-        led.append("o-9", &OrderEvent::Queued, foundry_domain::OrderState::Received, foundry_domain::OrderState::Queued, &actor, chrono::Utc::now()).unwrap();
+        led.append(
+            "o-9",
+            &OrderEvent::Queued,
+            foundry_domain::OrderState::Received,
+            foundry_domain::OrderState::Queued,
+            &actor,
+            chrono::Utc::now(),
+        )
+        .unwrap();
         let state = ServeState::new(&db).unwrap();
         let resp = state.orders(None, 50);
         assert_eq!(resp.height, 1);

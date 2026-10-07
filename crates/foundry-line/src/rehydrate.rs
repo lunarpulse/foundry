@@ -1,30 +1,18 @@
-//! Order rehydration — plan M1 (defect #7, found by the E2E).
-//!
-//! Orders live in the Line's in-memory map; when the watch process exits,
-//! FurnaceHold orders vanish from RAM — the ledger keeps the journal, but
-//! `foundry approve` in a NEW process hit "unknown order". Fix: replay the
-//! journal's events through the REAL state machine (no bypass — the same
-//! transition table enforces legality on replay), then re-bind the
-//! artifact digest for actionable states (waiting/FurnaceHold).
-//!
-//! Digest source: the Die workdir HEAD (identical to what the Die bound
-//! in-memory). If the workdir is gone, rehydrate refuses — an order must
-//! be re-run rather than approved blind (digest-결속 invariant, plan §11).
-use foundry_domain::{ExternalRef, Order, OrderEvent, OrderState};
-use foundry_ledger::{LedgerRow, SqliteLedger};
+//! Order rehydration — thin wrapper over the SINGLE replay engine
+//! (`foundry_ledger::replay`, M2 T16). The bespoke replay that lived here
+//! (defect #7 fix) is now the engine's job; this module keeps the
+//! approve-path ergonomics: read → verify → replay → bind digests for
+//! actionable (FurnaceHold) lifecycles from the workdir HEAD.
+use foundry_domain::OrderState;
+use foundry_ledger::SqliteLedger;
 use std::path::Path;
 
 #[derive(Debug)]
 pub enum RehydrateError {
     Ledger(String),
-    /// Journal replay hit an illegal transition (should be impossible for
-    /// a journal the Line itself wrote).
-    Replay {
-        order_id: String,
-        row_seq: i64,
-        err: String,
-    },
+    Replay(String),
     /// Order is actionable but its workdir (and thus digest) is gone.
+    /// Re-run the order rather than approve blind (digest-bound invariant).
     DigestUnavailable {
         order_id: String,
     },
@@ -33,147 +21,50 @@ pub enum RehydrateError {
 pub fn rehydrate(
     ledger: &SqliteLedger,
     _workdir_root: &Path,
-) -> Result<Vec<Order>, RehydrateError> {
+) -> Result<Vec<foundry_domain::Order>, RehydrateError> {
     let rows = ledger
         .read_all()
         .map_err(|e| RehydrateError::Ledger(format!("{e:?}")))?;
-
-    let mut by_order: std::collections::BTreeMap<String, Vec<&LedgerRow>> = Default::default();
-    for r in &rows {
-        by_order.entry(r.order_id.clone()).or_default().push(r);
+    if !ledger
+        .verify_chain()
+        .map_err(|e| RehydrateError::Ledger(format!("{e:?}")))?
+    {
+        return Err(RehydrateError::Replay(
+            "chain hash verification failed".into(),
+        ));
     }
+    let replayed = foundry_ledger::replay::replay(&rows, |rows| {
+        // the engine requires verified input; re-verify inside the seam
+        rows.iter()
+            .zip(rows.iter().skip(1))
+            .all(|(a, b)| b.prev_hash == a.hash)
+            && rows
+                .first()
+                .map(|r| !r.prev_hash.is_empty())
+                .unwrap_or(true)
+    })
+    .map_err(|e| RehydrateError::Replay(format!("{e:?}")))?;
 
     let mut out = Vec::new();
-    for (oid, rs) in by_order {
-        // A single order_id may span MULTIPLE lifecycles: re-orders reuse
-        // the id and restart from Received after a terminal state. Start a
-        // fresh Order at every `from_state == received` boundary.
-        let mut order = Order::new(oid.clone(), external_for(&oid), chrono::Utc::now());
-        for r in &rs {
-            if r.from_state == "received" && order.state() != OrderState::Received {
-                out.push(order);
-                order = Order::new(oid.clone(), external_for(&oid), chrono::Utc::now());
-            }
-            let ev = parse_event(&r.event, &r.intent);
-            let mut ea = event_attempt(&r.event);
-            if r.event.trim() == "DieStarted" {
-                ea = order.attempt().max(1);
-            }
-            match order.transition(ev, ea) {
-                Ok(_) => {}
-                Err(e) => {
-                    return Err(RehydrateError::Replay {
-                        order_id: oid,
-                        row_seq: r.seq,
-                        err: e.to_string(),
-                    });
-                }
-            }
-        }
-        // digest for actionable states — bind on the LAST lifecycle of this id
+    for ro in replayed {
+        let mut order = ro.order;
         if order.state() == OrderState::FurnaceHold {
             let attempt = order.attempt().max(1);
-            let repo = foundry_domain::repo_path(&oid, attempt);
+            let repo = foundry_domain::repo_path(&ro.order_id, attempt);
             if repo.join(".git").exists() {
                 if let Ok(h) = git_head(&repo) {
                     order.artifact_digest = Some(h);
                 }
             }
             if order.artifact_digest.is_none() {
-                return Err(RehydrateError::DigestUnavailable { order_id: oid });
+                return Err(RehydrateError::DigestUnavailable {
+                    order_id: ro.order_id.clone(),
+                });
             }
         }
         out.push(order);
     }
     Ok(out)
-}
-
-/// Parse the journal's event repr back into an OrderEvent. The reprs are
-/// `{event:?}` Debug strings written by the ledger (M0 contract).
-fn parse_event(repr: &str, intent: &str) -> OrderEvent {
-    let name = repr
-        .split(|c: char| c == ' ' || c == '{')
-        .next()
-        .unwrap_or("");
-    match name {
-        "Queued" => OrderEvent::Queued,
-        // DieStarted carries no attempt in its repr — the state machine
-        // expects the CURRENT attempt (max(1)); reconstruct contextually.
-        "DieStarted" => OrderEvent::DieStarted,
-        "DieSucceeded" => OrderEvent::DieSucceeded {
-            attempt: event_attempt(repr).max(1),
-        },
-        "DieFailed" => OrderEvent::DieFailed {
-            attempt: event_attempt(repr).max(1),
-            reason: repr.to_string(),
-        },
-        "InspectionPassed" => OrderEvent::InspectionPassed,
-        "InspectionFailed" => OrderEvent::InspectionFailed {
-            reason: repr.to_string(),
-        },
-        "Approved" => OrderEvent::Approved {
-            intent: intent.to_string(),
-            artifact_digest: extract_quoted(repr, "artifact_digest").unwrap_or_default(),
-        },
-        "Rejected" => OrderEvent::Rejected {
-            intent: intent.to_string(),
-        },
-        "PublishConfirmed" => OrderEvent::PublishConfirmed {
-            pr_url: repr.to_string(),
-        },
-        "PublishUnknown" => OrderEvent::PublishUnknown {
-            operation_id: repr.to_string(),
-        },
-        "CancelRequested" => OrderEvent::CancelRequested {
-            reason: repr.to_string(),
-        },
-        "CancelConfirmed" => OrderEvent::CancelConfirmed,
-        "Canceled" => OrderEvent::Canceled {
-            reason: repr.to_string(),
-        },
-        _ => OrderEvent::Queued, // unknown repr — should be impossible
-    }
-}
-
-/// Extract `field: "value"` from a Debug repr.
-fn extract_quoted(repr: &str, field: &str) -> Option<String> {
-    let pat = format!("{field}: ");
-    let i = repr.find(&pat)? + pat.len();
-    let mut rest = &repr[i..];
-    if rest.starts_with('"') {
-        rest = &rest[1..];
-    }
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
-}
-
-fn event_attempt(repr: &str) -> u32 {
-    // Debug repr "attempt: 1" — take the first digit run after "attempt"
-    let i = match repr.find("attempt") { Some(i) => i + "attempt".len(), None => return 0 };
-    let rest = &repr[i..];
-    let digits: String = rest
-        .trim_start_matches(|c: char| !c.is_ascii_digit())
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
-    digits.parse().unwrap_or(0)
-}
-
-/// M0 id convention: `o-<dedup tail>`; intake dedup_key = `issues#<n>`.
-fn external_for(oid: &str) -> ExternalRef {
-    let tail = oid.strip_prefix("o-").unwrap_or(oid);
-    // GitHub-intake ids are `o-<issue#>:<timestamp>` (colon mandatory);
-    // bare `o-<timestamp>` ids are cron/legacy — never treat as issues.
-    if tail.contains(':') {
-        if let Some(n) = tail.split(':').next().unwrap_or("").parse::<u64>().ok() {
-            return ExternalRef::github(
-                "lunarpulse/foundary-demo",
-                &n.to_string(),
-                format!("issues#{n}"),
-            );
-        }
-    }
-    ExternalRef::cron("rehydrate", tail)
 }
 
 fn git_head(repo: &Path) -> std::io::Result<String> {
@@ -198,17 +89,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn event_attempt_parses_debug_repr() {
-        assert_eq!(event_attempt("DieSucceeded { attempt: 2 }"), 2);
-        assert_eq!(event_attempt("DieStarted"), 0);
-        assert_eq!(event_attempt("DieFailed { attempt: 1, reason: x }"), 1);
-    }
-
-    #[test]
-    fn external_recovers_issue_number() {
-        let e = external_for("o-137:2026-10-07T13:59:47Z");
-        assert_eq!(e.dedup_key, "issues#137");
-        let c = external_for("o-1760123456789");
-        assert!(c.dedup_key.starts_with("cron:"));
+    fn rehydrate_runs_on_a_seeded_ledger() {
+        let db = std::env::temp_dir().join(format!("rehy-t-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db);
+        let mut led = SqliteLedger::open(&db).unwrap();
+        let oid = "o-999:2026-10-08T00:00:00Z";
+        let order = foundry_domain::Order::new(
+            oid.into(),
+            foundry_domain::ExternalRef::github("o/r", "999", "issues#999".into()),
+            chrono::Utc::now(),
+        );
+        use foundry_domain::ports::Ledger as _;
+        // drive to FurnaceHold through real transitions, journalling each
+        let mut o = order;
+        for ev in [
+            foundry_domain::OrderEvent::Queued,
+            foundry_domain::OrderEvent::DieStarted,
+            foundry_domain::OrderEvent::DieSucceeded { attempt: 1 },
+            foundry_domain::OrderEvent::InspectionPassed,
+        ] {
+            let from = o.state();
+            o.transition(ev.clone(), 1).unwrap();
+            led.append(
+                oid,
+                &ev,
+                from,
+                o.state(),
+                &foundry_domain::ActorId {
+                    kind: foundry_domain::ActorKind::Agent,
+                    source: "foundry".into(),
+                    id: "executor".into(),
+                },
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        }
+        drop(led);
+        let led = SqliteLedger::open(&db).unwrap();
+        // FurnaceHold without a workdir → DigestUnavailable (by design)
+        match rehydrate(&led, Path::new("/tmp")) {
+            Err(RehydrateError::DigestUnavailable { order_id }) => assert_eq!(order_id, oid),
+            other => panic!("expected DigestUnavailable, got {other:?}"),
+        }
     }
 }

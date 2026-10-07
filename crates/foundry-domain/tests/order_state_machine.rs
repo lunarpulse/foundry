@@ -20,7 +20,8 @@ fn full_happy_path_received_to_shipped() {
     o.transition(OrderEvent::Queued, 0).unwrap();
     o.transition(OrderEvent::DieStarted, 1).unwrap();
     assert_eq!(o.state(), OrderState::Working);
-    o.transition(OrderEvent::DieSucceeded { attempt: 1 }, 1).unwrap();
+    o.transition(OrderEvent::DieSucceeded { attempt: 1 }, 1)
+        .unwrap();
     assert_eq!(o.state(), OrderState::Inspecting);
     o.transition(OrderEvent::InspectionPassed, 1).unwrap();
     assert_eq!(o.state(), OrderState::FurnaceHold);
@@ -33,7 +34,8 @@ fn full_happy_path_received_to_shipped() {
     )
     .unwrap();
     assert_eq!(o.state(), OrderState::Publishing);
-    o.transition(OrderEvent::PublishConfirmed { pr_url: "u".into() }, 1).unwrap();
+    o.transition(OrderEvent::PublishConfirmed { pr_url: "u".into() }, 1)
+        .unwrap();
     assert_eq!(o.state(), OrderState::Shipped);
 }
 
@@ -43,7 +45,10 @@ fn retry_path_working_back_to_queued_then_failed_on_exhaustion() {
     o.transition(OrderEvent::Queued, 0).unwrap();
     o.transition(OrderEvent::DieStarted, 1).unwrap();
     o.transition(
-        OrderEvent::DieFailed { attempt: 1, reason: "timeout".into() },
+        OrderEvent::DieFailed {
+            attempt: 1,
+            reason: "timeout".into(),
+        },
         1,
     )
     .unwrap();
@@ -52,7 +57,10 @@ fn retry_path_working_back_to_queued_then_failed_on_exhaustion() {
 
     o.transition(OrderEvent::DieStarted, 2).unwrap();
     o.transition(
-        OrderEvent::DieFailed { attempt: 2, reason: "timeout".into() },
+        OrderEvent::DieFailed {
+            attempt: 2,
+            reason: "timeout".into(),
+        },
         2,
     )
     .unwrap();
@@ -61,7 +69,10 @@ fn retry_path_working_back_to_queued_then_failed_on_exhaustion() {
 
     o.transition(OrderEvent::DieStarted, 3).unwrap();
     o.transition(
-        OrderEvent::DieFailed { attempt: 3, reason: "final".into() },
+        OrderEvent::DieFailed {
+            attempt: 3,
+            reason: "final".into(),
+        },
         3,
     )
     .unwrap();
@@ -78,7 +89,10 @@ fn stale_die_result_is_rejected() {
     o.transition(OrderEvent::DieStarted, 1).unwrap();
     // Die retried (attempt 2 now) but attempt-1 result arrives late
     o.transition(
-        OrderEvent::DieFailed { attempt: 1, reason: "late".into() },
+        OrderEvent::DieFailed {
+            attempt: 1,
+            reason: "late".into(),
+        },
         1,
     )
     .unwrap(); // legal: this IS the retry transition
@@ -106,13 +120,17 @@ fn illegal_transitions_are_rejected() {
     struct Case(OrderEvent, &'static str);
     let cases = vec![
         // FurnaceHold → Shipped 직행 금지 (v3 핵심 수정)
-        Case(OrderEvent::PublishConfirmed { pr_url: "u".into() }, "skip approval"),
+        Case(
+            OrderEvent::PublishConfirmed { pr_url: "u".into() },
+            "skip approval",
+        ),
     ];
     for Case(ev, why) in cases {
         let mut o = order();
         o.transition(OrderEvent::Queued, 0).unwrap();
         o.transition(OrderEvent::DieStarted, 1).unwrap();
-        o.transition(OrderEvent::DieSucceeded { attempt: 1 }, 1).unwrap();
+        o.transition(OrderEvent::DieSucceeded { attempt: 1 }, 1)
+            .unwrap();
         o.transition(OrderEvent::InspectionPassed, 1).unwrap();
         assert_eq!(o.state(), OrderState::FurnaceHold);
         let err = o.transition(ev.clone(), 1);
@@ -131,20 +149,40 @@ fn terminal_states_accept_nothing() {
                 // reach Failed
                 for a in 1..=3 {
                     o.transition(OrderEvent::DieStarted, a).unwrap();
-                    o.transition(OrderEvent::DieFailed { attempt: a, reason: "x".into() }, a).unwrap();
+                    o.transition(
+                        OrderEvent::DieFailed {
+                            attempt: a,
+                            reason: "x".into(),
+                        },
+                        a,
+                    )
+                    .unwrap();
                 }
                 assert_eq!(o.state(), OrderState::Failed);
             }
             1 => {
                 // reach Rejected
                 o.transition(OrderEvent::DieStarted, 1).unwrap();
-                o.transition(OrderEvent::DieSucceeded { attempt: 1 }, 1).unwrap();
+                o.transition(OrderEvent::DieSucceeded { attempt: 1 }, 1)
+                    .unwrap();
                 o.transition(OrderEvent::InspectionPassed, 1).unwrap();
-                o.transition(OrderEvent::Rejected { intent: "no".into() }, 1).unwrap();
+                o.transition(
+                    OrderEvent::Rejected {
+                        intent: "no".into(),
+                    },
+                    1,
+                )
+                .unwrap();
                 assert_eq!(o.state(), OrderState::Rejected);
             }
             _ => {
-                o.transition(OrderEvent::Canceled { reason: "closed".into() }, 0).unwrap();
+                o.transition(
+                    OrderEvent::Canceled {
+                        reason: "closed".into(),
+                    },
+                    0,
+                )
+                .unwrap();
                 assert_eq!(o.state(), OrderState::Canceled);
             }
         }
@@ -160,14 +198,21 @@ fn approval_requires_digest() {
     let mut o = order();
     o.transition(OrderEvent::Queued, 0).unwrap();
     o.transition(OrderEvent::DieStarted, 1).unwrap();
-    o.transition(OrderEvent::DieSucceeded { attempt: 1 }, 1).unwrap();
+    o.transition(OrderEvent::DieSucceeded { attempt: 1 }, 1)
+        .unwrap();
     o.transition(OrderEvent::InspectionPassed, 1).unwrap();
     // empty digest = no provenance binding → reject
     let err = o.transition(
-        OrderEvent::Approved { intent: "ok".into(), artifact_digest: String::new() },
+        OrderEvent::Approved {
+            intent: "ok".into(),
+            artifact_digest: String::new(),
+        },
         1,
     );
-    assert!(err.is_err(), "approval without artifact digest must be rejected");
+    assert!(
+        err.is_err(),
+        "approval without artifact digest must be rejected"
+    );
 }
 
 // ---- Unknown / reconcile ----
@@ -177,14 +222,34 @@ fn publishing_unknown_then_reconciled() {
     let mut o = order();
     o.transition(OrderEvent::Queued, 0).unwrap();
     o.transition(OrderEvent::DieStarted, 1).unwrap();
-    o.transition(OrderEvent::DieSucceeded { attempt: 1 }, 1).unwrap();
+    o.transition(OrderEvent::DieSucceeded { attempt: 1 }, 1)
+        .unwrap();
     o.transition(OrderEvent::InspectionPassed, 1).unwrap();
-    o.transition(OrderEvent::Approved { intent: "ok".into(), artifact_digest: "d".into() }, 1).unwrap();
+    o.transition(
+        OrderEvent::Approved {
+            intent: "ok".into(),
+            artifact_digest: "d".into(),
+        },
+        1,
+    )
+    .unwrap();
     // publish attempt crashed before response
-    o.transition(OrderEvent::PublishUnknown { operation_id: "op-1".into() }, 1).unwrap();
+    o.transition(
+        OrderEvent::PublishUnknown {
+            operation_id: "op-1".into(),
+        },
+        1,
+    )
+    .unwrap();
     assert_eq!(o.state(), OrderState::Unknown);
     // reconcile finds the PR actually exists
-    o.transition(OrderEvent::PublishConfirmed { pr_url: "https://x".into() }, 1).unwrap();
+    o.transition(
+        OrderEvent::PublishConfirmed {
+            pr_url: "https://x".into(),
+        },
+        1,
+    )
+    .unwrap();
     assert_eq!(o.state(), OrderState::Shipped);
 }
 
@@ -195,7 +260,13 @@ fn canceling_from_working_then_canceled() {
     let mut o = order();
     o.transition(OrderEvent::Queued, 0).unwrap();
     o.transition(OrderEvent::DieStarted, 1).unwrap();
-    o.transition(OrderEvent::CancelRequested { reason: "issue closed".into() }, 1).unwrap();
+    o.transition(
+        OrderEvent::CancelRequested {
+            reason: "issue closed".into(),
+        },
+        1,
+    )
+    .unwrap();
     assert_eq!(o.state(), OrderState::Canceling);
     o.transition(OrderEvent::CancelConfirmed, 1).unwrap();
     assert_eq!(o.state(), OrderState::Canceled);
@@ -204,19 +275,24 @@ fn canceling_from_working_then_canceled() {
 #[test]
 fn direct_cancel_allowed_from_received_and_queued_only() {
     let mut o = order();
-    o.transition(OrderEvent::Canceled { reason: "r".into() }, 0).unwrap();
+    o.transition(OrderEvent::Canceled { reason: "r".into() }, 0)
+        .unwrap();
     assert_eq!(o.state(), OrderState::Canceled);
 
     let mut o2 = order();
     o2.transition(OrderEvent::Queued, 0).unwrap();
-    o2.transition(OrderEvent::Canceled { reason: "r".into() }, 0).unwrap();
+    o2.transition(OrderEvent::Canceled { reason: "r".into() }, 0)
+        .unwrap();
     assert_eq!(o2.state(), OrderState::Canceled);
 
     // Working must go through Canceling
     let mut o3 = order();
     o3.transition(OrderEvent::Queued, 0).unwrap();
     o3.transition(OrderEvent::DieStarted, 1).unwrap();
-    assert!(o3.transition(OrderEvent::Canceled { reason: "r".into() }, 1).is_err());
+    assert!(
+        o3.transition(OrderEvent::Canceled { reason: "r".into() }, 1)
+            .is_err()
+    );
 }
 
 // ---- state parsing (칸반 칼럼용) ----
@@ -224,10 +300,18 @@ fn direct_cancel_allowed_from_received_and_queued_only() {
 #[test]
 fn state_names_round_trip() {
     for s in [
-        OrderState::Received, OrderState::Queued, OrderState::Working,
-        OrderState::Inspecting, OrderState::FurnaceHold, OrderState::Publishing,
-        OrderState::Unknown, OrderState::Shipped, OrderState::Failed,
-        OrderState::Rejected, OrderState::Canceling, OrderState::Canceled,
+        OrderState::Received,
+        OrderState::Queued,
+        OrderState::Working,
+        OrderState::Inspecting,
+        OrderState::FurnaceHold,
+        OrderState::Publishing,
+        OrderState::Unknown,
+        OrderState::Shipped,
+        OrderState::Failed,
+        OrderState::Rejected,
+        OrderState::Canceling,
+        OrderState::Canceled,
     ] {
         assert_eq!(OrderState::from_str(&s.to_string()).unwrap(), s);
     }

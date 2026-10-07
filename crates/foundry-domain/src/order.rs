@@ -67,10 +67,7 @@ impl OrderState {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            OrderState::Shipped
-                | OrderState::Failed
-                | OrderState::Rejected
-                | OrderState::Canceled
+            OrderState::Shipped | OrderState::Failed | OrderState::Rejected | OrderState::Canceled
         )
     }
 }
@@ -123,21 +120,41 @@ pub enum OrderEvent {
     Queued,
     DieStarted,
     /// attempt numbers fence stale results (critique #3).
-    DieSucceeded { attempt: u32 },
-    DieFailed { attempt: u32, reason: String },
+    DieSucceeded {
+        attempt: u32,
+    },
+    DieFailed {
+        attempt: u32,
+        reason: String,
+    },
     InspectionPassed,
-    InspectionFailed { reason: String },
+    InspectionFailed {
+        reason: String,
+    },
     /// Approval binds intent + artifact digest (plan §11: re-verified pre-publish).
-    Approved { intent: String, artifact_digest: String },
-    Rejected { intent: String },
+    Approved {
+        intent: String,
+        artifact_digest: String,
+    },
+    Rejected {
+        intent: String,
+    },
     /// Publisher committed the PR — external confirmation.
-    PublishConfirmed { pr_url: String },
+    PublishConfirmed {
+        pr_url: String,
+    },
     /// Publisher crashed before response — outcome unknown, reconcile re-judges.
-    PublishUnknown { operation_id: String },
-    CancelRequested { reason: String },
+    PublishUnknown {
+        operation_id: String,
+    },
+    CancelRequested {
+        reason: String,
+    },
     CancelConfirmed,
     /// Direct cancel — legal only from Received/Queued.
-    Canceled { reason: String },
+    Canceled {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -250,7 +267,13 @@ impl Order {
                     OrderState::Queued
                 }
             }
-            (OrderEvent::Approved { intent: _, artifact_digest }, OrderState::FurnaceHold) => {
+            (
+                OrderEvent::Approved {
+                    intent: _,
+                    artifact_digest,
+                },
+                OrderState::FurnaceHold,
+            ) => {
                 // approval MUST bind provenance (§11)
                 if artifact_digest.is_empty() {
                     return Err(TransitionError(
@@ -268,7 +291,9 @@ impl Order {
             (OrderEvent::PublishUnknown { operation_id: _ }, OrderState::Publishing) => {
                 OrderState::Unknown
             }
-            (OrderEvent::PublishConfirmed { pr_url: _ }, OrderState::Unknown) => OrderState::Shipped,
+            (OrderEvent::PublishConfirmed { pr_url: _ }, OrderState::Unknown) => {
+                OrderState::Shipped
+            }
             // reconcile found nothing — retire the order (operator decides)
             (OrderEvent::Rejected { intent: _ }, OrderState::Unknown) => OrderState::Rejected,
             // ---- cancellation ----

@@ -7,9 +7,13 @@ struct OwnerPolicy;
 impl Policy for OwnerPolicy {
     fn authorize(&self, actor: &ActorId, _action: &str, _resource: &str) -> Decision {
         if actor.kind == ActorKind::Human {
-            Decision::Allow { reason: "local owner".into() }
+            Decision::Allow {
+                reason: "local owner".into(),
+            }
         } else {
-            Decision::Deny { reason: "agent self-approval forbidden".into() }
+            Decision::Deny {
+                reason: "agent self-approval forbidden".into(),
+            }
         }
     }
 }
@@ -17,10 +21,24 @@ impl Policy for OwnerPolicy {
 #[test]
 fn policy_forbids_agent_self_approval() {
     let p = OwnerPolicy;
-    let human = ActorId { kind: ActorKind::Human, source: "local".into(), id: "luna".into() };
-    let agent = ActorId { kind: ActorKind::Agent, source: "rustain".into(), id: "die-1".into() };
-    assert!(matches!(p.authorize(&human, "approve", "o-1"), Decision::Allow { .. }));
-    assert!(matches!(p.authorize(&agent, "approve", "o-1"), Decision::Deny { .. }));
+    let human = ActorId {
+        kind: ActorKind::Human,
+        source: "local".into(),
+        id: "luna".into(),
+    };
+    let agent = ActorId {
+        kind: ActorKind::Agent,
+        source: "rustain".into(),
+        id: "die-1".into(),
+    };
+    assert!(matches!(
+        p.authorize(&human, "approve", "o-1"),
+        Decision::Allow { .. }
+    ));
+    assert!(matches!(
+        p.authorize(&agent, "approve", "o-1"),
+        Decision::Deny { .. }
+    ));
 }
 
 // PortError taxonomy: Retryable vs Permanent is the outbox policy driver.
@@ -35,8 +53,12 @@ fn port_error_taxonomy() {
 // PublishOutcome models the crash-between-call-and-response case (critique #2).
 #[test]
 fn publish_outcome_has_unknown_variant() {
-    let confirmed = PublishOutcome::Confirmed { pr_url: "https://gh/pr/1".into() };
-    let unknown = PublishOutcome::Unknown { operation_id: "op-1".into() };
+    let confirmed = PublishOutcome::Confirmed {
+        pr_url: "https://gh/pr/1".into(),
+    };
+    let unknown = PublishOutcome::Unknown {
+        operation_id: "op-1".into(),
+    };
     assert!(matches!(confirmed, PublishOutcome::Confirmed { .. }));
     assert!(matches!(unknown, PublishOutcome::Unknown { .. }));
 }
@@ -48,7 +70,11 @@ fn approval_token_binds_provenance() {
         order_id: "o-1".into(),
         intent: "safe dep bump".into(),
         artifact_digest: "deadbeef".into(),
-        actor: ActorId { kind: ActorKind::Human, source: "local".into(), id: "luna".into() },
+        actor: ActorId {
+            kind: ActorKind::Human,
+            source: "local".into(),
+            id: "luna".into(),
+        },
         granted_at: foundry_domain::order::now(),
     };
     assert_eq!(t.artifact_digest, "deadbeef");

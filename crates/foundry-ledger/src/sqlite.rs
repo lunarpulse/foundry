@@ -7,8 +7,6 @@ use rusqlite::Connection;
 use std::path::Path;
 use std::sync::Mutex;
 
-
-
 #[derive(Debug, Clone)]
 pub struct AuditEntry {
     pub seq: i64,
@@ -74,8 +72,15 @@ impl SqliteLedger {
                 return Ok(false); // chain broken
             }
             let expect = entry_hash(
-                r.seq, &r.order_id, &r.from_state, &r.to_state, &r.event, &r.actor,
-                &r.intent, &r.at, &prev,
+                r.seq,
+                &r.order_id,
+                &r.from_state,
+                &r.to_state,
+                &r.event,
+                &r.actor,
+                &r.intent,
+                &r.at,
+                &prev,
             );
             if expect != r.hash {
                 return Ok(false);
@@ -160,9 +165,7 @@ fn event_repr(event: &OrderEvent) -> String {
 fn intent_of(event: &OrderEvent) -> String {
     match event {
         OrderEvent::Approved { intent, .. } | OrderEvent::Rejected { intent } => intent.clone(),
-        OrderEvent::Canceled { reason } | OrderEvent::CancelRequested { reason } => {
-            reason.clone()
-        }
+        OrderEvent::Canceled { reason } | OrderEvent::CancelRequested { reason } => reason.clone(),
         OrderEvent::DieFailed { reason, .. } | OrderEvent::InspectionFailed { reason } => {
             reason.clone()
         }
@@ -197,10 +200,12 @@ impl SqliteLedger {
     /// Project the freshest journal row into the JSONL mirror (durable).
     /// Journal stays authoritative; a failed projection only logs.
     fn project_to_mirror(&mut self) -> std::io::Result<()> {
-        let rows = self.read_all().map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, format!("{e:?}"))
-        })?;
-        let Some(last) = rows.last() else { return Ok(()) };
+        let rows = self
+            .read_all()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e:?}")))?;
+        let Some(last) = rows.last() else {
+            return Ok(());
+        };
         let mirror = crate::mirror::Mirror::new(&self.db_path);
         mirror.append_durable(last)
     }
@@ -223,7 +228,9 @@ impl SqliteLedger {
             )
             .unwrap_or_else(|_| "GENESIS".into());
         let seq: i64 = conn
-            .query_row("SELECT COALESCE(MAX(seq),0)+1 FROM ledger", [], |r| r.get(0))
+            .query_row("SELECT COALESCE(MAX(seq),0)+1 FROM ledger", [], |r| {
+                r.get(0)
+            })
             .map_err(port_err)?;
         let event_s = event_repr(event);
         let intent = intent_of(event);

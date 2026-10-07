@@ -73,7 +73,10 @@ fn update_is_blocked_by_trigger() {
         .execute("UPDATE ledger SET intent='forged' WHERE seq=1", [])
         .is_err();
     assert!(blocked, "append-only trigger must block UPDATE");
-    assert!(l.verify_chain().unwrap(), "chain intact after blocked update");
+    assert!(
+        l.verify_chain().unwrap(),
+        "chain intact after blocked update"
+    );
     let _ = std::fs::remove_file(&path);
 }
 

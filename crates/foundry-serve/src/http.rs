@@ -43,7 +43,10 @@ async fn orders(
     // cap limit: unbounded card lists are an ops trap (review #2)
     let limit = q.limit.unwrap_or(200).min(500);
     let resp = st.orders(q.state.as_deref(), limit);
-    ([(axum::http::header::CACHE_CONTROL, "no-store")], Json(resp))
+    (
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(resp),
+    )
 }
 
 async fn order_detail(

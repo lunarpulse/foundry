@@ -116,9 +116,13 @@ pub trait Publisher {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PublishOutcome {
-    Confirmed { pr_url: String },
+    Confirmed {
+        pr_url: String,
+    },
     /// Network died mid-call — remote state unknown; reconcile queries GitHub.
-    Unknown { operation_id: String },
+    Unknown {
+        operation_id: String,
+    },
 }
 
 /// The approval gate (plan §2). M0: human-only. Records intent — approval
@@ -135,12 +139,7 @@ pub struct ApprovalToken {
 pub trait Gate {
     /// Verify an approval for THIS order binds THIS artifact.
     /// Returns Err if digest mismatches (plan §11: re-verify pre-publish).
-    fn verify(
-        &self,
-        order: &Order,
-        token: &ApprovalToken,
-        current_digest: &str,
-    ) -> PortResult<()>;
+    fn verify(&self, order: &Order, token: &ApprovalToken, current_digest: &str) -> PortResult<()>;
 }
 
 /// Append-only audit ledger (plan §11). Every transition writes here in the

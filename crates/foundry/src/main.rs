@@ -7,11 +7,12 @@
 //!   show      — print Order state + recent journal
 use clap::{Parser, Subcommand};
 use foundry_domain::ports::{
-    ApprovalToken, Decision, DieOutput, Gate, Harness, Ledger, Policy, PortResult, PublishOutcome, Publisher,
+    ApprovalToken, Decision, DieOutput, Gate, Harness, Ledger, Policy, PortResult, PublishOutcome,
+    Publisher,
 };
 use foundry_domain::{ActorId, ActorKind, ExternalRef, Order};
-use foundry_harness_cli::fake::FakeHarness;
 use foundry_harness_cli::CliHarness;
+use foundry_harness_cli::fake::FakeHarness;
 use foundry_ledger::SqliteLedger;
 use foundry_line::Line;
 use std::pin::Pin;
@@ -116,7 +117,9 @@ enum Cmd {
 struct LocalPolicy;
 impl Policy for LocalPolicy {
     fn authorize(&self, _a: &ActorId, _action: &str, _r: &str) -> Decision {
-        Decision::Allow { reason: "local owner".into() }
+        Decision::Allow {
+            reason: "local owner".into(),
+        }
     }
 }
 
@@ -155,7 +158,11 @@ fn expand(p: &str) -> String {
 type AppLine = Line<DigestGate, AnyHarness, SqliteLedger, foundry_watch::GithubPublisher>;
 
 fn human() -> ActorId {
-    ActorId { kind: ActorKind::Human, source: "local".into(), id: "lunarpulse".into() }
+    ActorId {
+        kind: ActorKind::Human,
+        source: "local".into(),
+        id: "lunarpulse".into(),
+    }
 }
 
 #[tokio::main]
@@ -163,25 +170,32 @@ async fn main() {
     let cli = Cli::parse();
     let code = match cli.cmd {
         Cmd::Validate { path } => validate(&path),
-        Cmd::Run { id, task, die, blueprint } => run(id, task, die, &blueprint).await,
+        Cmd::Run {
+            id,
+            task,
+            die,
+            blueprint,
+        } => run(id, task, die, &blueprint).await,
         Cmd::Approve { order, intent, db } => approve(order, intent, &expand(&db)).await,
-        Cmd::Watch { once, every, repo, die, auto_approve } => {
-            watch_cmd(once, every, repo, die, auto_approve).await
-        }
+        Cmd::Watch {
+            once,
+            every,
+            repo,
+            die,
+            auto_approve,
+        } => watch_cmd(once, every, repo, die, auto_approve).await,
         Cmd::Show { order, db } => show(order, &expand(&db)).await,
         Cmd::Status { db } => status_cmd(&expand(&db)),
         Cmd::Doctor { db } => doctor_cmd(&expand(&db)),
         Cmd::Reconcile { db, apply } => reconcile_cmd(&expand(&db), apply).await,
         Cmd::Serve { db, bind } => {
-            let state = std::sync::Arc::new(
-                match foundry_serve::ServeState::new(&expand(&db)) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("✗ serve: {e}");
-                        std::process::exit(1);
-                    }
-                },
-            );
+            let state = std::sync::Arc::new(match foundry_serve::ServeState::new(&expand(&db)) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("✗ serve: {e}");
+                    std::process::exit(1);
+                }
+            });
             let app = foundry_serve::http::router(state);
             let listener = match tokio::net::TcpListener::bind(&bind).await {
                 Ok(l) => l,
@@ -248,7 +262,11 @@ async fn run(id: Option<String>, task: String, die: String, blueprint: &str) -> 
     };
 
     let order_id = id.unwrap_or_else(|| format!("o-{}", chrono::Utc::now().timestamp_millis()));
-    let order = Order::new(order_id.clone(), ExternalRef::cron("cli", &task), chrono::Utc::now());
+    let order = Order::new(
+        order_id.clone(),
+        ExternalRef::cron("cli", &task),
+        chrono::Utc::now(),
+    );
 
     let line = build_line(&die, ledger);
     if let Err(e) = line.acquire_lease("cli").await {
@@ -352,16 +370,16 @@ async fn approve(order_id: String, intent: String, db: &str) -> i32 {
                 return 1;
             }
         };
-        match foundry_line::rehydrate::rehydrate(
-            &ledger_ro,
-            std::path::Path::new("/tmp"),
-        ) {
+        match foundry_line::rehydrate::rehydrate(&ledger_ro, std::path::Path::new("/tmp")) {
             Ok(orders) => {
                 let n_waiting = orders
                     .iter()
                     .filter(|o| o.state() == foundry_domain::OrderState::FurnaceHold)
                     .count();
-                eprintln!("rehydrated {} order(s) from journal ({n_waiting} waiting)", orders.len());
+                eprintln!(
+                    "rehydrated {} order(s) from journal ({n_waiting} waiting)",
+                    orders.len()
+                );
                 for o in orders {
                     line.submit(o).await;
                 }
@@ -387,10 +405,7 @@ async fn approve(order_id: String, intent: String, db: &str) -> i32 {
         actor: human(),
         granted_at: chrono::Utc::now(),
     };
-    match line
-        .approve(&order_id, &token, &intent, &human())
-        .await
-    {
+    match line.approve(&order_id, &token, &intent, &human()).await {
         Ok(st) => {
             println!("{order_id} → {st:?}");
             match line.publish(&order_id, &human()).await {
@@ -435,7 +450,9 @@ async fn show(order_id: String, db: &str) -> i32 {
 }
 
 async fn watch_cmd(once: bool, every: u64, repo: String, die: String, auto_approve: String) -> i32 {
-    let (owner, name) = repo.split_once('/').unwrap_or((repo.as_str(), "contextmesh-rs"));
+    let (owner, name) = repo
+        .split_once('/')
+        .unwrap_or((repo.as_str(), "contextmesh-rs"));
     let cfg = foundry_watch::WatchConfig {
         tick_secs: every,
         owner: owner.into(),
@@ -516,7 +533,10 @@ async fn watch_cmd(once: bool, every: u64, repo: String, die: String, auto_appro
     }
     if foundry_watch::gc::guard_tripped(&gc_cfg) {
         let pct = foundry_watch::gc::tmp_usage_pct().unwrap_or(0);
-        eprintln!("gc: /tmp usage {pct}% ≥ guard {}% — holding new Dies this tick", gc_cfg.guard_pct);
+        eprintln!(
+            "gc: /tmp usage {pct}% ≥ guard {}% — holding new Dies this tick",
+            gc_cfg.guard_pct
+        );
     }
     if once {
         let actor = foundry_domain::ActorId {
@@ -527,13 +547,12 @@ async fn watch_cmd(once: bool, every: u64, repo: String, die: String, auto_appro
         use foundry_domain::ports::Notifier as _;
         // T13: Discord notifier — observation plane, never blocks the line.
         let mut notifier = foundry_watch::discord_notifier::DiscordNotifier::from_env();
-        let notify = |n: &mut foundry_watch::discord_notifier::DiscordNotifier,
-                      event: &str,
-                      oid: &str| {
-            if let Err(e) = n.notify(event, oid) {
-                eprintln!("notify: {oid} {event} failed (non-fatal): {e:?}");
-            }
-        };
+        let notify =
+            |n: &mut foundry_watch::discord_notifier::DiscordNotifier, event: &str, oid: &str| {
+                if let Err(e) = n.notify(event, oid) {
+                    eprintln!("notify: {oid} {event} failed (non-fatal): {e:?}");
+                }
+            };
         let intake = std::sync::Arc::new(tokio::sync::Mutex::new(intake));
         match foundry_watch::tick(&line, intake, &actor).await {
             Ok(n) => {
@@ -542,14 +561,21 @@ async fn watch_cmd(once: bool, every: u64, repo: String, die: String, auto_appro
                 // request (digest included — review #3); Failed orders get
                 // the first failure line. Shipped notifications fire on
                 // publish confirmation below.
-                for oid in line.ids_in_state(foundry_domain::OrderState::FurnaceHold).await {
+                for oid in line
+                    .ids_in_state(foundry_domain::OrderState::FurnaceHold)
+                    .await
+                {
                     let digest = line
                         .get(&oid)
                         .await
                         .and_then(|o| o.artifact_digest)
                         .unwrap_or_default();
                     let d: String = digest.chars().take(12).collect();
-                    notify(&mut notifier, &format!("furnace_hold attempt=1 digest={d}"), &oid);
+                    notify(
+                        &mut notifier,
+                        &format!("furnace_hold attempt=1 digest={d}"),
+                        &oid,
+                    );
                 }
                 for oid in line.ids_in_state(foundry_domain::OrderState::Failed).await {
                     notify(&mut notifier, "failed see ledger", &oid);
@@ -559,7 +585,9 @@ async fn watch_cmd(once: bool, every: u64, repo: String, die: String, auto_appro
                 // immutably, so the human-approval RECORD is never skipped.
                 if !auto_approve.is_empty() {
                     let human = human();
-                    let holds = line.ids_in_state(foundry_domain::OrderState::FurnaceHold).await;
+                    let holds = line
+                        .ids_in_state(foundry_domain::OrderState::FurnaceHold)
+                        .await;
                     for oid in holds {
                         let digest = line
                             .get(&oid)
@@ -605,7 +633,6 @@ async fn watch_cmd(once: bool, every: u64, repo: String, die: String, auto_appro
     }
 }
 
-
 // ---------- M1 T15: ops CLI ----------
 
 fn open_ledger_ro(db: &str) -> Option<foundry_ledger::SqliteLedger> {
@@ -620,14 +647,22 @@ fn status_cmd(db: &str) -> i32 {
     let rows = led.read_all().unwrap_or_default();
     let mirror = foundry_ledger::Mirror::new(std::path::Path::new(db));
     let mstate = mirror.state(&rows);
-    let counts = foundry_serve::replay(&rows);
+    let counts = foundry_serve::replay_cards(&rows, |rs| {
+        rs.iter()
+            .zip(rs.iter().skip(1))
+            .all(|(a, b)| b.prev_hash == a.hash)
+    })
+    .unwrap_or_default();
     let mut by_state: std::collections::BTreeMap<String, usize> = Default::default();
     for c in counts.values() {
         *by_state.entry(c.state.clone()).or_default() += 1;
     }
     println!("ledger height: {}", rows.len());
     println!("mirror: {mstate}");
-    println!("/tmp usage: {}%", foundry_watch::gc::tmp_usage_pct().unwrap_or(0));
+    println!(
+        "/tmp usage: {}%",
+        foundry_watch::gc::tmp_usage_pct().unwrap_or(0)
+    );
     println!("orders by state:");
     for (st, n) in &by_state {
         println!("  {st}: {n}");
@@ -645,7 +680,10 @@ fn doctor_cmd(db: &str) -> i32 {
     let rows = led.read_all().unwrap_or_default();
     match led.verify_chain() {
         Ok(true) => println!("✓ chain valid ({} rows)", rows.len()),
-        _ => { println!("✗ CHAIN BROKEN"); fail = 1; }
+        _ => {
+            println!("✗ CHAIN BROKEN");
+            fail = 1;
+        }
     }
     // 2. mirror
     let mirror = foundry_ledger::Mirror::new(std::path::Path::new(db));
@@ -666,7 +704,10 @@ fn doctor_cmd(db: &str) -> i32 {
         match std::fs::metadata(&p) {
             Ok(m) => {
                 #[cfg(unix)]
-                let owner_only = { use std::os::unix::fs::PermissionsExt; m.permissions().mode() & 0o077 == 0 };
+                let owner_only = {
+                    use std::os::unix::fs::PermissionsExt;
+                    m.permissions().mode() & 0o077 == 0
+                };
                 #[cfg(not(unix))]
                 let owner_only = true;
                 if owner_only {
@@ -687,7 +728,9 @@ fn doctor_cmd(db: &str) -> i32 {
     } else {
         println!("✓ /tmp at {pct}% (< 85% guard)");
     }
-    if fail == 0 { println!("doctor: ALL OK"); }
+    if fail == 0 {
+        println!("doctor: ALL OK");
+    }
     fail
 }
 
@@ -724,7 +767,9 @@ async fn reconcile_cmd(db: &str, apply: bool) -> i32 {
             use std::os::unix::io::AsRawFd;
             let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
             if rc != 0 {
-                eprintln!("✗ writer lock held ({lock_path}) — a writer (watch) is live; refusing reconcile --apply");
+                eprintln!(
+                    "✗ writer lock held ({lock_path}) — a writer (watch) is live; refusing reconcile --apply"
+                );
                 return 1;
             }
             // lock held for the remainder of this function via `f`

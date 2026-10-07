@@ -11,11 +11,12 @@
 // under src/vendor/ for M1 Transparency Log mirroring work.
 // #[cfg(any())] keeps it out of the build without deleting history.
 #[cfg(any())]
-pub(crate) mod vendor;
-#[cfg(any())]
 pub mod shim;
+#[cfg(any())]
+pub(crate) mod vendor;
 
 pub mod mirror;
+pub mod replay;
 pub mod sqlite;
 
 pub use mirror::{Mirror, MirrorLine, MirrorState};

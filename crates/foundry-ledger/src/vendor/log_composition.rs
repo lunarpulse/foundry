@@ -833,10 +833,12 @@ mod tests {
             report.summary.total_events, 2,
             "posture_delta must classify only the named Spirit's events"
         );
-        assert!(report
-            .events
-            .iter()
-            .all(|entry| entry.spirit_id.as_deref() == Some("target-spirit")));
+        assert!(
+            report
+                .events
+                .iter()
+                .all(|entry| entry.spirit_id.as_deref() == Some("target-spirit"))
+        );
     }
 
     #[test]

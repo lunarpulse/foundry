@@ -37,8 +37,14 @@ impl std::fmt::Display for MirrorState {
             MirrorState::BadJson { line_no } => write!(f, "bad_json(line={line_no})"),
             MirrorState::SeqGap { at_seq } => write!(f, "seq_gap(at={at_seq})"),
             MirrorState::HashMismatch { at_seq } => write!(f, "hash_mismatch(at={at_seq})"),
-            MirrorState::MirrorAhead { mirror_lines, ledger_rows } => {
-                write!(f, "mirror_ahead(mirror={mirror_lines},ledger={ledger_rows})")
+            MirrorState::MirrorAhead {
+                mirror_lines,
+                ledger_rows,
+            } => {
+                write!(
+                    f,
+                    "mirror_ahead(mirror={mirror_lines},ledger={ledger_rows})"
+                )
             }
         }
     }
@@ -163,7 +169,9 @@ impl Mirror {
                     if torn && i + 1 == raw.lines().count() {
                         return MirrorState::Truncated;
                     }
-                    return MirrorState::BadJson { line_no: i as u64 + 1 };
+                    return MirrorState::BadJson {
+                        line_no: i as u64 + 1,
+                    };
                 }
             }
         }
@@ -173,7 +181,10 @@ impl Mirror {
         let ledger_rows_count = ledger_rows.len() as u64;
         let mirror_count = parsed.len() as u64;
         if mirror_count > ledger_rows_count {
-            return MirrorState::MirrorAhead { mirror_lines: mirror_count, ledger_rows: ledger_rows_count };
+            return MirrorState::MirrorAhead {
+                mirror_lines: mirror_count,
+                ledger_rows: ledger_rows_count,
+            };
         }
         // seq continuity from 1
         let mut expect = 1i64;
@@ -199,7 +210,11 @@ impl Mirror {
 
     /// Rebuild the mirror from the ledger (recovery: last-good seq onwards,
     /// or whole file). Always possible — the ledger is the source of truth.
-    pub fn rebuild(&self, ledger_rows: &[LedgerRow], from_seq: Option<i64>) -> std::io::Result<u64> {
+    pub fn rebuild(
+        &self,
+        ledger_rows: &[LedgerRow],
+        from_seq: Option<i64>,
+    ) -> std::io::Result<u64> {
         // A rebuild ALWAYS catches the mirror up to the given ledger
         // snapshot: keep the intact on-disk prefix (lines 1..from-1), then
         // re-append every ledger row with seq >= from. Atomic tmp+rename.
@@ -233,7 +248,11 @@ mod tests {
     use foundry_domain::{ActorId, ActorKind, OrderEvent, OrderState};
 
     fn actor() -> ActorId {
-        ActorId { kind: ActorKind::Agent, source: "t".into(), id: "t".into() }
+        ActorId {
+            kind: ActorKind::Agent,
+            source: "t".into(),
+            id: "t".into(),
+        }
     }
 
     fn tmp_db(tag: &str) -> PathBuf {
@@ -309,7 +328,11 @@ mod tests {
         let lines: Vec<&str> = raw.lines().collect();
         let mut line2: MirrorLine = serde_json::from_str(lines[1]).unwrap();
         line2.hash = "deadbeef".into();
-        std::fs::write(m.path(), format!("{}\n{}\n", lines[0], serde_json::to_string(&line2).unwrap())).unwrap();
+        std::fs::write(
+            m.path(),
+            format!("{}\n{}\n", lines[0], serde_json::to_string(&line2).unwrap()),
+        )
+        .unwrap();
         assert_eq!(m.state(&rows), MirrorState::HashMismatch { at_seq: 2 });
     }
 

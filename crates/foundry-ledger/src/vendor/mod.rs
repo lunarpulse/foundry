@@ -8,12 +8,12 @@
 #![allow(dead_code)]
 #![allow(clippy::all)]
 
-#[path = "team.rs"]
-pub mod maos_team;
 #[path = "region.rs"]
 pub mod maos_region;
+#[path = "team.rs"]
+pub mod maos_team;
 
-#[path = "log_composition.rs"]
-pub mod log_composition;
 #[path = "backup.rs"]
 pub mod backup;
+#[path = "log_composition.rs"]
+pub mod log_composition;
