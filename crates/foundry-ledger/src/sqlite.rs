@@ -25,10 +25,12 @@ pub struct AuditEntry {
 
 pub struct SqliteLedger {
     conn: Mutex<Connection>,
+    db_path: std::path::PathBuf,
 }
 
 impl SqliteLedger {
     pub fn open(path: &Path) -> Result<Self, PortError> {
+        let db_path = path.to_path_buf();
         let conn = Connection::open(path)
             .map_err(|e| PortError::Permanent(format!("open ledger: {e}")))?;
         conn.execute_batch(
@@ -59,6 +61,7 @@ impl SqliteLedger {
         .map_err(|e| PortError::Permanent(format!("init ledger: {e}")))?;
         Ok(Self {
             conn: Mutex::new(conn),
+            db_path,
         })
     }
 
@@ -169,6 +172,40 @@ fn intent_of(event: &OrderEvent) -> String {
 
 impl Ledger for SqliteLedger {
     fn append(
+        &mut self,
+        order_id: &str,
+        event: &OrderEvent,
+        from: OrderState,
+        to: OrderState,
+        actor: &ActorId,
+        at: DateTime<Utc>,
+    ) -> PortResult<()> {
+        // journal commit FIRST — the mirror is a projection and must never
+        // gate the journal (review #1: lag=0 is a goal, not a guarantee;
+        // transient mirror failures surface in mirror_state, not here)
+        let appended = self.append_journal(order_id, event, from, to, actor, at);
+        if appended.is_ok() {
+            if let Err(e) = self.project_to_mirror() {
+                eprintln!("mirror: projection failed (journal unaffected): {e}");
+            }
+        }
+        appended
+    }
+}
+
+impl SqliteLedger {
+    /// Project the freshest journal row into the JSONL mirror (durable).
+    /// Journal stays authoritative; a failed projection only logs.
+    fn project_to_mirror(&mut self) -> std::io::Result<()> {
+        let rows = self.read_all().map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::Other, format!("{e:?}"))
+        })?;
+        let Some(last) = rows.last() else { return Ok(()) };
+        let mirror = crate::mirror::Mirror::new(&self.db_path);
+        mirror.append_durable(last)
+    }
+
+    fn append_journal(
         &mut self,
         order_id: &str,
         event: &OrderEvent,

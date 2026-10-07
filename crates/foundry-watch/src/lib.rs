@@ -3,6 +3,7 @@
 //! Loop: Intake.poll → dedup → Line.submit → drive → FurnaceHold → notify.
 //! Holds the Line lease for its whole life (critique #4: single writer).
 //! Reconcile pass re-judges Unknown publishes each tick (critique #2).
+pub mod discord_notifier;
 pub mod gc;
 pub mod github_publisher;
 pub mod intake;

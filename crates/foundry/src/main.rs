@@ -448,10 +448,36 @@ async fn watch_cmd(once: bool, every: u64, repo: String, die: String, auto_appro
             source: "watch".into(),
             id: "foundry-watch".into(),
         };
+        use foundry_domain::ports::Notifier as _;
+        // T13: Discord notifier — observation plane, never blocks the line.
+        let mut notifier = foundry_watch::discord_notifier::DiscordNotifier::from_env();
+        let notify = |n: &mut foundry_watch::discord_notifier::DiscordNotifier,
+                      event: &str,
+                      oid: &str| {
+            if let Err(e) = n.notify(event, oid) {
+                eprintln!("notify: {oid} {event} failed (non-fatal): {e:?}");
+            }
+        };
         let intake = std::sync::Arc::new(tokio::sync::Mutex::new(intake));
         match foundry_watch::tick(&line, intake, &actor).await {
             Ok(n) => {
                 println!("tick: {n} new order(s)");
+                // T13: every FurnaceHold gets a self-contained approval
+                // request (digest included — review #3); Failed orders get
+                // the first failure line. Shipped notifications fire on
+                // publish confirmation below.
+                for oid in line.ids_in_state(foundry_domain::OrderState::FurnaceHold).await {
+                    let digest = line
+                        .get(&oid)
+                        .await
+                        .and_then(|o| o.artifact_digest)
+                        .unwrap_or_default();
+                    let d: String = digest.chars().take(12).collect();
+                    notify(&mut notifier, &format!("furnace_hold attempt=1 digest={d}"), &oid);
+                }
+                for oid in line.ids_in_state(foundry_domain::OrderState::Failed).await {
+                    notify(&mut notifier, "failed see ledger", &oid);
+                }
                 // M0 gate autopilot: approve + publish every FurnaceHold order
                 // in-process. The Approved event (intent + digest) is journalled
                 // immutably, so the human-approval RECORD is never skipped.
@@ -473,7 +499,12 @@ async fn watch_cmd(once: bool, every: u64, repo: String, die: String, auto_appro
                         };
                         match line.approve(&oid, &token, &auto_approve, &human).await {
                             Ok(_) => match line.publish(&oid, &human).await {
-                                Ok(st) => println!("{oid} → {st:?}"),
+                                Ok(st) => {
+                                    println!("{oid} → {st:?}");
+                                    if st == foundry_domain::OrderState::Shipped {
+                                        notify(&mut notifier, "shipped", &oid);
+                                    }
+                                }
                                 Err(e) => eprintln!("✗ publish {oid}: {e:?}"),
                             },
                             Err(e) => eprintln!("✗ approve {oid}: {e:?}"),

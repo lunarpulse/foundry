@@ -15,6 +15,8 @@ pub(crate) mod vendor;
 #[cfg(any())]
 pub mod shim;
 
+pub mod mirror;
 pub mod sqlite;
 
+pub use mirror::{Mirror, MirrorLine, MirrorState};
 pub use sqlite::{AuditEntry, LedgerRow, SqliteLedger};
