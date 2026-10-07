@@ -19,6 +19,9 @@ pub struct AuditEntry {
     pub at: DateTime<Utc>,
     pub prev_hash: String,
     pub hash: String,
+    /// Journal schema v2 (T17): canonical JSON of the event; NULL/empty on
+    /// legacy (v1) rows. Hash-covered on v2 rows (see event_json.rs).
+    pub event_json: Option<String>,
 }
 
 pub struct SqliteLedger {
@@ -43,6 +46,7 @@ impl SqliteLedger {
                 intent     TEXT NOT NULL DEFAULT '',
                 at         TEXT NOT NULL,
                 prev_hash  TEXT NOT NULL,
+                event_json TEXT,
                 hash       TEXT NOT NULL
             );
             -- append-only: no UPDATE, no DELETE (plan §11 immutability)
@@ -71,17 +75,38 @@ impl SqliteLedger {
             if r.prev_hash != prev {
                 return Ok(false); // chain broken
             }
-            let expect = entry_hash(
-                r.seq,
-                &r.order_id,
-                &r.from_state,
-                &r.to_state,
-                &r.event,
-                &r.actor,
-                &r.intent,
-                &r.at,
-                &prev,
-            );
+            let expect = match crate::event_json::row_version(r) {
+                1 => entry_hash(
+                    r.seq,
+                    &r.order_id,
+                    &r.from_state,
+                    &r.to_state,
+                    &r.event,
+                    &r.actor,
+                    &r.intent,
+                    &r.at,
+                    &prev,
+                ),
+                _ => {
+                    // v2: v1 payload + canonical json (event_json hash-covered)
+                    let v1_payload = format!(
+                        "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                        r.seq,
+                        r.order_id,
+                        r.from_state,
+                        r.to_state,
+                        r.event,
+                        r.actor,
+                        r.intent,
+                        r.at,
+                        prev
+                    );
+                    let json = r.event_json.as_deref().unwrap_or("");
+                    let payload = crate::event_json::v2_hash_payload(&v1_payload, json);
+                    use sha2::{Digest, Sha256};
+                    hex::encode(sha2::Sha256::digest(payload.as_bytes()))
+                }
+            };
             if expect != r.hash {
                 return Ok(false);
             }
@@ -97,7 +122,7 @@ impl SqliteLedger {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT seq, order_id, from_state, to_state, event, actor, intent, at, prev_hash, hash FROM ledger ORDER BY seq",
+                "SELECT seq, order_id, from_state, to_state, event, actor, intent, at, prev_hash, hash, event_json FROM ledger ORDER BY seq",
             )
             .map_err(port_err)?;
         let rows = stmt
@@ -113,6 +138,7 @@ impl SqliteLedger {
                     at: r.get(7)?,
                     prev_hash: r.get(8)?,
                     hash: r.get(9)?,
+                    event_json: r.get::<_, Option<String>>(10)?,
                 })
             })
             .map_err(port_err)?
@@ -135,6 +161,8 @@ pub struct LedgerRow {
     pub at: String,
     pub prev_hash: String,
     pub hash: String,
+    /// Journal schema v2 (T17): canonical event JSON; NULL on v1 rows.
+    pub event_json: Option<String>,
 }
 
 fn port_err(e: rusqlite::Error) -> PortError {
@@ -236,20 +264,38 @@ impl SqliteLedger {
         let intent = intent_of(event);
         let at_s = at.to_rfc3339();
         let actor_s = format!("{:?}/{}", actor.kind, actor.id);
-        let hash = entry_hash(
-            seq,
-            order_id,
-            &from.to_string(),
-            &to.to_string(),
-            &event_s,
-            &actor_s,
-            &intent,
-            &at_s,
-            &prev_hash,
+        // T17: dual-write — canonical JSON alongside the repr. Consistency
+        // gate (review #3): the JSON must decode to the same event the
+        // replay engine's repr decoder yields, or the write is refused.
+        let json_s = crate::event_json::event_to_json(event);
+        {
+            let from_repr = crate::replay::decode_for_consistency(&event_s, &intent);
+            let from_json = crate::event_json::event_from_json(&json_s)
+                .ok_or_else(|| PortError::Permanent("event_json decode failed".into()))?;
+            let from_repr = from_repr.ok_or_else(|| {
+                PortError::Permanent("event repr decode failed (dual-write divergence)".into())
+            })?;
+            if format!("{from_repr:?}") != format!("{from_json:?}") {
+                return Err(PortError::Permanent(format!(
+                    "dual-write divergence: repr decodes {from_repr:?}, json decodes {from_json:?}"
+                )));
+            }
+        }
+        // T17: v2 hash — v1 payload + canonical json (review #2: event_json
+        // is hash-covered; tampering with it breaks the chain).
+        let v1_payload = format!(
+            "{seq}|{order_id}|{}|{}|{event_s}|{actor_s}|{intent}|{at_s}|{prev_hash}",
+            from.to_string(),
+            to.to_string()
         );
+        let hash = {
+            use sha2::{Digest, Sha256};
+            let payload = crate::event_json::v2_hash_payload(&v1_payload, &json_s);
+            hex::encode(Sha256::digest(payload.as_bytes()))
+        };
         conn.execute(
-            "INSERT INTO ledger (order_id, from_state, to_state, event, actor, intent, at, prev_hash, hash)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            "INSERT INTO ledger (order_id, from_state, to_state, event, actor, intent, at, prev_hash, hash, event_json)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             rusqlite::params![
                 order_id,
                 from.to_string(),
@@ -259,7 +305,8 @@ impl SqliteLedger {
                 intent,
                 at_s,
                 prev_hash,
-                hash
+                hash,
+                json_s
             ],
         )
         .map_err(port_err)?;

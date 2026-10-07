@@ -221,6 +221,11 @@ pub(crate) fn decode_event(repr: &str, intent: &str, ctx_attempt: u32) -> Option
     })
 }
 
+/// Dual-write consistency helper (T17): decode via the repr path.
+pub(crate) fn decode_for_consistency(repr: &str, intent: &str) -> Option<OrderEvent> {
+    decode_event(repr, intent, 1)
+}
+
 /// First digit run after "attempt" (Debug repr `attempt: 1`).
 pub(crate) fn event_attempt(repr: &str) -> Option<u32> {
     let i = repr.find("attempt")? + "attempt".len();
@@ -261,6 +266,7 @@ mod tests {
             at: "2026-10-08T00:00:00Z".into(),
             prev_hash: String::new(),
             hash: String::new(),
+            event_json: None,
         }
     }
 
