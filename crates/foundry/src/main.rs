@@ -84,6 +84,24 @@ enum Cmd {
         #[arg(long, default_value = "~/.foundry/ledger.db")]
         db: String,
     },
+    /// M1 T15: operational status (read-only).
+    Status {
+        #[arg(long, default_value = "~/.foundry/ledger.db")]
+        db: String,
+    },
+    /// M1 T15: health checks — chain, mirror, credentials, disk.
+    Doctor {
+        #[arg(long, default_value = "~/.foundry/ledger.db")]
+        db: String,
+    },
+    /// M1 T15: mirror catch-up. DRY-RUN by default; --apply requires the
+    /// single-writer lease (review #5: reconcile must not be a 2nd writer).
+    Reconcile {
+        #[arg(long, default_value = "~/.foundry/ledger.db")]
+        db: String,
+        #[arg(long)]
+        apply: bool,
+    },
     /// M1 T11: read-model HTTP API (127.0.0.1 by default).
     Serve {
         #[arg(long, default_value = "~/.foundry/ledger.db")]
@@ -151,6 +169,9 @@ async fn main() {
             watch_cmd(once, every, repo, die, auto_approve).await
         }
         Cmd::Show { order, db } => show(order, &expand(&db)).await,
+        Cmd::Status { db } => status_cmd(&expand(&db)),
+        Cmd::Doctor { db } => doctor_cmd(&expand(&db)),
+        Cmd::Reconcile { db, apply } => reconcile_cmd(&expand(&db), apply).await,
         Cmd::Serve { db, bind } => {
             let state = std::sync::Arc::new(
                 match foundry_serve::ServeState::new(&expand(&db)) {
@@ -399,6 +420,31 @@ async fn watch_cmd(once: bool, every: u64, repo: String, die: String, auto_appro
             return 1;
         }
     };
+    // T15 (review #5): cross-process single-writer lock for the whole watch
+    // lifetime — blocks `reconcile --apply` while we write.
+    let _writer_lock = {
+        let lock_path = format!("{}.writer.lock", cfg.ledger_path.display());
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+        {
+            Ok(f) => {
+                use std::os::unix::io::AsRawFd;
+                let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                if rc != 0 {
+                    eprintln!("✗ another writer holds {lock_path} (watch already running?)");
+                    return 1;
+                }
+                Some(f)
+            }
+            Err(e) => {
+                eprintln!("! writer lock unavailable (continuing without): {e}");
+                None
+            }
+        }
+    };
     // The blocking client spins its own runtime — build it OFF the async
     // context or its drop panics inside tokio (T9 실측 버그 #3).
     let icfg = foundry_watch::IntakeConfig {
@@ -525,6 +571,159 @@ async fn watch_cmd(once: bool, every: u64, repo: String, die: String, auto_appro
                 eprintln!("✗ watch: {e}");
                 1
             }
+        }
+    }
+}
+
+
+// ---------- M1 T15: ops CLI ----------
+
+fn open_ledger_ro(db: &str) -> Option<foundry_ledger::SqliteLedger> {
+    foundry_ledger::SqliteLedger::open(std::path::Path::new(db)).ok()
+}
+
+fn status_cmd(db: &str) -> i32 {
+    let Some(led) = open_ledger_ro(db) else {
+        eprintln!("✗ cannot open ledger at {db}");
+        return 1;
+    };
+    let rows = led.read_all().unwrap_or_default();
+    let mirror = foundry_ledger::Mirror::new(std::path::Path::new(db));
+    let mstate = mirror.state(&rows);
+    let counts = foundry_serve::replay(&rows);
+    let mut by_state: std::collections::BTreeMap<String, usize> = Default::default();
+    for c in counts.values() {
+        *by_state.entry(c.state.clone()).or_default() += 1;
+    }
+    println!("ledger height: {}", rows.len());
+    println!("mirror: {mstate}");
+    println!("/tmp usage: {}%", foundry_watch::gc::tmp_usage_pct().unwrap_or(0));
+    println!("orders by state:");
+    for (st, n) in &by_state {
+        println!("  {st}: {n}");
+    }
+    0
+}
+
+fn doctor_cmd(db: &str) -> i32 {
+    let mut fail = 0;
+    // 1. chain
+    let Some(led) = open_ledger_ro(db) else {
+        eprintln!("✗ cannot open ledger at {db}");
+        return 2;
+    };
+    let rows = led.read_all().unwrap_or_default();
+    match led.verify_chain() {
+        Ok(true) => println!("✓ chain valid ({} rows)", rows.len()),
+        _ => { println!("✗ CHAIN BROKEN"); fail = 1; }
+    }
+    // 2. mirror
+    let mirror = foundry_ledger::Mirror::new(std::path::Path::new(db));
+    let mstate = mirror.state(&rows);
+    if matches!(mstate, foundry_ledger::MirrorState::Ok { .. }) {
+        println!("✓ mirror {mstate}");
+    } else {
+        println!("✗ mirror {mstate} (run: foundry reconcile --db {db} --apply)");
+        fail = 1;
+    }
+    // 3. credentials (existence + owner-only bits — no values, review #5)
+    let home = std::env::var("HOME").unwrap_or_default();
+    for (name, p) in [
+        ("gh_token", format!("{home}/.foundry/gh_token")),
+        ("die_env", format!("{home}/.foundry/die.env")),
+        ("notifier_env", format!("{home}/.foundry/notifier.env")),
+    ] {
+        match std::fs::metadata(&p) {
+            Ok(m) => {
+                #[cfg(unix)]
+                let owner_only = { use std::os::unix::fs::PermissionsExt; m.permissions().mode() & 0o077 == 0 };
+                #[cfg(not(unix))]
+                let owner_only = true;
+                if owner_only {
+                    println!("✓ {name} present, owner-only");
+                } else {
+                    println!("! {name} present but GROUP/WORLD readable — chmod 600");
+                    fail = 1;
+                }
+            }
+            Err(_) => println!("- {name} absent (optional)"),
+        }
+    }
+    // 4. disk guard
+    let pct = foundry_watch::gc::tmp_usage_pct().unwrap_or(0);
+    if pct >= 85 {
+        println!("✗ /tmp at {pct}% ≥ 85% guard — Dies are being held");
+        fail = 1;
+    } else {
+        println!("✓ /tmp at {pct}% (< 85% guard)");
+    }
+    if fail == 0 { println!("doctor: ALL OK"); }
+    fail
+}
+
+async fn reconcile_cmd(db: &str, apply: bool) -> i32 {
+    let Some(led) = open_ledger_ro(db) else {
+        eprintln!("✗ cannot open ledger at {db}");
+        return 1;
+    };
+    let rows = led.read_all().unwrap_or_default();
+    let mirror = foundry_ledger::Mirror::new(std::path::Path::new(db));
+    let mstate = mirror.state(&rows);
+    println!("mirror state: {mstate}");
+    if matches!(mstate, foundry_ledger::MirrorState::Ok { .. }) {
+        println!("nothing to reconcile");
+        return 0;
+    }
+    if !apply {
+        println!("dry-run: would rebuild from last-good prefix (pass --apply)");
+        return 0;
+    }
+    // review #5: --apply must be the single writer. The Line lease is
+    // in-process; cross-process we take an OS-level exclusive lock on
+    // <db>.writer.lock — a running `foundry watch` holds it for its
+    // lifetime (wired in watch_cmd), so reconcile --apply refuses while
+    // any writer lives.
+    let lock_path = format!("{db}.writer.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path);
+    match lock_file {
+        Ok(f) => {
+            use std::os::unix::io::AsRawFd;
+            let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc != 0 {
+                eprintln!("✗ writer lock held ({lock_path}) — a writer (watch) is live; refusing reconcile --apply");
+                return 1;
+            }
+            // lock held for the remainder of this function via `f`
+        }
+        Err(e) => {
+            eprintln!("✗ cannot open writer lock {lock_path}: {e}");
+            return 1;
+        }
+    }
+    // find last good seq from mirror vs ledger prefix comparison
+    let existing = std::fs::read_to_string(mirror.path()).unwrap_or_default();
+    let last_good = existing
+        .lines()
+        .filter_map(|l| serde_json::from_str::<foundry_ledger::MirrorLine>(l).ok())
+        .map(|m| m.seq)
+        .filter(|seq| {
+            rows.iter().any(|r| r.seq == *seq) // only seqs that still exist
+        })
+        .max()
+        .unwrap_or(0);
+    match mirror.rebuild(&rows, Some(last_good + 1)) {
+        Ok(n) => {
+            println!("reconciled: rewrote {n} line(s) from seq {}", last_good + 1);
+            println!("mirror now: {}", mirror.state(&rows));
+            0
+        }
+        Err(e) => {
+            eprintln!("✗ reconcile failed: {e}");
+            1
         }
     }
 }

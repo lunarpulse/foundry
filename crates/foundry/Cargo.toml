@@ -20,3 +20,7 @@ clap.workspace = true
 tokio.workspace = true
 foundry-serve = { version = "0.1.0", path = "../foundry-serve" }
 axum = "0.8.9"
+serde_json.workspace = true
+
+[target.x86_64-unknown-linux-gnu.dependencies]
+libc = "0.2.190"

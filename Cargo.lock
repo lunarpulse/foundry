@@ -381,6 +381,8 @@ dependencies = [
  "foundry-line",
  "foundry-serve",
  "foundry-watch",
+ "libc",
+ "serde_json",
  "tokio",
 ]
 
