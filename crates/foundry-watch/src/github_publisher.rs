@@ -29,6 +29,18 @@ impl Publisher for GithubPublisher {
     ) -> impl Future<Output = PortResult<PublishOutcome>> + Send {
         let this = self.clone();
         let order_id = order.id.clone();
+        // Long-term fix for the E2E re-absorption loop: PR body carries
+        // `Closes #N` so a merged bump auto-closes its issue — intake stops
+        // re-ordering shipped work. dedup_key = "<owner>/<repo>#<n>:<ts>".
+        let closes = order
+            .external
+            .dedup_key
+            .split('#')
+            .nth(1)
+            .and_then(|tail| tail.split(':').next())
+            .filter(|n| n.chars().all(|c| c.is_ascii_digit()) && !n.is_empty())
+            .map(|n| format!("\nCloses #{n}"))
+            .unwrap_or_default();
         let attempt = operation_id
             .rsplit(':')
             .next()
@@ -40,7 +52,7 @@ impl Publisher for GithubPublisher {
             // reqwest::blocking must not drop inside the tokio runtime
             // (T9 measured-bug #3).
             tokio::task::spawn_blocking(move || {
-                this.publish_blocking(&order_id, attempt, &digest)
+                this.publish_blocking(&order_id, attempt, &digest, &closes)
             })
             .await
             .map_err(|e| PortError::Permanent(format!("publish join: {e}")))?
@@ -78,6 +90,7 @@ impl GithubPublisher {
         order_id: &str,
         attempt: u32,
         digest: &str,
+        closes: &str,
     ) -> PortResult<PublishOutcome> {
         let token = std::fs::read_to_string(&self.token_path)
             .map(|s| s.trim().to_string())
@@ -149,7 +162,7 @@ impl GithubPublisher {
             "head": branch,
             "base": self.base,
             "body": format!(
-                "Automated dep-bump by Foundry M0 gate.\n\n- order: `{}`\n- approved digest: `{}`\n- operation_id: `{}:{}`",
+                "Automated dep-bump by Foundry.\n\n- order: `{}`\n- approved digest: `{}`\n- operation_id: `{}:{}`{closes}",
                 order_id, digest, order_id, attempt
             ),
         });

@@ -7,7 +7,7 @@ use foundry_domain::ports::{
 };
 use foundry_domain::{ActorId, ActorKind, ExternalRef, Order, OrderEvent, OrderState};
 use foundry_harness_cli::fake::FakeHarness;
-use foundry_line::{backoff_delay, Line, LineConfig};
+use foundry_line::{Line, LineConfig, backoff_delay};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as TMutex;
@@ -39,14 +39,18 @@ impl Ledger for MemLedger {
 pub struct AllowPolicy;
 impl Policy for AllowPolicy {
     fn authorize(&self, _a: &ActorId, _action: &str, _r: &str) -> Decision {
-        Decision::Allow { reason: "test".into() }
+        Decision::Allow {
+            reason: "test".into(),
+        }
     }
 }
 
 pub struct DenyPolicy;
 impl Policy for DenyPolicy {
     fn authorize(&self, _a: &ActorId, _action: &str, _r: &str) -> Decision {
-        Decision::Deny { reason: "not yours".into() }
+        Decision::Deny {
+            reason: "not yours".into(),
+        }
     }
 }
 
@@ -76,21 +80,37 @@ impl Publisher for ScriptedPublisher {
             .lock()
             .unwrap()
             .pop_front()
-            .unwrap_or_else(|| Ok(PublishOutcome::Confirmed { pr_url: "https://pr/1".into() }));
+            .unwrap_or_else(|| {
+                Ok(PublishOutcome::Confirmed {
+                    pr_url: "https://pr/1".into(),
+                })
+            });
         async move { next }
     }
 }
 
 fn actor() -> ActorId {
-    ActorId { kind: ActorKind::Human, source: "test".into(), id: "luna".into() }
+    ActorId {
+        kind: ActorKind::Human,
+        source: "test".into(),
+        id: "luna".into(),
+    }
 }
 
 fn sys() -> ActorId {
-    ActorId { kind: ActorKind::Agent, source: "line".into(), id: "executor".into() }
+    ActorId {
+        kind: ActorKind::Agent,
+        source: "line".into(),
+        id: "executor".into(),
+    }
 }
 
 fn order(id: &str) -> Order {
-    Order::new(id.into(), ExternalRef::cron("dep", "serde"), chrono::Utc::now())
+    Order::new(
+        id.into(),
+        ExternalRef::cron("dep", "serde"),
+        chrono::Utc::now(),
+    )
 }
 
 type TestLine = Line<OpenGate, FakeHarness, MemLedger, ScriptedPublisher>;
@@ -103,7 +123,10 @@ fn mk_line(harness: FakeHarness, publisher: ScriptedPublisher) -> TestLine {
         Arc::new(publisher),
         Arc::new(AllowPolicy),
     )
-    .with_cfg(LineConfig { base_backoff_ms: 1, max_backoff_ms: 5 }) // tests: fast
+    .with_cfg(LineConfig {
+        base_backoff_ms: 1,
+        max_backoff_ms: 5,
+    }) // tests: fast
 }
 
 // ---------- tests ----------
@@ -164,9 +187,12 @@ async fn lease_is_exclusive() {
 #[tokio::test]
 async fn approval_then_publish_confirmed() {
     let mut pubr = ScriptedPublisher::default();
-    pubr.responses.lock().unwrap().push_back(Ok(PublishOutcome::Confirmed {
-        pr_url: "https://github.com/x/y/pull/9".into(),
-    }));
+    pubr.responses
+        .lock()
+        .unwrap()
+        .push_back(Ok(PublishOutcome::Confirmed {
+            pr_url: "https://github.com/x/y/pull/9".into(),
+        }));
     let line = mk_line(FakeHarness::default(), pubr);
     line.submit(order("o-c")).await;
     line.acquire_lease("watch").await.unwrap();
@@ -174,7 +200,18 @@ async fn approval_then_publish_confirmed() {
 
     // human approves (with a token) — separate step from publishing
     let st = line
-        .approve("o-c", &ApprovalToken { order_id: "o-c".into(), intent: "safe dep bump".into(), artifact_digest: String::new(), actor: actor(), granted_at: chrono::Utc::now() }, "safe dep bump", &actor())
+        .approve(
+            "o-c",
+            &ApprovalToken {
+                order_id: "o-c".into(),
+                intent: "safe dep bump".into(),
+                artifact_digest: String::new(),
+                actor: actor(),
+                granted_at: chrono::Utc::now(),
+            },
+            "safe dep bump",
+            &actor(),
+        )
         .await
         .unwrap();
     assert_eq!(st, OrderState::Publishing);
@@ -188,17 +225,37 @@ async fn approval_then_publish_confirmed() {
 #[tokio::test]
 async fn publish_unknown_records_state() {
     let mut pubr = ScriptedPublisher::default();
-    pubr.responses.lock().unwrap().push_back(Ok(PublishOutcome::Unknown {
-        operation_id: "o-d:1".into(),
-    }));
+    pubr.responses
+        .lock()
+        .unwrap()
+        .push_back(Ok(PublishOutcome::Unknown {
+            operation_id: "o-d:1".into(),
+        }));
     let line = mk_line(FakeHarness::default(), pubr);
     line.submit(order("o-d")).await;
     line.acquire_lease("watch").await.unwrap();
     line.drive("o-d").await.unwrap();
-    line.approve("o-d", &ApprovalToken { order_id: "o-d".into(), intent: "ok".into(), artifact_digest: String::new(), actor: actor(), granted_at: chrono::Utc::now() }, "ok", &actor()).await.unwrap();
+    line.approve(
+        "o-d",
+        &ApprovalToken {
+            order_id: "o-d".into(),
+            intent: "ok".into(),
+            artifact_digest: String::new(),
+            actor: actor(),
+            granted_at: chrono::Utc::now(),
+        },
+        "ok",
+        &actor(),
+    )
+    .await
+    .unwrap();
 
     let st = line.publish("o-d", &actor()).await.unwrap();
-    assert_eq!(st, OrderState::Unknown, "crash mid-publish → Unknown, not Shipped");
+    assert_eq!(
+        st,
+        OrderState::Unknown,
+        "crash mid-publish → Unknown, not Shipped"
+    );
 }
 
 #[tokio::test]
@@ -208,8 +265,8 @@ async fn publish_without_approval_is_illegal() {
     line.acquire_lease("watch").await.unwrap();
     line.drive("o-e").await.unwrap(); // ends at FurnaceHold
     let _ = line; // publish is only reachable through approve(); state machine
-                  // rejects Publishing from FurnaceHold without Approved event —
-                  // covered by T2 transition-table tests.
+    // rejects Publishing from FurnaceHold without Approved event —
+    // covered by T2 transition-table tests.
 }
 
 #[test]

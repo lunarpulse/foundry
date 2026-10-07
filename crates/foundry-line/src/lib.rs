@@ -5,6 +5,7 @@
 //! write (#5); operation_id idempotency guards publishing (#2).
 pub mod error;
 pub mod line;
+pub mod rehydrate;
 
 pub use error::LineError;
-pub use line::{backoff_delay, Line, LineConfig};
+pub use line::{Line, LineConfig, backoff_delay};

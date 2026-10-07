@@ -343,8 +343,38 @@ async fn approve(order_id: String, intent: String, db: &str) -> i32 {
     };
     let line = build_line("", ledger);
     if line.get(&order_id).await.is_none() {
-        eprintln!("✗ unknown order {order_id} (M0: orders live in-process; use `foundry run` in the same session, or wait for T9 store)");
-        return 1;
+        // M1 defect #7 fix: rehydrate orders from the journal so approvals
+        // survive watch-process restarts (the E2E caught this).
+        let ledger_ro = match open_ledger_ro(&db) {
+            Some(l) => l,
+            None => {
+                eprintln!("✗ cannot open ledger {db}");
+                return 1;
+            }
+        };
+        match foundry_line::rehydrate::rehydrate(
+            &ledger_ro,
+            std::path::Path::new("/tmp"),
+        ) {
+            Ok(orders) => {
+                let n_waiting = orders
+                    .iter()
+                    .filter(|o| o.state() == foundry_domain::OrderState::FurnaceHold)
+                    .count();
+                eprintln!("rehydrated {} order(s) from journal ({n_waiting} waiting)", orders.len());
+                for o in orders {
+                    line.submit(o).await;
+                }
+            }
+            Err(e) => {
+                eprintln!("✗ rehydrate failed: {e:?}");
+                return 1;
+            }
+        }
+        if line.get(&order_id).await.is_none() {
+            eprintln!("✗ unknown order {order_id} (not in journal either)");
+            return 1;
+        }
     }
     let token = ApprovalToken {
         order_id: order_id.clone(),

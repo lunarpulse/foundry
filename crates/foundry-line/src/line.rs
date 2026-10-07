@@ -12,10 +12,8 @@
 //! - **Approval ≠ published**: separate FurnaceHold → Publishing → Shipped
 //!   states; PR creation is fallible and re-verifies the digest (#1, §11).
 use crate::error::LineError;
-use foundry_domain::ports::{
-    Gate, Harness, Ledger, Policy, PortError, PublishOutcome, Publisher,
-};
-use foundry_domain::{workdir_path, ActorId, ActorKind, Order, OrderEvent, OrderState};
+use foundry_domain::ports::{Gate, Harness, Ledger, Policy, PortError, PublishOutcome, Publisher};
+use foundry_domain::{ActorId, ActorKind, Order, OrderEvent, OrderState, workdir_path};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -157,8 +155,15 @@ where
         // M0: the in-process Mutex IS the transaction. M1: one SQLite tx.
         {
             let mut led = self.ledger.lock().await;
-            led.append(order_id, &event, from, to, actor, foundry_domain::order::now())
-                .map_err(|e| LineError::Port(order_id.to_string(), e))?;
+            led.append(
+                order_id,
+                &event,
+                from,
+                to,
+                actor,
+                foundry_domain::order::now(),
+            )
+            .map_err(|e| LineError::Port(order_id.to_string(), e))?;
         }
         // NOTE: version is bumped by the domain transition() itself — the
         // executor must not double-bump (journal rows == version invariant).
@@ -207,8 +212,7 @@ where
                             {
                                 let mut orders = self.orders.lock().await;
                                 if let Some(o) = orders.get_mut(order_id) {
-                                    o.artifact_digest =
-                                        Some(die_out.result_commit.clone());
+                                    o.artifact_digest = Some(die_out.result_commit.clone());
                                 }
                             }
                             // Inspector (T7b) makes the real verdict; M0 passes through.
@@ -322,11 +326,7 @@ where
         let operation_id = format!("{order_id}:{attempt}");
         let digest = order.artifact_digest.clone().unwrap_or_default();
 
-        match self
-            .publisher
-            .publish(&order, &operation_id, &digest)
-            .await
-        {
+        match self.publisher.publish(&order, &operation_id, &digest).await {
             Ok(PublishOutcome::Confirmed { pr_url }) => {
                 self.commit(
                     order_id,
