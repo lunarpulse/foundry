@@ -64,36 +64,69 @@ impl SqliteLedger {
 
     /// Verify the whole chain (M1 gate: chain-hash check).
     pub fn verify_chain(&self) -> PortResult<bool> {
+        let rows = self.read_all()?;
+        let mut prev = "GENESIS".to_string();
+        for r in &rows {
+            if r.prev_hash != prev {
+                return Ok(false); // chain broken
+            }
+            let expect = entry_hash(
+                r.seq, &r.order_id, &r.from_state, &r.to_state, &r.event, &r.actor,
+                &r.intent, &r.at, &prev,
+            );
+            if expect != r.hash {
+                return Ok(false);
+            }
+            prev = r.hash.clone();
+        }
+        Ok(true)
+    }
+
+    /// Full journal snapshot, seq-ordered — the read-model's only input
+    /// (M1 T11: serve replays this inside ONE read transaction; the
+    /// ledger==state invariant makes a separate orders table unnecessary).
+    pub fn read_all(&self) -> PortResult<Vec<LedgerRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
                 "SELECT seq, order_id, from_state, to_state, event, actor, intent, at, prev_hash, hash FROM ledger ORDER BY seq",
             )
             .map_err(port_err)?;
-        let rows: Vec<(i64, String, String, String, String, String, String, String, String, String)> =
-            stmt.query_map([], |r| {
-                Ok((
-                    r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?,
-                    r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?,
-                ))
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(LedgerRow {
+                    seq: r.get(0)?,
+                    order_id: r.get(1)?,
+                    from_state: r.get(2)?,
+                    to_state: r.get(3)?,
+                    event: r.get(4)?,
+                    actor: r.get(5)?,
+                    intent: r.get(6)?,
+                    at: r.get(7)?,
+                    prev_hash: r.get(8)?,
+                    hash: r.get(9)?,
+                })
             })
             .map_err(port_err)?
             .collect::<Result<_, _>>()
             .map_err(port_err)?;
-        let mut prev = "GENESIS".to_string();
-        for (seq, order_id, from, to, event, actor, intent, at, stored_prev, stored_hash) in rows {
-            if stored_prev != prev {
-                return Ok(false); // chain broken
-            }
-            let expect =
-                entry_hash(seq, &order_id, &from, &to, &event, &actor, &intent, &at, &prev);
-            if expect != stored_hash {
-                return Ok(false);
-            }
-            prev = stored_hash;
-        }
-        Ok(true)
+        Ok(rows)
     }
+}
+
+/// One immutable journal row (serve read-model input).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LedgerRow {
+    pub seq: i64,
+    pub order_id: String,
+    pub from_state: String,
+    pub to_state: String,
+    pub event: String,
+    pub actor: String,
+    pub intent: String,
+    pub at: String,
+    pub prev_hash: String,
+    pub hash: String,
 }
 
 fn port_err(e: rusqlite::Error) -> PortError {

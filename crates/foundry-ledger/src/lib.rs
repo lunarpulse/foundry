@@ -17,4 +17,4 @@ pub mod shim;
 
 pub mod sqlite;
 
-pub use sqlite::{AuditEntry, SqliteLedger};
+pub use sqlite::{AuditEntry, LedgerRow, SqliteLedger};

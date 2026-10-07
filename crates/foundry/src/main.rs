@@ -84,6 +84,13 @@ enum Cmd {
         #[arg(long, default_value = "~/.foundry/ledger.db")]
         db: String,
     },
+    /// M1 T11: read-model HTTP API (127.0.0.1 by default).
+    Serve {
+        #[arg(long, default_value = "~/.foundry/ledger.db")]
+        db: String,
+        #[arg(long, default_value = "127.0.0.1:7700")]
+        bind: String,
+    },
 }
 
 // ---------- M0 stubs (replaced in T9 by real Furnace/Publisher) ----------
@@ -144,6 +151,33 @@ async fn main() {
             watch_cmd(once, every, repo, die, auto_approve).await
         }
         Cmd::Show { order, db } => show(order, &expand(&db)).await,
+        Cmd::Serve { db, bind } => {
+            let state = std::sync::Arc::new(
+                match foundry_serve::ServeState::new(&expand(&db)) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("✗ serve: {e}");
+                        std::process::exit(1);
+                    }
+                },
+            );
+            let app = foundry_serve::http::router(state);
+            let listener = match tokio::net::TcpListener::bind(&bind).await {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("✗ bind {bind}: {e}");
+                    std::process::exit(1);
+                }
+            };
+            println!("foundry-serve on http://{bind} (read-only)");
+            match axum::serve(listener, app).await {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("✗ serve: {e}");
+                    1
+                }
+            }
+        }
     };
     std::process::exit(code);
 }
