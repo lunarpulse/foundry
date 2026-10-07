@@ -17,12 +17,22 @@ struct Inner {
     fail_first_n: AtomicU32,
     /// Scripted exit codes per attempt (1-indexed). Missing => 0.
     script: Mutex<std::collections::HashMap<u32, i32>>,
+    /// When set, Die "succeeds" but produces no new commit (result == base)
+    /// — the M1 defect #8 shape for T19 taxonomy tests.
+    noop: std::sync::atomic::AtomicBool,
 }
 
 impl FakeHarness {
     pub fn fail_first(n: u32) -> Self {
         let h = Self::default();
         h.inner.fail_first_n.store(n, Ordering::SeqCst);
+        h
+    }
+
+    /// Die exits 0 but result_commit == base_commit (no-op success).
+    pub fn noop_success() -> Self {
+        let h = Self::default();
+        h.inner.noop.store(true, Ordering::SeqCst);
         h
     }
 
@@ -51,6 +61,7 @@ impl Harness for FakeHarness {
             .unwrap()
             .get(&attempt)
             .unwrap_or(&0);
+        let noop = self.inner.noop.load(Ordering::SeqCst);
         async move {
             if attempt <= n_fail {
                 return Err(PortError::Retryable(format!("scripted failure {attempt}")));
@@ -58,7 +69,7 @@ impl Harness for FakeHarness {
             Ok(DieOutput {
                 attempt,
                 base_commit: "base".into(),
-                result_commit: format!("die-{attempt}"),
+                result_commit: if noop { "base".into() } else { format!("die-{attempt}") },
                 log_path: "fake".into(),
                 exit_code: scripted,
             })

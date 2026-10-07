@@ -215,9 +215,39 @@ where
                                     o.artifact_digest = Some(die_out.result_commit.clone());
                                 }
                             }
-                            // Inspector (T7b) makes the real verdict; M0 passes through.
-                            self.commit(order_id, OrderEvent::InspectionPassed, attempt, &actor)
-                                .await?;
+                            // Inspector (T19): real verdict — no-op taxonomy
+                            // (PreflightNoWork -> Rejected, empty-diff-with-
+                            // change-required -> Failed, defect #8).
+                            // diff-empty evidence: no commit produced, or the
+                            // "new" commit IS the base (M1 defect #8 shape)
+                            let noop = die_out.result_commit.is_empty()
+                                || die_out.result_commit == die_out.base_commit;
+                            let diff = foundry_domain::inspector::DiffStats {
+                                files_changed: if noop { 0 } else { 1 },
+                                lines_changed: if noop { 0 } else { 1 },
+                            };
+                            let verdict = foundry_domain::inspector::inspect(
+                                &diff,
+                                foundry_domain::inspector::change_required(&order),
+                            );
+                            let ev = foundry_domain::inspector::event_for(&verdict);
+                            self.commit(order_id, ev, attempt, &actor).await?;
+                            match verdict {
+                                foundry_domain::inspector::Verdict::PreflightNoWork { .. }
+                                | foundry_domain::inspector::Verdict::ExpectedChangeButEmptyDiff => {
+                                    // terminal — stop driving this order,
+                                    // report its now-terminal state
+                                    let st = {
+                                        let orders = self.orders.lock().await;
+                                        orders
+                                            .get(order_id)
+                                            .map(|o| o.state())
+                                            .unwrap_or(OrderState::Failed)
+                                    };
+                                    return Ok(st);
+                                }
+                                _ => {}
+                            }
                         }
                         Err(PortError::Retryable(reason)) => {
                             self.commit(

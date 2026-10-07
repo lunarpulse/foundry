@@ -258,9 +258,14 @@ impl Order {
                 }
             }
             (OrderEvent::InspectionPassed, OrderState::Inspecting) => OrderState::FurnaceHold,
-            (OrderEvent::InspectionFailed { .. }, OrderState::Inspecting) => {
-                // inspector rejection is a retryable failure like DieFailed
-                if self.attempt >= MAX_ATTEMPTS {
+            (OrderEvent::InspectionFailed { reason }, OrderState::Inspecting) => {
+                // T19 taxonomy: an empty diff when a change was required is
+                // NOT retryable — retrying produces the same empty diff (M1
+                // defect #8: 3 no-op attempts then publish 422). Terminal.
+                // Other inspection failures stay retryable like DieFailed.
+                if reason.starts_with("no-op") {
+                    OrderState::Failed
+                } else if self.attempt >= MAX_ATTEMPTS {
                     OrderState::Failed
                 } else {
                     self.attempt += 1;

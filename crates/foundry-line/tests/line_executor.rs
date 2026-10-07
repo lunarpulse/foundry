@@ -292,3 +292,45 @@ async fn every_transition_is_journaled() {
     // version count == journal row count (1:1 atomicity)
     assert_eq!(rows.len() as u64, o.version);
 }
+
+// ---------- T19: no-op taxonomy (defect #8) ----------
+
+/// Die exits 0 with NO new commit, task expected a change → quality
+/// FAILURE: InspectionFailed, terminal Failed, never reaches FurnaceHold.
+#[tokio::test]
+async fn t19_noop_die_with_change_required_fails() {
+    let line = mk_line(FakeHarness::noop_success(), ScriptedPublisher::default());
+    let o = order("o-noop1");
+    line.submit(o).await;
+    line.acquire_lease("watch").await.unwrap();
+
+    let end = line.drive("o-noop1").await.unwrap();
+    assert_eq!(end, OrderState::Failed, "empty diff + change required must FAIL");
+    let o = line.get("o-noop1").await.unwrap();
+    assert_eq!(o.state(), OrderState::Failed);
+    // journal carries the honest reason
+    let led = line.ledger.lock().await;
+    let rows = led.rows.lock().unwrap();
+    let last = rows.last().unwrap();
+    match &last.1 {
+        OrderEvent::InspectionFailed { reason } => {
+            assert!(reason.contains("no-op"), "reason must name no-op: {reason}")
+        }
+        other => panic!("expected InspectionFailed, got {other:?}"),
+    }
+    // publish must be unreachable
+    drop(rows);
+    drop(led);
+    let pub_res = line.publish("o-noop1", &sys()).await;
+    assert!(pub_res.is_err(), "publishing a Failed order must be refused");
+}
+
+/// Real diff still passes through to FurnaceHold (no regression).
+#[tokio::test]
+async fn t19_real_diff_still_reaches_hold() {
+    let line = mk_line(FakeHarness::default(), ScriptedPublisher::default());
+    line.submit(order("o-ok1")).await;
+    line.acquire_lease("watch").await.unwrap();
+    let end = line.drive("o-ok1").await.unwrap();
+    assert_eq!(end, OrderState::FurnaceHold);
+}
