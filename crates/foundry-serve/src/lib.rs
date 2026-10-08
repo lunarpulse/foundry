@@ -7,9 +7,11 @@
 //! journal==state invariant is structural, not maintained.
 
 pub mod approve;
+pub mod approve_v2;
 pub mod fake_noop;
 pub mod health;
 pub mod http;
+pub mod identity;
 use foundry_ledger::{LedgerRow, SqliteLedger};
 use foundry_line::line::Line;
 use std::collections::HashMap;
@@ -108,6 +110,9 @@ pub type AppLine =
 
 pub struct ServeState {
     pub ledger: Arc<SqliteLedger>,
+    /// M4 T29: identity store — sessions, capability matrix, token
+    /// consumption. Guarded; every privileged op re-resolves state.
+    pub identity: tokio::sync::Mutex<identity::Identity>,
     /// T27 UI-1: the shared AppLine so approve actions go through the
     /// SAME gate/ledger path as the CLI (single token mint per action).
     /// Fake harness — serve never executes Dies; it only records human
@@ -127,8 +132,13 @@ impl ServeState {
             Arc::new(fake_noop::NoopPublisher),
             Arc::new(fake_noop::AllowHumanPolicy),
         );
+        let ident = identity::Identity::open(std::path::Path::new(
+            &path.with_extension("identity.db"),
+        ))
+        .map_err(|e| format!("identity open: {e}"))?;
         Ok(Self {
             ledger: Arc::new(ledger),
+            identity: tokio::sync::Mutex::new(ident),
             line: Arc::new(line),
         })
     }

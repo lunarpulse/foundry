@@ -17,7 +17,7 @@ pub fn router(state: Arc<ServeState>) -> Router {
         .route("/api/orders", get(orders))
         .route("/api/orders/{id}", get(order_detail))
         // UI-1: human approve action (T27) — single token mint per POST
-        .route("/api/orders/{id}/approve", post(crate::approve::approve))
+        .route("/api/orders/{id}/approve", post(crate::approve_v2::approve))
         .route("/api/audit/verify", get(verify))
         .route("/api/status", get(status))
         // UI-0: single static board, no build step (plan T12)
