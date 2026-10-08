@@ -15,6 +15,7 @@ pub mod shim;
 #[cfg(any())]
 pub(crate) mod vendor;
 
+pub mod casting_journal;
 pub mod event_json;
 pub mod mirror;
 pub mod replay;
