@@ -4,6 +4,7 @@
 //! Holds the Line lease for its whole life (critique #4: single writer).
 //! Reconcile pass re-judges Unknown publishes each tick (critique #2).
 pub mod benchmark;
+pub mod breaker;
 pub mod corpus;
 pub mod corpus_emit;
 pub mod discord_notifier;
