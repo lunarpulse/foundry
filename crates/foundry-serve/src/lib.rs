@@ -12,6 +12,7 @@ pub mod fake_noop;
 pub mod health;
 pub mod http;
 pub mod identity;
+pub mod privacy;
 pub mod read_guard;
 pub mod scope;
 use foundry_ledger::{LedgerRow, SqliteLedger};
@@ -36,7 +37,10 @@ pub const STATE_NAMES: &[&str] = &[
     "canceled",
 ];
 
-#[derive(serde::Serialize)]
+pub(crate) fn identity_hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
 pub struct SnapshotMeta {
     pub height: i64,
     pub head_hash: String,
@@ -68,7 +72,10 @@ pub struct OrderDetail {
     pub read_at: String,
     pub order_id: String,
     pub state: String,
-    pub journal: Vec<LedgerRow>,
+    /// T31: journal rows leave through the privacy whitelist —
+    /// event payloads scrubbed, actor omitted (kept in the raw
+    /// ledger for audit; the API never serializes it).
+    pub journal: Vec<crate::privacy::PublicLedgerRow>,
 }
 
 #[derive(serde::Serialize)]
@@ -201,12 +208,16 @@ impl ServeState {
     pub fn order_detail(&self, order_id: &str) -> Option<OrderDetail> {
         let rows = self.ledger.read_all().unwrap_or_default();
         let meta = self.snapshot_meta(&rows);
-        let mine: Vec<LedgerRow> = rows
+        let mine: Vec<crate::privacy::PublicLedgerRow> = rows
             .iter()
             .filter(|r| r.order_id == order_id)
-            .cloned()
+            .map(crate::privacy::PublicLedgerRow::from_row_public)
             .collect();
-        let state = mine.last().map(|r| r.to_state.clone())?;
+        let state = rows
+            .iter()
+            .filter(|r| r.order_id == order_id)
+            .last()
+            .map(|r| r.to_state.clone())?;
         Some(OrderDetail {
             height: meta.height,
             head_hash: meta.head_hash,

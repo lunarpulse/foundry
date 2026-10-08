@@ -88,7 +88,7 @@ pub async fn approve(
         if let Err(e) = ident.authorize(&user, Capability::Approve) {
             return (
                 StatusCode::FORBIDDEN,
-                Json(serde_json::json!({"error": e.to_string(), "username": user.username})),
+                Json(serde_json::json!({"error": crate::privacy::sanitize_error(&e.to_string()), "username": user.username})),
             )
                 .into_response();
         }
@@ -108,7 +108,7 @@ pub async fn approve(
             }
             Err(e) => return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "rehydrate failed", "detail": format!("{e:?}")})),
+                Json(serde_json::json!({"error": crate::privacy::sanitize_error(&format!("rehydrate failed: {e:?}"))})),
             )
                 .into_response(),
         }
@@ -194,7 +194,7 @@ fn auth_error(e: IdentityError) -> axum::response::Response {
         IdentityError::Disabled => StatusCode::UNAUTHORIZED,
         _ => StatusCode::UNAUTHORIZED,
     };
-    (code, Json(serde_json::json!({"error": e.to_string()}))).into_response()
+    (code, Json(serde_json::json!({"error": crate::privacy::sanitize_error(&e.to_string())}))).into_response()
 }
 
 fn not_found(id: &str) -> axum::response::Response {

@@ -34,7 +34,7 @@ pub fn scope_denied(e: ScopeError) -> axum::response::Response {
         ScopeError::Unauthenticated => StatusCode::UNAUTHORIZED,
         _ => StatusCode::FORBIDDEN,
     };
-    (code, Json(serde_json::json!({"error": e.to_string()}))).into_response()
+    (code, Json(serde_json::json!({"error": crate::privacy::sanitize_error(&e.to_string())}))).into_response()
 }
 
 // ---- guarded wrappers over ServeState reads ----
