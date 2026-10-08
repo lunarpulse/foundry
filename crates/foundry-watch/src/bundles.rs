@@ -192,6 +192,11 @@ impl BundleStore {
         self.by_digest.keys().cloned().collect()
     }
 
+    /// Test/ops accessor: number of issued tokens.
+    pub fn tokens_len(&self) -> usize {
+        self.tokens.len()
+    }
+
     /// Clone for scenario forks (gate/eval tooling).
     pub fn clone_for_test(&self) -> Self {
         BundleStore { by_digest: self.by_digest.clone(), tokens: self.tokens.clone() }

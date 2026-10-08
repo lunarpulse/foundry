@@ -6,6 +6,7 @@
 pub mod benchmark;
 pub mod breaker;
 pub mod casting_run;
+pub mod casting_wiring;
 pub mod corpus;
 pub mod corpus_emit;
 pub mod discord_notifier;
