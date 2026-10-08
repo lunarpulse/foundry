@@ -1,8 +1,8 @@
 //! T6 — CLI adapter tests: env isolation + FakeHarness determinism.
 use foundry_domain::ports::Harness;
 use foundry_domain::{ExternalRef, Order};
-use foundry_harness_cli::fake::FakeHarness;
 use foundry_harness_cli::CliHarness;
+use foundry_harness_cli::fake::FakeHarness;
 use std::path::PathBuf;
 
 fn order() -> Order {
@@ -38,7 +38,10 @@ async fn missing_binary_is_permanent_error() {
     let h = CliHarness::new("/nonexistent/foundry-die", "coding", 30);
     let o = order();
     let err = h.run(&o, 1, &PathBuf::from("/tmp")).await.unwrap_err();
-    assert!(matches!(err, foundry_domain::ports::PortError::Permanent(_)));
+    assert!(matches!(
+        err,
+        foundry_domain::ports::PortError::Permanent(_)
+    ));
 }
 
 #[tokio::test]
@@ -54,7 +57,11 @@ async fn die_env_is_allowlisted() {
     // Permanent error (no silent no-ops). Seed dir/repo so this wrapper
     // yields a HEAD — this also exercises the nested-repo HEAD resolution.
     let g = |args: &[&str]| {
-        std::process::Command::new("git").args(args).current_dir(&repo).output().unwrap();
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .unwrap();
     };
     g(&["init", "-q"]);
     g(&["config", "user.email", "t@t.local"]);

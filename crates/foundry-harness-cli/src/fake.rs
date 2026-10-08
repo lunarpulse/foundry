@@ -1,7 +1,7 @@
 //! FakeHarness — deterministic in-process Die for tests and Replay (plan M2).
 //! Records invocations; never touches the filesystem or network.
-use foundry_domain::ports::{DieOutput, Harness, PortError, PortResult};
 use foundry_domain::Order;
+use foundry_domain::ports::{DieOutput, Harness, PortError, PortResult};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -69,7 +69,11 @@ impl Harness for FakeHarness {
             Ok(DieOutput {
                 attempt,
                 base_commit: "base".into(),
-                result_commit: if noop { "base".into() } else { format!("die-{attempt}") },
+                result_commit: if noop {
+                    "base".into()
+                } else {
+                    format!("die-{attempt}")
+                },
                 log_path: "fake".into(),
                 exit_code: scripted,
             })

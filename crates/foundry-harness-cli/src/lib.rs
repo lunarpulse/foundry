@@ -6,8 +6,8 @@
 //! (plan §11: publish credentials never reach the Die).
 pub mod fake;
 
-use foundry_domain::ports::{DieOutput, Harness, PortError, PortResult};
 use foundry_domain::Order;
+use foundry_domain::ports::{DieOutput, Harness, PortError, PortResult};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::process::Command;
@@ -71,7 +71,10 @@ impl Harness for CliHarness {
                 .arg(&dedup_key)
                 .env_clear()
                 .env("PATH", "/usr/bin:/bin:/usr/local/bin")
-                .env("HOME", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
+                .env(
+                    "HOME",
+                    std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()),
+                )
                 .env("FOUNDRY_ORDER_ID", &order_id)
                 .env("FOUNDRY_ATTEMPT", attempt.to_string())
                 .stdin(Stdio::null())
@@ -84,12 +87,13 @@ impl Harness for CliHarness {
                 // would lose the log-file redirect. spawn() + wait() honors
                 // the Stdio::from(file) bindings.
                 async {
-                    let mut child = cmd.spawn().map_err(|e| {
-                        PortError::Retryable(format!("spawn: {e}"))
-                    })?;
-                    child.wait().await.map_err(|e| {
-                        PortError::Retryable(format!("wait: {e}"))
-                    })
+                    let mut child = cmd
+                        .spawn()
+                        .map_err(|e| PortError::Retryable(format!("spawn: {e}")))?;
+                    child
+                        .wait()
+                        .await
+                        .map_err(|e| PortError::Retryable(format!("wait: {e}")))
                 },
             )
             .await
@@ -103,7 +107,11 @@ impl Harness for CliHarness {
             // 20/20). Refuse EARLY instead of binding an empty digest.
             let result_commit = {
                 let h = git_head(&workdir);
-                if h.is_empty() { git_head(&workdir.join("repo")) } else { h }
+                if h.is_empty() {
+                    git_head(&workdir.join("repo"))
+                } else {
+                    h
+                }
             };
             if result_commit.is_empty() {
                 return Err(PortError::Permanent(format!(

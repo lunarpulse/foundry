@@ -5,6 +5,7 @@
 //! Reconcile pass re-judges Unknown publishes each tick (critique #2).
 pub mod benchmark;
 pub mod breaker;
+pub mod casting_run;
 pub mod corpus;
 pub mod corpus_emit;
 pub mod discord_notifier;
@@ -14,6 +15,7 @@ pub mod github_publisher;
 pub mod intake;
 pub mod judging;
 pub mod readjudicate;
+pub mod repro;
 pub mod watch;
 
 pub use github_publisher::GithubPublisher;

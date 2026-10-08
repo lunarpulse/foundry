@@ -97,6 +97,21 @@ enum Cmd {
     },
     /// M1 T15: mirror catch-up. DRY-RUN by default; --apply requires the
     /// single-writer lease (review #5: reconcile must not be a 2nd writer).
+    /// T26: casting A/B cycle — run/judge/promote.
+    Casting {
+        #[arg(long)]
+        run_profile: Option<String>,
+        #[arg(long)]
+        judge: Option<String>,
+        #[arg(long)]
+        promote: Option<String>,
+        #[arg(long, default_value = "~/.foundry/corpus")]
+        corpus: String,
+        #[arg(long, default_value = "~/.foundry/casting")]
+        casting_dir: String,
+        #[arg(long, default_value = "42")]
+        seed: u64,
+    },
     /// T20: benchmark over corpus — baseline snapshot / compare vs baseline.
     Benchmark {
         #[arg(long)]
@@ -203,6 +218,24 @@ async fn main() {
         Cmd::Show { order, db } => show(order, &expand(&db)).await,
         Cmd::Status { db } => status_cmd(&expand(&db)),
         Cmd::Doctor { db } => doctor_cmd(&expand(&db)),
+        Cmd::Casting {
+            run_profile,
+            judge,
+            promote,
+            corpus,
+            casting_dir,
+            seed,
+        } => {
+            casting_cmd(
+                run_profile,
+                judge,
+                promote,
+                &expand(&corpus),
+                &expand(&casting_dir),
+                seed,
+            )
+            .await
+        }
         Cmd::Benchmark {
             baseline,
             compare,
@@ -933,6 +966,151 @@ fn benchmark_cmd(baseline: Option<String>, compare: Option<String>, corpus_dir: 
         }
     } else {
         eprintln!("specify --baseline <path> or --compare <path>");
+        1
+    }
+}
+
+async fn casting_cmd(
+    run_profile: Option<String>,
+    judge: Option<String>,
+    promote: Option<String>,
+    corpus_dir: &str,
+    casting_dir: &str,
+    seed: u64,
+) -> i32 {
+    use foundry_domain::casting::CastingRun;
+    use foundry_ledger::casting_journal::CastingLedger;
+    use foundry_watch::casting_run;
+    use foundry_watch::judging::{self, JudgingPolicy, PrimaryMetric};
+
+    let cdir = std::path::PathBuf::from(casting_dir);
+    let journal = match CastingLedger::open(&cdir.join("casting.db")) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("✗ casting journal: {e}");
+            return 1;
+        }
+    };
+
+    if let Some(profile_id) = run_profile {
+        // profile hash: deterministic mock profile (M3 dry scope)
+        let profile = foundry_watch::dry_die::CandidateProfile {
+            id: profile_id.clone(),
+            model_id: "mock/deterministic".into(),
+            prompt_template: "dep-bump-v1".into(),
+            tool_allowlist: vec!["cargo".into()],
+            env_allowlist: vec!["PATH".into()],
+            seed,
+        };
+        let policy = JudgingPolicy {
+            max_cost_increase_frac: 0.10,
+            primary_metrics: vec![
+                PrimaryMetric::QualityFailuresDown,
+                PrimaryMetric::NoOpRejectsDown,
+            ],
+            min_coverage_frac: 0.80,
+            policy_version: 1,
+        };
+        // corpus hash: dir content digest
+        let corpus_hash = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            let mut names: Vec<_> = std::fs::read_dir(corpus_dir)
+                .map(|it| {
+                    it.filter_map(|e| e.ok())
+                        .map(|e| e.file_name().to_string_lossy().to_string())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            names.sort();
+            for n in names {
+                h.update(n.as_bytes());
+            }
+            hex::encode(h.finalize())
+        };
+        let run = CastingRun {
+            id: format!("cast-{profile_id}-{seed}"),
+            candidate_profile_id: profile_id.clone(),
+            candidate_profile_hash: profile.hash(),
+            corpus_ref: corpus_dir.to_string(),
+            corpus_hash,
+            policy_hash: judging::policy_hash(&policy),
+            metric_version: foundry_watch::benchmark::METRIC_VERSION,
+            seed,
+            base_git_sha: {
+                let corpus = foundry_watch::corpus::CorpusManifest::load_all(std::path::Path::new(
+                    corpus_dir,
+                ))
+                .unwrap_or_default();
+                corpus
+                    .first()
+                    .and_then(|c| c.base_git_sha.clone())
+                    .unwrap_or_default()
+            },
+            tool_versions: vec![("die".into(), "dry-1".into())],
+            input_digest: String::new(),
+            state: foundry_domain::casting::CastingState::Draft,
+        };
+        let input_digest = CastingRun::compute_input_digest(
+            &run.candidate_profile_hash,
+            &run.corpus_hash,
+            &run.policy_hash,
+            run.metric_version,
+            run.seed,
+            &run.base_git_sha,
+            &run.tool_versions,
+        );
+        let mut run = run;
+        run.input_digest = input_digest;
+        match casting_run::run_casting(
+            run,
+            std::path::Path::new(corpus_dir),
+            &cdir.join("sandbox"),
+            &cdir.join("candidate"),
+            &journal,
+        )
+        .await
+        {
+            Ok(out) => {
+                println!(
+                    "casting run {}: executed={} skipped-breaker={} non-replayable={}",
+                    out.run.id, out.executed, out.skipped_breaker, out.non_replayable
+                );
+                println!(
+                    "  input_digest {:.16}.. bound (profile/corpus/policy/seed/sha)",
+                    out.run.input_digest
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("✗ {e}");
+                1
+            }
+        }
+    } else if let Some(_run_id) = judge {
+        let policy = JudgingPolicy {
+            max_cost_increase_frac: 0.10,
+            primary_metrics: vec![
+                PrimaryMetric::QualityFailuresDown,
+                PrimaryMetric::NoOpRejectsDown,
+            ],
+            min_coverage_frac: 0.80,
+            policy_version: 1,
+        };
+        // NOTE: full judge requires a persisted CastingRun record; the
+        // M3 gate exercises judge via the integration test (4-path block).
+        eprintln!(
+            "judge: use the integration path (casting::tests) or persist run state first — direct CLI judge lands with serve (T27)"
+        );
+        let _ = policy;
+        1
+    } else if let Some(_run_id) = promote {
+        eprintln!(
+            "promote: requires human ApprovalToken — provide via serve approve action (T27); CLI cannot mint tokens"
+        );
+        1
+    } else {
+        eprintln!("specify --run-profile <id>, --judge <run-id>, or --promote <run-id>");
         1
     }
 }

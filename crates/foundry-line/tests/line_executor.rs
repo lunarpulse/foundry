@@ -305,7 +305,11 @@ async fn t19_noop_die_with_change_required_fails() {
     line.acquire_lease("watch").await.unwrap();
 
     let end = line.drive("o-noop1").await.unwrap();
-    assert_eq!(end, OrderState::Failed, "empty diff + change required must FAIL");
+    assert_eq!(
+        end,
+        OrderState::Failed,
+        "empty diff + change required must FAIL"
+    );
     let o = line.get("o-noop1").await.unwrap();
     assert_eq!(o.state(), OrderState::Failed);
     // journal carries the honest reason
@@ -322,7 +326,10 @@ async fn t19_noop_die_with_change_required_fails() {
     drop(rows);
     drop(led);
     let pub_res = line.publish("o-noop1", &sys()).await;
-    assert!(pub_res.is_err(), "publishing a Failed order must be refused");
+    assert!(
+        pub_res.is_err(),
+        "publishing a Failed order must be refused"
+    );
 }
 
 /// Real diff still passes through to FurnaceHold (no regression).
