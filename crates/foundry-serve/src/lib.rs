@@ -7,6 +7,7 @@
 //! journal==state invariant is structural, not maintained.
 
 pub mod approve;
+pub mod audit_report;
 pub mod approve_v2;
 pub mod fake_noop;
 pub mod health;
