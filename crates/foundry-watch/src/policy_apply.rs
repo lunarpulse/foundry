@@ -247,6 +247,19 @@ impl PolicyApplicationLayer {
     pub fn governance_ok(&self) -> bool {
         verify_stream(&self.governance).is_ok()
     }
+
+    /// Clone for scenario forks (gate tooling).
+    pub fn clone_state(&self) -> Self {
+        Self {
+            policy_version: self.policy_version,
+            applied: self.applied.clone(),
+            used_op_ids: self.used_op_ids.clone(),
+            track: self.track.clone(),
+            registered: self.registered.clone(),
+            governance: self.governance.clone(),
+            gov_seq: self.gov_seq,
+        }
+    }
 }
 
 fn parse_window(window: &str) -> u64 {

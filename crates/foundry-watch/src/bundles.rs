@@ -192,6 +192,11 @@ impl BundleStore {
         self.by_digest.keys().cloned().collect()
     }
 
+    /// Clone for scenario forks (gate/eval tooling).
+    pub fn clone_for_test(&self) -> Self {
+        BundleStore { by_digest: self.by_digest.clone(), tokens: self.tokens.clone() }
+    }
+
     /// Consumption-time re-verification (astra #11): recompute from
     /// the stored artifact; drift means the store was tampered with.
     pub fn get_verified(&self, digest: &str) -> Result<&CandidateBundle, BundleError> {
