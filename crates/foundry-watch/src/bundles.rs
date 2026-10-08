@@ -187,6 +187,11 @@ impl BundleStore {
         self.by_digest.len()
     }
 
+    /// Test/ops accessor: stored digest keys.
+    pub fn by_digest_keys(&self) -> Vec<String> {
+        self.by_digest.keys().cloned().collect()
+    }
+
     /// Consumption-time re-verification (astra #11): recompute from
     /// the stored artifact; drift means the store was tampered with.
     pub fn get_verified(&self, digest: &str) -> Result<&CandidateBundle, BundleError> {
