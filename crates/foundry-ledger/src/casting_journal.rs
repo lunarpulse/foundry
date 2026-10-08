@@ -159,6 +159,20 @@ impl CastingLedger {
         Ok(true)
     }
 
+    /// ADVERSARIAL path for gate fixtures: drop the append-only
+    /// trigger and rewrite a row, simulating a DB-level attacker.
+    /// Only used by tests/examples to prove verify_chain catches it.
+    #[doc(hidden)]
+    pub fn adversarial_tamper(&self) -> rusqlite::Result<()> {
+        self.con
+            .execute_batch("DROP TRIGGER IF EXISTS casting_append_only;")?;
+        self.con.execute(
+            "UPDATE casting_runs SET to_state='promoted' WHERE seq=1",
+            [],
+        )?;
+        Ok(())
+    }
+
     /// Full state of a run by replaying its rows (single consumer rule:
     /// no bespoke parser — this IS the casting replay, engine-style).
     pub fn final_state(&self, run_id: &str) -> Option<CastingState> {

@@ -9,6 +9,7 @@ name = "foundry"
 path = "src/main.rs"
 
 [dependencies]
+futures = "0.3"
 sha2 = "0.10"
 hex = "0.4"
 foundry-domain = { path = "../foundry-domain" }
