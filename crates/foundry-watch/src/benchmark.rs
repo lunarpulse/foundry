@@ -134,7 +134,7 @@ pub enum CompareError {
     },
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct CompareReport {
     pub baseline: Metrics,
     pub current: Metrics,

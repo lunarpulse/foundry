@@ -11,6 +11,7 @@ pub mod dry_die;
 pub mod gc;
 pub mod github_publisher;
 pub mod intake;
+pub mod judging;
 pub mod readjudicate;
 pub mod watch;
 
