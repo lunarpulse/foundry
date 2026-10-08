@@ -62,6 +62,20 @@ pub enum BudgetEvent {
     CancelConfirmed { run: String },
 }
 
+impl std::fmt::Display for BudgetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoExplicitLimit { scope } => write!(f, "no explicit limit covers {scope:?} — fail closed"),
+            Self::OverLimit { scope, would, limit } => write!(f, "{scope:?}: would use {would} > limit {limit}"),
+            Self::UnknownReservation { id } => write!(f, "unknown reservation {id}"),
+            Self::StaleEpoch { id, got, want } => write!(f, "reservation {id}: stale epoch {got} != {want} (fenced)"),
+            Self::CommitExceedsReservation { id, used, reserved } => write!(f, "{id}: commit {used} > reserved {reserved}"),
+            Self::CancelAfterSettlement { run } => write!(f, "run {run} already settled — not cancellable"),
+            Self::CancelConfirmedWithoutRequest { run } => write!(f, "cancel confirmation without request for {run}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum BudgetError {
     NoExplicitLimit { scope: Vec<String> },

@@ -181,6 +181,11 @@ impl LessonStore {
         Ok(())
     }
 
+    /// Read accessor used by the synthesizer (T47).
+    pub fn store_get(&self, id: &str) -> Option<&LessonRecord> {
+        self.lessons.get(id)
+    }
+
     /// Eligible lessons for candidate synthesis (Active only).
     pub fn eligible(&self) -> Vec<&LessonRecord> {
         self.lessons

@@ -182,6 +182,11 @@ impl BundleStore {
         d
     }
 
+    /// Test/ops accessor: number of stored bundles.
+    pub fn by_digest_len(&self) -> usize {
+        self.by_digest.len()
+    }
+
     /// Consumption-time re-verification (astra #11): recompute from
     /// the stored artifact; drift means the store was tampered with.
     pub fn get_verified(&self, digest: &str) -> Result<&CandidateBundle, BundleError> {
