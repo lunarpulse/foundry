@@ -23,6 +23,7 @@ pub mod inventory;
 pub mod lessons;
 pub mod jira_intake;
 pub mod profile_ext;
+pub mod retro;
 pub mod synthesis;
 pub mod judging;
 pub mod readjudicate;
