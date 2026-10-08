@@ -13,6 +13,7 @@ pub mod dry_die;
 pub mod gc;
 pub mod github_publisher;
 pub mod intake;
+pub mod budget_accounting;
 pub mod evaluation_protocol;
 pub mod governance_events;
 pub mod inventory;
