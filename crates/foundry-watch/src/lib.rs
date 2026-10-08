@@ -18,6 +18,7 @@ pub mod bundles;
 pub mod model_proxy;
 pub mod policy_apply;
 pub mod evaluation_protocol;
+pub mod command_binding;
 pub mod coordinator;
 pub mod governance_events;
 pub mod integration_eval;
