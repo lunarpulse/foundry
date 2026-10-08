@@ -14,6 +14,7 @@ pub mod gc;
 pub mod github_publisher;
 pub mod intake;
 pub mod budget_accounting;
+pub mod bundles;
 pub mod model_proxy;
 pub mod evaluation_protocol;
 pub mod governance_events;
