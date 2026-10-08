@@ -14,6 +14,7 @@ pub mod gc;
 pub mod github_publisher;
 pub mod intake;
 pub mod jira_intake;
+pub mod profile_ext;
 pub mod judging;
 pub mod readjudicate;
 pub mod repro;
