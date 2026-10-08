@@ -6,6 +6,8 @@
 //!   publish   — create the PR for an approved Order (idempotent)
 //!   show      — print Order state + recent journal
 use clap::{Parser, Subcommand};
+
+mod deploy_profile;
 use foundry_domain::ports::{
     ApprovalToken, Decision, DieOutput, Gate, Harness, Ledger, Policy, PortResult, PublishOutcome,
     Publisher,
@@ -28,6 +30,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// M4 T34: deployment profile — check boundary, emit systemd units/readme
+    DeployProfile {
+        /// run the on-host boundary + permission check
+        #[arg(long)]
+        check: bool,
+        /// print systemd units to stdout
+        #[arg(long)]
+        units: bool,
+        /// print the deployment readme to stdout
+        #[arg(long)]
+        readme: bool,
+    },
     /// Validate a blueprint file.
     Validate {
         /// Path to foundry.yaml
@@ -200,6 +214,31 @@ fn human() -> ActorId {
 async fn main() {
     let cli = Cli::parse();
     let code = match cli.cmd {
+        Cmd::DeployProfile { check, units, readme } => {
+            if check {
+                match deploy_profile::check_profile() {
+                    deploy_profile::CheckOutcome::Ok => {
+                        println!("deploy profile: OK — boundary table consistent, credentials 600");
+                        0
+                    }
+                    deploy_profile::CheckOutcome::Violations(v) => {
+                        for x in v {
+                            eprintln!("VIOLATION: {x}");
+                        }
+                        1
+                    }
+                }
+            } else if units {
+                print!("{}", deploy_profile::systemd_units());
+                0
+            } else if readme {
+                print!("{}", deploy_profile::readme());
+                0
+            } else {
+                eprintln!("nothing to do: pass --check, --units, or --readme");
+                2
+            }
+        }
         Cmd::Validate { path } => validate(&path),
         Cmd::Run {
             id,
