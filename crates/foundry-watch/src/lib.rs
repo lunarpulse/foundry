@@ -18,6 +18,7 @@ pub mod bundles;
 pub mod model_proxy;
 pub mod evaluation_protocol;
 pub mod governance_events;
+pub mod integration_eval;
 pub mod inventory;
 pub mod lessons;
 pub mod jira_intake;
