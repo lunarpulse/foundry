@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+sha2 = "0.10"
+hex = "0.4"
 foundry-domain = { path = "../foundry-domain" }
 foundry-line = { path = "../foundry-line" }
 foundry-ledger = { path = "../foundry-ledger" }

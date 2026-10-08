@@ -7,6 +7,7 @@ pub mod benchmark;
 pub mod corpus;
 pub mod corpus_emit;
 pub mod discord_notifier;
+pub mod dry_die;
 pub mod gc;
 pub mod github_publisher;
 pub mod intake;
