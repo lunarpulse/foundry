@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+rusqlite = "0.32"
 sha2 = "0.10"
 hex = "0.4"
 foundry-domain = { path = "../foundry-domain" }
