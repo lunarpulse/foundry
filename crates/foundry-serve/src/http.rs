@@ -14,11 +14,11 @@ use std::sync::Arc;
 
 pub fn router(state: Arc<ServeState>) -> Router {
     Router::new()
-        .route("/api/orders", get(orders))
-        .route("/api/orders/{id}", get(order_detail))
+        .route("/api/orders", get(crate::read_guard::orders_handler))
+        .route("/api/orders/{id}", get(crate::read_guard::detail_handler))
         // UI-1: human approve action (T27) — single token mint per POST
         .route("/api/orders/{id}/approve", post(crate::approve_v2::approve))
-        .route("/api/audit/verify", get(verify))
+        .route("/api/audit/verify", get(crate::read_guard::verify_handler))
         .route("/api/status", get(status))
         // UI-0: single static board, no build step (plan T12)
         .route("/", get(board))

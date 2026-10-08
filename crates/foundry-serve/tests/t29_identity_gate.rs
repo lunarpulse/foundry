@@ -5,8 +5,8 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::routing::Router;
 use foundry_domain::{Order, OrderEvent, OrderState};
-use foundry_serve::identity::{Identity, PasswordHasher, Role};
 use foundry_serve::ServeState;
+use foundry_serve::identity::{Identity, PasswordHasher, Role};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -48,7 +48,10 @@ async fn order_at_hold(st: &ServeState, id: &str) {
         (E::InspectionPassed, OrderState::Inspecting),
     ];
     for (e, _from) in seq {
-        st.line.commit_for_test(id, &e, _from, OrderState::FurnaceHold, &a).await.unwrap();
+        st.line
+            .commit_for_test(id, &e, _from, OrderState::FurnaceHold, &a)
+            .await
+            .unwrap();
     }
     let mut o = st.line.get(id).await.unwrap();
     o.artifact_digest = Some("commit-xyz".into());
@@ -62,7 +65,10 @@ async fn setup_with_users(tag: &str) -> Arc<ServeState> {
         let mut id = Identity::open(&p.with_extension("identity.db")).unwrap();
         id.bootstrap_owner("root", "pw", &FastHasher).unwrap();
         id.create_user(
-            &foundry_serve::identity::AuthenticatedUser { username: "root".into(), role: Role::Owner },
+            &foundry_serve::identity::AuthenticatedUser {
+                username: "root".into(),
+                role: Role::Owner,
+            },
             "obs",
             "pw",
             Role::Observer,
@@ -97,7 +103,9 @@ async fn req(app: Router, token: Option<&str>, intent: &str) -> (StatusCode, ser
             .await
             .unwrap();
         let code = resp.status();
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         (code, serde_json::from_slice(&body).unwrap_or_default())
     }
 }
@@ -151,7 +159,10 @@ async fn disabled_user_session_dies_instantly() {
     {
         let mut id = st.identity.lock().await;
         id.set_disabled(
-            &foundry_serve::identity::AuthenticatedUser { username: "root".into(), role: Role::Owner },
+            &foundry_serve::identity::AuthenticatedUser {
+                username: "root".into(),
+                role: Role::Owner,
+            },
             "obs",
             true,
         )

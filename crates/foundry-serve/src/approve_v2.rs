@@ -7,12 +7,12 @@
 //! line.approve. Also wires the legacy compat boundary: an order
 //! approved before M4 keeps its journal rows; NEW approvals always
 //! need identity.
+use crate::identity::{Capability, IdentityError};
+use axum::Json;
 use axum::extract::{FromRequestParts, Path, State};
 use axum::http::request::Parts;
-use axum::http::{header, StatusCode};
+use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
-use axum::Json;
-use crate::identity::{Capability, IdentityError};
 use std::sync::Arc;
 
 #[derive(serde::Deserialize)]
@@ -58,7 +58,7 @@ pub async fn approve(
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"error": "intent required"})),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -70,7 +70,7 @@ pub async fn approve(
                 StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({"error": "authentication required"})),
             )
-                .into_response()
+                .into_response();
         }
     };
     // helper closure can't borrow st mutably in async fn easily; inline:
@@ -106,13 +106,11 @@ pub async fn approve(
                     st.line.submit(o).await;
                 }
             }
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": "rehydrate failed", "detail": format!("{e:?}")})),
-                )
-                    .into_response()
-            }
+            Err(e) => return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "rehydrate failed", "detail": format!("{e:?}")})),
+            )
+                .into_response(),
         }
     }
 
@@ -127,7 +125,7 @@ pub async fn approve(
                     "state": o.state().to_string(),
                 })),
             )
-                .into_response()
+                .into_response();
         }
         None => return not_found(&id),
     }
@@ -189,8 +187,6 @@ pub async fn approve(
             .into_response(),
     }
 }
-
-
 
 fn auth_error(e: IdentityError) -> axum::response::Response {
     let code = match &e {

@@ -12,6 +12,8 @@ pub mod fake_noop;
 pub mod health;
 pub mod http;
 pub mod identity;
+pub mod read_guard;
+pub mod scope;
 use foundry_ledger::{LedgerRow, SqliteLedger};
 use foundry_line::line::Line;
 use std::collections::HashMap;
@@ -113,6 +115,8 @@ pub struct ServeState {
     /// M4 T29: identity store — sessions, capability matrix, token
     /// consumption. Guarded; every privileged op re-resolves state.
     pub identity: tokio::sync::Mutex<identity::Identity>,
+    /// T30: single-org scope store — guards every read and mutation.
+    pub scope: tokio::sync::Mutex<scope::ScopeStore>,
     /// T27 UI-1: the shared AppLine so approve actions go through the
     /// SAME gate/ledger path as the CLI (single token mint per action).
     /// Fake harness — serve never executes Dies; it only records human
@@ -132,13 +136,21 @@ impl ServeState {
             Arc::new(fake_noop::NoopPublisher),
             Arc::new(fake_noop::AllowHumanPolicy),
         );
-        let ident = identity::Identity::open(std::path::Path::new(
-            &path.with_extension("identity.db"),
-        ))
-        .map_err(|e| format!("identity open: {e}"))?;
+        let ident =
+            identity::Identity::open(std::path::Path::new(&path.with_extension("identity.db")))
+                .map_err(|e| format!("identity open: {e}"))?;
+        let scope_store = scope::ScopeStore::open(
+            std::path::Path::new(&path.with_extension("scope.db")),
+            scope::OrgConfig {
+                org_id: "local".into(),
+                bound_sources: vec!["github:lunarpulse/foundary-demo".into()],
+            },
+        )
+        .map_err(|e| format!("scope open: {e}"))?;
         Ok(Self {
             ledger: Arc::new(ledger),
             identity: tokio::sync::Mutex::new(ident),
+            scope: tokio::sync::Mutex::new(scope_store),
             line: Arc::new(line),
         })
     }

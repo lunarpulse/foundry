@@ -17,11 +17,22 @@ async fn unauthenticated_approval_is_refused() {
     let _ = std::fs::remove_file(db.with_extension("identity.db"));
     let st = Arc::new(ServeState::new(&db).unwrap());
     // order at hold
-    let o = Order::new("o-r".into(), foundry_domain::ExternalRef::github("o/r","1","k".into()), chrono::Utc::now());
+    let o = Order::new(
+        "o-r".into(),
+        foundry_domain::ExternalRef::github("o/r", "1", "k".into()),
+        chrono::Utc::now(),
+    );
     st.line.submit(o).await;
-    let a = foundry_domain::ActorId { kind: foundry_domain::ActorKind::Agent, source: "t".into(), id: "t".into() };
+    let a = foundry_domain::ActorId {
+        kind: foundry_domain::ActorKind::Agent,
+        source: "t".into(),
+        id: "t".into(),
+    };
     for e in [OrderEvent::Queued, OrderEvent::DieStarted] {
-        st.line.commit_for_test("o-r", &e, OrderState::Received, OrderState::FurnaceHold, &a).await.unwrap();
+        st.line
+            .commit_for_test("o-r", &e, OrderState::Received, OrderState::FurnaceHold, &a)
+            .await
+            .unwrap();
     }
     let app = Router::new().merge(foundry_serve::http::router(st));
     let resp = app
