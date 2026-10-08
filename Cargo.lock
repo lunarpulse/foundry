@@ -473,11 +473,13 @@ dependencies = [
  "chrono",
  "foundry-domain",
  "foundry-ledger",
+ "foundry-line",
  "foundry-watch",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
+ "tower",
 ]
 
 [[package]]

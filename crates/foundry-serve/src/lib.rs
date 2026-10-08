@@ -6,9 +6,12 @@
 //! knows which ledger state it is looking at. No orders table — the
 //! journal==state invariant is structural, not maintained.
 
+pub mod approve;
+pub mod fake_noop;
 pub mod health;
 pub mod http;
 use foundry_ledger::{LedgerRow, SqliteLedger};
+use foundry_line::line::Line;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -100,16 +103,33 @@ pub fn replay_cards(
     Ok(cards)
 }
 
+pub type AppLine =
+    Line<fake_noop::ServeGate, fake_noop::NoopHarness, SqliteLedger, fake_noop::NoopPublisher>;
+
 pub struct ServeState {
     pub ledger: Arc<SqliteLedger>,
+    /// T27 UI-1: the shared AppLine so approve actions go through the
+    /// SAME gate/ledger path as the CLI (single token mint per action).
+    /// Fake harness — serve never executes Dies; it only records human
+    /// decisions on already-executed orders.
+    pub line: Arc<AppLine>,
 }
 
 impl ServeState {
     pub fn new(ledger_path: impl Into<PathBuf>) -> Result<Self, String> {
-        let ledger =
-            SqliteLedger::open(&ledger_path.into()).map_err(|e| format!("open ledger: {e:?}"))?;
+        let path: PathBuf = ledger_path.into();
+        let ledger = SqliteLedger::open(&path).map_err(|e| format!("open ledger: {e:?}"))?;
+        let ledger2 = SqliteLedger::open(&path).map_err(|e| format!("open ledger: {e:?}"))?;
+        let line: AppLine = Line::new(
+            Arc::new(fake_noop::ServeGate),
+            Arc::new(fake_noop::NoopHarness),
+            Arc::new(tokio::sync::Mutex::new(ledger2)),
+            Arc::new(fake_noop::NoopPublisher),
+            Arc::new(fake_noop::AllowHumanPolicy),
+        );
         Ok(Self {
             ledger: Arc::new(ledger),
+            line: Arc::new(line),
         })
     }
 

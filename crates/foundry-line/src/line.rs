@@ -51,7 +51,7 @@ where
     pub harness: Arc<P>,
     pub ledger: Arc<Mutex<L>>,
     pub publisher: Arc<PUB>,
-    pub policy: Arc<dyn Policy>,
+    pub policy: Arc<dyn Policy + Send + Sync>,
     pub cfg: LineConfig,
     lease: Mutex<Option<String>>,
     /// In-memory store for M0 (single process, single writer).
@@ -71,7 +71,7 @@ where
         harness: Arc<P>,
         ledger: Arc<Mutex<L>>,
         publisher: Arc<PUB>,
-        policy: Arc<dyn Policy>,
+        policy: Arc<dyn Policy + Send + Sync>,
     ) -> Self {
         Self {
             gate,
@@ -88,6 +88,20 @@ where
     pub fn with_cfg(mut self, cfg: LineConfig) -> Self {
         self.cfg = cfg;
         self
+    }
+
+    /// Test/integration helper: commit a specific event WITHOUT running
+    /// the Die — drives the same state machine + ledger append as a real
+    /// run (used by serve T27 tests to place an order at FurnaceHold).
+    pub async fn commit_for_test(
+        &self,
+        order_id: &str,
+        event: &OrderEvent,
+        _from: OrderState,
+        _to: OrderState,
+        actor: &ActorId,
+    ) -> Result<Order, LineError> {
+        self.commit(order_id, event.clone(), 1, actor).await
     }
 
     // ---- lease (single writer, critique #4) ----

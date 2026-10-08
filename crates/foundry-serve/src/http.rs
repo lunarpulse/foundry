@@ -7,7 +7,7 @@ use crate::ServeState;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use std::sync::Arc;
@@ -16,6 +16,8 @@ pub fn router(state: Arc<ServeState>) -> Router {
     Router::new()
         .route("/api/orders", get(orders))
         .route("/api/orders/{id}", get(order_detail))
+        // UI-1: human approve action (T27) — single token mint per POST
+        .route("/api/orders/{id}/approve", post(crate::approve::approve))
         .route("/api/audit/verify", get(verify))
         .route("/api/status", get(status))
         // UI-0: single static board, no build step (plan T12)
