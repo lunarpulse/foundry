@@ -209,6 +209,10 @@ pub fn docker_argv(spec: &CastContainerSpec, name: &str) -> Vec<String> {
     if spec.read_only_rootfs {
         argv.push("--read-only".into());
     }
+    // T56w: non-root by construction — nobody (65534). The runtime
+    // test asserts this is LIVE, not just declared.
+    argv.push("--user".into());
+    argv.push("65534:65534".into());
     if spec.capabilities_drop_all {
         argv.push("--cap-drop=ALL".into());
         argv.push("--security-opt".into());
