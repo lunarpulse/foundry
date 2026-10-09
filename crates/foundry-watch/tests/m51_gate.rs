@@ -356,7 +356,7 @@ fn g7_audit_precision() -> bool {
         c.append(ev(op, Phase::Committed)).unwrap();
     }
     let (max_seq, count) = c.head().unwrap();
-    let pin = HeadPin { max_seq, count };
+    let pin = HeadPin { max_seq, count, chain_head: foundry_watch::audit_precision::chain_head(&c.replay().unwrap()) };
     let clean = audit(&c, &pin) == Ok(());
     // truncation named
     let mut cut = GovernanceCoordinator::open_in_memory().unwrap();
