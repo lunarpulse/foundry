@@ -13,6 +13,7 @@ pub mod fake_noop;
 pub mod health;
 pub mod http;
 pub mod identity;
+pub mod serve_wiring;
 pub mod privacy;
 pub mod read_guard;
 pub mod scope;

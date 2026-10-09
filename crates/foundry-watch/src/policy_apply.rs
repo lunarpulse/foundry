@@ -151,11 +151,21 @@ impl PolicyApplicationLayer {
         if now > cmd.expires_at {
             return Err(ApplyError::Expired { at: now, expires: cmd.expires_at });
         }
-        // the proposal must be filed and Supported
+        // the proposal must be filed and Supported. Since T54w the
+        // canonical digest binds the COMPLETE content (diff, target,
+        // prediction, base version) — the apply layer accepts the
+        // canonical form (prop- prefixed) and, for compat, the old
+        // simple form.
         let supported = pipeline.proposals();
-        let found = supported
-            .iter()
-            .find(|r| Self::digest_of(&[&r.insight_id, &r.evidence.result_digest]) == cmd.proposal_digest);
+        let found = supported.iter().find(|r| {
+            let canonical = crate::command_binding::HardenedApply::command_digest_for(
+                pipeline,
+                &r.insight_id,
+                cmd.base_policy_version,
+            );
+            canonical.as_deref() == Some(cmd.proposal_digest.as_str())
+                || Self::digest_of(&[&r.insight_id, &r.evidence.result_digest]) == cmd.proposal_digest
+        });
         let record = found.ok_or_else(|| ApplyError::NoSuchSupportedProposal { digest: cmd.proposal_digest.clone() })?;
         let target = record.proposal.as_ref().unwrap().target.clone();
         let fields = record.proposal.as_ref().unwrap().changes.clone();
