@@ -1032,15 +1032,33 @@ async fn casting_cmd(
     };
 
     if let Some(profile_id) = run_profile {
-        // profile hash: deterministic mock profile (M3 dry scope)
-        let profile = foundry_watch::dry_die::CandidateProfile {
-            id: profile_id.clone(),
-            model_id: "mock/deterministic".into(),
-            prompt_template: "dep-bump-v1".into(),
-            tool_allowlist: vec!["cargo".into()],
-            env_allowlist: vec!["PATH".into()],
-            seed,
+        // M5.2 T60c: the profile is built through the WIRING layer —
+        // bundle-<digest> routes load a verified bundle (projection,
+        // consumption-verified); anything else is the legacy string
+        // path, journaled as such and non-promotable (astra B1).
+        use foundry_watch::casting_wiring::{classify_profile_arg, legacy_profile, profile_from_bundle, ProfileSource};
+
+        let (profile, route_record) = match classify_profile_arg(&profile_id) {
+            ProfileSource::Bundle { digest } => {
+                let store = foundry_watch::bundles::BundleStore::open(&cdir.join("bundles.db"));
+                match profile_from_bundle(&store, &digest, &format!("cast-{profile_id}-{seed}")) {
+                    Ok((p, rec)) => (p, rec),
+                    Err(e) => {
+                        eprintln!("✗ bundle route: {e:?} — only verified bundles run");
+                        return 1;
+                    }
+                }
+            }
+            ProfileSource::Legacy { raw } => {
+                let (p, rec) = legacy_profile(&raw, &format!("cast-{profile_id}-{seed}"), seed);
+                eprintln!(
+                    "⚠ legacy profile route (journaled, non-promotable): run_id={} route={} verified={}",
+                    rec.run_id, rec.route, rec.consumption_verified
+                );
+                (p, rec)
+            }
         };
+        let _ = &route_record.bundle_digest; // route choice observable on the record
         let policy = JudgingPolicy {
             max_cost_increase_frac: 0.10,
             primary_metrics: vec![

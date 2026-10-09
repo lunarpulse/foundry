@@ -175,7 +175,42 @@ pub struct BundleStore {
     tokens: BTreeMap<String, String>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct BundleStoreSnapshot {
+    by_digest: BTreeMap<String, CandidateBundle>,
+    tokens: BTreeMap<String, String>,
+}
+
 impl BundleStore {
+    /// T60c: durable bundle storage — the casting CLI loads bundles
+    /// from disk; a missing store is an EMPTY store (first use).
+    pub fn open(path: &std::path::Path) -> BundleStore {
+        match std::fs::read(path) {
+            Ok(bytes) => match serde_json::from_slice::<BundleStoreSnapshot>(&bytes) {
+                Ok(snap) => BundleStore { by_digest: snap.by_digest, tokens: snap.tokens },
+                Err(_) => BundleStore::default(),
+            },
+            Err(_) => BundleStore::default(),
+        }
+    }
+
+    pub fn save(&self, path: &std::path::Path) -> Result<(), BundleError> {
+        let snap = BundleStoreSnapshot {
+            by_digest: self.by_digest.clone(),
+            tokens: self.tokens.clone(),
+        };
+        let bytes = serde_json::to_vec(&snap).map_err(|e| BundleError::DigestDrift {
+            bundle_id: String::new(),
+            stored: format!("serialize store: {e}"),
+            recomputed: String::new(),
+        })?;
+        std::fs::write(path, bytes).map_err(|e| BundleError::DigestDrift {
+            bundle_id: String::new(),
+            stored: format!("write store: {e}"),
+            recomputed: String::new(),
+        })
+    }
+
     pub fn put(&mut self, b: CandidateBundle) -> String {
         let d = b.digest();
         self.by_digest.insert(d.clone(), b);
