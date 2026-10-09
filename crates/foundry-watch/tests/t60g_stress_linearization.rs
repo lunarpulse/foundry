@@ -171,6 +171,10 @@ fn l2_process_group_cancellation_durability() {
     // the real proof the kill LANDED.
     let _ = status;
     let _ = child.wait();
+    // the kill must have landed BEFORE completion: the done marker
+    // (written after the final committed pair) must be absent —
+    // otherwise this run proved nothing about cancellation (astra 3rd).
+    assert!(!dir.join("done").exists(), "child completed before the kill — run proved nothing");
 
     // durability contract holds after group cancellation
     let mut coord = foundry_watch::coordinator::GovernanceCoordinator::open(&db)
