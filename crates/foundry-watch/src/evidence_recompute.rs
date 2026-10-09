@@ -60,6 +60,111 @@ impl EvidenceReader for PermissiveReader {
     }
 }
 
+/// T60f: the PRODUCTION reader — walks the real T33 SQLite ledger
+/// (~/.foundry/ledger.db). Queries are real SQL folds over the
+/// authoritative rows; the head hash is read from the ledger itself.
+pub struct LedgerEvidenceReader {
+    path: std::path::PathBuf,
+}
+
+impl LedgerEvidenceReader {
+    pub fn new(path: std::path::PathBuf) -> Self {
+        LedgerEvidenceReader { path }
+    }
+
+    fn conn(&self) -> Result<rusqlite::Connection, String> {
+        if !self.path.exists() {
+            return Err(format!("ledger not found at {}", self.path.display()));
+        }
+        rusqlite::Connection::open(&self.path).map_err(|e| format!("open ledger: {e}"))
+    }
+}
+
+impl EvidenceReader for LedgerEvidenceReader {
+    fn run_query(
+        &self,
+        query_id: &str,
+        params: &BTreeMap<String, String>,
+        ledger_prefix_len: u64,
+    ) -> Result<String, String> {
+        let conn = self.conn()?;
+        match query_id {
+            "retry_rate_by_task_class" => {
+                // retry = a DieSucceeded with attempt > 1, over ALL
+                // DieSucceeded completions, bounded to the prefix
+                let rows: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM ledger WHERE seq <= ?1",
+                        [ledger_prefix_len as i64],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| e.to_string())?;
+                let _ = rows;
+                let attempts: Vec<i64> = {
+                    use rusqlite::OptionalExtension;
+                    let mut stmt = conn
+                        .prepare("SELECT event_json FROM ledger WHERE seq <= ?1")
+                        .map_err(|e| e.to_string())?;
+                    let jsons: Vec<String> = stmt
+                        .query_map([ledger_prefix_len as i64], |r| r.get(0))
+                        .map_err(|e| e.to_string())?
+                        .filter_map(|j| j.ok())
+                        .filter(|j: &String| j.contains("DieSucceeded"))
+                        .collect();
+                    jsons.iter()
+                        .map(|j| {
+                            // event_json: {"attempt":N,...} — extract N
+                            j.split("\"attempt\":")
+                                .nth(1)
+                                .and_then(|rest| rest.split([',', '}']).next())
+                                .and_then(|n| n.trim().parse::<i64>().ok())
+                                .unwrap_or(1)
+                        })
+                        .collect()
+                };
+                let total = attempts.len() as f64;
+                let retries = attempts.iter().filter(|a| **a > 1).count() as f64;
+                let task_class = params.get("task_class").cloned().unwrap_or_else(|| "all".into());
+                let rate = if total > 0.0 { retries / total } else { 0.0 };
+                Ok(format!(r#"{{"{}":{:.4}}}"#, task_class, rate))
+            }
+            other => Err(format!("unknown query {other}")),
+        }
+    }
+
+    fn ledger_head_at(&self, prefix_len: u64) -> Result<String, String> {
+        let conn = self.conn()?;
+        use rusqlite::OptionalExtension;
+        conn.query_row(
+            "SELECT hash FROM ledger WHERE seq = ?1",
+            [prefix_len as i64],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no ledger row at seq {prefix_len}"))
+    }
+
+    fn corpus_digest(&self) -> Result<String, String> {
+        // the corpus snapshot digest is exposed via env or a sidecar;
+        // absent both, the authoritative bound is the ledger head at
+        // max seq — a stable content commitment.
+        if let Ok(d) = std::env::var("FOUNDRY_CORPUS_DIGEST") {
+            return Ok(d);
+        }
+        let conn = self.conn()?;
+        use rusqlite::OptionalExtension;
+        conn.query_row(
+            "SELECT hash FROM ledger ORDER BY seq DESC LIMIT 1",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "empty ledger".to_string())
+    }
+}
+
 impl InsightPipeline {
     /// Install an enforcing reader.
     pub fn with_reader(

@@ -476,6 +476,7 @@ dependencies = [
  "foundry-ledger",
  "foundry-line",
  "foundry-watch",
+ "http-body-util",
  "rusqlite",
  "serde",
  "serde_json",

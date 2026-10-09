@@ -20,6 +20,9 @@ pub fn router(state: Arc<ServeState>) -> Router {
         .route("/api/orders/{id}/approve", post(crate::approve_v2::approve))
         .route("/api/audit/verify", get(crate::read_guard::verify_handler))
         .route("/api/status", get(status))
+        // M5.2 T60b: the production policy-application entry (N1
+        // ordering, N2 rebinding, session-resolved roles)
+        .route("/api/policy/apply", post(crate::policy_http::apply))
         // UI-0: single static board, no build step (plan T12)
         .route("/", get(board))
         .with_state(state)

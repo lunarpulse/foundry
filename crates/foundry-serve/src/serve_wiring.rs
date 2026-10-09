@@ -80,31 +80,60 @@ pub fn apply_policy_via_serve(
 
     // 3. BINDING (T54w): digest must equal the canonical digest of
     //    the filed content; field classification; base version.
-    HardenedApply::verify_binding(pipeline, cmd, layer.policy_version)?;
+    //    N2: the command is REBOUND to the authenticated principal —
+    //    the caller's approver string is never trusted as authority.
+    let mut cmd = cmd.clone();
+    cmd.approver = user.username.clone();
+    cmd.role = Role::Owner; // derived from the session lookup above
+    HardenedApply::verify_binding(pipeline, &cmd, layer.policy_version)?;
 
-    // 4. APPLY (T50b): owner authority, single-use, expiry.
-    let applied = layer.apply(cmd, pipeline, &foundry_watch::evaluation_protocol::frozen_policy_graph(), proposer, now)?;
+    // 4. DURABLE INTENT FIRST (N1): the Pending intent MUST be on the
+    //    journal BEFORE any effect. If this append fails, apply is
+    //    never attempted — no effect-without-intent can exist.
+    let at = chrono::Utc::now().to_rfc3339(); // N5: server clock, not a constant
+    coordinator.append(GovernanceEvent {
+        schema_version: 1,
+        seq: 0,
+        op: foundry_watch::governance_events::OpKind::PolicyApplication,
+        phase: foundry_watch::governance_events::Phase::Pending,
+        op_id: format!("serve:{}", cmd.op_id),
+        payload_digest: cmd.proposal_digest.clone(),
+        actor: format!("serve:{}", user.username),
+        at: at.clone(),
+    })?;
 
-    // 5. DURABILITY (T52w): the activation pair rides the single
-    //    journal — appended through the coordinator, seq assigned by
-    //    the database.
-    for phase_use in ["pending", "committed"] {
-        let ev = GovernanceEvent {
-            schema_version: 1,
-            seq: 0,
-            op: foundry_watch::governance_events::OpKind::PolicyApplication,
-            phase: if phase_use == "pending" {
-                foundry_watch::governance_events::Phase::Pending
-            } else {
-                foundry_watch::governance_events::Phase::Committed
-            },
-            op_id: format!("serve:{}", cmd.op_id),
-            payload_digest: cmd.proposal_digest.clone(),
-            actor: format!("serve:{}", user.username),
-            at: "2026-10-08T00:00:00Z".into(),
-        };
-        coordinator.append(ev)?;
-    }
+    // 5. APPLY (T50b): owner authority, single-use, expiry.
+    let applied = match layer.apply(&cmd, pipeline, &foundry_watch::evaluation_protocol::frozen_policy_graph(), proposer, now) {
+        Ok(a) => a,
+        Err(e) => {
+            // the intent is durable but the effect failed: journal the
+            // ABORT so recovery never auto-retries (PolicyApplication
+            // is AbortAndSurface — T49a).
+            let _ = coordinator.append(GovernanceEvent {
+                schema_version: 1,
+                seq: 0,
+                op: foundry_watch::governance_events::OpKind::PolicyApplication,
+                phase: foundry_watch::governance_events::Phase::Aborted,
+                op_id: format!("serve:{}", cmd.op_id),
+                payload_digest: cmd.proposal_digest.clone(),
+                actor: format!("serve:{}", user.username),
+                at,
+            });
+            return Err(e.into());
+        }
+    };
+
+    // 6. EFFECT COMMITTED: the Committed record closes the pair.
+    coordinator.append(GovernanceEvent {
+        schema_version: 1,
+        seq: 0,
+        op: foundry_watch::governance_events::OpKind::PolicyApplication,
+        phase: foundry_watch::governance_events::Phase::Committed,
+        op_id: format!("serve:{}", cmd.op_id),
+        payload_digest: cmd.proposal_digest.clone(),
+        actor: format!("serve:{}", user.username),
+        at: at.clone(),
+    })?;
 
     Ok(format!(
         "applied target={} fields={} policy_version={}",
@@ -316,5 +345,59 @@ mod tests {
             "fail-closed either way, got: {err:?}"
         );
         assert_eq!(coord.head().unwrap().1, 2, "only the FIRST activation is journaled");
+    }
+
+    #[test]
+    fn n1_intent_precedes_effect_in_the_journal() {
+        let (mut id, tok) = identity_with_owner();
+        let p = pipeline();
+        let mut layer = PolicyApplicationLayer::new();
+        let mut coord = GovernanceCoordinator::open_in_memory().unwrap();
+        let d = HardenedApply::command_digest_for(&p, "I1", 0).unwrap();
+        apply_policy_via_serve(&mut id, &p, &mut layer, &mut coord, &tok, &owner_cmd(d), "a", 10).unwrap();
+        let stream = coord.replay().unwrap();
+        assert_eq!(stream.len(), 2);
+        // seq order: Pending BEFORE Committed — write-ahead governance
+        assert!(matches!(stream[0].phase, foundry_watch::governance_events::Phase::Pending));
+        assert!(matches!(stream[1].phase, foundry_watch::governance_events::Phase::Committed));
+        assert_eq!(stream[0].seq, 1);
+        assert_eq!(stream[1].seq, 2);
+        // timestamps are server-clock (not a shared constant)
+        assert!(!stream[0].at.starts_with("2026-10-08T00:00:00"), "N5: real event time, got {}", stream[0].at);
+    }
+
+    #[test]
+    fn n2_approver_is_rebound_to_the_session_principal() {
+        let (mut id, tok) = identity_with_owner();
+        let p = pipeline();
+        let mut layer = PolicyApplicationLayer::new();
+        let mut coord = GovernanceCoordinator::open_in_memory().unwrap();
+        let d = HardenedApply::command_digest_for(&p, "I1", 0).unwrap();
+        let mut cmd = owner_cmd(d);
+        cmd.approver = "someone-else".into(); // forged approver string
+        apply_policy_via_serve(&mut id, &p, &mut layer, &mut coord, &tok, &cmd, "a", 10).unwrap();
+        // the journal records the SESSION user, not the forged string
+        let stream = coord.replay().unwrap();
+        assert!(stream.iter().all(|e| e.actor.contains("owner-1")), "actor is the session principal");
+    }
+
+    #[test]
+    fn n1_failed_apply_journals_abort_not_pending() {
+        // expiry in the past -> apply fails -> the durable record must
+        // be Pending+Aborted (never a dangling Pending, never silent)
+        let (mut id, tok) = identity_with_owner();
+        let p = pipeline();
+        let mut layer = PolicyApplicationLayer::new();
+        let mut coord = GovernanceCoordinator::open_in_memory().unwrap();
+        let d = HardenedApply::command_digest_for(&p, "I1", 0).unwrap();
+        let mut cmd = owner_cmd(d);
+        cmd.expires_at = 1; // expired
+        let _ = apply_policy_via_serve(&mut id, &p, &mut layer, &mut coord, &tok, &cmd, "a", 10);
+        let stream = coord.replay().unwrap();
+        assert_eq!(stream.len(), 2, "Pending + Aborted pair");
+        assert!(matches!(stream[1].phase, foundry_watch::governance_events::Phase::Aborted),
+            "failed effect closes the pair with Aborted — recovery never auto-retries");
+        let rs = coord.restart_state().unwrap();
+        assert!(rs.clean, "no dangling pending after the abort");
     }
 }

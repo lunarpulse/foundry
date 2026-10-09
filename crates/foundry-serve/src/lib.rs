@@ -13,6 +13,7 @@ pub mod fake_noop;
 pub mod health;
 pub mod http;
 pub mod identity;
+pub mod policy_http;
 pub mod serve_wiring;
 pub mod privacy;
 pub mod read_guard;
@@ -131,6 +132,10 @@ pub struct ServeState {
     /// Fake harness — serve never executes Dies; it only records human
     /// decisions on already-executed orders.
     pub line: Arc<AppLine>,
+    /// M5.2 T60b: the governance half — pipeline, apply layer,
+    /// durable coordinator. ONE instance; the /api/policy/apply
+    /// handler is the only production borrower.
+    pub policy: policy_http::PolicyState,
 }
 
 impl ServeState {
@@ -156,11 +161,37 @@ impl ServeState {
             },
         )
         .map_err(|e| format!("scope open: {e}"))?;
+        // M5.2 T60f: the pipeline is constructed WITH a real ledger
+        // reader — production ingestion cannot be permissive.
+        let pipeline = foundry_watch::retro::InsightPipeline::with_reader(
+            foundry_watch::retro::QueryCatalog::frozen_v1(),
+            foundry_watch::evaluation_protocol::frozen_policy_graph(),
+            std::sync::Arc::new(foundry_watch::evidence_recompute::LedgerEvidenceReader::new(
+                std::path::PathBuf::from(
+                    std::env::var("FOUNDRY_LEDGER").unwrap_or_else(|_| "~/.foundry/ledger.db".into()),
+                ),
+            )),
+        );
+        let gov_path = std::env::var("FOUNDRY_GOVERNANCE_DB")
+            .unwrap_or_else(|_| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+                format!("{home}/.foundry/governance.db")
+            });
+        let coordinator = foundry_watch::coordinator::GovernanceCoordinator::open(
+            std::path::Path::new(&gov_path),
+        )
+        .map_err(|e| format!("open governance journal: {e:?}"))?;
         Ok(Self {
             ledger: Arc::new(ledger),
             identity: tokio::sync::Mutex::new(ident),
             scope: tokio::sync::Mutex::new(scope_store),
             line: Arc::new(line),
+            policy: policy_http::PolicyState {
+                pipeline,
+                layer: tokio::sync::Mutex::new(foundry_watch::policy_apply::PolicyApplicationLayer::new()),
+                coordinator: tokio::sync::Mutex::new(coordinator),
+                proposer: "serve".into(),
+            },
         })
     }
 
