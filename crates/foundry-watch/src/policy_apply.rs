@@ -119,7 +119,7 @@ impl PolicyApplicationLayer {
         });
     }
 
-    fn digest_of(parts: &[&str]) -> String {
+    pub fn digest_of(parts: &[&str]) -> String {
         let mut h = Sha256::new();
         for p in parts {
             h.update(&(p.len() as u64).to_be_bytes());
