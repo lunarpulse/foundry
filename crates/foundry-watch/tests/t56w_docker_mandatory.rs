@@ -87,8 +87,15 @@ fn runtime_boundary_mandatory() {
     assert!(argv.windows(2).any(|w| w[0] == "--security-opt" && w[1] == "no-new-privileges"));
     assert!(argv.windows(2).any(|w| w[0] == "--network" && w[1] == NET), "the ONLY network is the internal proxy net");
     // full-spelling enforcement: no short/alternate forms anywhere
-    for bad in ["-v", "--volume", "-it", "-i", "-t", "--privileged", "--pid=host", "--network=host"] {
+    for bad in ["-v", "--volume", "--mount", "-it", "-i", "-t", "--privileged", "--pid=host", "--network=host"] {
         assert!(!argv.contains(&bad.to_string()), "forbidden flag {bad} in derived argv: {argv:?}");
+    }
+    // attached spellings: -v/path:/path and --volume=/path:/path and
+    // --mount=... must not appear as PREFIXES of any token either
+    for tok in &argv {
+        for pfx in ["-v/", "--volume=", "--mount="] {
+            assert!(!tok.starts_with(pfx), "attached mount spelling {tok} forbidden: {argv:?}");
+        }
     }
     // non-root user in the derived argv
     assert!(
@@ -99,33 +106,71 @@ fn runtime_boundary_mandatory() {
     let spec = foundry_watch::model_proxy::cast_container_spec(IMG, NET);
     assert!(!spec.env_passthrough.iter().any(|e| e.contains("KEY") || e.contains("TOKEN")));
 
-    // --- R1: external egress refused (derived argv)
+    // --- R1: external egress refused (derived argv).
+    // N3: a FAILED probe run must FAIL the test, not pass it via an
+    // empty string. Require the probe to have EXECUTED (an rc= line
+    // exists) and then require the non-zero exit.
     let egress_out = run_derived(
         "t56w-r1",
-        &["sh", "-c", "wget -q -T 3 -O /dev/null http://93.184.216.34/ 2>&1; echo rc=$?"],
+        &["sh", "-c", "wget -q -T 3 -O /dev/null http://93.184.216.34/ 2>&1; echo rc=$?; echo probe-done"],
     )
-    .unwrap_or_default();
+    .expect("R1 probe must execute — a docker failure is a test failure, not a pass");
+    assert!(egress_out.contains("probe-done"), "probe output identifiable: {egress_out}");
     assert!(
-        !egress_out.trim().ends_with("rc=0"),
+        !egress_out.lines().any(|l| l.trim() == "rc=0"),
         "external egress must fail on the internal proxy network, got: {egress_out}"
     );
 
-    // --- R2: credential files invisible (derived argv)
+    // --- R2: credential files invisible (derived argv) — same rule:
+    // execution is mandatory, absence of output is not evidence.
     let creds_out = run_derived(
         "t56w-r2",
-        &["sh", "-c", "find / -maxdepth 3 \\( -name gh_token -o -name die.env -o -name notifier.env \\) 2>/dev/null | head -3; id"],
+        &["sh", "-c", "find / -maxdepth 3 \\( -name gh_token -o -name die.env -o -name notifier.env \\) 2>/dev/null | head -3; id; echo probe-done"],
     )
-    .unwrap_or_default();
+    .expect("R2 probe must execute");
+    assert!(creds_out.contains("probe-done"), "probe output identifiable: {creds_out}");
     assert!(
         !creds_out.contains("gh_token") && !creds_out.contains("die.env") && !creds_out.contains("notifier.env"),
         "credentials must not be visible inside the cast container: {creds_out}"
     );
     assert!(creds_out.contains("uid=65534"), "live container runs as nobody: {creds_out}");
 
-    // --- R3: read-only rootfs (derived argv already carries --read-only)
-    let write_out = run_derived("t56w-r3", &["sh", "-c", "echo x > /probe 2>&1; echo rc=$?"])
-        .unwrap_or_default();
-    assert!(!write_out.trim().ends_with("rc=0"), "rootfs write must fail, got: {write_out}");
+    // --- R3: read-only rootfs. Distinguish the INTENDED denial from
+    // unrelated failures: uid 65534 could lack write permission
+    // independently of --read-only. Control run WITHOUT --read-only
+    // as the SAME nobody user: if the control write SUCCEEDS, the
+    // denial in the hardened run is attributable to --read-only.
+    let write_out = run_derived(
+        "t56w-r3",
+        &["sh", "-c", "exec 2>&1; echo x > /probe; rc=$?; echo rc=$rc; echo probe-done"],
+    )
+    .expect("R3 hardened probe must execute");
+    assert!(write_out.contains("probe-done"), "probe output identifiable: {write_out}");
+    assert!(
+        !write_out.lines().any(|l| l.trim() == "rc=0"),
+        "rootfs write must fail in the hardened run: {write_out}"
+    );
+    assert!(
+        write_out.to_lowercase().contains("read-only") || write_out.contains("EROFS"),
+        "the denial must be the READ-ONLY filesystem error, got: {write_out}"
+    );
+    // control: same user, NO --read-only -> the write SUCCEEDS
+    let spec_ctl = foundry_watch::model_proxy::CastContainerSpec {
+        image: IMG.to_string(),
+        networks: vec![NET.to_string()],
+        mounts: vec![],
+        read_only_rootfs: false,
+        capabilities_drop_all: true,
+        env_passthrough: spec.env_passthrough.clone(),
+    };
+    let mut argv_ctl = foundry_watch::model_proxy::docker_argv(&spec_ctl, "t56w-r3ctl");
+    argv_ctl.extend(["sh".to_string(), "-c".to_string(), "echo x > /tmp/probe-ctl 2>&1; echo rc=$?; echo probe-done".to_string()]);
+    let refs: Vec<&str> = argv_ctl.iter().map(|s| s.as_str()).collect();
+    let ctl_out = docker(&refs).expect("R3 control probe must execute");
+    assert!(
+        ctl_out.lines().any(|l| l.trim() == "rc=0"),
+        "control write (same uid, no --read-only) must SUCCEED — otherwise the hardened denial proves nothing: {ctl_out}"
+    );
 
     // --- R4: hardening + user LIVE in HostConfig (derived argv, daemon-run)
     let inspect = {
