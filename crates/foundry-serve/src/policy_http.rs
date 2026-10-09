@@ -27,7 +27,7 @@ use std::sync::Arc;
 /// T60f), the apply layer, and the durable coordinator. Constructed
 /// at server startup — handlers only borrow it.
 pub struct PolicyState {
-    pub pipeline: InsightPipeline,
+    pub pipeline: tokio::sync::Mutex<InsightPipeline>,
     pub layer: tokio::sync::Mutex<PolicyApplicationLayer>,
     pub coordinator: tokio::sync::Mutex<foundry_watch::coordinator::GovernanceCoordinator>,
     pub proposer: String,
@@ -57,7 +57,7 @@ pub async fn apply(
         .unwrap_or(0);
     match apply_policy_via_serve(
         &mut identity,
-        &st.policy.pipeline,
+        &mut *st.policy.pipeline.lock().await,
         &mut layer,
         &mut coord,
         &token,

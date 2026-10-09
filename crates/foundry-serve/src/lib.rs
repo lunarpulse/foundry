@@ -187,7 +187,7 @@ impl ServeState {
             scope: tokio::sync::Mutex::new(scope_store),
             line: Arc::new(line),
             policy: policy_http::PolicyState {
-                pipeline,
+                pipeline: tokio::sync::Mutex::new(pipeline),
                 layer: tokio::sync::Mutex::new(foundry_watch::policy_apply::PolicyApplicationLayer::new()),
                 coordinator: tokio::sync::Mutex::new(coordinator),
                 proposer: "serve".into(),
