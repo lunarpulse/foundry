@@ -18,6 +18,7 @@ pub mod budget_accounting;
 pub mod bundles;
 pub mod model_proxy;
 pub mod policy_apply;
+pub mod evidence_recompute;
 pub mod evaluation_protocol;
 pub mod command_binding;
 pub mod coordinator;

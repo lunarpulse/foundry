@@ -125,6 +125,11 @@ pub enum InsightError {
     ProtectedTarget { target: String, detail: String },
     /// free text claiming to be an insight without an envelope
     NoEvidence,
+    /// T55w: independent recomputation against the trusted source
+    ResultMismatch { claimed: String, recomputed: String },
+    LedgerHeadMismatch { claimed: String, authoritative: String },
+    CorpusMismatch { claimed: String, authoritative: String },
+    RecomputeRefused { detail: String },
     /// prediction not falsifiable (no metric, no direction, no window)
     UnfalsifiablePrediction,
 }
@@ -181,11 +186,14 @@ pub struct InsightPipeline {
     pub catalog: QueryCatalog,
     pub policy_graph: PolicyGraph,
     insights: Vec<InsightRecord>,
+    /// T55w trusted-source reader; None = unit scope (self-
+    /// consistency only). Production ingestion installs one.
+    pub(crate) reader: Option<std::sync::Arc<dyn crate::evidence_recompute::EvidenceReader + Send + Sync>>,
 }
 
 impl InsightPipeline {
     pub fn new(catalog: QueryCatalog, policy_graph: PolicyGraph) -> Self {
-        InsightPipeline { catalog, policy_graph, insights: Vec::new() }
+        InsightPipeline { catalog, policy_graph, insights: Vec::new(), reader: None }
     }
 
     /// Ingest an insight. Every C-R1/C-E1 gate fires HERE, before the
@@ -198,6 +206,10 @@ impl InsightPipeline {
                 got: rec.evidence.result_digest.clone(),
             });
         }
+        // 1b. T55w: when a trusted reader is installed, the evidence
+        // must also match the AUTHORITATIVE source — self-consistent
+        // fabrications fail here.
+        self.recompute_evidence_pub(&rec.evidence)?;
         // 2. the query must be in the finite catalog — arbitrary
         //    analysis code never enters through the evidence door
         let min_n = match self.catalog.get(&rec.evidence.query_id) {
@@ -236,6 +248,11 @@ impl InsightPipeline {
         }
         self.insights.push(rec);
         Ok(())
+    }
+
+    /// internal wrapper for ingestion (shared with T55w extension)
+    fn recompute_evidence_pub(&self, e: &EvidenceEnvelope) -> Result<(), InsightError> {
+        crate::evidence_recompute::recompute_with(self, e)
     }
 
     /// Proposal-only output: what the owner path (T50b) may review.
