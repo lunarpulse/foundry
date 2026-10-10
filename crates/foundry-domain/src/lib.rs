@@ -4,6 +4,7 @@ pub mod inspector;
 pub mod order;
 pub mod ports;
 pub mod workdir;
+pub mod workflow_encoding;
 
 pub use order::{ExternalRef, Order, OrderEvent, OrderState, Source, TransitionError};
 pub use ports::{

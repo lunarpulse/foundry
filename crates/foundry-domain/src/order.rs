@@ -210,6 +210,16 @@ impl Order {
         self.attempt
     }
 
+    /// Test/proof helper (T51a): place the order in an arbitrary
+    /// state/attempt WITHOUT walking legal transitions — the encoding
+    /// proofs enumerate (state × event) pairs and need a base camp.
+    /// Never used by production paths (grep-verified by review).
+    #[cfg(any(test, feature = "proof-fixture"))]
+    pub fn force_state_for_test(&mut self, state: OrderState, attempt: u32) {
+        self.state = state;
+        self.attempt = attempt;
+    }
+
     /// Apply an event. Returns Err and leaves state untouched on any illegal
     /// transition. `event_attempt` is the attempt number the caller believes
     /// this Order is on (0 for lifecycle events before first Die).
