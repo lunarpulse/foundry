@@ -390,6 +390,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "foundry-approval"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "foundry-domain",
+ "rusqlite",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "foundry-blueprint"
 version = "0.1.0"
 dependencies = [
