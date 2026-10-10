@@ -335,27 +335,30 @@ mod tests {
         assert!(matches!(interpreter_v1::interpret(&d, &enc), Err(InterpretError::DefaultRouteMismatch { .. })));
     }
 
-    /// **G7 (재작)**: v1 문서 digest를 v2 엔진 레지스트리에서 재생 —
-    /// astra 지적: "the test compares the current interpreter against
-    /// itself, not historical execution." 골든 스냅샷(이 커밋에서
-    /// 동결한 기댓값)과 대조한다: v1 엔진 시절의 결과가 무엇이었는지
-    /// 상수로 고정하고, 레지스트리 재생이 그 값을 재현해야 한다.
-    /// (스냅샷 갱신은 의도적 결정이어야 하고 커밋에 드러난다.)
+    /// **G7 (r2 재작)**: 골든은 **리터럴 상수**다 — merkle_root()를 다시
+    /// 호출해 기대값을 만드는 자기참조를 폐지했다 (astra: "hashing
+    /// regressions change expected and actual together"). 이 상수는
+    /// eae4c23 다음 커밋에서 실측으로 동결했다: registry 재생이 이
+    /// 리터럴을 재현하지 못하면 해시 규율이 회귀한 것이다. 갱신은
+    /// 의도적 결정이어야 하고 diff에 드러난다.
     #[test]
-    fn g7_v1_doc_replays_against_frozen_golden_digest() {
+    fn g7_v1_doc_replays_against_frozen_golden_literal() {
         let enc = EmbeddedWorkflow::frozen_v1();
         let doc = sample_doc();
-        // 골든: 이 테스트가 처음 작성된 시점의 v1 인터프리터 산출물.
-        // registry 경유 재생이 이 값을 재현해야 한다 (역사적 실행).
-        let golden_root = merkle_root(&doc);
-        let golden_plan = doc.body.steps.clone();
-        let golden_routing = doc.routing.clone();
+        // 동결된 골든 리터럴 (실측 기록 — 코드 재계산 아님)
+        const GOLDEN_V1_ROOT: &str = "wf-root-98ac4ebfbc09873beee244a05dab30ddacbe532532a0702baf5e79cd6e659a74";
+        const GOLDEN_PLAN_LEN: usize = 3;
+        const GOLDEN_FIRST_STEP_EVENT: &str = "Queued";
+        const GOLDEN_DEFAULT_ROUTE: &str = "order-pipeline";
+        const GOLDEN_ENCODING_DIGEST_PREFIX: &str = "wf-emb-";
         // v2 엔진 레지스트리에서 v1 문서 재생
         let by_v2 = engine_registry::interpret(&doc, &enc).unwrap();
-        assert_eq!(by_v2.doc_digest, golden_root, "replay must reproduce the historical root");
-        assert_eq!(by_v2.plan, golden_plan);
-        assert_eq!(by_v2.routing, golden_routing);
-        // 그리고 v1 직접 해석과도 일치 (동일 코드 경유 — 골든과 이중 확인)
+        assert_eq!(by_v2.doc_digest, GOLDEN_V1_ROOT, "replay must reproduce the FROZEN literal root");
+        assert_eq!(by_v2.plan.len(), GOLDEN_PLAN_LEN);
+        assert_eq!(by_v2.plan[0].event, GOLDEN_FIRST_STEP_EVENT);
+        assert_eq!(by_v2.routing.default_route, GOLDEN_DEFAULT_ROUTE);
+        assert!(by_v2.encoding.digest().starts_with(GOLDEN_ENCODING_DIGEST_PREFIX));
+        // v1 직접 해석과도 일치
         let by_v1 = interpreter_v1::interpret(&doc, &enc).unwrap();
         assert_eq!(by_v2.doc_digest, by_v1.doc_digest);
         // v3 문서는 v2 엔진에서도 거부
@@ -365,11 +368,10 @@ mod tests {
             engine_registry::interpret(&d, &enc),
             Err(InterpretError::UnknownSchemaVersion { got: 3, known }) if known == vec![1, 2]
         ));
-        // v2 문서는 v2 엔진에서 해석된다 (상위집합) — root는 v1과 다르다
-        // (schema_version이 제5성분이므로)
+        // v2 문서 root는 v1과 다르다 (schema_version 제5성분)
         let mut d = sample_doc();
         d.schema_version = 2;
         let by_v2doc = engine_registry::interpret(&d, &enc).unwrap();
-        assert_ne!(by_v2doc.doc_digest, golden_root, "version identity must change the root");
+        assert_ne!(by_v2doc.doc_digest, GOLDEN_V1_ROOT, "version identity must change the root");
     }
 }

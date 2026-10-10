@@ -103,9 +103,10 @@ pub struct WorkflowEngine {
     ops: u64,
     /// G5: 실행별 결속 digest (획득 시점의 문서 Merkle root).
     exec_bindings: HashMap<ExecId, String>,
-    /// G5: 엔진이 서비스 중인 활성 문서 root (None = 미설정 — 결속 검사 없음,
-    /// v1 호환. 문서 축이 연결되면 항상 설정된다).
+    /// G5: 엔진이 서비스 중인 활성 문서 root.
     active_root: Option<String>,
+    /// B2: 예산 소진 래치 — 한 번 정지한 실행은 재디스패치 불가.
+    exhausted: std::collections::HashSet<ExecId>,
 }
 
 impl WorkflowEngine {
@@ -121,6 +122,7 @@ impl WorkflowEngine {
             ops: 0,
             exec_bindings: HashMap::new(),
             active_root: None,
+            exhausted: Default::default(),
         }
     }
 
@@ -236,6 +238,17 @@ impl WorkflowEngine {
         // 교체로 root가 바뀌어도 진행 중 실행은 옛 root를 고수하거나
         // 명시적으로 거부된다 (혼합 없음).
         let active_root_now = self.active_root.clone();
+        // astra r2 MAJOR: unbound executions bypass root changes — on an
+        // engine with an active root, dispatch REQUIRES a binding.
+        if let Some(active) = &active_root_now {
+            if !self.exec_bindings.contains_key(exec_id) {
+                return Err(EngineError::EncodingDrift {
+                    detail: format!(
+                        "exec {exec_id} has NO root binding — dispatch refused while active root {active} is set (G5 mandatory)"
+                    ),
+                });
+            }
+        }
         if let Some(bound) = self.exec_bindings.get(exec_id).cloned() {
             if let Some(active) = &active_root_now {
                 if &bound != active {
@@ -259,14 +272,24 @@ impl WorkflowEngine {
                 detail: format!("order {order_id} not enrolled"),
             })?;
         // B2: 예산 — 노드 실행만 계수 (wf.lock_* 생명주기 관측은 제외:
-        // B2: 예산 — 노드 실행만 계수 (wf.lock_* 생명주기 관측은 제외:
-        // 잠금 획득이 예산을 소모하지 않는다).
+        // B2: 예산 — 노드 실행만 계수 (wf.lock_* 생명주기 관측은 제외).
+        // astra r2 MAJOR: exhaustion LATCHES — repeated dispatches return
+        // the same error without appending more stop records (the old
+        // code double-counted prior BudgetStopped rows as steps and
+        // appended a new stop record each time).
+        if self.exhausted.contains(exec_id) {
+            return Err(EngineError::BudgetExhausted {
+                exec_id: exec_id.into(),
+                steps: self.budget.max_steps,
+                cap: self.budget.max_steps,
+            });
+        }
         let steps = self.observations.iter().filter(|o| {
             &o.exec_id == exec_id && !o.event_family.starts_with("wf.lock_")
         }).count() as u32;
         if steps >= self.budget.max_steps {
-            let obs = self.observe(exec_id, event, from, None, "-", Outcome::BudgetStopped);
-            let _ = obs;
+            self.exhausted.insert(exec_id.into());
+            let _ = self.observe(exec_id, event, from, None, "-", Outcome::BudgetStopped);
             return Err(EngineError::BudgetExhausted {
                 exec_id: exec_id.into(),
                 steps,
@@ -327,8 +350,11 @@ impl WorkflowEngine {
                 }
             }
         };
-        // 도메인 승인 — 유일한 런타임 권위
+        // 도메인 승인 — 유일한 런타임 권위. astra r2 MAJOR(atomicity):
+        // 드리프트 거부가 살아있는 주문을 진행시켜선 안 된다 — 전이 전
+        // 스냅샷으로 원자적 되돌림.
         let order = self.orders.get_mut(order_id).unwrap();
+        let snapshot = order.clone();
         let before = order.attempt();
         match order.transition(event.clone(), event_attempt) {
             Ok(to) => {
@@ -348,11 +374,17 @@ impl WorkflowEngine {
                     EdgeTarget::BackEdge { to: t, .. } => *t == to && order.attempt() == before + 1,
                 };
                 if !edge_dest_ok {
+                    // 원자적 되돌림 + 관측 기록 후 정지 (래치).
+                    // 가변 대여 정리 후 observe (E0499 회피 구조).
+                    *order = snapshot;
+                    let after = order.attempt();
+                    let edge_repr = format!("{:?}", &edge.to);
+                    drop(order);
+                    self.exhausted.insert(exec_id.into());
+                    let _ = self.observe(exec_id, event, from, None, guard_name(&edge.guard).as_str(), Outcome::Refused { detail: "encoding drift: destination mismatch (exec latched)".into() });
                     return Err(EngineError::EncodingDrift {
                         detail: format!(
-                            "domain reached {to:?} (attempt {before}->{}) but edge says {:?} — E1/E2 destination violated",
-                            order.attempt(),
-                            &edge.to
+                            "domain reached {to:?} (attempt {before}->{after}) but edge says {edge_repr} — E1/E2 destination violated (order ROLLED BACK, exec latched)"
                         ),
                     });
                 }
@@ -563,10 +595,12 @@ mod tests {
             other => panic!("in-flight exec must be refused on digest change, got {other:?}"),
         };
         assert!(detail.contains("refuse to mix"));
-        // 미결속 실행은 새 digest로 자유롭게 시작 가능 (새 실행 = 새 root)
-        e.acquire("o1", "ex2").is_err(); // 잠금은 여전히 ex가…
+        // 새 실행도 결속 없이는 시작 불가 (r2 MAJOR: unbound bypass 폐쇄)
+        let _ = e.acquire("o1", "ex2").is_err();
         assert!(e.release("o1", "ex"));
         e.acquire("o1", "ex2").unwrap();
+        assert!(e.dispatch("o1", "ex2", &OrderEvent::DieStarted, 1).is_err(), "unbound dispatch must be refused");
+        e.bind_root("ex2", "wf-root-changed").unwrap();
         assert_eq!(e.dispatch("o1", "ex2", &OrderEvent::DieStarted, 1).unwrap(), Outcome::Applied);
     }
 
