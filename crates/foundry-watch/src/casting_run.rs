@@ -32,6 +32,13 @@ pub async fn run_casting(
     sandbox_root: &Path,
     candidate_dir: &Path,
     journal: &foundry_ledger::casting_journal::CastingLedger,
+    // M5.2 (astra 5th, HIGH): the EXECUTED profile — the very
+    // CandidateProfile whose hash the run records. Previously this
+    // function reconstructed a hardcoded profile from run.seed,
+    // so a bundle-verified seed 7 could execute as CLI seed 0
+    // while recording the hash for 7. The verified profile is now
+    // CARRIED through execution.
+    executed_profile: crate::dry_die::CandidateProfile,
 ) -> Result<CastingOutcome, String> {
     // gate: base SHA (review #1) — refuse before any execution
     let corpus = CorpusManifest::load_all(corpus_dir).map_err(|e| e.to_string())?;
@@ -73,16 +80,10 @@ pub async fn run_casting(
             skipped += 1;
             continue;
         }
-        // execute candidate in sandbox (T23)
-        let profile = crate::dry_die::CandidateProfile {
-            id: run.candidate_profile_id.clone(),
-            model_id: "mock/deterministic".into(),
-            prompt_template: "dep-bump-v1".into(),
-            tool_allowlist: vec!["cargo".into()],
-            env_allowlist: vec!["PATH".into()],
-            seed: run.seed,
-        };
-        let die = DryDie::new(profile, sandbox_root);
+        // execute candidate in sandbox (T23) — the profile verified at
+        // load time IS the profile executed (astra 5th round: hash/seed
+        // must describe the same thing that ran)
+        let die = DryDie::new(executed_profile.clone(), sandbox_root);
         let order = foundry_domain::Order::new(
             m.order_id.clone(),
             foundry_domain::ExternalRef::cron("casting", "casting"),

@@ -1125,6 +1125,7 @@ async fn casting_cmd(
             &cdir.join("sandbox"),
             &cdir.join("candidate"),
             &journal,
+            profile, // the verified profile IS what executes (astra 5th)
         )
         .await
         {

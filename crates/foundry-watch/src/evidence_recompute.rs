@@ -117,12 +117,16 @@ impl EvidenceReader for LedgerEvidenceReader {
                 let attempts: Vec<i64> = raw
                     .iter()
                     .filter_map(|(ev, js)| {
-                        let hay: String = if ev.contains("DieSucceeded") {
+                        // canonical JSON emits "type":"die_succeeded"
+                        // (snake_case tag) — accept BOTH spellings
+                        // (astra 5th round MEDIUM: the fallback shape)
+                        let hit = |h: &str| h.contains("DieSucceeded") || h.contains("die_succeeded");
+                        let hay: String = if hit(ev) {
                             ev.clone()
                         } else {
                             js.clone().unwrap_or_default()
                         };
-                        if !hay.contains("DieSucceeded") {
+                        if !hit(&hay) {
                             return None;
                         }
                         // 'DieSucceeded { attempt: N }' or {"attempt":N,...}
