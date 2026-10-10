@@ -115,6 +115,30 @@ impl SqliteLedger {
         Ok(true)
     }
 
+    /// (T56 r4) rows[..=idx] 접두사를 재해시해 마지막 행의 기대 해시 산출 —
+    /// 커서 결속에서 저장 해시 보존형 페이로드 변조 감지용.
+    pub fn row_hash_at(rows: &[LedgerRow]) -> Option<String> {
+        let last = rows.last()?;
+        let expect = match crate::event_json::row_version(last) {
+            1 => entry_hash(
+                last.seq, &last.order_id, &last.from_state, &last.to_state,
+                &last.event, &last.actor, &last.intent, &last.at, &last.prev_hash,
+            ),
+            _ => {
+                let v1_payload = format!(
+                    "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                    last.seq, last.order_id, last.from_state, last.to_state,
+                    last.event, last.actor, last.intent, last.at, last.prev_hash
+                );
+                let json = last.event_json.as_deref().unwrap_or("");
+                let payload = crate::event_json::v2_hash_payload(&v1_payload, json);
+                use sha2::{Digest, Sha256};
+                hex::encode(sha2::Sha256::digest(payload.as_bytes()))
+            }
+        };
+        Some(expect)
+    }
+
     /// Verify a row slice's chain (T56 cursor issuance) — same algorithm
     /// as verify_chain but over caller-provided rows (prefix re-verification).
     pub fn verify_rows(rows: &[LedgerRow]) -> bool {

@@ -146,13 +146,13 @@ impl WorkflowEngine {
         self.clock_steps = 0;
     }
 
-    /// **P1b + astra T56 BLOCKER 폐쇄**: 커서 소유 재생 — 유일한 공개 재생
-    /// 입구. 재생은 **인증된 저널 행만** 발화한다: 커서가 가리키는 행을
-    /// 저널에서 찾아 (i)row_digest 일치 (ii)행의 이벤트 == 재생하려는 이벤트
-    /// 를 대조한다. 위조 커서·타행 커서·행 없는 커서·"커서는 유효하지만
-    /// 다른 이벤트를 발화" 전부 EncodingDrift — 재생 경로로 승인 이벤트를
-    /// 무인가 발화하는 것은 구조적으로 불가능해진다(승인 이벤트는 원장
-    /// 게이트를 지닌 dispatch_live 전용).
+    /// **P1b + astra 방화벽**: 커서 소유 재생 — 유일한 공개 재생 입구.
+    /// 결속 계약(위치 결속): 커서가 가리키는 **행**(order_id, seq)이 저널에
+    /// 존재하고 (i)저장 해시 == 커서 row_digest (ii)선택 행 재해시 일치
+    /// (iii)커서 위치 핀 == 행 해시 를 대조한다. 이벤트 동등 대조는 하지
+    /// 않는다(재생 이벤트는 정의상 아직 저널에 없다 — 엔진 배선이 append).
+    /// 승인 패밀리(Approved/Rejected)는 이 경로에서 원천 거부된다 — 인간
+    /// 게이트의 유일한 생산 경로는 dispatch_live(원장 grant)다.
     pub fn dispatch_replay_ctx(
         &mut self,
         order_id: &str,
@@ -208,6 +208,19 @@ impl WorkflowEngine {
         if row.hash != ctx.cursor.row_digest {
             return Err(crate::EngineError::EncodingDrift {
                 detail: "cursor row_digest mismatch — post-issuance substitution".into(),
+            });
+        }
+        // (astra T56 r4 조건) 저장 해시만 믿지 않는다 — 선택 행을 **재해시**
+        // 해 대조: 페이로드 변조(event/from/to/at)가 저장 hash 를 그대로
+        // 보존한 채 남아 있으면 여기서 잡힌다.
+        let idx = rows.iter().position(|r| r.seq == ctx.cursor.seq && r.order_id == order_id).unwrap();
+        let recomputed = foundry_ledger::sqlite::SqliteLedger::row_hash_at(&rows[..=idx]);
+        if recomputed.as_deref() != Some(row.hash.as_str()) {
+            return Err(crate::EngineError::EncodingDrift {
+                detail: format!(
+                    "cursor row re-hash failed at seq {} — payload corrupted with preserved hash",
+                    ctx.cursor.seq
+                ),
             });
         }
         // pin 검증 (astra T56 r2 MAJOR 폐쇄): 커서 seq 에서의 체인 헤드가
