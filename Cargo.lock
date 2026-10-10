@@ -508,6 +508,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "foundry-workflow"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "foundry-domain",
+ "foundry-ledger",
+ "sha2",
+]
+
+[[package]]
 name = "futures"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"

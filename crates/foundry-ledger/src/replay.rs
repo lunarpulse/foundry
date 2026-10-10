@@ -191,11 +191,19 @@ pub(crate) fn decode_event(repr: &str, intent: &str, ctx_attempt: u32) -> Option
         },
         "DieFailed" => OrderEvent::DieFailed {
             attempt: event_attempt(repr).unwrap_or(ctx_attempt.max(1)),
-            reason: repr.to_string(),
+            // G1 (M6 T51b) latent defect: reason comes from the INTENT
+            // column (where intent_of put the clean reason) — the old
+            // `repr.to_string()` embedded the whole Debug repr, which
+            // diverged from the canonical JSON decode and made the
+            // dual-write consistency gate refuse every DieFailed/
+            // Canceled append with a non-empty reason. Never fired in
+            // production because the live journal (157 rows) only ever
+            // held DieSucceeded rows.
+            reason: intent.to_string(),
         },
         "InspectionPassed" => OrderEvent::InspectionPassed,
         "InspectionFailed" => OrderEvent::InspectionFailed {
-            reason: repr.to_string(),
+            reason: intent.to_string(),
         },
         "Approved" => OrderEvent::Approved {
             intent: intent.to_string(),
@@ -211,11 +219,11 @@ pub(crate) fn decode_event(repr: &str, intent: &str, ctx_attempt: u32) -> Option
             operation_id: extract_quoted(repr, "operation_id").unwrap_or_else(|| repr.to_string()),
         },
         "CancelRequested" => OrderEvent::CancelRequested {
-            reason: repr.to_string(),
+            reason: intent.to_string(),
         },
         "CancelConfirmed" => OrderEvent::CancelConfirmed,
         "Canceled" => OrderEvent::Canceled {
-            reason: repr.to_string(),
+            reason: intent.to_string(),
         },
         _ => return None,
     })

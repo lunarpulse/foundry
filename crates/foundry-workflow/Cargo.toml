@@ -1,0 +1,12 @@
+[package]
+name = "foundry-workflow"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+foundry-domain = { path = "../foundry-domain" }
+
+[dev-dependencies]
+foundry-ledger = { path = "../foundry-ledger" }
+chrono = { workspace = true }
+sha2 = "0.10"
