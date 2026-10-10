@@ -69,6 +69,8 @@ pub struct GrantRef {
 /// 원장 트랜잭션이 보장한다. Err(String)은 인가 거부 사유.
 pub trait ApprovalLedgerHook {
     fn reserve(&mut self, grant_id: String, scope: serde_json::Value, exec_id: String, dispatch_seq: u64) -> Result<u64, String>;
+    /// apply 직전 예약 재검증 (T53a-r1 BLOCKER) — 회복 경쟁 창 폐쇄.
+    fn verify(&mut self, grant_id: String, exec_id: String, dispatch_seq: u64, fence: u64) -> Result<(), String>;
     fn release(&mut self, grant_id: String, exec_id: String, dispatch_seq: u64) -> Result<(), String>;
     fn finalize(&mut self, grant_id: String, exec_id: String, dispatch_seq: u64, fence: u64) -> Result<(), String>;
 }
@@ -272,41 +274,74 @@ impl WorkflowEngine {
     where
         L: ApprovalLedgerHook,
     {
+        // halted 최선위 (v6 E) — 래치된 실행은 예약조차 시도하지 않고
+        // 최초 사유를 재생한다 (astra T53-r1 MAJOR: 사유 보존은 insert만이
+        // 아니라 반환 경로 전체에서 성립해야 한다).
+        if self.halted.contains_key(exec_id) {
+            return Err(self.halted_error(exec_id));
+        }
         // 승인 계열 이벤트 판별 — 인가가 필요한 전이만.
         let needs_authority = matches!(event, OrderEvent::Approved { .. } | OrderEvent::Rejected { .. });
         if needs_authority {
+            // 연산 정체성 — seq는 이 디스패치 내내 불변 (관측 수와 무관하게
+            // 진입 시 1회 계산. astra T53-r1 MAJOR: release가 N-1을 쓰는
+            // 불일치 폐쇄).
+            let seq = self.next_dispatch_seq(exec_id);
             let scope_json = self.scope_for(order_id, event);
             let reservation = match grant {
                 None => Err("no grant presented (live approval dispatch requires a GrantRef)".to_string()),
-                Some(g) => approval
-                    .reserve(g.grant_id.clone(), scope_json, exec_id.to_string(), self.next_dispatch_seq(exec_id)),
+                Some(g) => approval.reserve(g.grant_id.clone(), scope_json, exec_id.to_string(), seq),
             };
             match reservation {
-                Ok(_fence) => {
-                    // 예약 보유 — 잔여 검증 체인 진행 (드리프트/예산 실패 시
-                    // 해제는 호출자 책임: release_reservation).
+                Ok(fence) => {
+                    // apply 직전 예약 재검증 (astra BLOCKER 보조): 회복이 이
+                    // 사이에 릴리즈했으면 여기서 실패해야 한다.
+                    if let Some(g) = grant {
+                        if let Err(reason) = approval.verify(g.grant_id.clone(), exec_id.to_string(), seq, fence) {
+                            let grant_id = grant.map(|g| g.grant_id.clone());
+                            self.halted.insert(
+                                exec_id.into(),
+                                HaltCause::AuthorizationRefused { grant_id: grant_id.clone(), reason: reason.clone() },
+                            );
+                            let _ = self.observe(exec_id, event, from_placeholder(), None, "-", Outcome::Refused { detail: "authorization refused (reservation lost pre-apply)".into() });
+                            return Err(EngineError::AuthorizationRefused { exec_id: exec_id.into(), grant_id, reason });
+                        }
+                    }
                     let out = self.dispatch_inner(order_id, exec_id, event, event_attempt);
-                    if out.is_err() || matches!(out, Ok(Outcome::Refused { .. })) {
-                        // 검증 실패 — 예약은 소비되지 않는다 (해제).
+                    let applied = matches!(&out, Ok(Outcome::Applied));
+                    if !applied {
+                        // 거부/NoEdge/에러 전부 — 예약은 소비되지 않는다.
+                        // (astra MAJOR: NoEdge가 grant를 소비하던 결함 폐쇄.)
                         if let Some(g) = grant {
-                            let _ = approval.release(g.grant_id.clone(), exec_id.to_string(), self.next_dispatch_seq(exec_id).saturating_sub(1));
+                            let _ = approval.release(g.grant_id.clone(), exec_id.to_string(), seq);
                         }
                     } else if let Some(g) = grant {
-                        // 전이 적용 성공 직후 — 확정.
-                        let _ = approval.finalize(g.grant_id.clone(), exec_id.to_string(), self.next_dispatch_seq(exec_id).saturating_sub(1), _fence);
+                        // 전이 적용 성공 직후 — 확정. 확정 실패는 삼키지 않는다
+                        // (astra BLOCKER): 그 상태로 Applied를 반환하면
+                        // grant가 재사용 가능한 채 남는다. 치명 에러로 전파.
+                        if let Err(reason) = approval.finalize(g.grant_id.clone(), exec_id.to_string(), seq, fence) {
+                            return Err(EngineError::EncodingDrift {
+                                detail: format!(
+                                    "grant {} finalized FAILED after transition: {reason} — approval-ledger inconsistency; halting exec (order state already advanced — recovery_scan will reconcile)", g.grant_id
+                                ),
+                            });
+                        }
                     }
                     out
                 }
                 Err(reason) => {
                     let grant_id = grant.map(|g| g.grant_id.clone());
-                    let detail = reason.clone();
-                    // 래치 + 관측 — 도메인 전이 미발생, 주문 상태 불변.
-                    self.halted.insert(
-                        exec_id.into(),
-                        HaltCause::AuthorizationRefused { grant_id: grant_id.clone(), reason: detail.clone() },
-                    );
-                    let _ = self.observe(exec_id, event, from_placeholder(), None, "-", Outcome::Refused { detail: "authorization refused (exec latched)".into() });
-                    return Err(EngineError::AuthorizationRefused { exec_id: exec_id.into(), grant_id, reason: detail });
+                    // 래치 사유 보존 (astra MAJOR): 이미 래치된 실행은 새 실패로
+                    // 사유를 덮지 않는다 — halted 조회가 최선위이므로 여기는
+                    // 첫 인가 실패만 기록한다.
+                    if !self.halted.contains_key(exec_id) {
+                        self.halted.insert(
+                            exec_id.into(),
+                            HaltCause::AuthorizationRefused { grant_id: grant_id.clone(), reason: reason.clone() },
+                        );
+                        let _ = self.observe(exec_id, event, from_placeholder(), None, "-", Outcome::Refused { detail: "authorization refused (exec latched)".into() });
+                    }
+                    return Err(EngineError::AuthorizationRefused { exec_id: exec_id.into(), grant_id, reason });
                 }
             }
         } else {
@@ -366,14 +401,20 @@ impl WorkflowEngine {
         self.observations.iter().filter(|o| o.exec_id == exec_id).count() as u64 + 1
     }
 
-    /// 승인 이벤트의 grant 스코프 — 주문 상태에서 유도.
+    /// 승인 이벤트의 grant 스코프 — 주문 상태 + 활성 root에서 유도.
+    /// (astra T53-r1 MAJOR: 엔진 스코프가 root를 누락해 grant_scope의
+    /// root_scope와 정합하지 않았다 — 이제 active_root가 설정된 엔진의
+    /// 라이브 승인은 root-결속 grant만 매칭된다.)
     fn scope_for(&self, order_id: &str, event: &OrderEvent) -> serde_json::Value {
+        let root_scope = self.active_root.clone().unwrap_or_default();
         match event {
             OrderEvent::Approved { intent, artifact_digest } => serde_json::json!({
                 "order_id": order_id, "intent": intent, "artifact_digest": artifact_digest,
+                "root_scope": root_scope,
             }),
             OrderEvent::Rejected { intent } => serde_json::json!({
                 "order_id": order_id, "intent": intent, "artifact_digest": "",
+                "root_scope": root_scope,
             }),
             _ => unreachable!("scope_for is only called for approval events"),
         }
@@ -471,6 +512,13 @@ impl WorkflowEngine {
                 exec_id: exec_id.into(),
                 grant_id: grant_id.clone(),
                 reason: reason.clone(),
+            });
+        }
+        if let Some(HaltCause::UnmappableFailure { node, error }) = self.halted.get(exec_id) {
+            return Err(EngineError::UnmappableFailure {
+                exec_id: exec_id.into(),
+                node: node.clone(),
+                error: error.clone(),
             });
         }
         let steps = self.observations.iter().filter(|o| {
@@ -907,6 +955,9 @@ mod tests {
         fn reserve(&mut self, grant_id: String, scope: serde_json::Value, exec_id: String, dispatch_seq: u64) -> Result<u64, String> {
             self.0.reserve_grant(&grant_id, &scope, &exec_id, dispatch_seq).map(|r| r.fence_token).map_err(|e| e.to_string())
         }
+        fn verify(&mut self, grant_id: String, exec_id: String, dispatch_seq: u64, fence: u64) -> Result<(), String> {
+            self.0.verify_reservation(&grant_id, &exec_id, dispatch_seq, fence).map_err(|e| e.to_string())
+        }
         fn release(&mut self, grant_id: String, exec_id: String, dispatch_seq: u64) -> Result<(), String> {
             self.0.release_reservation(&grant_id, &exec_id, dispatch_seq).map_err(|e| e.to_string())
         }
@@ -956,7 +1007,7 @@ mod tests {
         let mut ledger = foundry_approval::ApprovalLedger::open_in_memory().unwrap();
         // 다른 artifact_digest 스코프로 발급된 (진짜 인간) grant.
         let wrong_scope = serde_json::json!({
-            "order_id": "g3-o", "intent": "ship", "artifact_digest": "dig-OTHER",
+            "order_id": "g3-o", "intent": "ship", "artifact_digest": "dig-OTHER", "root_scope": "",
         });
         ledger.issue_grant("g-wrong", "tok-1", &wrong_scope).unwrap();
         let mut hook = LedgerHook(ledger);
@@ -975,8 +1026,9 @@ mod tests {
         let mut e = g3_engine();
         e.acquire("g3-o", "ex").unwrap();
         let mut ledger = foundry_approval::ApprovalLedger::open_in_memory().unwrap();
+        // 엔진에 active_root가 없으면 root_scope=''/ — 정합 스코프.
         let right = serde_json::json!({
-            "order_id": "g3-o", "intent": "ship", "artifact_digest": "dig-1",
+            "order_id": "g3-o", "intent": "ship", "artifact_digest": "dig-1", "root_scope": "",
         });
         ledger.issue_grant("g-right", "tok-9", &right).unwrap();
         let mut hook = LedgerHook(ledger);
@@ -998,6 +1050,64 @@ mod tests {
         let _ = &mut hook;
         let out = e.dispatch_replay("g3-o", "ex", &g3_approval_event(), 1);
         assert_eq!(out.unwrap(), Outcome::Applied, "replay of a journaled approval needs no grant (envelope owns integrity)");
+    }
+
+    /// (astra T53-r1 MAJOR 4) 래치 사유 보존 — 첫 인가 실패 사유가 이후
+    /// 실패로 덮이지 않는다. 재디스패치는 항상 최초 사유 재생.
+    #[test]
+    fn t53r1_latch_cause_first_failure_wins() {
+        let mut e = g3_engine();
+        e.acquire("g3-o", "ex").unwrap();
+        let mut hook = LedgerHook(foundry_approval::ApprovalLedger::open_in_memory().unwrap());
+        let r1 = e.dispatch_live("g3-o", "ex", &g3_approval_event(), 1, None, &mut hook).unwrap_err();
+        assert!(matches!(&r1, EngineError::AuthorizationRefused { grant_id: None, .. }));
+        // 다른 grant로 재시도 — 여전히 최초 사유 (None) 재생.
+        let grant = GrantRef { grant_id: "g-other".into() };
+        let r2 = e.dispatch_live("g3-o", "ex", &g3_approval_event(), 1, Some(&grant), &mut hook).unwrap_err();
+        assert_eq!(r1, r2, "latched cause must NOT be overwritten by later failures");
+    }
+
+    /// (astra T53-r1 MAJOR 3) NoEdge는 grant를 소비하지 않는다 —
+    /// 승인 상태가 아닌 곳에서 라이브 승인 디스패치.
+    #[test]
+    fn t53r1_noedge_does_not_consume_grant() {
+        let mut e = WorkflowEngine::embedded_default();
+        e.enroll(order("g3-n2"));
+        e.acquire("g3-n2", "ex").unwrap();
+        let mut ledger = foundry_approval::ApprovalLedger::open_in_memory().unwrap();
+        // 승인 상태와 무관한 스코프로 발급 (매칭될 것).
+        let sc = serde_json::json!({
+            "order_id": "g3-n2", "intent": "ship", "artifact_digest": "dig-1", "root_scope": "",
+        });
+        ledger.issue_grant("g-n", "tok-n", &sc).unwrap();
+        let mut hook = LedgerHook(ledger);
+        let grant = GrantRef { grant_id: "g-n".into() };
+        // Received에서 Approved — 부호화에 엣지 없음 = NoEdge.
+        let out = e.dispatch_live("g3-n2", "ex", &g3_approval_event(), 1, Some(&grant), &mut hook).unwrap();
+        assert_eq!(out, Outcome::NoEdge);
+        // grant는 소비되지 않았다 — Issued.
+        assert_eq!(hook.0.get_grant("g-n").unwrap().state, foundry_approval::GrantState::Issued, "NoEdge must NOT consume the grant");
+    }
+
+    /// (astra T53-r1 MAJOR 5) root-결속 라이브 승인 — active_root 엔진의
+    /// 스코프는 root를 포함: 타 root grant는 거부, 정확 root grant는 통과.
+    #[test]
+    fn t53r1_root_bound_live_approval() {
+        let mut e = g3_engine();
+        e.set_active_root("wf-root-X");
+        e.acquire("g3-o", "ex").unwrap();
+        e.bind_root("ex", "wf-root-X").unwrap();
+        let mut ledger = foundry_approval::ApprovalLedger::open_in_memory().unwrap();
+        // 타 root로 발급된 (유효한 인간) grant — 거부되어야.
+        let wrong_root = serde_json::json!({
+            "order_id": "g3-o", "intent": "ship", "artifact_digest": "dig-1", "root_scope": "wf-root-OTHER",
+        });
+        ledger.issue_grant("g-w", "tok-w", &wrong_root).unwrap();
+        let mut hook = LedgerHook(ledger);
+        let grant = GrantRef { grant_id: "g-w".into() };
+        let r = e.dispatch_live("g3-o", "ex", &g3_approval_event(), 1, Some(&grant), &mut hook);
+        assert!(matches!(r, Err(EngineError::AuthorizationRefused { .. })), "{r:?}");
+        assert_eq!(e.order("g3-o").unwrap().state(), OrderState::FurnaceHold);
     }
 
     /// 비승인 이벤트는 라이브여도 grant 불요 — 자율 구간.
