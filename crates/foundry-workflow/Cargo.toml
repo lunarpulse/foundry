@@ -5,6 +5,9 @@ edition.workspace = true
 
 [dependencies]
 foundry-domain = { path = "../foundry-domain" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
 
 [dev-dependencies]
 foundry-ledger = { path = "../foundry-ledger" }

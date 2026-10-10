@@ -93,6 +93,7 @@ pub enum EdgeTarget {
 }
 
 /// 내장 워크플로 — M1-M5 주문 상태머신의 전체·구조 보존 부호화.
+#[derive(Debug, Clone, PartialEq)]
 pub struct EmbeddedWorkflow {
     pub schema_version: u32,
     pub edges: Vec<EncodedEdge>,

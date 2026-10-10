@@ -24,6 +24,8 @@
 //! 동일한 승인·동일한 거부를 산출하고, 관측 벡터는 결정적이다 —
 //! 같은 이벤트 스트림 → 같은 관측 바이트열.
 
+pub mod dsl;
+
 use foundry_domain::order::{Order, OrderEvent, OrderState};
 use foundry_domain::ports::Ledger;
 use foundry_domain::workflow_encoding::{edge_event_of, EmbeddedWorkflow};
@@ -98,6 +100,8 @@ pub struct WorkflowEngine {
     orders: HashMap<String, Order>,
     observations: Vec<ExecObservation>,
     ops: u64,
+    /// G5: 실행별 결속 digest (획득 시점의 Merkle root).
+    exec_bindings: HashMap<ExecId, String>,
 }
 
 impl WorkflowEngine {
@@ -111,6 +115,7 @@ impl WorkflowEngine {
             orders: HashMap::new(),
             observations: Vec::new(),
             ops: 0,
+            exec_bindings: HashMap::new(),
         }
     }
 
@@ -131,6 +136,16 @@ impl WorkflowEngine {
         }
         l.held_by = Some(exec_id.to_string());
         Ok(())
+    }
+
+    /// G5: 실행을 digest에 결속 (획득 직후 1회).
+    pub fn bind_digest(&mut self, exec_id: &str, digest: &str) {
+        self.exec_bindings.insert(exec_id.into(), digest.into());
+    }
+
+    /// G5: 실행의 결속 digest — 없으면 아직 미결속.
+    pub fn binding_of(&self, exec_id: &str) -> Option<&str> {
+        self.exec_bindings.get(exec_id).map(|s| s.as_str())
     }
 
     /// B1 해제 — 보유자만.
@@ -169,6 +184,22 @@ impl WorkflowEngine {
                     order_id: order_id.into(),
                     by: "<unheld>".into(),
                 })
+            }
+        }
+        // G5: 결속된 실행은 자기 시점의 digest로 완결 — 스킬/정책
+        // 교체로 root가 바뀌어도 진행 중 실행은 옛 root를 고수하거나
+        // 명시적으로 거부된다 (혼합 없음).
+        if let Some(bound) = self.exec_bindings.get(exec_id).cloned() {
+            if bound != self.wf_digest {
+                let _ = self.observe(exec_id, event, from_placeholder(), None, "-", Outcome::Refused {
+                    detail: "digest rebound mid-flight (G5: no mixing)".into(),
+                });
+                return Err(EngineError::EncodingDrift {
+                    detail: format!(
+                        "exec {exec_id} bound to {bound} but engine digest is {} — refuse to mix",
+                        self.wf_digest
+                    ),
+                });
             }
         }
         // 상태 조회 (등록 필요)
@@ -277,6 +308,10 @@ impl WorkflowEngine {
         self.observations.push(obs.clone());
         obs
     }
+}
+
+fn from_placeholder() -> OrderState {
+    OrderState::Unknown
 }
 
 /// 가드 이름 (관측용).
@@ -394,6 +429,34 @@ mod tests {
         assert_eq!(obs[0].guard, "None");
         assert_eq!(obs[0].outcome, Outcome::Applied);
         assert_eq!(obs[0].to, Some(OrderState::Queued));
+    }
+
+    /// G5: 참조 스킬 digest 변경 → 진행 중 실행은 옛 root로 완결하거나
+    /// 거부된다 — 혼합 없음. 엔진 인스턴스의 wf_digest가 교체되면
+    /// 결속된 실행의 dispatch는 즉시 거부.
+    #[test]
+    fn g5_rebound_digest_refuses_in_flight_exec() {
+        let mut e = WorkflowEngine::embedded_default();
+        e.enroll(order("o1"));
+        e.acquire("o1", "ex").unwrap();
+        let root1 = e.wf_digest.clone();
+        e.bind_digest("ex", &root1);
+        // 결속 일치 — 정상 진행
+        assert_eq!(e.dispatch("o1", "ex", &OrderEvent::Queued, 1).unwrap(), Outcome::Applied);
+        // 스킬 교체 등으로 문서가 바뀌어 새 엔진(새 digest)이 로드됨 —
+        // 시뮬레이션: 같은 실행이 새 digest로 결속 시도 없이, 엔진 digest 교체
+        e.wf_digest = "wf-root-changed".into();
+        let r = e.dispatch("o1", "ex", &OrderEvent::DieStarted, 1);
+        let detail = match &r {
+            Err(EngineError::EncodingDrift { detail }) => detail.clone(),
+            other => panic!("in-flight exec must be refused on digest change, got {other:?}"),
+        };
+        assert!(detail.contains("refuse to mix"));
+        // 미결속 실행은 새 digest로 자유롭게 시작 가능 (새 실행 = 새 root)
+        e.acquire("o1", "ex2").is_err(); // 잠금은 여전히 ex가…
+        assert!(e.release("o1", "ex"));
+        e.acquire("o1", "ex2").unwrap();
+        assert_eq!(e.dispatch("o1", "ex2", &OrderEvent::DieStarted, 1).unwrap(), Outcome::Applied);
     }
 
     /// 잠금 없는 디스패치 = 계약 위반 거부.
