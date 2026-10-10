@@ -69,8 +69,9 @@ pub struct GrantRef {
 /// 원장 트랜잭션이 보장한다. Err(String)은 인가 거부 사유.
 pub trait ApprovalLedgerHook {
     fn reserve(&mut self, grant_id: String, scope: serde_json::Value, exec_id: String, dispatch_seq: u64) -> Result<u64, String>;
-    /// apply 직전 예약 재검증 (T53a-r1 BLOCKER) — 회복 경쟁 창 폐쇄.
-    fn verify(&mut self, grant_id: String, exec_id: String, dispatch_seq: u64, fence: u64) -> Result<(), String>;
+    /// apply 직전 **원자적 적용 시작** (T53a-r2 BLOCKER) — 즉시 쓰기
+    /// 트랜잭션에서 소유권 검증 후 state=Applying 전환·커밋.
+    fn begin_apply(&mut self, grant_id: String, exec_id: String, dispatch_seq: u64, fence: u64) -> Result<(), String>;
     fn release(&mut self, grant_id: String, exec_id: String, dispatch_seq: u64) -> Result<(), String>;
     fn finalize(&mut self, grant_id: String, exec_id: String, dispatch_seq: u64, fence: u64) -> Result<(), String>;
 }
@@ -294,16 +295,19 @@ impl WorkflowEngine {
             };
             match reservation {
                 Ok(fence) => {
-                    // apply 직전 예약 재검증 (astra BLOCKER 보조): 회복이 이
-                    // 사이에 릴리즈했으면 여기서 실패해야 한다.
+                    // apply 직전 **원자적 적용 시작** (astra r2 BLOCKER):
+                    // 즉시 쓰기 트랜잭션에서 소유권 검증+Applying 전환이
+                    // 함께 커밋 — 검증↔전이 사이 회복 끼임 불가.
                     if let Some(g) = grant {
-                        if let Err(reason) = approval.verify(g.grant_id.clone(), exec_id.to_string(), seq, fence) {
+                        if let Err(reason) = approval.begin_apply(g.grant_id.clone(), exec_id.to_string(), seq, fence) {
                             let grant_id = grant.map(|g| g.grant_id.clone());
-                            self.halted.insert(
-                                exec_id.into(),
-                                HaltCause::AuthorizationRefused { grant_id: grant_id.clone(), reason: reason.clone() },
-                            );
-                            let _ = self.observe(exec_id, event, from_placeholder(), None, "-", Outcome::Refused { detail: "authorization refused (reservation lost pre-apply)".into() });
+                            if !self.halted.contains_key(exec_id) {
+                                self.halted.insert(
+                                    exec_id.into(),
+                                    HaltCause::AuthorizationRefused { grant_id: grant_id.clone(), reason: reason.clone() },
+                                );
+                                let _ = self.observe(exec_id, event, from_placeholder(), None, "-", Outcome::Refused { detail: "authorization refused (apply-intent lost)".into() });
+                            }
                             return Err(EngineError::AuthorizationRefused { exec_id: exec_id.into(), grant_id, reason });
                         }
                     }
@@ -313,18 +317,26 @@ impl WorkflowEngine {
                         // 거부/NoEdge/에러 전부 — 예약은 소비되지 않는다.
                         // (astra MAJOR: NoEdge가 grant를 소비하던 결함 폐쇄.)
                         if let Some(g) = grant {
-                            let _ = approval.release(g.grant_id.clone(), exec_id.to_string(), seq);
+                            if let Err(cleanup) = approval.release(g.grant_id.clone(), exec_id.to_string(), seq) {
+                                return Err(EngineError::EncodingDrift {
+                                    detail: format!("grant {} release FAILED after refusal: {cleanup} — recovery_scan will reconcile", g.grant_id),
+                                });
+                            }
                         }
                     } else if let Some(g) = grant {
                         // 전이 적용 성공 직후 — 확정. 확정 실패는 삼키지 않는다
                         // (astra BLOCKER): 그 상태로 Applied를 반환하면
                         // grant가 재사용 가능한 채 남는다. 치명 에러로 전파.
                         if let Err(reason) = approval.finalize(g.grant_id.clone(), exec_id.to_string(), seq, fence) {
-                            return Err(EngineError::EncodingDrift {
-                                detail: format!(
-                                    "grant {} finalized FAILED after transition: {reason} — approval-ledger inconsistency; halting exec (order state already advanced — recovery_scan will reconcile)", g.grant_id
-                                ),
-                            });
+                            // astra r2 MAJOR: "halting exec" 주장을 실제로 —
+                            // 래치. Applying이므로 회복은 CONSUMED로 완결한다.
+                            let detail = format!(
+                                "grant {} finalized FAILED after transition: {reason} — recovery_scan will complete CONSUMED; exec halted", g.grant_id
+                            );
+                            if !self.halted.contains_key(exec_id) {
+                                self.halted.insert(exec_id.into(), HaltCause::EncodingDrift { detail: detail.clone() });
+                            }
+                            return Err(EngineError::EncodingDrift { detail });
                         }
                     }
                     out
@@ -392,6 +404,9 @@ impl WorkflowEngine {
 
     /// 외부 진입점용 래치 — 사유 + 관측 1회 (T55a 규율: 바이트 동일 detail).
     pub fn halt_with(&mut self, exec_id: &str, cause: HaltCause, detail: String) {
+        if self.halted.contains_key(exec_id) {
+            return; // astra r2 MAJOR: 최초 사유 보존 — 덮지 않는다.
+        }
         self.halted.insert(exec_id.into(), cause);
         let _ = self.observe(exec_id, &foundry_domain::OrderEvent::Queued, from_placeholder(), None, "-", Outcome::Refused { detail });
     }
@@ -955,8 +970,8 @@ mod tests {
         fn reserve(&mut self, grant_id: String, scope: serde_json::Value, exec_id: String, dispatch_seq: u64) -> Result<u64, String> {
             self.0.reserve_grant(&grant_id, &scope, &exec_id, dispatch_seq).map(|r| r.fence_token).map_err(|e| e.to_string())
         }
-        fn verify(&mut self, grant_id: String, exec_id: String, dispatch_seq: u64, fence: u64) -> Result<(), String> {
-            self.0.verify_reservation(&grant_id, &exec_id, dispatch_seq, fence).map_err(|e| e.to_string())
+        fn begin_apply(&mut self, grant_id: String, exec_id: String, dispatch_seq: u64, fence: u64) -> Result<(), String> {
+            self.0.begin_apply(&grant_id, &exec_id, dispatch_seq, fence).map_err(|e| e.to_string())
         }
         fn release(&mut self, grant_id: String, exec_id: String, dispatch_seq: u64) -> Result<(), String> {
             self.0.release_reservation(&grant_id, &exec_id, dispatch_seq).map_err(|e| e.to_string())

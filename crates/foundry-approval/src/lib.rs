@@ -92,6 +92,9 @@ pub enum GrantState {
     Issued,
     /// 예약됨 — 소비 진행 중 (fence_token 보유).
     Pending,
+    /// **적용 시작(astra r2 BLOCKER)**: 도메인 전이 직전 begin_apply가
+    /// 획득 — 회복은 이 상태를 CONSUMED로 완결한다. 재예약/해제 거부.
+    Applying,
     /// 소비 완료 — 재사용 불가.
     Consumed,
 }
@@ -112,6 +115,27 @@ pub struct ApprovalLedger {
 }
 
 impl ApprovalLedger {
+    /// activations 재구축 마이그레이션 — token_id UNIQUE 적용 (멱등).
+    fn migrate_activations_unique(conn: &Connection) -> Result<(), LedgerError> {
+        conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE IF NOT EXISTS activations_migrate (
+                 root TEXT NOT NULL,
+                 intent TEXT NOT NULL,
+                 token_id TEXT NOT NULL UNIQUE,
+                 activated_at TEXT NOT NULL,
+                 PRIMARY KEY (root, intent)
+             );
+             DELETE FROM activations_migrate;
+             INSERT INTO activations_migrate SELECT root, intent, token_id, activated_at FROM activations;
+             DROP TABLE IF EXISTS activations;
+             ALTER TABLE activations_migrate RENAME TO activations;
+             COMMIT;",
+        )
+        .map_err(|e| LedgerError::Db(e.to_string()))?;
+        Ok(())
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LedgerError> {
         let conn = Connection::open(path).map_err(|e| LedgerError::Db(e.to_string()))?;
         Self::init(conn)
@@ -166,6 +190,9 @@ impl ApprovalLedger {
              COMMIT;",
         )
         .map_err(|e| LedgerError::Db(e.to_string()))?;
+        // 마이그레이션(astra r2 MAJOR): 기존 activations에 token_id UNIQUE가
+        // 없으면 CREATE IF NOT EXISTS로는 못 붙인다 — 재구축(멱등).
+        Self::migrate_activations_unique(&conn)?;
         Ok(Self { conn })
     }
 
@@ -225,6 +252,7 @@ impl ApprovalLedger {
                         state: match r.get::<_, String>(5)?.as_str() {
                             "issued" => GrantState::Issued,
                             "pending" => GrantState::Pending,
+                            "applying" => GrantState::Applying,
                             "consumed" => GrantState::Consumed,
                             _ => unreachable!(),
                         },
@@ -269,11 +297,9 @@ impl ApprovalLedger {
         if g.1 != scope_json {
             return Err(LedgerError::GrantNotFound { grant_id: grant_id.into() });
         }
-        if g.2 == "consumed" {
-            return Err(LedgerError::AlreadyConsumed { grant_id: grant_id.into() });
-        }
 
-        // 기존 예약 조회 — 멱등 vs 충돌.
+        // 기존 예약 조회를 상태 가드보다 먼저 — 같은 키의 멱등 재시도는
+        // state=pending에서도 같은 fence를 반환해야 한다 (r2 재개 버그).
         let existing: Option<(String, i64, i64)> = tx
             .query_row(
                 "SELECT exec_id, dispatch_seq, fence_token FROM reservations WHERE grant_id = ?1",
@@ -295,6 +321,11 @@ impl ApprovalLedger {
                 });
             }
             None => {
+                // 신규 예약 — issued 상태만.
+                if g.2 != "issued" {
+                    // pending(진행 중)/applying(전이 확정 중)/consumed 전부 — 재예약 거부.
+                    return Err(LedgerError::AlreadyConsumed { grant_id: grant_id.into() });
+                }
                 // 신규 예약 — fence 발급.
                 let fence: u64 = tx
                     .query_row("UPDATE fence_counter SET next = next + 1 WHERE id = 1 RETURNING next", [], |r| r.get::<_, i64>(0))
@@ -318,9 +349,54 @@ impl ApprovalLedger {
         Ok(Reservation { grant_id: grant_id.into(), exec_id: exec_id.into(), dispatch_seq, fence_token: fence })
     }
 
-    /// **예약 재검증 (T53a-r1 BLOCKER 보조)** — apply 직전 호출. 예약 행이
-    /// 여전히 (grant, exec, seq, fence)로 유효한가 — 회복이 릴리즈했거나
-    /// 다른 소유자가 잡았으면 Err. 예약→apply 사이 창을 닫는다.
+    /// **begin_apply (astra r2 BLOCKER 폐쇄)** — 도메인 전이 직전 호출.
+    /// 즉시 쓰기 트랜잭션(IMMEDIATE)에서: 예약 소유권 (grant, exec, seq,
+    /// fence) 확인 → state=Applying 전환 → 커밋. 커밋 후에는 회복조차
+    /// 릴리즈 불가(회복은 APPLYING을 CONSUMED로 완결). verify의 TOCTOU
+    /// 창(원장 밖 SELECT) 폐쇄 — 검증과 상태 전환이 한 트랜잭션.
+    pub fn begin_apply(
+        &mut self,
+        grant_id: &str,
+        exec_id: &str,
+        dispatch_seq: u64,
+        fence_token: u64,
+    ) -> Result<(), LedgerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| LedgerError::Db(e.to_string()))?;
+        let rf: Option<i64> = tx
+            .query_row(
+                "SELECT fence_token FROM reservations WHERE grant_id = ?1 AND exec_id = ?2 AND dispatch_seq = ?3",
+                params![grant_id, exec_id, dispatch_seq as i64],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| LedgerError::Db(e.to_string()))?;
+        match rf {
+            Some(f) if f == fence_token as i64 => {}
+            _ => {
+                return Err(LedgerError::FenceStale {
+                    grant_id: grant_id.into(),
+                    your_fence: fence_token,
+                    current_fence: rf.unwrap_or(0) as u64,
+                });
+            }
+        }
+        let n = tx
+            .execute(
+                "UPDATE grants SET state = 'applying' WHERE grant_id = ?1 AND state = 'pending' AND fence_token = ?2",
+                params![grant_id, fence_token as i64],
+            )
+            .map_err(|e| LedgerError::Db(e.to_string()))?;
+        if n != 1 {
+            return Err(LedgerError::AlreadyConsumed { grant_id: grant_id.into() });
+        }
+        tx.commit().map_err(|e| LedgerError::Db(e.to_string()))?;
+        Ok(())
+    }
+
+    /// **예약 재검증 (하위 호환 진단용)** — 읽기 전용 조회.
     pub fn verify_reservation(
         &self,
         grant_id: &str,
@@ -486,6 +562,31 @@ impl ApprovalLedger {
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| LedgerError::Db(e.to_string()))?;
+        // APPLYING 전체 — begin_apply가 커밋됐으면 도메인 전이가 났거나
+        // 곧 난다: 회복은 CONSUMED로 완결 (재발급 금지 — astra r2 BLOCKER:
+        // "applied-but-finalize-failed"의 비대칭 폐쇄). 예약 행도 삭제 —
+        // 이후 수집되는 pending에는 더 이상 나타나지 않는다.
+        {
+            let mut stmt = tx
+                .prepare("SELECT grant_id FROM grants WHERE state = 'applying'")
+                .map_err(|e| LedgerError::Db(e.to_string()))?;
+            let applying: Vec<String> = stmt
+                .query_map([], |r| r.get(0))
+                .map_err(|e| LedgerError::Db(e.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| LedgerError::Db(e.to_string()))?;
+            for g in applying {
+                tx.execute(
+                    "UPDATE grants SET state = 'consumed', reserved_exec = NULL, reserved_seq = NULL WHERE grant_id = ?1",
+                    params![g],
+                )
+                .map_err(|e| LedgerError::Db(e.to_string()))?;
+                tx.execute("DELETE FROM reservations WHERE grant_id = ?1", params![g])
+                    .map_err(|e| LedgerError::Db(e.to_string()))?;
+            }
+        }
+
+        // PENDING 수집 — APPLYING 정리 후이므로 진짜 미결 예약만 담긴다.
         let pending: Vec<(String, String, i64)> = {
             let mut stmt = tx
                 .prepare("SELECT grant_id, exec_id, dispatch_seq FROM reservations")
@@ -704,11 +805,10 @@ mod tests {
         // 확정 — 멱등.
         l.finalize_grant("g-1", "ex-1", 7, r1.fence_token).unwrap();
         l.finalize_grant("g-1", "ex-1", 7, r1.fence_token).unwrap();
-        // 소비 후 재예약 거부.
-        assert!(matches!(
-            l.reserve_grant("g-1", &scope_a(), "ex-2", 1),
-            Err(LedgerError::AlreadyConsumed { .. })
-        ));
+        // 소비 후 재예약 거부 — finalize가 예약 행을 지우므로 이미
+        // CONSUMED 상태 = AlreadyConsumed (state != issued).
+        let err = l.reserve_grant("g-1", &scope_a(), "ex-2", 1).unwrap_err();
+        assert!(matches!(err, LedgerError::AlreadyConsumed { .. }), "{err:?}");
     }
 
     // 회복-디스패처 경쟁 — fence가 옛 소유자를 차단 (A′ BLOCKER 폐쇄).
@@ -727,11 +827,14 @@ mod tests {
                 if *your_fence == x.fence_token && *current_fence != x.fence_token),
             "stale owner must be fence-refused: {err:?}"
         );
-        // same-key가 아닌 재예약 시도 (Y가 보유 중) — 충돌 거부.
-        assert!(matches!(
-            l.reserve_grant("g-1", &scope_a(), "ex-X", 2),
-            Err(LedgerError::ReservationConflict { .. })
-        ));
+        // same-key가 아닌 재예약 시도 (Y가 보유 중=state pending) — 거부.
+        // (state!=issued 가드가 Conflict보다 먼저 걸린다 — 어느 쪾이든
+        // X는 Y의 진행 중 예약을 뺏을 수 없다.)
+        let err = l.reserve_grant("g-1", &scope_a(), "ex-X", 2).unwrap_err();
+        assert!(
+            matches!(err, LedgerError::ReservationConflict { .. } | LedgerError::AlreadyConsumed { .. }),
+            "{err:?}"
+        );
     }
 
     // 회복 스캔 — 증거 있으면 CONSUMED, 없으면 릴리즈.
@@ -839,6 +942,44 @@ mod tests {
         // 해제 후 — 실패.
         l.release_reservation("g-1", "ex-1", 5).unwrap();
         assert!(l.verify_reservation("g-1", "ex-1", 5, r.fence_token).is_err());
+    }
+
+    // (astra r2 BLOCKER) begin_apply 커밋 후에는 회복조차 릴리즈 불가 —
+    // APPLYING은 CONSUMED로 완결된다 ("적용됐지만 확정 실패"의 비대칭 폐쇄).
+    #[test]
+    fn t53r2_applying_is_completed_not_released_by_recovery() {
+        let mut l = ledger();
+        l.issue_grant("g-1", "tok-1", &scope_a()).unwrap();
+        let r = l.reserve_grant("g-1", &scope_a(), "ex-1", 3).unwrap();
+        // 도메인 전이 직전 — 적용 시작.
+        l.begin_apply("g-1", "ex-1", 3, r.fence_token).unwrap();
+        assert_eq!(l.get_grant("g-1").unwrap().state, GrantState::Applying);
+        // 크래시 시뮬레이션: finalize 없이 회복 스캔.
+        let released = l.recovery_scan().unwrap();
+        assert!(released.is_empty(), "APPLYING must NEVER be released: {released:?}");
+        assert_eq!(l.get_grant("g-1").unwrap().state, GrantState::Consumed, "recovery completes APPLYING to CONSUMED — no reissue");
+        // 재발급 시도도 불가.
+        assert!(matches!(
+            l.reserve_grant("g-1", &scope_a(), "ex-2", 1),
+            Err(LedgerError::AlreadyConsumed { .. })
+        ));
+    }
+
+    // (astra r2 BLOCKER) begin_apply 자체의 경쟁 — 회복이 먼저 릴리즈한
+    // 예약은 begin_apply가 거부한다 (TOCTOU 폐쇄의 증명).
+    #[test]
+    fn t53r2_begin_apply_refuses_released_reservation() {
+        let mut l = ledger();
+        l.issue_grant("g-1", "tok-1", &scope_a()).unwrap();
+        let r = l.reserve_grant("g-1", &scope_a(), "ex-1", 3).unwrap();
+        // 회복이 먼저 정리 (전이 없음 — PENDING 릴리즈).
+        l.recovery_scan().unwrap();
+        // 이후의 begin_apply는 옛 fence로 거부.
+        assert!(matches!(
+            l.begin_apply("g-1", "ex-1", 3, r.fence_token),
+            Err(LedgerError::FenceStale { .. })
+        ));
+        assert_eq!(l.get_grant("g-1").unwrap().state, GrantState::Issued);
     }
 
     // 정규 스코프 — 키 순서 무관 동결 비교.
