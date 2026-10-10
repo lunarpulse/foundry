@@ -460,6 +460,22 @@ mod tests {
         assert!(matches!(review.kind, SkillKind::Advisory));
     }
 
+    /// (astra T55 MAJOR) 로더는 거짓 encoding_digest 선언을 마스킹하지
+    /// 않는다 — 센티넬/빈값만 실측 치환, 불일치 선언은 거부.
+    #[test]
+    fn t55_preset_false_digest_declaration_refused() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let path = std::path::Path::new(manifest).parent().unwrap().parent().unwrap()
+            .join("presets/bmad-intake-pool.v3.json");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let tampered = raw.replace("\"enc-frozen-v1\"", "\"wf-emb-deadbeef\"");
+        assert_ne!(tampered, raw, "tamper must take effect");
+        let err = crate::dsl::load_preset_from_str(&tampered).unwrap_err();
+        assert!(err.contains("refusing to mask"), "{err}");
+        // 센티넬 그대로는 통과.
+        assert!(crate::dsl::load_preset_from_str(&raw).is_ok());
+    }
+
     /// 프리셋 변조 방어 —Waive 주입 시 검증기가 거부하는지 (프리셋 파일이
     /// 아닌 메모리 변형으로 증명).
     #[test]

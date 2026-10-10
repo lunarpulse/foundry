@@ -133,11 +133,28 @@ pub struct RouteRule {
 /// 뒤처지지 않게 — digest는 문서 내용이 아니라 부호화 정체성의 참조).
 pub fn load_preset(path: &std::path::Path) -> Result<WorkflowDoc, String> {
     let raw = std::fs::read_to_string(path).map_err(|e| format!("preset read failed: {e}"))?;
+    load_preset_from_str(&raw)
+}
+
+/// 문자열 프리셋 로딩 (테스트·변조 프로브용 — 동일 결속 규율).
+pub fn load_preset_from_str(raw: &str) -> Result<WorkflowDoc, String> {
     let mut doc: WorkflowDoc =
         serde_json::from_str(&raw).map_err(|e| format!("preset parse failed: {e}"))?;
     // deny_unknown_fields는 파싱에서 이미 시행됨 — 프리셋에 불명 필드가
     // 있으면 여기서 실패한다.
-    doc.body.encoding_digest = foundry_domain::workflow_encoding::EmbeddedWorkflow::frozen_v1().digest();
+    // (astra T55 MAJOR) 치환은 무조건이 아니다: 빈 값 또는 센티넬
+    // "enc-frozen-v1"만 템플릿으로 간주해 실측 digest로 결속한다.
+    // **다른 모든 선언값은 정확히 일치해야** — 거짓 digest 선언을
+    // 로더가 마스킹하지 않는다.
+    let live = foundry_domain::workflow_encoding::EmbeddedWorkflow::frozen_v1().digest();
+    let declared = doc.body.encoding_digest.trim().to_string();
+    if declared.is_empty() || declared == "enc-frozen-v1" {
+        doc.body.encoding_digest = live;
+    } else if declared != live {
+        return Err(format!(
+            "preset declares encoding_digest '{declared}' but the live frozen_v1 digest is '{live}' — refusing to mask a mismatched declaration"
+        ));
+    }
     Ok(doc)
 }
 
