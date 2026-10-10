@@ -28,15 +28,7 @@ fn sc() -> serde_json::Value {
 }
 
 fn replay_ctx(rows: &[foundry_ledger::sqlite::LedgerRow]) -> ReplayContext {
-    let commit = terminal_commitment_from(rows);
-    ReplayContext {
-        cursor: VerifiedReplayCursor {
-            order_id: ORDER.into(),
-            seq: commit.max_seq,
-            row_digest: commit.chain_head.clone(),
-            pin_digest: commit.chain_head.clone(),
-        },
-    }
+    crate::common::replay_ctx_for(ORDER, rows)
 }
 
 #[test]
@@ -184,13 +176,12 @@ fn full_cycle_preset_to_shipped_with_cursor_replay() {
     // ── 발급 커서 재생 — 상태 재구축 동일 (M1-M5 동등 인코딩).
     let commit = terminal_commitment_from(&rows);
     let cursor = issue_replay_cursor(&rows, &commit, ORDER, rows.last().unwrap().seq).unwrap();
-    // 발급된 커서의 row_digest 는 실제 마지막 행 해시와 일치 (발급 검증).
-    assert_eq!(cursor.row_digest, rows.last().unwrap().hash, "issued cursor binds the real row");
-    assert_eq!(cursor.pin_digest, commit.chain_head);
-    // 마지막 행은 Shipped 전이다 — PublishConfirmed 행. 커서-행 결속으로
-    // **인증된 재생 입구** 가 그 행을 가리키는지 대조.
-    let last_row = rows.last().unwrap();
-    assert_eq!(cursor.seq, last_row.seq);
+    // 발급된 커서의 row_digest/pin/seq 는 실제 마지막 행과 일치 (발급 검증).
+    let (coid, cseq, crowd, cpind) = cursor.parts();
+    assert_eq!(crowd, rows.last().unwrap().hash, "issued cursor binds the real row");
+    assert_eq!(cpind, commit.chain_head);
+    assert_eq!(coid, ORDER);
+    assert_eq!(cseq, rows.last().unwrap().seq);
     let mut replayed = WorkflowEngine::embedded_default();
     replayed.rebuild(&jr2).unwrap();
     assert_eq!(replayed.order(ORDER).unwrap().state(), fresh.order(ORDER).unwrap().state(), "replay rebuild equals restart rebuild");

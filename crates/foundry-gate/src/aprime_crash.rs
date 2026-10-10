@@ -214,8 +214,7 @@ fn aprime_wired_engine_full_recovery_cycle() {
     // 자율 구간 — 커서 소유 재생 경로 (저널 배선이 append).
     for ev in [OE::Queued, OE::DieStarted, OE::DieSucceeded { attempt: 1 }, OE::InspectionPassed] {
         let att = e.order("o-a").unwrap().attempt().max(1);
-        let rows_now = foundry_ledger::SqliteLedger::open(&jr_path).unwrap().read_all().unwrap();
-        let ctx = crate::common::replay_ctx_for("o-a", &rows_now);
+        let ctx = crate::common::replay_ctx_for("o-a", &foundry_ledger::SqliteLedger::open(&jr_path).unwrap().read_all().unwrap());
         let journal_ro: &'static mut foundry_ledger::SqliteLedger =
             Box::leak(Box::new(foundry_ledger::SqliteLedger::open(&jr_path).unwrap()));
         e.dispatch_replay_ctx("o-a", "ex", &ev, att, &ctx, journal_ro).unwrap();

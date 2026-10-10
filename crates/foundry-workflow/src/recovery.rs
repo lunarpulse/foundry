@@ -18,7 +18,9 @@ use foundry_ledger::SqliteLedger;
 pub struct RecoveryReport {
     /// 회복이 릴리즈한 grant (fence 무효화 포함).
     pub released: Vec<String>,
-    /// 회복이 CONSUMED로 완결한 grant (APPLYING 포함).
+    /// **항상 비어 있음**(astra T56 r2 MINOR 문서화): recovery_scan 의
+    /// 반환값은 릴리즈만 다루고, CONSUMED 완결 상태는 게이트가 get_grant
+    /// 로 직접 단정한다. 이 필드는 호환용으로 유지된다.
     pub consumed: Vec<String>,
     /// 저널 체인 검증.
     pub journal_verified: bool,

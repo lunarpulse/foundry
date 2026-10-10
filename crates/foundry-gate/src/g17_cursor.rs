@@ -38,9 +38,10 @@ fn g17_case1_no_cursor_no_replay_entry() {
     let commit = terminal_commitment(&journal);
     let rows = journal.read_all().unwrap();
     let c = issue_replay_cursor(&rows, &commit, "g17-o", rows.last().unwrap().seq).unwrap();
-    assert_eq!(c.order_id, "g17-o");
-    assert!(!c.row_digest.is_empty());
-    assert_eq!(c.pin_digest, commit.chain_head);
+    let (oid, _seq, rowd, pind) = c.parts();
+    assert_eq!(oid, "g17-o");
+    assert!(!rowd.is_empty());
+    assert_eq!(pind, commit.chain_head);
 }
 
 /// ② 이벤트 치환 — 행 내용 변경 시 커서 발급의 재검산이 실패.
@@ -71,7 +72,8 @@ fn g17_case3_forged_suffix_not_authenticated() {
     rows.push(forged.clone());
     // 커밋먼트 내 seq 발급은 성공 — 그 커서는 위조 행 이전 시점 (미인증).
     let c = issue_replay_cursor(&rows, &commit, "g17-o", rows[0].seq).unwrap();
-    assert!(c.seq < forged.seq, "cursor predates the forged row");
+    let (_, cseq, _, _) = c.parts();
+    assert!(cseq < forged.seq, "cursor predates the forged row");
     // 위조 행 seq 발급 시도 — 범위 밖 거부.
     assert!(matches!(
         issue_replay_cursor(&rows, &commit, "g17-o", forged.seq),

@@ -152,53 +152,74 @@ fn g1_journal_bytes_identical_direct_vs_engine() {
             let oid = format!("o-{tag}");
             engine.enroll(Order::new(oid.clone(), ExternalRef::cron("a", "b"), t0));
             engine.acquire(&oid, "exec-g1").unwrap();
-            // 커서 발급 (신규 실행 의미론: 재생은 커서 소유 경로만).
-            // 커밋먼트는 현재 저널 시점 (빈 저널 = GENESIS 핀).
-            // 읽기는 별도 연결 — 엔진의 쓰기 핸들과 무관.
-            let rows_now = SqliteLedger::open(&path_b).unwrap().read_all().unwrap();
-            let commit = foundry_workflow::replay::TerminalCommitment {
-                max_seq: rows_now.last().map(|r| r.seq).unwrap_or(0),
-                count: rows_now.len() as i64,
-                chain_head: rows_now.last().map(|r| r.hash.clone()).unwrap_or_else(|| "GENESIS".into()),
-            };
-            // 재생 컨텍스트 — order 결속 (seq 0 = GENESIS 시점).
-            let ctx = foundry_workflow::replay::ReplayContext {
-                cursor: foundry_workflow::replay::VerifiedReplayCursor {
-                    order_id: oid.clone(),
-                    seq: 0,
-                    row_digest: "GENESIS".into(),
-                    pin_digest: commit.chain_head.clone(),
-                },
-            };
             for ev in &events {
                 let cur_attempt = engine.order(&oid).unwrap().attempt();
                 let claim = cur_attempt.max(1);
-                // 이벤트마다 커서 갱신 — 직전에 커밋된 **이 주문의** 행을
-                // 가리킨다 (첫 이벤트는 GENESIS). 발급은 커밋먼트 경유.
-                let rows_now2 = SqliteLedger::open(&path_b).unwrap().read_all().unwrap();
-                let last_mine = rows_now2.iter().filter(|r| r.order_id == oid).next_back();
+                // 이벤트마다 커서 갱신 — 신뢰 경로(발급/제네시스)만 사용
+                // (r2: 수동 커서 구성 금지).
+                let rows_now = SqliteLedger::open(&path_b).unwrap().read_all().unwrap();
+                let commit = foundry_workflow::replay::TerminalCommitment {
+                    max_seq: rows_now.last().map(|r| r.seq).unwrap_or(0),
+                    count: rows_now.len() as i64,
+                    chain_head: rows_now.last().map(|r| r.hash.clone()).unwrap_or_else(|| "GENESIS".into()),
+                };
+                let last_mine = rows_now.iter().filter(|r| r.order_id == oid).next_back();
                 let ctx = foundry_workflow::replay::ReplayContext {
                     cursor: match last_mine {
-                        Some(r) => foundry_workflow::replay::VerifiedReplayCursor {
-                            order_id: oid.clone(),
-                            seq: r.seq,
-                            row_digest: r.hash.clone(),
-                            pin_digest: commit.chain_head.clone(),
-                        },
-                        None => foundry_workflow::replay::VerifiedReplayCursor {
-                            order_id: oid.clone(),
-                            seq: 0,
-                            row_digest: "GENESIS".into(),
-                            pin_digest: commit.chain_head.clone(),
-                        },
+                        Some(r) => foundry_workflow::replay::issue_replay_cursor(
+                            &rows_now, &commit, &oid, r.seq,
+                        )
+                        .expect("trusted issuance"),
+                        None => foundry_workflow::replay::VerifiedReplayCursor::genesis(&oid),
                     },
                 };
-                // 읽기 전용 재오픈 — 결속 대조용 (엔진의 쓰기 핸들과 무관).
-                let jr_ro = SqliteLedger::open(&path_b).unwrap();
-                let _ = engine.dispatch_replay_ctx(&oid, "exec-g1", ev, claim, &ctx, &jr_ro);
-                drop(jr_ro);
-                // refused/NoEdge는 저널에 안 심긴다 (양 경로 동일 규율 —
-                // P0 배선은 Applied만 append).
+                // 승인 패밀리는 재생 경로가 원천 거부한다 (r2 BLOCKER
+                // 폐쇄의 G1 반영) — 엔진 경로의 승인은 **라이브** 경로
+                // (원장 grant)로만, 직접 경로의 도메인 승인과 동등하게.
+                let is_gate = matches!(
+                    ev,
+                    foundry_domain::OrderEvent::Approved { .. }
+                        | foundry_domain::OrderEvent::Rejected { .. }
+                );
+                if is_gate {
+                    // 이 테스트의 승인은 자동 승인 절차(도메인 직접 경로가
+                    // 인간 개입 없이 승인하는 것과 동등) — 게이트 이벤트를
+                    // 위한 grant 를 원장에서 발급·소비한다.
+                    let mut ledger_g = foundry_approval::ApprovalLedger::open_in_memory().unwrap();
+                    // 스코프는 이벤트에서 실측 (Approved 는 intent+digest,
+                    // Rejected 는 intent — 도메인 승인이 소비하는 값).
+                    let (intent, digest) = match ev {
+                        foundry_domain::OrderEvent::Approved { intent, artifact_digest } => {
+                            (intent.clone(), artifact_digest.clone())
+                        }
+                        foundry_domain::OrderEvent::Rejected { intent } => {
+                            (intent.clone(), String::new())
+                        }
+                        _ => unreachable!(),
+                    };
+                    ledger_g
+                        .issue_grant(
+                            &format!("g1-gate-{oid}"),
+                            &format!("tok-g1-{oid}"),
+                            &serde_json::json!({
+                                "order_id": oid, "intent": intent,
+                                "artifact_digest": digest, "root_scope": "",
+                            }),
+                        )
+                        .unwrap();
+                    let mut hook =
+                        foundry_workflow::ApprovalLedgerAdapter(ledger_g);
+                    let _ = engine.dispatch_live(
+                        &oid, "exec-g1", ev, claim,
+                        Some(&foundry_workflow::GrantRef { grant_id: format!("g1-gate-{oid}") }),
+                        &mut hook,
+                    );
+                } else {
+                    let jr_ro = SqliteLedger::open(&path_b).unwrap();
+                    let _ = engine.dispatch_replay_ctx(&oid, "exec-g1", ev, claim, &ctx, &jr_ro);
+                    drop(jr_ro);
+                }
+                // refused/NoEdge는 저널에 안 심긴다 (양 경로 동일 규율).
             }
             // 엔진 내부 상태 == 직접 경로 최종 상태.
             let final_engine = engine.order(&oid).unwrap().state();

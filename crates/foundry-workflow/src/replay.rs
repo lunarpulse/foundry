@@ -33,14 +33,36 @@ pub struct TerminalCommitment {
 }
 
 /// 발급된 재생 커서 — 특정 (order_id, seq) 행에 대한 검증된 참조.
+/// **필드는 비공개** (astra T56 r2): 위조 커서는 구성 자체가 불가능하다.
+/// 신뢰 경로는 (i) issue_replay_cursor(커밋먼트 경유 검증 발급)
+/// (ii) VerifiedReplayCursor::genesis(유일한 부트스트랩 — 이 주문의
+/// 재생 시작점) 뿐이다.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VerifiedReplayCursor {
-    pub order_id: String,
-    pub seq: i64,
+    order_id: String,
+    seq: i64,
     /// 요청 행의 해시.
-    pub row_digest: String,
+    row_digest: String,
     /// 발급 시점 체인 헤드 — 이후 행은 어떤 커서로도 인증 불가.
-    pub pin_digest: String,
+    pin_digest: String,
+}
+
+impl VerifiedReplayCursor {
+    /// 유일한 비발급 생성자 — GENESIS 시작점 (이 주문의 저널 행 부재 시에만
+    /// 유효; dispatch 가 재검증한다).
+    pub fn genesis(order_id: &str) -> Self {
+        Self {
+            order_id: order_id.into(),
+            seq: 0,
+            row_digest: "GENESIS".into(),
+            pin_digest: "GENESIS".into(),
+        }
+    }
+
+    /// 접근자 (진단·게이트 단정용).
+    pub fn parts(&self) -> (&str, i64, &str, &str) {
+        (&self.order_id, self.seq, &self.row_digest, &self.pin_digest)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -143,17 +165,28 @@ impl WorkflowEngine {
                 ),
             });
         }
-        // 커서-행 결속 (astra T56 BLOCKER 폐쇄): 커서가 가리키는 행이
-        // 저널에 존재하고 그 해시와 정확히 일치해야 한다. 위조 커서(행
-        // 부재)·발급 후 행 변조(hash 불일치)·타 저널 커서 전부 거부.
-        // 재생되는 이벤트의 합법성(엣지·가드·도메인 승인)은 dispatch_inner
-        // 가 권위 — 재생 경로는 인증 소스(저널)에 대한 결속만 검증한다.
+        // 승인 패밀리 원천 거부 (astra T56 r2 BLOCKER 폐쇄): Approved/
+        // Rejected 는 인간 게이트 이벤트 — 재생(부록 경로)으로 발화할 수
+        // 없다. 라이브 승인은 dispatch_live 가 원장 grant 게이트와 함께
+        // 소유한다. 과거 Approved 행의 재구축은 rebuild(저널 재생)가
+        // 담당하며 이 경로를 거치지 않는다.
+        if matches!(
+            event,
+            OrderEvent::Approved { .. } | OrderEvent::Rejected { .. }
+        ) {
+            return Err(crate::EngineError::AuthorizationRefused {
+                exec_id: exec_id.into(),
+                grant_id: None,
+                reason: "approval-family events are live-gated: replay path cannot fire the human gate (use dispatch_live with a grant)".into(),
+            });
+        }
+        // 커서-행 결속: 커서가 가리키는 행이 저널에 존재하고 해시가 정확히
+        // 일치해야 한다. 위조·대체·타 저널 커서 전부 거부.
         let rows = journal.read_all().map_err(|e| crate::EngineError::EncodingDrift {
             detail: format!("replay journal unreadable: {e:?}"),
         })?;
         // GENESIS 시점 커서: 이 주문의 행이 저널에 아직 없다 (다른 주문의
-        // 행은 있을 수 있다 — 공유 저널). 커서 seq 0 + GENESIS digest 는
-        // "이 주문의 재생 시작점"으로 유효.
+        // 행은 있을 수 있다 — 공유 저널).
         let order_has_rows = rows.iter().any(|r| r.order_id == order_id);
         if ctx.cursor.seq == 0 && ctx.cursor.row_digest == "GENESIS" && !order_has_rows {
             return self.dispatch_inner_pub(order_id, exec_id, event, event_attempt);
@@ -170,6 +203,16 @@ impl WorkflowEngine {
         if row.hash != ctx.cursor.row_digest {
             return Err(crate::EngineError::EncodingDrift {
                 detail: "cursor row_digest mismatch — post-issuance substitution".into(),
+            });
+        }
+        // pin 검증 (astra T56 r2 MAJOR 폐쇄): 커서 seq 에서의 체인 헤드가
+        // pin_digest 와 일치해야 한다 — 발급 시점 신뢰 범위의 재확인.
+        if ctx.cursor.pin_digest != row.hash {
+            return Err(crate::EngineError::EncodingDrift {
+                detail: format!(
+                    "cursor pin_digest does not match the chain head at seq {} — untrusted issuance",
+                    ctx.cursor.seq
+                ),
             });
         }
         self.dispatch_inner_pub(order_id, exec_id, event, event_attempt)

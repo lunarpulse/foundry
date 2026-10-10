@@ -36,8 +36,8 @@ pub fn file_journal(tag: &str) -> (SqliteLedger, std::path::PathBuf) {
     (SqliteLedger::open(&path).unwrap(), path)
 }
 
-/// 게이트 표준 재생 진입 — 커서 발급 후 dispatch_replay_ctx (P1b 계약:
-/// 외부 재생 입구는 이 경로뿐).
+/// 게이트 표준 재생 진입 — 커서는 **발급 또는 제네시스** 경로로만 만든다
+/// (P1b+r2 계약: 수동 커서 구성은 존재하지 않는다).
 pub fn replay_event(
     e: &mut WorkflowEngine,
     journal: &SqliteLedger,
@@ -46,39 +46,23 @@ pub fn replay_event(
     event: &foundry_domain::OrderEvent,
     attempt: u32,
 ) -> Result<foundry_workflow::Outcome, foundry_workflow::EngineError> {
-    let commit = terminal_commitment(journal);
-    let ctx = foundry_workflow::replay::ReplayContext {
-        cursor: foundry_workflow::replay::VerifiedReplayCursor {
-            order_id: order_id.to_string(),
-            seq: commit.max_seq,
-            row_digest: commit.chain_head.clone(),
-            pin_digest: commit.chain_head.clone(),
-        },
-    };
+    let ctx = replay_ctx_for(order_id, &journal.read_all().unwrap());
     e.dispatch_replay_ctx(order_id, exec_id, event, attempt, &ctx, journal)
 }
 
 /// 터미널 커밋먼트 — 저널 전체 행에서 촬영 (운영자 대역 외 보관 역할).
-/// 이 주문의 직전 커밋 행을 가리키는 재생 컨텍스트 (첫 이벤트=GENESIS).
+/// 이 주문의 직전 커밋 행을 가리키는 재생 컨텍스트 — 신뢰 경로:
+/// 행이 있으면 커밋먼트 경유 **발급**(issue_replay_cursor), 없으면
+/// **제네시스**(유일 부트스트랩).
 pub fn replay_ctx_for(order: &str, rows: &[foundry_ledger::sqlite::LedgerRow]) -> foundry_workflow::replay::ReplayContext {
     let last_mine = rows.iter().filter(|r| r.order_id == order).next_back();
     let c = terminal_commitment_from(rows);
-    foundry_workflow::replay::ReplayContext {
-        cursor: match last_mine {
-            Some(r) => foundry_workflow::replay::VerifiedReplayCursor {
-                order_id: order.into(),
-                seq: r.seq,
-                row_digest: r.hash.clone(),
-                pin_digest: c.chain_head,
-            },
-            None => foundry_workflow::replay::VerifiedReplayCursor {
-                order_id: order.into(),
-                seq: 0,
-                row_digest: "GENESIS".into(),
-                pin_digest: c.chain_head,
-            },
-        },
-    }
+    let cursor = match last_mine {
+        Some(r) => foundry_workflow::replay::issue_replay_cursor(rows, &c, order, r.seq)
+            .expect("trusted issuance from the terminal commitment"),
+        None => foundry_workflow::replay::VerifiedReplayCursor::genesis(order),
+    };
+    foundry_workflow::replay::ReplayContext { cursor }
 }
 
 pub fn terminal_commitment_from(rows: &[foundry_ledger::sqlite::LedgerRow]) -> foundry_workflow::replay::TerminalCommitment {
