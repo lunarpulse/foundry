@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 foundry-domain = { path = "../foundry-domain" }
 foundry-ledger = { path = "../foundry-ledger" }
+foundry-approval = { path = "../foundry-approval" }
 chrono = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

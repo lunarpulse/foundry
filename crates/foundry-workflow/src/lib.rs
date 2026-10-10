@@ -24,12 +24,33 @@
 //! 동일한 승인·동일한 거부를 산출하고, 관측 벡터는 결정적이다 —
 //! 같은 이벤트 스트림 → 같은 관측 바이트열.
 
+
+/// **T56**: 승인 원장의 프로덕션 어댑터 — ApprovalLedgerHook 구현.
+/// (게이트·서비스가 사용하는 정상 경로; 단위 테스트용 로컬 정의는 유지.)
+pub struct ApprovalLedgerAdapter(pub foundry_approval::ApprovalLedger);
+
+impl ApprovalLedgerHook for ApprovalLedgerAdapter {
+    fn reserve(&mut self, grant_id: String, scope: serde_json::Value, exec_id: String, dispatch_seq: u64) -> Result<u64, String> {
+        self.0.reserve_grant(&grant_id, &scope, &exec_id, dispatch_seq).map(|r| r.fence_token).map_err(|e| format!("{e:?}"))
+    }
+    fn begin_apply(&mut self, grant_id: String, exec_id: String, dispatch_seq: u64, fence: u64) -> Result<(), String> {
+        self.0.begin_apply(&grant_id, &exec_id, dispatch_seq, fence).map_err(|e| format!("{e:?}"))
+    }
+    fn release(&mut self, grant_id: String, exec_id: String, dispatch_seq: u64, expect_fence: u64) -> Result<(), String> {
+        self.0.release_reservation_fenced(&grant_id, &exec_id, dispatch_seq, expect_fence).map_err(|e| format!("{e:?}"))
+    }
+    fn finalize(&mut self, grant_id: String, exec_id: String, dispatch_seq: u64, fence: u64) -> Result<(), String> {
+        self.0.finalize_grant(&grant_id, &exec_id, dispatch_seq, fence).map_err(|e| format!("{e:?}"))
+    }
+}
+
 pub mod dsl;
 pub mod skill;
 pub mod validator;
 pub mod router;
 pub mod executor_failures;
 pub mod replay;
+pub mod recovery;
 
 use foundry_domain::order::{Order, OrderEvent, OrderState};
 use foundry_domain::ports::Ledger;

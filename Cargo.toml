@@ -11,6 +11,7 @@ members = [
     "crates/foundry-serve",
     "crates/foundry-watch",
     "crates/foundry-workflow",
+    "crates/foundry-gate",
     "crates/foundry-approval",
     "crates/foundry",
 ]
