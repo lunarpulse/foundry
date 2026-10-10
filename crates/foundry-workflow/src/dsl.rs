@@ -127,6 +127,20 @@ pub struct RouteRule {
     pub workflow_id: String,
 }
 
+/// **프리셋 로더 (T55)** — presets/ 디렉토리의 JSON 문서를 읽어
+/// WorkflowDoc으로. encoding_digest는 문서의 선언값 대신 **로딩 시점의
+/// frozen_v1 실측 digest**로 결속한다 (프리셋 파일이 부호화 진화에
+/// 뒤처지지 않게 — digest는 문서 내용이 아니라 부호화 정체성의 참조).
+pub fn load_preset(path: &std::path::Path) -> Result<WorkflowDoc, String> {
+    let raw = std::fs::read_to_string(path).map_err(|e| format!("preset read failed: {e}"))?;
+    let mut doc: WorkflowDoc =
+        serde_json::from_str(&raw).map_err(|e| format!("preset parse failed: {e}"))?;
+    // deny_unknown_fields는 파싱에서 이미 시행됨 — 프리셋에 불명 필드가
+    // 있으면 여기서 실패한다.
+    doc.body.encoding_digest = foundry_domain::workflow_encoding::EmbeddedWorkflow::frozen_v1().digest();
+    Ok(doc)
+}
+
 /// 해석 결과 — 실행 가능 형태.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompiledWorkflow {

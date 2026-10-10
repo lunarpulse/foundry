@@ -430,6 +430,51 @@ mod tests {
         }
     }
 
+    /// **T55 프리셋 (BMad 풀)** — 저장소 동봉 프리셋이 (i) 로드되고
+    /// (ii) 검증기를 통과하며 (iii) dev 노드의 Prepare 게이트가 살아있음을
+    /// 증명. 프리셋은 문서 자체가 배포 자산 — 검증 통과가 출하 조건.
+    #[test]
+    fn t55_bmad_pool_preset_validates() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let path = std::path::Path::new(manifest).parent().unwrap().parent().unwrap()
+            .join("presets/bmad-intake-pool.v3.json");
+        let doc = crate::dsl::load_preset(&path)
+            .unwrap_or_else(|e| panic!("preset must load: {e}"));
+        assert_eq!(doc.id, "bmad-intake-pool");
+        assert_eq!(doc.body.steps.len(), 5, "4 BMad role steps + advisory review + ship gate");
+        assert_eq!(doc.skills.len(), 5);
+        // 검증 통과 — 오류 0.
+        let out = validate(&doc, &EmbeddedWorkflow::frozen_v1())
+            .unwrap_or_else(|errs| panic!("preset must validate: {errs:?}"));
+        assert!(out.warnings.is_empty(), "no warnings expected: {:?}", out.warnings);
+        // 정책 — ship-gate 노드 Prepare (도메인 승인 게이트와 정합).
+        let pol = doc.policy.as_ref().expect("v3 embeds policy");
+        assert_eq!(pol.approvals.len(), 1);
+        assert_eq!(pol.approvals[0].node_ref, "intake-review", "Prepare sits on the last autonomous step before the FurnaceHold approval gate");
+        assert!(matches!(pol.approvals[0].level, PolicyLevel::Prepare));
+        // 스킬 카탈로그 — BMad 5역할. role: analyst/architect/dev(+pm 미배선),
+        // advisory: review (저널 권한 없음 — 스텝 배선도 없음).
+        let dev = doc.skills.iter().find(|s| s.id == "dev").unwrap();
+        assert!(matches!(dev.kind, SkillKind::Role));
+        let review = doc.skills.iter().find(|s| s.id == "review").unwrap();
+        assert!(matches!(review.kind, SkillKind::Advisory));
+    }
+
+    /// 프리셋 변조 방어 —Waive 주입 시 검증기가 거부하는지 (프리셋 파일이
+    /// 아닌 메모리 변형으로 증명).
+    #[test]
+    fn t55_bmad_pool_preset_waive_injection_rejected() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let path = std::path::Path::new(manifest).parent().unwrap().parent().unwrap()
+            .join("presets/bmad-intake-pool.v3.json");
+        let mut doc = crate::dsl::load_preset(&path).unwrap();
+        let pol = doc.policy.as_mut().unwrap();
+        pol.approvals[0].level = PolicyLevel::Waive;
+        let errs = validate(&doc, &EmbeddedWorkflow::frozen_v1()).unwrap_err();
+        assert!(errs.iter().any(|d| matches!(d, Diagnostic::Error { code, .. } if code.contains("waive"))),
+            "waive must be refused: {errs:?}");
+    }
+
     // (1) 정상 v3 문서 — 검증 통과 (경고 없음).
     #[test]
     fn g3_case0_valid_v3_doc_passes() {
