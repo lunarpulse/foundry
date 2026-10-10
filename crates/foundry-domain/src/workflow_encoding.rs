@@ -453,6 +453,29 @@ mod tests {
             !edge_realizable(&spurious, &wf),
             "spurious edge must be caught by the SAME check E2 runs: {spurious:?}"
         );
+
+        // astra r4 MINOR: 같은 패밀리의 엣지가 선언 가드 밖에서만 실현
+        // 가능한 경우 — 가드 필터 제거 시 E8이 빨개지는지 검증.
+        // DieSucceeded/Working에 모순 가드(MaxAttemptsExhausted∧RetriesRemain
+        // — Die 계열에서 항상 거짓은 아니지만 이 이벤트엔 무의미)를
+        // 단 엣지: 가드 평가에서 AttemptNotStale 아닌 조건이 걸리므로
+        // 가드를 존중하는 checker는 실현 프로브를 거부한다.
+        let guard_evading = EncodedEdge {
+            event: EdgeEvent::DieSucceeded,
+            from: OrderState::Working,
+            guard: Guard::Conj(vec![Guard::MaxAttemptsExhausted, Guard::RetriesRemain]), // 모순
+            to: EdgeTarget::State(OrderState::Inspecting),
+        };
+        assert!(
+            !edge_realizable(&guard_evading, &wf),
+            "same-family edge with a contradictory guard must NOT be realizable — the guard filter is load-bearing in the shared checker"
+        );
+        // 그리고 이 모순 가드 없이는 실현 가능함을 확인 (가드가 거부의 원인)
+        let legitimate = EncodedEdge { guard: Guard::AttemptNotStale, ..guard_evading.clone() };
+        assert!(
+            edge_realizable(&legitimate, &wf),
+            "the same edge with its true guard IS realizable — the family/destination logic is sound"
+        );
     }
 
     /// E2의 실현가능성 검사 — E2 본테스트와 E8 회귀가 공유한다.

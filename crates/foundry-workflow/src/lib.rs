@@ -391,22 +391,18 @@ impl WorkflowEngine {
                 };
                 if !edge_dest_ok {
                     // 원자적 되돌림 + 관측 기록 후 정지 (래치).
-                    // 가변 대여 정리 후 observe (E0499 회피 구조).
+                    // astra r4 MINOR: ONE shared detail string — the latch,
+                    // the returned error, and redispatch are byte-identical.
                     *order = snapshot;
                     let after = order.attempt();
                     let edge_repr = format!("{:?}", &edge.to);
                     drop(order);
-                    self.halted.insert(exec_id.into(), HaltCause::EncodingDrift {
-                        detail: format!("destination mismatch: edge says {edge_repr}"),
-                    });
+                    let detail = format!(
+                        "destination mismatch: edge says {edge_repr} (domain reached {to:?}, attempt {before}->{after}) — E1/E2 violated; order ROLLED BACK, exec latched"
+                    );
+                    self.halted.insert(exec_id.into(), HaltCause::EncodingDrift { detail: detail.clone() });
                     let _ = self.observe(exec_id, event, from, None, guard_name(&edge.guard).as_str(), Outcome::Refused { detail: "encoding drift: destination mismatch (exec latched)".into() });
-                    // 반환 문자열도 래치 사유와 동일 접두어로 통일 —
-                    // 재디스패치가 같은 형태를 재현하는지 테스트가 검증 가능.
-                    return Err(EngineError::EncodingDrift {
-                        detail: format!(
-                            "destination mismatch: edge says {edge_repr} (domain reached {to:?}, attempt {before}->{after}) — E1/E2 violated; order ROLLED BACK, exec latched"
-                        ),
-                    });
+                    return Err(EngineError::EncodingDrift { detail });
                 }
                 let _ = self.observe(exec_id, event, from, Some(to), guard_name(&edge.guard).as_str(), Outcome::Applied);
                 Ok(Outcome::Applied)
@@ -648,11 +644,56 @@ mod tests {
         assert!(detail.contains("destination mismatch"), "{detail}");
         // 주문은 Received 그대로 (롤백)
         assert_eq!(e.order("o2").unwrap().state(), OrderState::Received);
-        // 래치: 재디스패치는 같은 사유
+        // 래치: 재디스패치는 **동일한** 사유 (문자열 동등성)
         let r2 = e.dispatch("o2", "ex3", &OrderEvent::Queued, 1);
-        assert!(matches!(&r2, Err(EngineError::EncodingDrift { detail }) if detail.contains("destination mismatch")));
+        assert_eq!(
+            r2, r,
+            "redispatch must replay the identical drift error (byte identity)"
+        );
         // 사유 보존: BudgetExhausted로 위장하지 않는다
         assert!(!matches!(r2, Err(EngineError::BudgetExhausted { .. })));
+    }
+
+    /// r4 MINOR 회귀: 엣지 제거 드리프트 — DieStarted 엣지를 부호화에서
+    /// 지우면 (도메인은 수용, 부호화에는 없음 = E1 위반) dispatch는
+    /// 드리프트로 래치되고, 다른 합법 이벤트(Canceled)도 거부된다.
+    #[test]
+    fn missing_edge_drift_latches_and_blocks_other_events() {
+        let mut e = WorkflowEngine::embedded_default();
+        e.enroll(order("o1"));
+        e.acquire("o1", "ex").unwrap();
+        e.dispatch("o1", "ex", &OrderEvent::Queued, 1).unwrap();
+        // 부호화 변조: DieStarted 엣지 제거 (도메인엔 있음 — E1 위반)
+        e.wf.edges.retain(|edge| edge.event != foundry_domain::workflow_encoding::EdgeEvent::DieStarted);
+        let r = e.dispatch("o1", "ex", &OrderEvent::DieStarted, 1);
+        assert!(matches!(&r, Err(EngineError::EncodingDrift { detail }) if detail.contains("no edge")), "{r:?}");
+        // 래치 확인: 다른 합법 이벤트조차 같은 드리프트로 거부
+        let r2 = e.dispatch("o1", "ex", &OrderEvent::Canceled { reason: "r".into() }, 1);
+        assert_eq!(r2, r, "latched exec refuses even otherwise-legal events with the same cause");
+    }
+
+    /// r4 MINOR 회귀: 가드 미충족 드리프트 — 엣지는 있으나 어느 가드도
+    /// 만족하지 않는데 도메인이 수용하면 (E7 위반) 드리프트로 래치.
+    #[test]
+    fn unsatisfied_guard_drift_latches() {
+        let mut e = WorkflowEngine::embedded_default();
+        e.enroll(order("o1"));
+        e.acquire("o1", "ex").unwrap();
+        e.dispatch("o1", "ex", &OrderEvent::Queued, 1).unwrap();
+        // 부호화 변조: DieStarted 엣지의 가드를 절대 만족 불가로 교체
+        // (가드 평가기는 거짓, 도메인은 수용 — 가드/도메인 불일치 = E7 위반)
+        for edge in e.wf.edges.iter_mut() {
+            if edge.event == foundry_domain::workflow_encoding::EdgeEvent::DieStarted {
+                edge.guard = foundry_domain::workflow_encoding::Guard::Conj(vec![
+                    foundry_domain::workflow_encoding::Guard::MaxAttemptsExhausted,
+                    foundry_domain::workflow_encoding::Guard::RetriesRemain,
+                ]); // 모순 가드: 항상 거짓
+            }
+        }
+        let r = e.dispatch("o1", "ex", &OrderEvent::DieStarted, 1);
+        assert!(matches!(&r, Err(EngineError::EncodingDrift { detail }) if detail.contains("NO matching edge's guard")), "{r:?}");
+        let r2 = e.dispatch("o1", "ex", &OrderEvent::DieStarted, 1);
+        assert_eq!(r2, r, "redispatch replays the identical cause");
     }
 
     /// r3 MINOR 회귀: 예산 소진은 정확히 한 번 관측되고 이후 디스패치는
