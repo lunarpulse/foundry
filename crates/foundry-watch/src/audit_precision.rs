@@ -38,6 +38,7 @@ pub fn chain_head(events: &[GovernanceEvent]) -> String {
     h.update(b"foundry-governance-chain-v1");
     for e in events {
         for part in [
+            e.schema_version.to_string(),
             e.seq.to_string(),
             format!("{:?}", e.op),
             format!("{:?}", e.phase),

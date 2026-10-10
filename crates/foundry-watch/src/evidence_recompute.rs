@@ -99,29 +99,61 @@ impl EvidenceReader for LedgerEvidenceReader {
                         |r| r.get(0),
                     )
                     .map_err(|e| e.to_string())?;
+                // N6 (astra 3rd review): the PRODUCTION ledger stores
+                // events in the `event` column ('DieSucceeded { attempt: N }');
+                // `event_json` is NULL there (157/157 rows measured).
+                // Read `event` first with `event_json` fallback, and
+                // DISTINGUISH 'no rows in prefix' (reader cannot
+                // certify -> Err) from 'rows but no completions' (0.0
+                // is REAL). Silent zero is gone.
+                let mut stmt = conn
+                    .prepare("SELECT event, event_json FROM ledger WHERE seq <= ?1")
+                    .map_err(|e| e.to_string())?;
+                let raw: Vec<(String, Option<String>)> = stmt
+                    .query_map([ledger_prefix_len as i64], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .map_err(|e| e.to_string())?
+                    .filter_map(|row| row.ok())
+                    .collect();
+                let attempts: Vec<i64> = raw
+                    .iter()
+                    .filter_map(|(ev, js)| {
+                        let hay: String = if ev.contains("DieSucceeded") {
+                            ev.clone()
+                        } else {
+                            js.clone().unwrap_or_default()
+                        };
+                        if !hay.contains("DieSucceeded") {
+                            return None;
+                        }
+                        // 'DieSucceeded { attempt: N }' or {"attempt":N,...}
+                        hay.split("attempt")
+                            .nth(1)
+                            .and_then(|rest| {
+                                let digits: String = rest
+                                    .chars()
+                                    .skip_while(|c| !c.is_ascii_digit())
+                                    .take_while(|c| c.is_ascii_digit())
+                                    .collect();
+                                if digits.is_empty() {
+                                    None
+                                } else {
+                                    digits.parse::<i64>().ok()
+                                }
+                            })
+                            .or(Some(1))
+                    })
+                    .collect();
+                let any_rows: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM ledger WHERE seq <= ?1",
+                        [ledger_prefix_len as i64],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| e.to_string())?;
+                if any_rows == 0 {
+                    return Err("retry_rate: no ledger rows in prefix — reader cannot certify".into());
+                }
                 let _ = rows;
-                let attempts: Vec<i64> = {
-                    use rusqlite::OptionalExtension;
-                    let mut stmt = conn
-                        .prepare("SELECT event_json FROM ledger WHERE seq <= ?1")
-                        .map_err(|e| e.to_string())?;
-                    let jsons: Vec<String> = stmt
-                        .query_map([ledger_prefix_len as i64], |r| r.get(0))
-                        .map_err(|e| e.to_string())?
-                        .filter_map(|j| j.ok())
-                        .filter(|j: &String| j.contains("DieSucceeded"))
-                        .collect();
-                    jsons.iter()
-                        .map(|j| {
-                            // event_json: {"attempt":N,...} — extract N
-                            j.split("\"attempt\":")
-                                .nth(1)
-                                .and_then(|rest| rest.split([',', '}']).next())
-                                .and_then(|n| n.trim().parse::<i64>().ok())
-                                .unwrap_or(1)
-                        })
-                        .collect()
-                };
                 let total = attempts.len() as f64;
                 let retries = attempts.iter().filter(|a| **a > 1).count() as f64;
                 let task_class = params.get("task_class").cloned().unwrap_or_else(|| "all".into());

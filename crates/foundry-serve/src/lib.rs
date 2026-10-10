@@ -120,6 +120,18 @@ pub fn replay_cards(
 pub type AppLine =
     Line<fake_noop::ServeGate, fake_noop::NoopHarness, SqliteLedger, fake_noop::NoopPublisher>;
 
+/// T60f: the default ledger path with `~` EXPANDED — an unexpanded
+/// literal tilde silently points at a nonexistent file (astra 3rd).
+fn foundry_ledger_path() -> std::path::PathBuf {
+    let raw = std::env::var("FOUNDRY_LEDGER").unwrap_or_else(|_| "~/.foundry/ledger.db".into());
+    if let Some(rest) = raw.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return std::path::PathBuf::from(home).join(rest);
+        }
+    }
+    std::path::PathBuf::from(raw)
+}
+
 pub struct ServeState {
     pub ledger: Arc<SqliteLedger>,
     /// M4 T29: identity store — sessions, capability matrix, token
@@ -132,7 +144,8 @@ pub struct ServeState {
     /// Fake harness — serve never executes Dies; it only records human
     /// decisions on already-executed orders.
     pub line: Arc<AppLine>,
-    /// M5.2 T60b: the governance half — pipeline, apply layer,
+
+/// M5.2 T60b: the governance half — pipeline, apply layer,
     /// durable coordinator. ONE instance; the /api/policy/apply
     /// handler is the only production borrower.
     pub policy: policy_http::PolicyState,
@@ -167,9 +180,7 @@ impl ServeState {
             foundry_watch::retro::QueryCatalog::frozen_v1(),
             foundry_watch::evaluation_protocol::frozen_policy_graph(),
             std::sync::Arc::new(foundry_watch::evidence_recompute::LedgerEvidenceReader::new(
-                std::path::PathBuf::from(
-                    std::env::var("FOUNDRY_LEDGER").unwrap_or_else(|_| "~/.foundry/ledger.db".into()),
-                ),
+                foundry_ledger_path(),
             )),
         );
         let gov_path = std::env::var("FOUNDRY_GOVERNANCE_DB")
