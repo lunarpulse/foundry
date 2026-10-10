@@ -28,6 +28,7 @@ pub mod dsl;
 pub mod skill;
 pub mod validator;
 pub mod router;
+pub mod executor_failures;
 
 use foundry_domain::order::{Order, OrderEvent, OrderState};
 use foundry_domain::ports::Ledger;
@@ -53,6 +54,8 @@ pub enum EngineError {
     /// T53a (v6): 라이브 승인 디스패치의 인가 실패 — 도메인 전이 미발생,
     /// 주문 저널 미기록, 실행 래치. 인가는 승인 원장이 소유한다.
     AuthorizationRefused { exec_id: ExecId, grant_id: Option<String>, reason: String },
+    /// T55a (v6 B5): 매핑 불능 실행기 실패 — 주문 상태 불변, 실행 래치.
+    UnmappableFailure { exec_id: ExecId, node: String, error: String },
 }
 
 /// 라이브 디스패치가 제시하는 grant 참조 (T53a).
@@ -141,6 +144,9 @@ pub enum HaltCause {
     /// T53a (v6 E): 승인 계열 이벤트의 라이브 디스패치가 유효 grant
     /// 예약에 실패 — 실행 래치. detail은 바이트 동일 재생.
     AuthorizationRefused { grant_id: Option<String>, reason: String },
+    /// T55a (v6 B5/G14): 매핑 불능 실행기 오류 — 합법적 실패 엣지가 없는
+    /// 상태. 엔진 래치, 주문 상태 불변 (새 상태 발명 금지).
+    UnmappableFailure { node: String, error: String },
 }
 
 impl WorkflowEngine {
@@ -320,6 +326,39 @@ impl WorkflowEngine {
         event_attempt: u32,
     ) -> Result<Outcome, EngineError> {
         self.dispatch_inner(order_id, exec_id, event, event_attempt)
+    }
+
+    /// 실행의 현재 래치 사유 조회 (T55a).
+    pub fn halted_of(&self, exec_id: &str) -> Option<&HaltCause> {
+        self.halted.get(exec_id)
+    }
+
+    /// 래치 사유를 EngineError로 재생 (T55a) — 사유 종류별 동일 규율.
+    pub fn halted_error(&self, exec_id: &str) -> EngineError {
+        match self.halted.get(exec_id).expect("caller checked halted_of") {
+            HaltCause::BudgetExhausted { steps, cap } => EngineError::BudgetExhausted {
+                exec_id: exec_id.into(),
+                steps: *steps,
+                cap: *cap,
+            },
+            HaltCause::EncodingDrift { detail } => EngineError::EncodingDrift { detail: detail.clone() },
+            HaltCause::AuthorizationRefused { grant_id, reason } => EngineError::AuthorizationRefused {
+                exec_id: exec_id.into(),
+                grant_id: grant_id.clone(),
+                reason: reason.clone(),
+            },
+            HaltCause::UnmappableFailure { node, error } => EngineError::UnmappableFailure {
+                exec_id: exec_id.into(),
+                node: node.clone(),
+                error: error.clone(),
+            },
+        }
+    }
+
+    /// 외부 진입점용 래치 — 사유 + 관측 1회 (T55a 규율: 바이트 동일 detail).
+    pub fn halt_with(&mut self, exec_id: &str, cause: HaltCause, detail: String) {
+        self.halted.insert(exec_id.into(), cause);
+        let _ = self.observe(exec_id, &foundry_domain::OrderEvent::Queued, from_placeholder(), None, "-", Outcome::Refused { detail });
     }
 
     /// 이 실행의 다음 디스패치 일련번호 (연산 정체성 — 예약 키).
