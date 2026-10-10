@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 
 /// DSL 문서 — 사용자 작성·콘텐츠 주소·실행 가능 아티팩트.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkflowDoc {
     pub schema_version: u32,
     pub id: String,
@@ -31,12 +32,44 @@ pub struct WorkflowDoc {
     pub skills: Vec<SkillRef>,
     /// 라우팅 규칙 (C-W3 — 규칙만 권위).
     pub routing: RoutingRules,
-    /// 정책 아티팩트 digest (워크플로는 홀드를 요청할 수 있으나
+    /// 정책 아티팩트 digest (v1/v2 — 워크플로는 홀드를 요청할 수 있으나
     /// 면제할 수 없다 — C-W4; digest만 결속).
     pub policy_digest: String,
+    /// **v3**: 내장 PolicyDoc (플랜 v6 — digest 참조가 아니라 내용이 곧
+    /// 커밋먼트). v1/v2 문서는 None (직렬화에서 제외 — 레거시 root 불변).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<PolicyDoc>,
+}
+
+/// **PolicyDoc (v3, T54)** — 승인 정책의 내용 스키마 (플랜 v6 C-W4a).
+/// deny_unknown_fields — 불명 필드 조용히 버림 금지 (astra r2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyDoc {
+    pub schema_version: u32,
+    pub approvals: Vec<PolicyApproval>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyApproval {
+    /// 대상 노드 (body.steps의 StepId — 검증기가 해석).
+    pub node_ref: String,
+    pub level: PolicyLevel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyLevel {
+    /// 승인 게이트를 요청 (실행 시 approval_prepared 후 인간 날인 대기).
+    Prepare,
+    /// 승인 면제 — **금지 선언**: 표현 가능하나 검증기가 작성 시 오류 거부
+    /// (G3의 공격 재료 — 존재 자체가 신호).
+    Waive,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkflowBody {
     /// 이 문서가 구동할 상태머신 부호화의 digest (T51a frozen_v1 등).
     /// 엔진은 이 digest가 로딩된 부호화와 일치하는지 검증한다.
@@ -46,7 +79,12 @@ pub struct WorkflowBody {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StepSpec {
+    /// **StepId (v3 계약, 플랜 v6)**: 비어있지 않음·문서 내 유일.
+    /// v1/v2 문서는 공백(직렬화 제외 — 레거시 root 불변).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
     /// OrderEvent 패밀리 이름 ("Queued", "DieStarted", ...).
     pub event: String,
     /// 이 스텝에 배선된 스킬 (skills 내 id 참조 — digest 간접 참조).
@@ -54,6 +92,7 @@ pub struct StepSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillRef {
     pub id: String,
     /// 스킬 digest — Merkle root 성분.
@@ -72,6 +111,7 @@ pub enum SkillKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RoutingRules {
     /// 명시적 규칙만 — 암묵 폴백 금지 (C-W3: default_route 필수).
     pub rules: Vec<RouteRule>,
@@ -79,6 +119,7 @@ pub struct RoutingRules {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RouteRule {
     /// 매칭 소스 ("cron:*", "github:*", ...).
     pub source_pattern: String,
@@ -93,6 +134,8 @@ pub struct CompiledWorkflow {
     pub encoding: EmbeddedWorkflow,
     pub plan: Vec<StepSpec>,
     pub routing: RoutingRules,
+    /// v3 문서의 내장 정책 (v1/v2는 None).
+    pub policy: Option<PolicyDoc>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -135,7 +178,13 @@ pub fn merkle_root(doc: &WorkflowDoc) -> String {
     let l1 = leaf("body", &body_s);
     let l2 = leaf("skills", &skills_s);
     let l3 = leaf("routing", &routing_s);
-    let l4 = leaf("policy", &doc.policy_digest);
+    // v3 (플랜 v6): 리프 5 = 내장 PolicyDoc의 canonical 직렬화.
+    // v1/v2: 기존 policy_digest 문자열 — 레거시 root 불변.
+    let policy_s = match &doc.policy {
+        Some(p) => serde_json::to_string(p).unwrap(),
+        None => doc.policy_digest.clone(),
+    };
+    let l4 = leaf("policy", &policy_s);
     let mut root = sha2::Sha256::new();
     root.update(b"foundry-workflow-merkle-v1");
     for l in [l0, l1, l2, l3, l4] {
@@ -182,6 +231,7 @@ pub mod interpreter_v1 {
         }
         Ok(CompiledWorkflow {
             doc_digest: merkle_root(doc),
+            policy: None,
             // astra MAJOR fix: the AUTHENTICATED encoding is carried —
             // the old code silently replaced it with frozen_v1(), so a
             // modified encoding whose digest matched the doc's claim
@@ -200,9 +250,9 @@ pub mod interpreter_v1 {
 pub mod engine_registry {
     use super::*;
 
-    /// 현재 엔진이 구동 가능한 스키마 버전들 (v2 엔진: v1+v2).
+    /// 현재 엔진이 구동 가능한 스키마 버전들 (T54 이후: v1+v2+v3).
     pub fn known_versions() -> Vec<u32> {
-        vec![1, 2]
+        vec![1, 2, 3]
     }
 
     /// 버전 디스패치 — 각 버전의 동결 인터프리터로.
@@ -237,6 +287,38 @@ pub mod engine_registry {
                     encoding: loaded_encoding.clone(),
                     plan: doc.body.steps.clone(),
                     routing: doc.routing.clone(),
+                    policy: None,
+                })
+            }
+            // v3 (T54, 플랜 v6): v1 구조 검증 + 내장 정책 전달.
+            // 정책의 의미 검증(Waive/Prepare)은 작성 시 검증기가 소유 —
+            // 인터프리터는 구조만 (동결 시점의 v3 규칙).
+            3 => {
+                if doc.body.encoding_digest != loaded_encoding.digest() {
+                    return Err(InterpretError::EncodingMismatch {
+                        doc: doc.body.encoding_digest.clone(),
+                        loaded: loaded_encoding.digest(),
+                    });
+                }
+                for st in &doc.body.steps {
+                    if let Some(sk) = &st.skill {
+                        let r = doc.skills.iter().find(|s| &s.id == sk).ok_or_else(|| {
+                            InterpretError::UnknownSkillRef { step_event: st.event.clone(), skill: sk.clone() }
+                        })?;
+                        if r.kind == SkillKind::Advisory {
+                            return Err(InterpretError::AdvisoryInRoleSlot { skill: sk.clone() });
+                        }
+                    }
+                }
+                if doc.routing.default_route != doc.id {
+                    return Err(InterpretError::DefaultRouteMismatch { expected: doc.id.clone(), got: doc.routing.default_route.clone() });
+                }
+                Ok(CompiledWorkflow {
+                    doc_digest: merkle_root(doc),
+                    encoding: loaded_encoding.clone(),
+                    plan: doc.body.steps.clone(),
+                    routing: doc.routing.clone(),
+                    policy: doc.policy.clone(),
                 })
             }
             got => Err(InterpretError::UnknownSchemaVersion { got, known: known_versions() }),
@@ -256,9 +338,9 @@ mod tests {
             body: WorkflowBody {
                 encoding_digest: EmbeddedWorkflow::frozen_v1().digest(),
                 steps: vec![
-                    StepSpec { event: "Queued".into(), skill: Some("die".into()) },
-                    StepSpec { event: "DieStarted".into(), skill: Some("die".into()) },
-                    StepSpec { event: "InspectionPassed".into(), skill: Some("inspector".into()) },
+                    StepSpec { id: String::new(), event: "Queued".into(), skill: Some("die".into()) },
+                    StepSpec { id: String::new(), event: "DieStarted".into(), skill: Some("die".into()) },
+                    StepSpec { id: String::new(), event: "InspectionPassed".into(), skill: Some("inspector".into()) },
                 ],
             },
             skills: vec![
@@ -270,6 +352,7 @@ mod tests {
                 default_route: "order-pipeline".into(),
             },
             policy_digest: "pol-001".into(),
+            policy: None,
         }
     }
 
@@ -280,7 +363,7 @@ mod tests {
         let base = merkle_root(&sample_doc());
         // 본문
         let mut d = sample_doc();
-        d.body.steps.push(StepSpec { event: "Canceled".into(), skill: None });
+        d.body.steps.push(StepSpec { id: String::new(), event: "Canceled".into(), skill: None });
         assert_ne!(merkle_root(&d), base, "body change must change root");
         // 스킬 digest (본문 불변!)
         let mut d = sample_doc();
@@ -361,12 +444,13 @@ mod tests {
         // v1 직접 해석과도 일치
         let by_v1 = interpreter_v1::interpret(&doc, &enc).unwrap();
         assert_eq!(by_v2.doc_digest, by_v1.doc_digest);
-        // v3 문서는 v2 엔진에서도 거부
+        // 미지 버전은 여전히 거부 — T54가 v3 인터프리터를 추가하면서
+        // 미지 프로브는 v4로 이동 (의도적·가시적 갱신).
         let mut d = sample_doc();
-        d.schema_version = 3;
+        d.schema_version = 4;
         assert!(matches!(
             engine_registry::interpret(&d, &enc),
-            Err(InterpretError::UnknownSchemaVersion { got: 3, known }) if known == vec![1, 2]
+            Err(InterpretError::UnknownSchemaVersion { got: 4, known }) if known == vec![1, 2, 3]
         ));
         // v2 문서 root는 v1과 다르다 (schema_version 제5성분)
         let mut d = sample_doc();

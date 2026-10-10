@@ -234,11 +234,12 @@ mod tests {
             id: "w".into(),
             body: WorkflowBody {
                 encoding_digest: "wf-emb-x".into(),
-                steps: vec![StepSpec { event: "Queued".into(), skill: Some("advis".into()) }],
+                steps: vec![StepSpec { id: String::new(), event: "Queued".into(), skill: Some("advis".into()) }],
             },
             skills: vec![SkillRef { id: "advis".into(), digest: "d".into(), kind: SkillKind::Advisory }],
             routing: RoutingRules { rules: vec![], default_route: "w".into() },
             policy_digest: "p".into(),
+            policy: None,
         }
     }
 
