@@ -94,50 +94,70 @@ fn genuine_zero_completions_is_real_zero() {
 
 #[tokio::test]
 async fn astra6_verified_profile_with_bundle_seed_executes_as_bundle_seed() {
-    // THE B1 HIGH regression: a bundle-verified profile with seed 7,
-    // invoked through a CLI whose --seed is 0. The EXECUTED artifact
-    // must be a pure function of the VERIFIED profile's seed (7) —
-    // and the recorded hash must describe THAT profile, not a
-    // reconstructed seed-0 one.
+    // B1 HIGH regression, FULL wiring path (astra 7th: the previous
+    // version hand-built the profile and never asserted a recorded
+    // hash — it could not detect the wiring regression):
+    //   bundle (seed 7) -> BundleStore.put -> profile_from_bundle
+    //   (VERIFIED load, consumption re-verified) -> the returned
+    //   profile's hash IS the record's profile_hash -> execution via
+    //   DryDie (as run_casting now receives the executed_profile) ->
+    //   artifact must match a seed-7 execution and DIFFER from seed 0.
     use foundry_domain::ports::Harness as _;
-    use foundry_watch::dry_die::{DryDie, Sandbox};
-    let verified = foundry_watch::dry_die::CandidateProfile {
-        id: "bundle-x".into(),
-        model_id: "deepseek-v4".into(),
-        prompt_template: "solve {{task}}".into(),
-        tool_allowlist: vec!["cargo".into()],
-        env_allowlist: vec!["PATH".into()],
-        seed: 7, // the BUNDLE seed
-    };
-    let cli_seed: u64 = 0; // the CLI flag — must NOT drive execution
+    use foundry_watch::bundles::{BundleProfile, BundleStore, CandidateBundle, DependencyPins, LessonSnapshot};
+    use foundry_watch::casting_wiring::profile_from_bundle;
+
+    fn lesson_hash(content: &str) -> String {
+        use sha2::Digest as _;
+        let mut h = sha2::Sha256::new();
+        h.update(&(content.len() as u64).to_be_bytes());
+        h.update(content.as_bytes());
+        format!("{:x}", h.finalize())
+    }
+
+    let mut store = BundleStore::default();
+    let bundle = CandidateBundle::build(
+        "cand-b1",
+        BundleProfile { model: "deepseek-v4".into(), temperature: Some(0.0), seed: Some(7), max_output_tokens: 512 },
+        "solve {{task}}",
+        vec![LessonSnapshot { lesson_id: "L1".into(), content_hash: lesson_hash("prefer map_err"), content: "prefer map_err".into() }],
+        DependencyPins {
+            image_digest: "sha256:aa".into(),
+            tool_digests: [("cargo".to_string(), "sha256:bb".into())].into_iter().collect(),
+            model_revision: Some("rev-9".into()),
+        },
+    )
+    .unwrap();
+    let digest = store.put(bundle);
+
+    // the VERIFIED load — this is the wiring entry casting main uses
+    let (verified, record) = profile_from_bundle(&store, &digest, "run-b1").unwrap();
+    assert_eq!(verified.seed, 7, "the bundle's seed is the verified profile's seed");
+    assert!(record.consumption_verified);
+    // the recorded hash IS the hash of the profile we will execute
+    assert_eq!(record.profile_hash, verified.hash(), "recorded hash describes the EXECUTED profile");
+
+    // execute THROUGH the verified profile (run_casting's contract)
     let dir = std::env::temp_dir().join(format!("t60f-exec-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let sandbox = Sandbox::new(&dir, &verified).unwrap();
+    let sandbox = foundry_watch::dry_die::Sandbox::new(&dir, &verified).unwrap();
     let order = foundry_domain::Order::new(
-        "order-1".into(),
+        "order-b1".into(),
         foundry_domain::ExternalRef::cron("casting", "casting"),
         chrono::Utc::now(),
     );
-    // execute THROUGH the profile (as run_casting now does)
-    let die = DryDie::new(verified.clone(), &sandbox.root);
+    let die = foundry_watch::dry_die::DryDie::new(verified.clone(), &sandbox.root);
     let out = die.run(&order, 1, std::path::Path::new("wd")).await.unwrap();
-    // the artifact embeds the profile's seed: '# seed 7' in the diff
-    assert!(
-        out.result_commit.starts_with("dry-"),
-        "artifact produced: {}",
-        out.result_commit
-    );
-    // the recorded hash is the hash of the EXECUTED profile (seed 7)
-    assert_eq!(verified.seed, 7);
-    assert_ne!(cli_seed, verified.seed, "CLI seed 0 must not leak into the verified profile");
-    // and the artifact under seed 7 differs from a seed-0 execution:
+
+    // the executed artifact is a function of seed 7: a seed-0 profile
+    // (what the OLD hardcoded reconstruction produced from CLI seed 0)
+    // yields a DIFFERENT artifact
     let seed0 = foundry_watch::dry_die::CandidateProfile { seed: 0, ..verified.clone() };
-    let die0 = DryDie::new(seed0, &sandbox.root);
+    let die0 = foundry_watch::dry_die::DryDie::new(seed0, &sandbox.root);
     let out0 = die0.run(&order, 1, std::path::Path::new("wd")).await.unwrap();
     assert_ne!(
         out.result_commit, out0.result_commit,
-        "executed artifact is a function of the VERIFIED seed (7), not the CLI seed (0)"
+        "executed artifact follows the VERIFIED seed (7), not a CLI seed (0)"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
