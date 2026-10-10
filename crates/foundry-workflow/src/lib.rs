@@ -72,7 +72,7 @@ pub trait ApprovalLedgerHook {
     /// apply 직전 **원자적 적용 시작** (T53a-r2 BLOCKER) — 즉시 쓰기
     /// 트랜잭션에서 소유권 검증 후 state=Applying 전환·커밋.
     fn begin_apply(&mut self, grant_id: String, exec_id: String, dispatch_seq: u64, fence: u64) -> Result<(), String>;
-    fn release(&mut self, grant_id: String, exec_id: String, dispatch_seq: u64) -> Result<(), String>;
+    fn release(&mut self, grant_id: String, exec_id: String, dispatch_seq: u64, expect_fence: u64) -> Result<(), String>;
     fn finalize(&mut self, grant_id: String, exec_id: String, dispatch_seq: u64, fence: u64) -> Result<(), String>;
 }
 
@@ -295,24 +295,54 @@ impl WorkflowEngine {
             };
             match reservation {
                 Ok(fence) => {
-                    // 사전 엣지 검증 (astra r3): NoEdge/거부가 예정된
-                    // 디스패치에 begin_apply를 내면 Applying이 해제 불가로
-                    // 남는다. 부호화에 (패밀리, from) 엣지 존재 + 가드 만족
-                    // 가능을 먼저 확인 — 순수 읽기, 전이가 안 날 경로는
-                    // 인가를 소비하지 않는다.
-                    let from_state = self.orders.get(order_id).map(|o| o.state()).unwrap_or(OrderState::Received);
-                    let fam = foundry_domain::workflow_encoding::edge_event_of(event);
-                    let edge_exists = self
-                        .wf
-                        .edges
-                        .iter()
-                        .any(|e| e.event == fam && e.from == from_state);
-                    if !edge_exists {
-                        // 전이가 날 수 없다 — begin_apply 없이 NoEdge 경로로.
+                    // **사전 전수 검증 (astra r3/r4 MAJOR)**: begin_apply를
+                    // 내기 전에 실패 가능성 전부를 순수 읽기로 확인한다 —
+                    // 잠금·예산·(패밀리,from) 엣지 존재·가드 만족 가능.
+                    // 하나라도 결격이면 begin_apply 없이 dispatch_inner로 —
+                    // 전이가 안 날 경로는 인가를 소비하지 않는다 (Applying
+                    // 좌초 원천 차단).
+                    let can_apply = (|| -> bool {
+                        // 잠금 — 이 실행이 주문을 잡고 있어야.
+                        match self.locks.get(order_id) {
+                            Some(l) if l.held_by.as_deref() == Some(exec_id) => {}
+                            _ => return false,
+                        }
+                        // 예산 — 잔여 스텝.
+                        let steps = self.observations.iter().filter(|o| o.exec_id == exec_id).count() as u32;
+                        if steps >= self.budget.max_steps {
+                            return false;
+                        }
+                        // 엣지 — 부호화에 (패밀리, from) 존재.
+                        let from_state = self.orders.get(order_id).map(|o| o.state()).unwrap_or(OrderState::Received);
+                        let fam = foundry_domain::workflow_encoding::edge_event_of(event);
+                        if !self.wf.edges.iter().any(|e| e.event == fam && e.from == from_state) {
+                            return false;
+                        }
+                        // 가드 — 현재 시도값에서 만족 가능.
+                        let cur_attempt = self.orders.get(order_id).map(|o| o.attempt()).unwrap_or(1);
+                        self.wf
+                            .edges
+                            .iter()
+                            .any(|e| e.event == fam && e.from == from_state
+                                && foundry_domain::workflow_encoding::guard_satisfied(&e.guard, event, cur_attempt))
+                    })();
+                    if !can_apply {
+                        // 전이가 나지 못한다 — begin_apply 없이 진행·거부.
                         let out = self.dispatch_inner(order_id, exec_id, event, event_attempt);
+                        // 실패한 디스패치의 예약은 즉시 해제 (NoEdge 포함).
                         if !matches!(&out, Ok(Outcome::Applied)) {
                             if let Some(g) = grant {
-                                let _ = approval.release(g.grant_id.clone(), exec_id.to_string(), seq);
+                                // 해제 실패도 무시하지 않는다: 래치+전파.
+                                if let Err(cleanup) = approval.release(g.grant_id.clone(), exec_id.to_string(), seq, fence) {
+                                    let detail = format!(
+                                        "grant {} release FAILED after refusal: {cleanup} — recovery_scan will reconcile; exec halted",
+                                        g.grant_id
+                                    );
+                                    if !self.halted.contains_key(exec_id) {
+                                        self.halted.insert(exec_id.into(), HaltCause::EncodingDrift { detail: detail.clone() });
+                                    }
+                                    return Err(EngineError::EncodingDrift { detail });
+                                }
                             }
                         }
                         return out;
@@ -340,9 +370,9 @@ impl WorkflowEngine {
                         // 거부/NoEdge/에러 전부 — 예약은 소비되지 않는다.
                         // (astra MAJOR: NoEdge가 grant를 소비하던 결함 폐쇄.)
                         if let Some(g) = grant {
-                            if let Err(cleanup) = approval.release(g.grant_id.clone(), exec_id.to_string(), seq) {
-                                // astra r3 MAJOR: 클린업 실패도 래치 — 방치된
-                                // 예약은 회복이 정리하되 실행은 정지시킨다.
+                            if let Err(cleanup) = approval.release(g.grant_id.clone(), exec_id.to_string(), seq, fence) {
+                                // astra r3/r4 MAJOR: 클린업 실패도 래치 —
+                                // 방치 예약은 회복이 정리하되 실행 정지.
                                 let detail = format!(
                                     "grant {} release FAILED after refusal: {cleanup} — recovery_scan will reconcile; exec halted",
                                     g.grant_id
@@ -1013,8 +1043,8 @@ mod tests {
         fn begin_apply(&mut self, grant_id: String, exec_id: String, dispatch_seq: u64, fence: u64) -> Result<(), String> {
             self.0.begin_apply(&grant_id, &exec_id, dispatch_seq, fence).map_err(|e| e.to_string())
         }
-        fn release(&mut self, grant_id: String, exec_id: String, dispatch_seq: u64) -> Result<(), String> {
-            self.0.release_reservation(&grant_id, &exec_id, dispatch_seq).map_err(|e| e.to_string())
+        fn release(&mut self, grant_id: String, exec_id: String, dispatch_seq: u64, expect_fence: u64) -> Result<(), String> {
+            self.0.release_reservation_fenced(&grant_id, &exec_id, dispatch_seq, expect_fence).map_err(|e| e.to_string())
         }
         fn finalize(&mut self, grant_id: String, exec_id: String, dispatch_seq: u64, fence: u64) -> Result<(), String> {
             self.0.finalize_grant(&grant_id, &exec_id, dispatch_seq, fence).map_err(|e| e.to_string())

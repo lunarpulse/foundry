@@ -168,6 +168,13 @@ impl ApprovalLedger {
                  fence_token INTEGER NOT NULL,
                  created_at TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS apply_intents (
+                 grant_id TEXT PRIMARY KEY,
+                 exec_id  TEXT NOT NULL,
+                 dispatch_seq INTEGER NOT NULL,
+                 fence_token INTEGER NOT NULL,
+                 intent_at TEXT NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS finalize_records (
                  grant_id TEXT PRIMARY KEY,
                  exec_id  TEXT NOT NULL,
@@ -406,8 +413,30 @@ impl ApprovalLedger {
         if n != 1 {
             return Err(LedgerError::AlreadyConsumed { grant_id: grant_id.into() });
         }
+        // 내구 적용 의도 (astra r4 MAJOR): begin_apply 커밋 = "전이가 날
+        // 것"의 증거. 크래시 후 감사·회복이 이 테이블로 의도를 재구성한다.
+        tx.execute(
+            "INSERT OR REPLACE INTO apply_intents (grant_id, exec_id, dispatch_seq, fence_token, intent_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![grant_id, exec_id, dispatch_seq as i64, fence_token as i64, Utc::now().to_rfc3339()],
+        )
+        .map_err(|e| LedgerError::Db(e.to_string()))?;
         tx.commit().map_err(|e| LedgerError::Db(e.to_string()))?;
         Ok(())
+    }
+
+    /// 적용 의도 조회 (astra r4) — 크래시 조사·감사용: 그 (grant, exec,
+    /// seq)가 begin_apply를 통과했는가.
+    pub fn apply_intent(&self, grant_id: &str, exec_id: &str, dispatch_seq: u64) -> Result<bool, LedgerError> {
+        let row: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM apply_intents WHERE grant_id = ?1 AND exec_id = ?2 AND dispatch_seq = ?3",
+                params![grant_id, exec_id, dispatch_seq as i64],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| LedgerError::Db(e.to_string()))?;
+        Ok(row.is_some())
     }
 
     /// **예약 재검증 (하위 호환 진단용)** — 읽기 전용 조회.
@@ -440,6 +469,44 @@ impl ApprovalLedger {
     /// **2단계 보조: 예약 해제** — 엔진 검증 실패 시. 멱등 (이미 없으면 Ok).
     /// fence 무효화: 예약 행 삭제 + grants.fence_token 증가 (옛 fence는
     /// 영구히 무효 — 회복과 동일 규율).
+    /// fence 명시 해제 (astra r4 MAJOR) — 예약 (grant, exec, seq)의 현재
+    /// fence가 `expect_fence`와 일치할 때만 해제. 옛 fence의 지연된 클린업이
+    /// **새** 예약(회복 후 재예약)을 지우는 것을 차단한다.
+    pub fn release_reservation_fenced(
+        &mut self,
+        grant_id: &str,
+        exec_id: &str,
+        dispatch_seq: u64,
+        expect_fence: u64,
+    ) -> Result<(), LedgerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| LedgerError::Db(e.to_string()))?;
+        let cur: Option<i64> = tx
+            .query_row(
+                "SELECT fence_token FROM reservations WHERE grant_id = ?1 AND exec_id = ?2 AND dispatch_seq = ?3",
+                params![grant_id, exec_id, dispatch_seq as i64],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| LedgerError::Db(e.to_string()))?;
+        match cur {
+            None => Ok(()), // 멱등.
+            Some(f) if f == expect_fence as i64 => {
+                Self::release_inner(&tx, grant_id, exec_id, dispatch_seq)?;
+                tx.commit().map_err(|e| LedgerError::Db(e.to_string()))?;
+                Ok(())
+            }
+            Some(_) => Err(LedgerError::FenceStale {
+                grant_id: grant_id.into(),
+                your_fence: expect_fence,
+                current_fence: cur.unwrap_or(0) as u64,
+            }),
+        }
+    }
+
+    /// 하위 호환 해제 (fence 무지) — 진단용. 프로덕션 경로는 _fenced.
     pub fn release_reservation(&mut self, grant_id: &str, exec_id: &str, dispatch_seq: u64) -> Result<(), LedgerError> {
         let tx = self.conn.transaction().map_err(|e| LedgerError::Db(e.to_string()))?;
         Self::release_inner(&tx, grant_id, exec_id, dispatch_seq)?;
@@ -554,6 +621,12 @@ impl ApprovalLedger {
         tx.execute(
             "INSERT INTO finalize_records (grant_id, exec_id, dispatch_seq, fence_token, finalized_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![grant_id, exec_id, dispatch_seq as i64, fence_token as i64, now],
+        )
+        .map_err(|e| LedgerError::Db(e.to_string()))?;
+        // 확정 완료 — 의도 기록 정리 (이력은 finalize_records가 보존).
+        tx.execute(
+            "DELETE FROM apply_intents WHERE grant_id = ?1 AND exec_id = ?2 AND dispatch_seq = ?3",
+            params![grant_id, exec_id, dispatch_seq as i64],
         )
         .map_err(|e| LedgerError::Db(e.to_string()))?;
         tx.execute(
@@ -1020,6 +1093,48 @@ mod tests {
             l.reserve_grant("g-1", &scope_a(), "ex-1", 3),
             Err(LedgerError::AlreadyConsumed { .. })
         ));
+    }
+
+    // (astra r4 MAJOR 3) 지연된 클린업의 옛 fence는 새 예약을 못 지운다.
+    #[test]
+    fn t53r4_stale_fence_cannot_release_newer_reservation() {
+        let mut l = ledger();
+        l.issue_grant("g-1", "tok-1", &scope_a()).unwrap();
+        let f1 = l.reserve_grant("g-1", &scope_a(), "ex-1", 7).unwrap().fence_token;
+        // 회복이 릴리즈 → 같은 키로 재예약 (새 fence).
+        l.release_reservation_fenced("g-1", "ex-1", 7, f1).unwrap();
+        let f2 = l.reserve_grant("g-1", &scope_a(), "ex-1", 7).unwrap().fence_token;
+        assert_ne!(f1, f2);
+        // 옛 fence f1으로의 지연 해제 — 거부, 새 예약 보존.
+        let err = l.release_reservation_fenced("g-1", "ex-1", 7, f1).unwrap_err();
+        assert!(matches!(err, LedgerError::FenceStale { .. }), "{err:?}");
+        assert_eq!(l.get_grant("g-1").unwrap().state, GrantState::Pending, "newer reservation survives");
+        // 올바른 fence f2는 해제 가능.
+        l.release_reservation_fenced("g-1", "ex-1", 7, f2).unwrap();
+        assert_eq!(l.get_grant("g-1").unwrap().state, GrantState::Issued);
+    }
+
+    // (astra r4 MAJOR 4) 적용 의도의 내구성 — begin_apply 커밋 직후 크래시를
+    // 시뮬레이션(확정 없이)해도 의도 기록이 남고, 확정 시 정리된다.
+    #[test]
+    fn t53r4_durable_apply_intent() {
+        let mut l = ledger();
+        l.issue_grant("g-1", "tok-1", &scope_a()).unwrap();
+        let r = l.reserve_grant("g-1", &scope_a(), "ex-1", 5).unwrap();
+        assert!(!l.apply_intent("g-1", "ex-1", 5).unwrap(), "no intent before begin_apply");
+        l.begin_apply("g-1", "ex-1", 5, r.fence_token).unwrap();
+        // "크래시" — 확정 없이 조사.
+        assert!(l.apply_intent("g-1", "ex-1", 5).unwrap(), "intent survives the crash window");
+        // 회복은 CONSUMED로 완결.
+        l.recovery_scan().unwrap();
+        assert_eq!(l.get_grant("g-1").unwrap().state, GrantState::Consumed);
+        // 정상 경로: 의도 → 확정 → 정리.
+        l.issue_grant("g-2", "tok-2", &grant_scope("o-2", "s", "d", "r")).unwrap();
+        let r2 = l.reserve_grant("g-2", &grant_scope("o-2", "s", "d", "r"), "ex-2", 1).unwrap();
+        l.begin_apply("g-2", "ex-2", 1, r2.fence_token).unwrap();
+        assert!(l.apply_intent("g-2", "ex-2", 1).unwrap());
+        l.finalize_grant("g-2", "ex-2", 1, r2.fence_token).unwrap();
+        assert!(!l.apply_intent("g-2", "ex-2", 1).unwrap(), "intent cleaned after finalize");
     }
 
     // 정규 스코프 — 키 순서 무관 동결 비교.
