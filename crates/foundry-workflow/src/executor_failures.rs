@@ -103,8 +103,9 @@ impl WorkflowEngine {
         match mapping {
             FailureMapping::RetryViaDieFailed { reason } => {
                 let ev = OrderEvent::DieFailed { attempt: self.order(order_id).unwrap().attempt(), reason };
-                // 재생 경로 디스패치 — 실행기 실패은 인가 대상이 아니다.
-                self.dispatch_replay(order_id, exec_id, &ev, self.order(order_id).unwrap().attempt())
+                // 내부 전이 경로 — 실행기 실패는 인가 대상이 아니고 재생
+                // 도 아니다 (T56 P1b: 재생은 커서 소유 경로만).
+                self.dispatch_inner(order_id, exec_id, &ev, self.order(order_id).unwrap().attempt())
             }
             FailureMapping::ExhaustedViaDieFailed => {
                 let att = self.order(order_id).unwrap().attempt();
@@ -115,7 +116,7 @@ impl WorkflowEngine {
                     attempt: att,
                     reason: format!("executor-exhausted: {error}"),
                 };
-                self.dispatch_replay(order_id, exec_id, &ev, att)
+                self.dispatch_inner(order_id, exec_id, &ev, att)
             }
             FailureMapping::Unmappable { node, error } => {
                 let detail = format!("unmappable executor failure at node '{node}': {error} — no legal failure edge from {state:?}; order state UNCHANGED (no state invention)");

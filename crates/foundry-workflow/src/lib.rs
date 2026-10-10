@@ -29,6 +29,7 @@ pub mod skill;
 pub mod validator;
 pub mod router;
 pub mod executor_failures;
+pub mod replay;
 
 use foundry_domain::order::{Order, OrderEvent, OrderState};
 use foundry_domain::ports::Ledger;
@@ -56,6 +57,8 @@ pub enum EngineError {
     AuthorizationRefused { exec_id: ExecId, grant_id: Option<String>, reason: String },
     /// T55a (v6 B5): 매핑 불능 실행기 실패 — 주문 상태 불변, 실행 래치.
     UnmappableFailure { exec_id: ExecId, node: String, error: String },
+    /// T56 P0: 저널 append 실패 — 전이 롤백됨, 관측 미발행, 실행 래치.
+    Infrastructure { detail: String },
 }
 
 /// 라이브 디스패치가 제시하는 grant 참조 (T53a).
@@ -131,6 +134,14 @@ pub struct WorkflowEngine {
     exec_bindings: HashMap<ExecId, String>,
     /// G5: 엔진이 서비스 중인 활성 문서 root.
     active_root: Option<String>,
+    /// **P0 (T56)**: 프로덕션 저널 배선 — 설정 시 모든 Applied 전이는
+    /// Ledger::append 성공 후에만 공개된다 (append 실패=롤백+래치).
+    pub(crate) ledger: Option<crate::replay::LedgerHandle>,
+    /// **P3 (T56)**: 저널 시각 소스 — 기본 Utc::now(), set_clock(t0)으로
+    /// 고정 시계 시작(append마다 +1초). 결정론 게이트용.
+    pub(crate) clock: Option<chrono::DateTime<chrono::Utc>>,
+    /// 고정 시계 스텝 카운터.
+    pub(crate) clock_steps: u64,
     /// 정지한 실행 — 값은 정지 사유 (예산 소진 또는 치명 드리프트).
     /// astra r3 MAJOR: every fatal drift path must latch (missing edge,
     /// unsatisfied guard, destination mismatch — a drifted exec must
@@ -150,6 +161,8 @@ pub enum HaltCause {
     /// T55a (v6 B5/G14): 매핑 불능 실행기 오류 — 합법적 실패 엣지가 없는
     /// 상태. 엔진 래치, 주문 상태 불변 (새 상태 발명 금지).
     UnmappableFailure { node: String, error: String },
+    /// T56 P0: 저널 append 실패 — 인프라 계열 정지 (실행기·원장 아님).
+    Infrastructure { detail: String },
 }
 
 impl WorkflowEngine {
@@ -165,6 +178,9 @@ impl WorkflowEngine {
             ops: 0,
             exec_bindings: HashMap::new(),
             active_root: None,
+            ledger: None,
+            clock: None,
+            clock_steps: 0,
             halted: Default::default(),
         }
     }
@@ -448,23 +464,9 @@ impl WorkflowEngine {
         }
     }
 
-    /// **재생 디스패치 (T53a, v6 B)** — 인증된 감사 봉투 하의 재생 전용.
-    /// 커서는 이 타입 계통에는 등장하지 않는다 (타입 격리): 재생은
-    /// ReplayContext(foundry-workflow replay 모듈 예정)에서만 가능하며,
-    /// 이 내부 진입점은 G1 동등성·M1-M5 재생이 그대로 사용한다 — grant 불요.
-    pub fn dispatch_replay(
-        &mut self,
-        order_id: &str,
-        exec_id: &str,
-        event: &OrderEvent,
-        event_attempt: u32,
-    ) -> Result<Outcome, EngineError> {
-        // astra r3 MAJOR: 재생 진입도 halted 최선위 (사유 보존의 경로 무관성).
-        if self.halted.contains_key(exec_id) {
-            return Err(self.halted_error(exec_id));
-        }
-        self.dispatch_inner(order_id, exec_id, event, event_attempt)
-    }
+    /// **T56 P1b**: 무커서 공개 dispatch_replay도 제거되었다 — 재생의
+    /// 유일한 입구는 replay::ReplayContext 소유 dispatch_replay_ctx다
+    /// (G17① 원천 봉쇄: 커서 없는 재생은 존재하지 않는다).
 
     /// 실행의 현재 래치 사유 조회 (T55a).
     pub fn halted_of(&self, exec_id: &str) -> Option<&HaltCause> {
@@ -485,6 +487,7 @@ impl WorkflowEngine {
                 grant_id: grant_id.clone(),
                 reason: reason.clone(),
             },
+            HaltCause::Infrastructure { detail } => EngineError::Infrastructure { detail: detail.clone() },
             HaltCause::UnmappableFailure { node, error } => EngineError::UnmappableFailure {
                 exec_id: exec_id.into(),
                 node: node.clone(),
@@ -526,21 +529,16 @@ impl WorkflowEngine {
         }
     }
 
-    /// 기존 공개 디스패치 — **재생 의미** (dispatch_replay와 동일).
-    /// G1 테스트·레거시 경로가 사용한다. 라이브 승인은 dispatch_live.
-    /// astra r3 MAJOR: halted 최선위 — 래치된 실행은 잠금 상태와 무관하게
-    /// 최초 사유를 재생한다 (래치→release→후속 획득 후 LockHeld가 최초
-    /// 사유를 가리던 불일치 폐쇄).
-    pub fn dispatch(
+    /// **T56 P1b**: 공개 무커서 dispatch는 **제거**되었다 — 재생의 유일한
+    /// 입구는 ReplayContext 소유 dispatch_replay_ctx다 (G17① 원천 봉쇄).
+    /// 내부 테스트·직접 경로는 dispatch_inner(비공개)를 사용한다.
+    pub(crate) fn dispatch_inner_pub(
         &mut self,
         order_id: &str,
         exec_id: &str,
         event: &OrderEvent,
         event_attempt: u32,
     ) -> Result<Outcome, EngineError> {
-        if self.halted.contains_key(exec_id) {
-            return Err(self.halted_error(exec_id));
-        }
         self.dispatch_inner(order_id, exec_id, event, event_attempt)
     }
 
@@ -556,6 +554,11 @@ impl WorkflowEngine {
         event: &OrderEvent,
         event_attempt: u32,
     ) -> Result<Outcome, EngineError> {
+        // halted 최선위 (v6 E · astra r3/r5 · T56 P1b — 공개 래퍼 제거로
+        // 내부로 통합): 래치된 실행은 잠금·커서와 무관하게 최초 사유 재생.
+        if self.halted.contains_key(exec_id) {
+            return Err(self.halted_error(exec_id));
+        }
         // B1: 잠금 확인 — 미획득 디스패치는 계약 위반
         match self.locks.get(order_id) {
             Some(l) if l.held_by.as_deref() == Some(exec_id) => {}
@@ -739,6 +742,33 @@ impl WorkflowEngine {
                     let _ = self.observe(exec_id, event, from, None, guard_name(&edge.guard).as_str(), Outcome::Refused { detail: "encoding drift: destination mismatch (exec latched)".into() });
                     return Err(EngineError::EncodingDrift { detail });
                 }
+                // P0 (T56): 저널 배선 — append 성공 후에만 상태 공개·관측.
+                // append 실패 = 전이 무효 (롤백·관측 미발행·Infrastructure 래치).
+                if let Some(handle) = &self.ledger {
+                    let at = match self.clock {
+                        Some(t0) => {
+                            self.clock_steps += 1;
+                            t0 + chrono::Duration::seconds(self.clock_steps as i64)
+                        }
+                        None => chrono::Utc::now(),
+                    };
+                    match crate::replay::journal_append(handle, order_id, event, from, to, at) {
+                        Ok(()) => {}
+                        Err(e) => {
+                            *order = snapshot;
+                            drop(order);
+                            let detail = format!(
+                                "journal append FAILED after transition: {e} — transition ROLLED BACK, no observation, exec latched (infrastructure)"
+                            );
+                            if !self.halted.contains_key(exec_id) {
+                                self.halted.insert(exec_id.into(), HaltCause::Infrastructure { detail: detail.clone() });
+                            }
+                            let _ = self.observe(exec_id, event, from, None, "-", Outcome::Refused { detail: "journal append failed (exec latched)".into() });
+                            return Err(EngineError::Infrastructure { detail });
+                        }
+                    }
+                }
+                drop(order);
                 let _ = self.observe(exec_id, event, from, Some(to), guard_name(&edge.guard).as_str(), Outcome::Applied);
                 Ok(Outcome::Applied)
             }
@@ -844,13 +874,13 @@ mod tests {
         e.enroll(order("o1"));
         e.acquire("o1", "ex").unwrap();
         // 합법 2스텝
-        assert_eq!(e.dispatch("o1", "ex", &OrderEvent::Queued, 1).unwrap(), Outcome::Applied);
+        assert_eq!(e.dispatch_inner("o1", "ex", &OrderEvent::Queued, 1).unwrap(), Outcome::Applied);
         assert_eq!(
-            e.dispatch("o1", "ex", &OrderEvent::DieStarted, 1).unwrap(),
+            e.dispatch_inner("o1", "ex", &OrderEvent::DieStarted, 1).unwrap(),
             Outcome::Applied
         );
         // 3스텝째: 예산 초과 — 상태는 Working에 머문다 (새 상태 없음)
-        let err = e.dispatch("o1", "ex", &OrderEvent::DieSucceeded { attempt: 1 }, 1).unwrap_err();
+        let err = e.dispatch_inner("o1", "ex", &OrderEvent::DieSucceeded { attempt: 1 }, 1).unwrap_err();
         assert!(matches!(err, EngineError::BudgetExhausted { steps: 2, cap: 2, .. }));
         assert_eq!(e.order("o1").unwrap().state(), OrderState::Working);
         // 저널 심기 재료가 산출된다
@@ -864,10 +894,10 @@ mod tests {
         let mut e = WorkflowEngine::embedded_default();
         e.enroll(order("o1"));
         e.acquire("o1", "ex").unwrap();
-        e.dispatch("o1", "ex", &OrderEvent::Queued, 1).unwrap();
-        e.dispatch("o1", "ex", &OrderEvent::DieStarted, 1).unwrap();
+        e.dispatch_inner("o1", "ex", &OrderEvent::Queued, 1).unwrap();
+        e.dispatch_inner("o1", "ex", &OrderEvent::DieStarted, 1).unwrap();
         // stale: 현재 attempt 1에 attempt 0 주장
-        let r = e.dispatch("o1", "ex", &OrderEvent::DieSucceeded { attempt: 0 }, 1).unwrap();
+        let r = e.dispatch_inner("o1", "ex", &OrderEvent::DieSucceeded { attempt: 0 }, 1).unwrap();
         assert!(matches!(r, Outcome::Refused { .. }));
         assert_eq!(e.order("o1").unwrap().state(), OrderState::Working);
     }
@@ -879,10 +909,10 @@ mod tests {
         let mut e = WorkflowEngine::embedded_default();
         e.enroll(order("o1"));
         e.acquire("o1", "ex").unwrap();
-        e.dispatch("o1", "ex", &OrderEvent::Queued, 1).unwrap();
+        e.dispatch_inner("o1", "ex", &OrderEvent::Queued, 1).unwrap();
         // Working에서 Queued 이벤트는 부호화·도메인 모두에 없음
-        e.dispatch("o1", "ex", &OrderEvent::DieStarted, 1).unwrap();
-        let r = e.dispatch("o1", "ex", &OrderEvent::Queued, 1).unwrap();
+        e.dispatch_inner("o1", "ex", &OrderEvent::DieStarted, 1).unwrap();
+        let r = e.dispatch_inner("o1", "ex", &OrderEvent::Queued, 1).unwrap();
         assert_eq!(r, Outcome::NoEdge);
     }
 
@@ -899,7 +929,7 @@ mod tests {
                 OrderEvent::DieSucceeded { attempt: 1 },
                 OrderEvent::InspectionPassed,
             ] {
-                e.dispatch("o1", "ex", &ev, 1).unwrap();
+                e.dispatch_inner("o1", "ex", &ev, 1).unwrap();
             }
             format!("{:?}", e.observations())
         };
@@ -912,7 +942,7 @@ mod tests {
         let mut e = WorkflowEngine::embedded_default();
         e.enroll(order("o1"));
         e.acquire("o1", "ex").unwrap();
-        e.dispatch("o1", "ex", &OrderEvent::Queued, 1).unwrap();
+        e.dispatch_inner("o1", "ex", &OrderEvent::Queued, 1).unwrap();
         let all = e.observations();
         // B1 생명주기 관측(lock_acquired) + 노드 관측 1
         assert_eq!(all.len(), 2);
@@ -936,11 +966,11 @@ mod tests {
         e.bind_root("ex", &root1).unwrap();
         e.set_active_root(&root1);
         // 결속 일치 — 정상 진행
-        assert_eq!(e.dispatch("o1", "ex", &OrderEvent::Queued, 1).unwrap(), Outcome::Applied);
+        assert_eq!(e.dispatch_inner("o1", "ex", &OrderEvent::Queued, 1).unwrap(), Outcome::Applied);
         // 스킬 교체 등으로 문서가 바뀌어 새 root가 로드됨 — 결속 재시도는 거부
         assert!(e.bind_root("ex", "wf-root-changed").is_err(), "rebinding must be refused");
         e.set_active_root("wf-root-changed");
-        let r = e.dispatch("o1", "ex", &OrderEvent::DieStarted, 1);
+        let r = e.dispatch_inner("o1", "ex", &OrderEvent::DieStarted, 1);
         let detail = match &r {
             Err(EngineError::EncodingDrift { detail }) => detail.clone(),
             other => panic!("in-flight exec must be refused on digest change, got {other:?}"),
@@ -950,9 +980,9 @@ mod tests {
         let _ = e.acquire("o1", "ex2").is_err();
         assert!(e.release("o1", "ex"));
         e.acquire("o1", "ex2").unwrap();
-        assert!(e.dispatch("o1", "ex2", &OrderEvent::DieStarted, 1).is_err(), "unbound dispatch must be refused");
+        assert!(e.dispatch_inner("o1", "ex2", &OrderEvent::DieStarted, 1).is_err(), "unbound dispatch must be refused");
         e.bind_root("ex2", "wf-root-changed").unwrap();
-        assert_eq!(e.dispatch("o1", "ex2", &OrderEvent::DieStarted, 1).unwrap(), Outcome::Applied);
+        assert_eq!(e.dispatch_inner("o1", "ex2", &OrderEvent::DieStarted, 1).unwrap(), Outcome::Applied);
     }
 
     /// r3 MINOR 회귀: 변조 목적지 → 원자적 롤백 + 래치 + 사유 보존.
@@ -964,14 +994,14 @@ mod tests {
         let mut e = WorkflowEngine::embedded_default();
         e.enroll(order("o1"));
         e.acquire("o1", "ex").unwrap();
-        e.dispatch("o1", "ex", &OrderEvent::Queued, 1).unwrap();
+        e.dispatch_inner("o1", "ex", &OrderEvent::Queued, 1).unwrap();
         // 부호화 변조: Queued/Received 엣지의 목적지를 Failed로 찢는다
         e.wf.edges[0].to = EdgeTarget::State(OrderState::Failed);
         // 미결속 엔진(active_root 없음)에서도 목적지 드리프트는 치명 —
         // 새 등록 주문으로 재현
         e.enroll(order("o2"));
         e.acquire("o2", "ex3").unwrap();
-        let r = e.dispatch("o2", "ex3", &OrderEvent::Queued, 1);
+        let r = e.dispatch_inner("o2", "ex3", &OrderEvent::Queued, 1);
         let detail = match &r {
             Err(EngineError::EncodingDrift { detail }) => detail.clone(),
             other => panic!("expected drift, got {other:?}"),
@@ -980,7 +1010,7 @@ mod tests {
         // 주문은 Received 그대로 (롤백)
         assert_eq!(e.order("o2").unwrap().state(), OrderState::Received);
         // 래치: 재디스패치는 **동일한** 사유 (문자열 동등성)
-        let r2 = e.dispatch("o2", "ex3", &OrderEvent::Queued, 1);
+        let r2 = e.dispatch_inner("o2", "ex3", &OrderEvent::Queued, 1);
         assert_eq!(
             r2, r,
             "redispatch must replay the identical drift error (byte identity)"
@@ -997,13 +1027,13 @@ mod tests {
         let mut e = WorkflowEngine::embedded_default();
         e.enroll(order("o1"));
         e.acquire("o1", "ex").unwrap();
-        e.dispatch("o1", "ex", &OrderEvent::Queued, 1).unwrap();
+        e.dispatch_inner("o1", "ex", &OrderEvent::Queued, 1).unwrap();
         // 부호화 변조: DieStarted 엣지 제거 (도메인엔 있음 — E1 위반)
         e.wf.edges.retain(|edge| edge.event != foundry_domain::workflow_encoding::EdgeEvent::DieStarted);
-        let r = e.dispatch("o1", "ex", &OrderEvent::DieStarted, 1);
+        let r = e.dispatch_inner("o1", "ex", &OrderEvent::DieStarted, 1);
         assert!(matches!(&r, Err(EngineError::EncodingDrift { detail }) if detail.contains("no edge")), "{r:?}");
         // 래치 확인: 다른 합법 이벤트조차 같은 드리프트로 거부
-        let r2 = e.dispatch("o1", "ex", &OrderEvent::Canceled { reason: "r".into() }, 1);
+        let r2 = e.dispatch_inner("o1", "ex", &OrderEvent::Canceled { reason: "r".into() }, 1);
         assert_eq!(r2, r, "latched exec refuses even otherwise-legal events with the same cause");
     }
 
@@ -1014,7 +1044,7 @@ mod tests {
         let mut e = WorkflowEngine::embedded_default();
         e.enroll(order("o1"));
         e.acquire("o1", "ex").unwrap();
-        e.dispatch("o1", "ex", &OrderEvent::Queued, 1).unwrap();
+        e.dispatch_inner("o1", "ex", &OrderEvent::Queued, 1).unwrap();
         // 부호화 변조: DieStarted 엣지의 가드를 절대 만족 불가로 교체
         // (가드 평가기는 거짓, 도메인은 수용 — 가드/도메인 불일치 = E7 위반)
         for edge in e.wf.edges.iter_mut() {
@@ -1025,9 +1055,9 @@ mod tests {
                 ]); // 모순 가드: 항상 거짓
             }
         }
-        let r = e.dispatch("o1", "ex", &OrderEvent::DieStarted, 1);
+        let r = e.dispatch_inner("o1", "ex", &OrderEvent::DieStarted, 1);
         assert!(matches!(&r, Err(EngineError::EncodingDrift { detail }) if detail.contains("NO matching edge's guard")), "{r:?}");
-        let r2 = e.dispatch("o1", "ex", &OrderEvent::DieStarted, 1);
+        let r2 = e.dispatch_inner("o1", "ex", &OrderEvent::DieStarted, 1);
         assert_eq!(r2, r, "redispatch replays the identical cause");
     }
 
@@ -1038,14 +1068,14 @@ mod tests {
         let mut e = WorkflowEngine::new(EmbeddedWorkflow::frozen_v1(), Budget { max_steps: 1 });
         e.enroll(order("o1"));
         e.acquire("o1", "ex").unwrap();
-        assert_eq!(e.dispatch("o1", "ex", &OrderEvent::Queued, 1).unwrap(), Outcome::Applied);
+        assert_eq!(e.dispatch_inner("o1", "ex", &OrderEvent::Queued, 1).unwrap(), Outcome::Applied);
         let stops_before = e.observations().iter()
             .filter(|o| &o.exec_id == "ex" && o.outcome == Outcome::BudgetStopped).count();
         assert_eq!(stops_before, 0);
         // 초과 디스패치 3회 — 모두 같은 에러
         for _ in 0..3 {
             assert!(matches!(
-                e.dispatch("o1", "ex", &OrderEvent::DieStarted, 1),
+                e.dispatch_inner("o1", "ex", &OrderEvent::DieStarted, 1),
                 Err(EngineError::BudgetExhausted { .. })
             ));
         }
@@ -1160,7 +1190,7 @@ mod tests {
         e.acquire("g3-o", "ex").unwrap();
         let mut hook = LedgerHook(foundry_approval::ApprovalLedger::open_in_memory().unwrap());
         let _ = &mut hook;
-        let out = e.dispatch_replay("g3-o", "ex", &g3_approval_event(), 1);
+        let out = e.dispatch_inner("g3-o", "ex", &g3_approval_event(), 1);
         assert_eq!(out.unwrap(), Outcome::Applied, "replay of a journaled approval needs no grant (envelope owns integrity)");
     }
 
@@ -1309,7 +1339,7 @@ mod tests {
     fn dispatch_requires_lock() {
         let mut e = WorkflowEngine::embedded_default();
         e.enroll(order("o1"));
-        let r = e.dispatch("o1", "rogue", &OrderEvent::Queued, 1);
+        let r = e.dispatch_inner("o1", "rogue", &OrderEvent::Queued, 1);
         assert!(matches!(r, Err(EngineError::LockHeld { .. })));
     }
 }

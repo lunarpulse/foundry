@@ -22,7 +22,7 @@ use foundry_domain::ports::{ActorId, ActorKind, Ledger};
 use foundry_ledger::sqlite::SqliteLedger;
 use foundry_workflow::WorkflowEngine;
 
-fn actor() -> ActorId {
+fn make_actor() -> ActorId {
     ActorId { kind: ActorKind::Agent, source: "g1".into(), id: "agent-1".into() }
 }
 
@@ -110,7 +110,7 @@ fn scenarios() -> Vec<(&'static str, Vec<OrderEvent>)> {
 
 #[test]
 fn g1_journal_bytes_identical_direct_vs_engine() {
-    let actor = actor();
+    let actor_id = make_actor();
     let t0 = chrono::Utc::now();
 
     // 경로 A: 직접 (M1-M5 프로덕션 경로)
@@ -125,7 +125,7 @@ fn g1_journal_bytes_identical_direct_vs_engine() {
             match o.transition(ev.clone(), attempt_for(ev, &o)) {
                 Ok(to) => {
                     ledger_a
-                        .append(&o.id, ev, from, to, &actor, at(&mut clock))
+                        .append(&o.id, ev, from, to, &actor_id, at(&mut clock))
                         .unwrap();
                     journaled_a.push((o.id.clone(), ev.clone()));
                 }
@@ -135,53 +135,63 @@ fn g1_journal_bytes_identical_direct_vs_engine() {
     }
     drop(ledger_a);
 
-    // 경로 B (재작, astra MAJOR): 엔진 경유 — 로컬 Order 폐지.
-    // 엔진 내부의 order에서 상태를 직접 읽어 심는다: 저널 B의 내용이
-    // 엔진의 실제 산출물임이 이제 구조적으로 보장된다. 시도 주장도
-    // 엔진 내부 attempt에서 계산한다.
+    // 경로 B (T56 P1b 마이그레이션): 엔진이 **자체 저널**에 append 한다
+    // (P0 배선 — 관측이 아니라 Ledger::append). 무커서 공개 dispatch는
+    // 제거되었으므로 재생 입구는 커서 발급 경로뿐이다. borrow 단순화:
+    // 엔진 1개가 전 시나리오를 담당한다 (원래 시나리오별 독립 엔진과
+    // 동치 — 저널 append만 전역 공유).
     let path_b = tmp_path("engine");
-    let mut ledger_b = SqliteLedger::open(&path_b).unwrap();
-    let mut clock_b = 0i64;
-    for (tag, events) in scenarios() {
-        let oid = format!("o-{tag}");
+    {
+        let ledger_b: &'static mut SqliteLedger =
+            Box::leak(Box::new(SqliteLedger::open(&path_b).unwrap()));
         let mut engine = WorkflowEngine::embedded_default();
-        engine.enroll(Order::new(oid.clone(), ExternalRef::cron("a", "b"), t0));
-        engine.acquire(&oid, "exec-g1").unwrap();
-        for ev in &events {
-            // from/시도 주장을 모두 엔진 내부 상태에서
-            let from = engine.order(&oid).unwrap().state();
-            let cur_attempt = engine.order(&oid).unwrap().attempt();
-            let claim = match ev {
-                OrderEvent::DieStarted => cur_attempt.max(1),
-                _ => cur_attempt.max(1),
+        engine.set_ledger(ledger_b, make_actor());
+        // 직접 경로의 at()과 동일 계열: 1_700_000_000+n초 (n≥1).
+        engine.set_clock(chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap());
+        for (tag, events) in scenarios() {
+            let oid = format!("o-{tag}");
+            engine.enroll(Order::new(oid.clone(), ExternalRef::cron("a", "b"), t0));
+            engine.acquire(&oid, "exec-g1").unwrap();
+            // 커서 발급 (신규 실행 의미론: 재생은 커서 소유 경로만).
+            // 커밋먼트는 현재 저널 시점 (빈 저널 = GENESIS 핀).
+            // 읽기는 별도 연결 — 엔진의 쓰기 핸들과 무관.
+            let rows_now = SqliteLedger::open(&path_b).unwrap().read_all().unwrap();
+            let commit = foundry_workflow::replay::TerminalCommitment {
+                max_seq: rows_now.last().map(|r| r.seq).unwrap_or(0),
+                count: rows_now.len() as i64,
+                chain_head: rows_now.last().map(|r| r.hash.clone()).unwrap_or_else(|| "GENESIS".into()),
             };
-            match engine.dispatch(&oid, "exec-g1", ev, claim) {
-                Ok(foundry_workflow::Outcome::Applied) => {
-                    let to = engine.order(&oid).unwrap().state();
-                    ledger_b
-                        .append(&oid, ev, from, to, &actor, at(&mut clock_b))
-                        .unwrap();
-                }
-                _ => { /* refused/NoEdge — not journaled (both paths) */ }
+            // 재생 컨텍스트 — order 결속 (seq 0 = GENESIS 시점).
+            let ctx = foundry_workflow::replay::ReplayContext {
+                cursor: foundry_workflow::replay::VerifiedReplayCursor {
+                    order_id: oid.clone(),
+                    seq: 0,
+                    row_digest: "GENESIS".into(),
+                    pin_digest: commit.chain_head.clone(),
+                },
+            };
+            let _ = foundry_workflow::replay::issue_replay_cursor(
+                &rows_now, &commit, &oid, rows_now.last().map(|r| r.seq).unwrap_or(0),
+            );
+            for ev in &events {
+                let cur_attempt = engine.order(&oid).unwrap().attempt();
+                let claim = cur_attempt.max(1);
+                let _ = engine.dispatch_replay_ctx(&oid, "exec-g1", ev, claim, &ctx);
+                // refused/NoEdge는 저널에 안 심긴다 (양 경로 동일 규율 —
+                // P0 배선은 Applied만 append).
             }
+            // 엔진 내부 상태 == 직접 경로 최종 상태.
+            let final_engine = engine.order(&oid).unwrap().state();
+            let mut direct = Order::new(oid.clone(), ExternalRef::cron("a", "b"), t0);
+            for ev in &events {
+                let _ = direct.transition(ev.clone(), direct.attempt().max(1));
+            }
+            assert_eq!(
+                final_engine, direct.state(),
+                "engine internal state must equal direct replay state for {oid}"
+            );
         }
-        // 엔진 내부 상태는 시나리오 종료 상태와 일치해야 한다 (직접 경로와
-        // 같은 최종 상태 — 미비교면 "엔진이 다른 곳에 있었어도 통과").
-        let final_engine = engine.order(&oid).unwrap().state();
-        let mut direct = Order::new(oid.clone(), ExternalRef::cron("a", "b"), t0);
-        for ev in &events {
-            let claim = match ev {
-                OrderEvent::DieStarted => direct.attempt().max(1),
-                _ => direct.attempt().max(1),
-            };
-            let _ = direct.transition(ev.clone(), claim);
-        }
-        assert_eq!(
-            final_engine, direct.state(),
-            "engine internal state must equal direct replay state for {oid}"
-        );
     }
-    drop(ledger_b);
 
     let bytes_a = std::fs::read(&path_a).unwrap();
     let bytes_b = std::fs::read(&path_b).unwrap();

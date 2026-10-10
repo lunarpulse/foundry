@@ -115,6 +115,53 @@ impl SqliteLedger {
         Ok(true)
     }
 
+    /// Verify a row slice's chain (T56 cursor issuance) — same algorithm
+    /// as verify_chain but over caller-provided rows (prefix re-verification).
+    pub fn verify_rows(rows: &[LedgerRow]) -> bool {
+        let mut prev = "GENESIS".to_string();
+        for r in rows {
+            if r.prev_hash != prev {
+                return false;
+            }
+            let expect = match crate::event_json::row_version(r) {
+                1 => entry_hash(
+                    r.seq,
+                    &r.order_id,
+                    &r.from_state,
+                    &r.to_state,
+                    &r.event,
+                    &r.actor,
+                    &r.intent,
+                    &r.at,
+                    &prev,
+                ),
+                _ => {
+                    let v1_payload = format!(
+                        "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                        r.seq,
+                        r.order_id,
+                        r.from_state,
+                        r.to_state,
+                        r.event,
+                        r.actor,
+                        r.intent,
+                        r.at,
+                        prev
+                    );
+                    let json = r.event_json.as_deref().unwrap_or("");
+                    let payload = crate::event_json::v2_hash_payload(&v1_payload, json);
+                    use sha2::{Digest, Sha256};
+                    hex::encode(sha2::Sha256::digest(payload.as_bytes()))
+                }
+            };
+            if expect != r.hash {
+                return false;
+            }
+            prev = r.hash.clone();
+        }
+        true
+    }
+
     /// Full journal snapshot, seq-ordered — the read-model's only input
     /// (M1 T11: serve replays this inside ONE read transaction; the
     /// ledger==state invariant makes a separate orders table unnecessary).
