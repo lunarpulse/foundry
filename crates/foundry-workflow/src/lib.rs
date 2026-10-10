@@ -307,9 +307,18 @@ impl WorkflowEngine {
                             Some(l) if l.held_by.as_deref() == Some(exec_id) => {}
                             _ => return false,
                         }
-                        // 예산 — 잔여 스텝.
-                        let steps = self.observations.iter().filter(|o| o.exec_id == exec_id).count() as u32;
+                        // 예산 — 잔여 스텝. dispatch_inner와 **동일 필터**
+                        // (wf.lock_* 관측 제외 — astra r5 BLOCKER: 카운트
+                        // 불일치가 precheck 오판을 냈다).
+                        let steps = self.observations.iter().filter(|o| {
+                            o.exec_id == exec_id && !o.event_family.starts_with("wf.lock_")
+                        }).count() as u32;
                         if steps >= self.budget.max_steps {
+                            return false;
+                        }
+                        // root 결속 — active root 엔진은 실행 결속 필수
+                        // (dispatch_inner의 G5 검사와 동일 — astra r5 MAJOR).
+                        if self.active_root.is_some() && !self.exec_bindings.contains_key(exec_id) {
                             return false;
                         }
                         // 엣지 — 부호화에 (패밀리, from) 존재.
@@ -329,6 +338,17 @@ impl WorkflowEngine {
                     if !can_apply {
                         // 전이가 나지 못한다 — begin_apply 없이 진행·거부.
                         let out = self.dispatch_inner(order_id, exec_id, event, event_attempt);
+                        if matches!(&out, Ok(Outcome::Applied)) {
+                            // astra r5 BLOCKER: precheck 불능인데 전이가 났다면
+                            // precheck와 dispatch_inner의 논리가 갈라진 것 —
+                            // 엔진 계약 위반. 래치하고 치명으로 보고 (인가 없는
+                            // 적용은 절대 승인하지 않는다).
+                            let detail = "precheck judged dispatch inapplicable but dispatch_inner APPLIED — engine invariant broken (precheck/inner logic divergence)".to_string();
+                            if !self.halted.contains_key(exec_id) {
+                                self.halted.insert(exec_id.into(), HaltCause::EncodingDrift { detail: detail.clone() });
+                            }
+                            return Err(EngineError::EncodingDrift { detail });
+                        }
                         // 실패한 디스패치의 예약은 즉시 해제 (NoEdge 포함).
                         if !matches!(&out, Ok(Outcome::Applied)) {
                             if let Some(g) = grant {
@@ -1193,6 +1213,53 @@ mod tests {
         let r = e.dispatch_live("g3-o", "ex", &g3_approval_event(), 1, Some(&grant), &mut hook);
         assert!(matches!(r, Err(EngineError::AuthorizationRefused { .. })), "{r:?}");
         assert_eq!(e.order("g3-o").unwrap().state(), OrderState::FurnaceHold);
+    }
+
+    /// (astra r5 BLOCKER) precheck 불능 경로에서 전이가 나지 않는다 —
+    /// 예산 0 엔진의 라이브 승인: Applied 불가, grant 미소비.
+    #[test]
+    fn t53r5_precheck_failure_never_applies_or_consumes() {
+        let mut e = WorkflowEngine::new(EmbeddedWorkflow::frozen_v1(), Budget { max_steps: 0 });
+        let mut o = order("r5-o");
+        o.force_state_for_test(OrderState::FurnaceHold, 1);
+        e.enroll(o);
+        e.acquire("r5-o", "ex").unwrap();
+        let mut ledger = foundry_approval::ApprovalLedger::open_in_memory().unwrap();
+        let sc = serde_json::json!({
+            "order_id": "r5-o", "intent": "ship", "artifact_digest": "dig-1", "root_scope": "",
+        });
+        ledger.issue_grant("g-r5", "tok-r5", &sc).unwrap();
+        let mut hook = LedgerHook(ledger);
+        let grant = GrantRef { grant_id: "g-r5".into() };
+        let out = e.dispatch_live("r5-o", "ex", &g3_approval_event(), 1, Some(&grant), &mut hook);
+        // 예산 0 → BudgetExhausted (Applied 아님), grant는 미소비.
+        assert!(matches!(out, Err(EngineError::BudgetExhausted { .. })), "{out:?}");
+        assert_eq!(hook.0.get_grant("g-r5").unwrap().state, foundry_approval::GrantState::Issued, "precheck-ineligible dispatch must NOT consume");
+        assert_eq!(e.order("r5-o").unwrap().state(), OrderState::FurnaceHold);
+    }
+
+    /// (astra r5 MAJOR) root 미결속 실행의 라이브 승인 — precheck에서
+    /// 결격 → Applying 없이 거부, grant 무사.
+    #[test]
+    fn t53r5_unbound_exec_root_refusal_preserves_grant() {
+        let mut e = WorkflowEngine::embedded_default();
+        e.set_active_root("wf-root-Z");
+        let mut o = order("r5-u");
+        o.force_state_for_test(OrderState::FurnaceHold, 1);
+        e.enroll(o);
+        e.acquire("r5-u", "ex").unwrap();
+        // ex는 root 결속 없음 — G5 위반 경로.
+        let mut ledger = foundry_approval::ApprovalLedger::open_in_memory().unwrap();
+        let sc = serde_json::json!({
+            "order_id": "r5-u", "intent": "ship", "artifact_digest": "dig-1", "root_scope": "wf-root-Z",
+        });
+        ledger.issue_grant("g-u", "tok-u", &sc).unwrap();
+        let mut hook = LedgerHook(ledger);
+        let grant = GrantRef { grant_id: "g-u".into() };
+        let r = e.dispatch_live("r5-u", "ex", &g3_approval_event(), 1, Some(&grant), &mut hook);
+        assert!(matches!(r, Err(EngineError::EncodingDrift { .. })), "{r:?}");
+        assert_eq!(hook.0.get_grant("g-u").unwrap().state, foundry_approval::GrantState::Issued, "root refusal must not strand Applying");
+        assert_eq!(e.order("r5-u").unwrap().state(), OrderState::FurnaceHold);
     }
 
     /// 비승인 이벤트는 라이브여도 grant 불요 — 자율 구간.
