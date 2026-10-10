@@ -27,6 +27,7 @@
 pub mod dsl;
 pub mod skill;
 pub mod validator;
+pub mod router;
 
 use foundry_domain::order::{Order, OrderEvent, OrderState};
 use foundry_domain::ports::Ledger;

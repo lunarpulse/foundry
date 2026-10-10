@@ -72,6 +72,19 @@ pub fn validate(doc: &WorkflowDoc, encoding: &EmbeddedWorkflow) -> Result<Valida
         errors.push(interpret_error_to_diag(e));
     }
 
+    // (2b) 공유 검증 계약 (플랜 v6 T54-T53 seam): 라우팅 패턴 문법은
+    // router::validate_routing이 유일 소유 — 검증기는 그것을 호출한다
+    // (재구현 금지). 대상 id 존재 검사는 라우터 적재 시점(외부 등록부)에
+    // 완결 — 여기선 문법만.
+    for r in &doc.routing.rules {
+        if let Err(reason) = crate::router::check_pattern_public(&r.source_pattern) {
+            errors.push(Diagnostic::err(
+                "bad_route_pattern",
+                format!("routing pattern '{}' invalid: {}", r.source_pattern, reason),
+            ));
+        }
+    }
+
     // (3) StepId 계약 — 비어있지 않음·문서 내 유일.
     let mut seen_ids: Vec<&str> = Vec::new();
     for (i, st) in doc.body.steps.iter().enumerate() {
@@ -546,6 +559,22 @@ mod tests {
         assert!(errs.iter().any(|e| matches!(e, Diagnostic::Error { code, .. } if code == "schema_version")));
         // 그리고 v1 인터프리터로는 여전히 해석된다 (레거시 재생 불변).
         assert!(interpreter_v1::interpret(&d, &enc).is_ok());
+    }
+
+    // 공유 라우팅 계약 — 나쁜 패턴은 문서 검증 단계에서도 잡힌다.
+    #[test]
+    fn t53_validator_uses_shared_pattern_contract() {
+        let enc = EmbeddedWorkflow::frozen_v1();
+        let mut d = v3_doc();
+        d.routing.rules.push(crate::dsl::RouteRule {
+            source_pattern: "a*b*c".into(),
+            workflow_id: "order-pipeline-v3".into(),
+        });
+        let errs = validate(&d, &enc).unwrap_err();
+        assert!(
+            errs.iter().any(|e| matches!(e, Diagnostic::Error { code, .. } if code == "bad_route_pattern")),
+            "{errs:?}"
+        );
     }
 
     // (astra T54 MAJOR 1) PolicyDoc 지원되지 않는 버전 → 거부.
