@@ -170,13 +170,33 @@ fn g1_journal_bytes_identical_direct_vs_engine() {
                     pin_digest: commit.chain_head.clone(),
                 },
             };
-            let _ = foundry_workflow::replay::issue_replay_cursor(
-                &rows_now, &commit, &oid, rows_now.last().map(|r| r.seq).unwrap_or(0),
-            );
             for ev in &events {
                 let cur_attempt = engine.order(&oid).unwrap().attempt();
                 let claim = cur_attempt.max(1);
-                let _ = engine.dispatch_replay_ctx(&oid, "exec-g1", ev, claim, &ctx);
+                // 이벤트마다 커서 갱신 — 직전에 커밋된 **이 주문의** 행을
+                // 가리킨다 (첫 이벤트는 GENESIS). 발급은 커밋먼트 경유.
+                let rows_now2 = SqliteLedger::open(&path_b).unwrap().read_all().unwrap();
+                let last_mine = rows_now2.iter().filter(|r| r.order_id == oid).next_back();
+                let ctx = foundry_workflow::replay::ReplayContext {
+                    cursor: match last_mine {
+                        Some(r) => foundry_workflow::replay::VerifiedReplayCursor {
+                            order_id: oid.clone(),
+                            seq: r.seq,
+                            row_digest: r.hash.clone(),
+                            pin_digest: commit.chain_head.clone(),
+                        },
+                        None => foundry_workflow::replay::VerifiedReplayCursor {
+                            order_id: oid.clone(),
+                            seq: 0,
+                            row_digest: "GENESIS".into(),
+                            pin_digest: commit.chain_head.clone(),
+                        },
+                    },
+                };
+                // 읽기 전용 재오픈 — 결속 대조용 (엔진의 쓰기 핸들과 무관).
+                let jr_ro = SqliteLedger::open(&path_b).unwrap();
+                let _ = engine.dispatch_replay_ctx(&oid, "exec-g1", ev, claim, &ctx, &jr_ro);
+                drop(jr_ro);
                 // refused/NoEdge는 저널에 안 심긴다 (양 경로 동일 규율 —
                 // P0 배선은 Applied만 append).
             }

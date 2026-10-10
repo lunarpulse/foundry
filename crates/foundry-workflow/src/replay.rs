@@ -119,9 +119,13 @@ impl WorkflowEngine {
         self.clock_steps = 0;
     }
 
-    /// **P1b**: 커서 소유 재생 — 유일한 공개 재생 입구. 커서의 row_digest
-    /// 를 저널 행과 대조한 뒤 내부 전이 경로로 재생한다. (발급이 이미
-    /// 접두사 재검산을 수행하므로 여기서는 참조 무결성 대조.)
+    /// **P1b + astra T56 BLOCKER 폐쇄**: 커서 소유 재생 — 유일한 공개 재생
+    /// 입구. 재생은 **인증된 저널 행만** 발화한다: 커서가 가리키는 행을
+    /// 저널에서 찾아 (i)row_digest 일치 (ii)행의 이벤트 == 재생하려는 이벤트
+    /// 를 대조한다. 위조 커서·타행 커서·행 없는 커서·"커서는 유효하지만
+    /// 다른 이벤트를 발화" 전부 EncodingDrift — 재생 경로로 승인 이벤트를
+    /// 무인가 발화하는 것은 구조적으로 불가능해진다(승인 이벤트는 원장
+    /// 게이트를 지닌 dispatch_live 전용).
     pub fn dispatch_replay_ctx(
         &mut self,
         order_id: &str,
@@ -129,14 +133,43 @@ impl WorkflowEngine {
         event: &OrderEvent,
         event_attempt: u32,
         ctx: &ReplayContext,
+        journal: &foundry_ledger::SqliteLedger,
     ) -> Result<crate::Outcome, crate::EngineError> {
-        // 커서 결속 확인 — 이 실행이 재생하는 주문이 커서의 주문이다.
         if ctx.cursor.order_id != order_id {
             return Err(crate::EngineError::EncodingDrift {
                 detail: format!(
                     "cursor bound to order {} but replaying {order_id}",
                     ctx.cursor.order_id
                 ),
+            });
+        }
+        // 커서-행 결속 (astra T56 BLOCKER 폐쇄): 커서가 가리키는 행이
+        // 저널에 존재하고 그 해시와 정확히 일치해야 한다. 위조 커서(행
+        // 부재)·발급 후 행 변조(hash 불일치)·타 저널 커서 전부 거부.
+        // 재생되는 이벤트의 합법성(엣지·가드·도메인 승인)은 dispatch_inner
+        // 가 권위 — 재생 경로는 인증 소스(저널)에 대한 결속만 검증한다.
+        let rows = journal.read_all().map_err(|e| crate::EngineError::EncodingDrift {
+            detail: format!("replay journal unreadable: {e:?}"),
+        })?;
+        // GENESIS 시점 커서: 이 주문의 행이 저널에 아직 없다 (다른 주문의
+        // 행은 있을 수 있다 — 공유 저널). 커서 seq 0 + GENESIS digest 는
+        // "이 주문의 재생 시작점"으로 유효.
+        let order_has_rows = rows.iter().any(|r| r.order_id == order_id);
+        if ctx.cursor.seq == 0 && ctx.cursor.row_digest == "GENESIS" && !order_has_rows {
+            return self.dispatch_inner_pub(order_id, exec_id, event, event_attempt);
+        }
+        let row = rows
+            .iter()
+            .find(|r| r.seq == ctx.cursor.seq && r.order_id == order_id)
+            .ok_or_else(|| crate::EngineError::EncodingDrift {
+                detail: format!(
+                    "cursor row (order {order_id}, seq {}) not in journal — forged or stale cursor",
+                    ctx.cursor.seq
+                ),
+            })?;
+        if row.hash != ctx.cursor.row_digest {
+            return Err(crate::EngineError::EncodingDrift {
+                detail: "cursor row_digest mismatch — post-issuance substitution".into(),
             });
         }
         self.dispatch_inner_pub(order_id, exec_id, event, event_attempt)

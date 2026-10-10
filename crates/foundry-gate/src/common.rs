@@ -55,10 +55,32 @@ pub fn replay_event(
             pin_digest: commit.chain_head.clone(),
         },
     };
-    e.dispatch_replay_ctx(order_id, exec_id, event, attempt, &ctx)
+    e.dispatch_replay_ctx(order_id, exec_id, event, attempt, &ctx, journal)
 }
 
 /// 터미널 커밋먼트 — 저널 전체 행에서 촬영 (운영자 대역 외 보관 역할).
+/// 이 주문의 직전 커밋 행을 가리키는 재생 컨텍스트 (첫 이벤트=GENESIS).
+pub fn replay_ctx_for(order: &str, rows: &[foundry_ledger::sqlite::LedgerRow]) -> foundry_workflow::replay::ReplayContext {
+    let last_mine = rows.iter().filter(|r| r.order_id == order).next_back();
+    let c = terminal_commitment_from(rows);
+    foundry_workflow::replay::ReplayContext {
+        cursor: match last_mine {
+            Some(r) => foundry_workflow::replay::VerifiedReplayCursor {
+                order_id: order.into(),
+                seq: r.seq,
+                row_digest: r.hash.clone(),
+                pin_digest: c.chain_head,
+            },
+            None => foundry_workflow::replay::VerifiedReplayCursor {
+                order_id: order.into(),
+                seq: 0,
+                row_digest: "GENESIS".into(),
+                pin_digest: c.chain_head,
+            },
+        },
+    }
+}
+
 pub fn terminal_commitment_from(rows: &[foundry_ledger::sqlite::LedgerRow]) -> foundry_workflow::replay::TerminalCommitment {
     foundry_workflow::replay::TerminalCommitment {
         max_seq: rows.last().map(|r| r.seq).unwrap_or(0),

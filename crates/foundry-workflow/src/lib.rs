@@ -784,7 +784,8 @@ impl WorkflowEngine {
                             if !self.halted.contains_key(exec_id) {
                                 self.halted.insert(exec_id.into(), HaltCause::Infrastructure { detail: detail.clone() });
                             }
-                            let _ = self.observe(exec_id, event, from, None, "-", Outcome::Refused { detail: "journal append failed (exec latched)".into() });
+                            // astra T56 MAJOR: append 실패는 관측도 내지 않는다
+                            // — "no observation" 계약의 문자 그대로 이행.
                             return Err(EngineError::Infrastructure { detail });
                         }
                     }

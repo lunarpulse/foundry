@@ -103,19 +103,58 @@ fn aprime_p3_crash_after_begin_apply_fails_closed() {
     assert!(ap.apply_intent("g-a", "ex", 1).unwrap(), "audit evidence retained");
 }
 
-/// ④ 전이 적용·finalize 직전 크래시 — APPLYING 은 회복이 CONSUMED 완결.
+/// ④ 전이 적용·finalize 직전 크래시 — **실제 저널 append 후** (astra T56
+/// MAJOR: begin_apply 반복이 아니라 진짜 전이 커밋 뒤). 재구축 상태 +
+/// CONSUMED 단정.
 #[test]
 fn aprime_p4_crash_before_finalize() {
     let (mut ap, ap_path) = file_approval("p4");
-    let (jr, jr_path) = file_journal("ap4");
-    let _ = jr;
     ap.issue_grant("g-a", "tok-a", &sc("o-a")).unwrap();
+
+    let jr_path = std::env::temp_dir().join(format!("gate-ap4-j-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&jr_path);
+    let jr_static: &'static mut foundry_ledger::SqliteLedger =
+        Box::leak(Box::new(foundry_ledger::SqliteLedger::open(&jr_path).unwrap()));
+    let mut e = WorkflowEngine::embedded_default();
+    e.set_ledger(jr_static, actor("p4"));
+    e.set_clock(chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap());
+    // 완전한 라이프사이클 — 자율 구간 재생.
+    let mut o = furnace_order("o-a");
+    o.force_state_for_test(OrderState::Received, 1);
+    e.enroll(o);
+    e.acquire("o-a", "ex").unwrap();
+    use foundry_domain::OrderEvent as OE;
+    for ev in [OE::Queued, OE::DieStarted, OE::DieSucceeded { attempt: 1 }, OE::InspectionPassed] {
+        let att = e.order("o-a").unwrap().attempt().max(1);
+        let rows = foundry_ledger::SqliteLedger::open(&jr_path).unwrap().read_all().unwrap();
+        let ctx = crate::common::replay_ctx_for("o-a", &rows);
+        let jr_ro: &'static mut foundry_ledger::SqliteLedger =
+            Box::leak(Box::new(foundry_ledger::SqliteLedger::open(&jr_path).unwrap()));
+        e.dispatch_replay_ctx("o-a", "ex", &ev, att, &ctx, jr_ro).unwrap();
+    }
+    // 승인 전이 — dispatch_live 는 begin_apply~finalize 를 원자적으로 마는데,
+    // 크래시 지점 재현: reserve+begin_apply 만 수동 수행 후 **전이를 엔진이
+    // 아니라 저널에만** 심는다(전이 적용됨·finalize 미수행).
     let r = ap.reserve_grant("g-a", &sc("o-a"), "ex", 1).unwrap();
     ap.begin_apply("g-a", "ex", 1, r.fence_token).unwrap();
+    // 전이 적용 (도메인 직접 — 엔진을 거치지 않는 크래시 경계 시뮬레이션).
+    drop(e); // 엔진 폐기 — 쓰기 핸들 해제.
+    let mut dom = furnace_order("o-a"); // FurnaceHold 현재 상태
+    let to = dom.transition(OE::Approved { intent: "ship".into(), artifact_digest: "dig-a".into() }, 1).unwrap();
+    let mut jr_w = foundry_ledger::SqliteLedger::open(&jr_path).unwrap();
+    use foundry_domain::ports::Ledger as _;
+    jr_w.append("o-a", &OE::Approved { intent: "ship".into(), artifact_digest: "dig-a".into() }, foundry_domain::OrderState::FurnaceHold, to, &actor("p4"), chrono::Utc::now()).unwrap();
+    drop(jr_w);
     drop(ap);
-    let _ = restart_and_assert(&ap_path, &jr_path, true);
-    let ap = foundry_approval::ApprovalLedger::open(&ap_path).unwrap();
-    assert_eq!(ap.get_grant("g-a").unwrap().state, foundry_approval::GrantState::Consumed);
+    // 재시작 — 저널 검증·재구축(Publishing)·APPLYING→CONSUMED.
+    let mut ap2 = foundry_approval::ApprovalLedger::open(&ap_path).unwrap();
+    let jr2 = foundry_ledger::SqliteLedger::open(&jr_path).unwrap();
+    assert!(jr2.verify_chain().unwrap());
+    let mut fresh = WorkflowEngine::embedded_default();
+    let report = RecoveryRunner::run(&mut ap2, &jr2, &mut fresh).unwrap();
+    assert_eq!(report.rebuilt_orders, 1);
+    assert_eq!(fresh.order("o-a").unwrap().state(), OrderState::Publishing, "transition survived in journal");
+    assert_eq!(ap2.get_grant("g-a").unwrap().state, foundry_approval::GrantState::Consumed, "APPLYING completed — no transition-without-consumption");
 }
 
 /// ⑤ finalize 커밋 직후 — 이미 CONSUMED: 회복은 무연산 (멱등).
@@ -176,16 +215,10 @@ fn aprime_wired_engine_full_recovery_cycle() {
     for ev in [OE::Queued, OE::DieStarted, OE::DieSucceeded { attempt: 1 }, OE::InspectionPassed] {
         let att = e.order("o-a").unwrap().attempt().max(1);
         let rows_now = foundry_ledger::SqliteLedger::open(&jr_path).unwrap().read_all().unwrap();
-        let commit = crate::common::terminal_commitment_from(&rows_now);
-        let ctx = foundry_workflow::replay::ReplayContext {
-            cursor: foundry_workflow::replay::VerifiedReplayCursor {
-                order_id: "o-a".into(),
-                seq: commit.max_seq,
-                row_digest: commit.chain_head.clone(),
-                pin_digest: commit.chain_head.clone(),
-            },
-        };
-        e.dispatch_replay_ctx("o-a", "ex", &ev, att, &ctx).unwrap();
+        let ctx = crate::common::replay_ctx_for("o-a", &rows_now);
+        let journal_ro: &'static mut foundry_ledger::SqliteLedger =
+            Box::leak(Box::new(foundry_ledger::SqliteLedger::open(&jr_path).unwrap()));
+        e.dispatch_replay_ctx("o-a", "ex", &ev, att, &ctx, journal_ro).unwrap();
     }
     assert_eq!(e.order("o-a").unwrap().state(), OrderState::FurnaceHold, "autonomous leg done");
     let mut hook = LedgerHook(ap);
