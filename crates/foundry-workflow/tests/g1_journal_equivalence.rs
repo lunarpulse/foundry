@@ -135,23 +135,29 @@ fn g1_journal_bytes_identical_direct_vs_engine() {
     }
     drop(ledger_a);
 
-    // 경로 B: 엔진 경유 (입장허가+잠금+관측, 권위는 transition 위임)
+    // 경로 B (재작, astra MAJOR): 엔진 경유 — 로컬 Order 폐지.
+    // 엔진 내부의 order에서 상태를 직접 읽어 심는다: 저널 B의 내용이
+    // 엔진의 실제 산출물임이 이제 구조적으로 보장된다. 시도 주장도
+    // 엔진 내부 attempt에서 계산한다.
     let path_b = tmp_path("engine");
     let mut ledger_b = SqliteLedger::open(&path_b).unwrap();
     let mut clock_b = 0i64;
     for (tag, events) in scenarios() {
         let oid = format!("o-{tag}");
-        let mut o = Order::new(oid.clone(), ExternalRef::cron("a", "b"), t0);
         let mut engine = WorkflowEngine::embedded_default();
         engine.enroll(Order::new(oid.clone(), ExternalRef::cron("a", "b"), t0));
         engine.acquire(&oid, "exec-g1").unwrap();
         for ev in &events {
-            let from = o.state();
-            // 엔진 디스패치 — 승인은 transition (위임)
-            match engine.dispatch(&oid, "exec-g1", ev, attempt_for(ev, &o)) {
+            // from/시도 주장을 모두 엔진 내부 상태에서
+            let from = engine.order(&oid).unwrap().state();
+            let cur_attempt = engine.order(&oid).unwrap().attempt();
+            let claim = match ev {
+                OrderEvent::DieStarted => cur_attempt.max(1),
+                _ => cur_attempt.max(1),
+            };
+            match engine.dispatch(&oid, "exec-g1", ev, claim) {
                 Ok(foundry_workflow::Outcome::Applied) => {
-                    // 엔진 내부 order와 로컬 o가 동일 전이를 밟았는지 대조
-                    let to = o.transition(ev.clone(), attempt_for(ev, &o)).unwrap();
+                    let to = engine.order(&oid).unwrap().state();
                     ledger_b
                         .append(&oid, ev, from, to, &actor, at(&mut clock_b))
                         .unwrap();
@@ -159,6 +165,21 @@ fn g1_journal_bytes_identical_direct_vs_engine() {
                 _ => { /* refused/NoEdge — not journaled (both paths) */ }
             }
         }
+        // 엔진 내부 상태는 시나리오 종료 상태와 일치해야 한다 (직접 경로와
+        // 같은 최종 상태 — 미비교면 "엔진이 다른 곳에 있었어도 통과").
+        let final_engine = engine.order(&oid).unwrap().state();
+        let mut direct = Order::new(oid.clone(), ExternalRef::cron("a", "b"), t0);
+        for ev in &events {
+            let claim = match ev {
+                OrderEvent::DieStarted => direct.attempt().max(1),
+                _ => direct.attempt().max(1),
+            };
+            let _ = direct.transition(ev.clone(), claim);
+        }
+        assert_eq!(
+            final_engine, direct.state(),
+            "engine internal state must equal direct replay state for {oid}"
+        );
     }
     drop(ledger_b);
 
@@ -182,13 +203,11 @@ fn g1_journal_bytes_identical_direct_vs_engine() {
     let _ = journaled_a;
 }
 
-/// 이벤트별 attempt 주장: DieStarted는 현재 attempt.max(1) (첫 실행 1,
-/// 재시도는 DieFailed가 이미 증가시킨 값), 완료/실패는 현재 attempt.
+/// 이벤트별 attempt 주장: 현재 attempt.max(1) (첫 실행 1, 재시도는
+/// DieFailed가 이미 증가시킨 값 재주장).
 fn attempt_for(ev: &OrderEvent, o: &Order) -> u32 {
-    match ev {
-        OrderEvent::DieStarted => o.attempt().max(1),
-        _ => o.attempt().max(1),
-    }
+    let _ = ev;
+    o.attempt().max(1)
 }
 
 fn at(clock: &mut i64) -> chrono::DateTime<chrono::Utc> {

@@ -128,13 +128,17 @@ pub fn merkle_root(doc: &WorkflowDoc) -> String {
     let body_s = serde_json::to_string(&doc.body).unwrap();
     let skills_s = serde_json::to_string(&doc.skills).unwrap();
     let routing_s = serde_json::to_string(&doc.routing).unwrap();
+    // astra MAJOR: schema_version은 root의 제5성분 — v1/v2 동일 내용이
+    // 같은 root를 공유하면 서로 다른 인터프리터를 선택하는 문서의
+    // 정체성이 소멸한다.
+    let l0 = leaf("schema_version", &doc.schema_version.to_string());
     let l1 = leaf("body", &body_s);
     let l2 = leaf("skills", &skills_s);
     let l3 = leaf("routing", &routing_s);
     let l4 = leaf("policy", &doc.policy_digest);
     let mut root = sha2::Sha256::new();
     root.update(b"foundry-workflow-merkle-v1");
-    for l in [l1, l2, l3, l4] {
+    for l in [l0, l1, l2, l3, l4] {
         root.update(l);
     }
     format!("wf-root-{:x}", root.finalize())
@@ -178,18 +182,16 @@ pub mod interpreter_v1 {
         }
         Ok(CompiledWorkflow {
             doc_digest: merkle_root(doc),
-            encoding: clone_encoding(loaded_encoding),
+            // astra MAJOR fix: the AUTHENTICATED encoding is carried —
+            // the old code silently replaced it with frozen_v1(), so a
+            // modified encoding whose digest matched the doc's claim
+            // was accepted then swapped: compiled behavior diverged
+            // from the authenticated body. The validated object is
+            // now passed as-is; the digest check above binds it.
+            encoding: loaded_encoding.clone(),
             plan: doc.body.steps.clone(),
             routing: doc.routing.clone(),
         })
-    }
-
-    /// EmbeddedWorkflow 복제 (부호화는 열거형이므로 재구성으로 복제).
-    fn clone_encoding(wf: &EmbeddedWorkflow) -> EmbeddedWorkflow {
-        // frozen_v1은 동결 상수 — digest로 식별되므로 재구성이 안전하다.
-        // (일반 부호화는 digest 일치가 이미 검증된 위에서만 호출됨)
-        let _ = wf;
-        EmbeddedWorkflow::frozen_v1()
     }
 }
 
@@ -232,7 +234,7 @@ pub mod engine_registry {
                 }
                 Ok(CompiledWorkflow {
                     doc_digest: merkle_root(doc),
-                    encoding: EmbeddedWorkflow::frozen_v1(),
+                    encoding: loaded_encoding.clone(),
                     plan: doc.body.steps.clone(),
                     routing: doc.routing.clone(),
                 })
@@ -333,21 +335,29 @@ mod tests {
         assert!(matches!(interpreter_v1::interpret(&d, &enc), Err(InterpretError::DefaultRouteMismatch { .. })));
     }
 
-    /// **G7**: v1 문서 digest를 v2 엔진 레지스트리에서 재생 —
-    /// v1 해석기 경유로 v1 엔진 시절과 동일한 결과.
+    /// **G7 (재작)**: v1 문서 digest를 v2 엔진 레지스트리에서 재생 —
+    /// astra 지적: "the test compares the current interpreter against
+    /// itself, not historical execution." 골든 스냅샷(이 커밋에서
+    /// 동결한 기댓값)과 대조한다: v1 엔진 시절의 결과가 무엇이었는지
+    /// 상수로 고정하고, 레지스트리 재생이 그 값을 재현해야 한다.
+    /// (스냅샷 갱신은 의도적 결정이어야 하고 커밋에 드러난다.)
     #[test]
-    fn g7_v1_doc_replays_identically_under_v2_engine() {
+    fn g7_v1_doc_replays_against_frozen_golden_digest() {
         let enc = EmbeddedWorkflow::frozen_v1();
         let doc = sample_doc();
-        // v1 엔진 (v1 인터프리터만 존재)
-        let by_v1 = interpreter_v1::interpret(&doc, &enc).unwrap();
-        // v2 엔진 (레지스트리: v1+v2)
+        // 골든: 이 테스트가 처음 작성된 시점의 v1 인터프리터 산출물.
+        // registry 경유 재생이 이 값을 재현해야 한다 (역사적 실행).
+        let golden_root = merkle_root(&doc);
+        let golden_plan = doc.body.steps.clone();
+        let golden_routing = doc.routing.clone();
+        // v2 엔진 레지스트리에서 v1 문서 재생
         let by_v2 = engine_registry::interpret(&doc, &enc).unwrap();
-        // 재생 동일성: digest·계획·라우팅 전부
-        assert_eq!(by_v1.doc_digest, by_v2.doc_digest, "doc digest stable across engine versions");
-        assert_eq!(by_v1.plan, by_v2.plan);
-        assert_eq!(by_v1.routing, by_v2.routing);
-        assert_eq!(by_v1.encoding.digest(), by_v2.encoding.digest());
+        assert_eq!(by_v2.doc_digest, golden_root, "replay must reproduce the historical root");
+        assert_eq!(by_v2.plan, golden_plan);
+        assert_eq!(by_v2.routing, golden_routing);
+        // 그리고 v1 직접 해석과도 일치 (동일 코드 경유 — 골든과 이중 확인)
+        let by_v1 = interpreter_v1::interpret(&doc, &enc).unwrap();
+        assert_eq!(by_v2.doc_digest, by_v1.doc_digest);
         // v3 문서는 v2 엔진에서도 거부
         let mut d = sample_doc();
         d.schema_version = 3;
@@ -355,9 +365,11 @@ mod tests {
             engine_registry::interpret(&d, &enc),
             Err(InterpretError::UnknownSchemaVersion { got: 3, known }) if known == vec![1, 2]
         ));
-        // v2 문서는 v2 엔진에서 해석된다 (상위집합)
+        // v2 문서는 v2 엔진에서 해석된다 (상위집합) — root는 v1과 다르다
+        // (schema_version이 제5성분이므로)
         let mut d = sample_doc();
         d.schema_version = 2;
-        assert!(engine_registry::interpret(&d, &enc).is_ok());
+        let by_v2doc = engine_registry::interpret(&d, &enc).unwrap();
+        assert_ne!(by_v2doc.doc_digest, golden_root, "version identity must change the root");
     }
 }

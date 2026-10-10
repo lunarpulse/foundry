@@ -29,7 +29,7 @@ pub mod skill;
 
 use foundry_domain::order::{Order, OrderEvent, OrderState};
 use foundry_domain::ports::Ledger;
-use foundry_domain::workflow_encoding::{edge_event_of, EmbeddedWorkflow};
+use foundry_domain::workflow_encoding::{edge_event_of, EdgeTarget, EmbeddedWorkflow};
 use std::collections::HashMap;
 
 /// 실행 식별자 (op_id 관례 승계).
@@ -101,8 +101,11 @@ pub struct WorkflowEngine {
     orders: HashMap<String, Order>,
     observations: Vec<ExecObservation>,
     ops: u64,
-    /// G5: 실행별 결속 digest (획득 시점의 Merkle root).
+    /// G5: 실행별 결속 digest (획득 시점의 문서 Merkle root).
     exec_bindings: HashMap<ExecId, String>,
+    /// G5: 엔진이 서비스 중인 활성 문서 root (None = 미설정 — 결속 검사 없음,
+    /// v1 호환. 문서 축이 연결되면 항상 설정된다).
+    active_root: Option<String>,
 }
 
 impl WorkflowEngine {
@@ -117,6 +120,7 @@ impl WorkflowEngine {
             observations: Vec::new(),
             ops: 0,
             exec_bindings: HashMap::new(),
+            active_root: None,
         }
     }
 
@@ -125,35 +129,76 @@ impl WorkflowEngine {
         Self::new(EmbeddedWorkflow::frozen_v1(), Budget::default())
     }
 
-    /// B1 획득 — 이미 잡혀 있으면 결정론적 거부 (G10).
+    /// B1 획득 — 이미 잡혀 있으면 결정론적 거부 (G10). 획득은 관측된다
+    /// (wf.lock_acquired — astra: "acquisition/release produce neither
+    /// observations nor journal records").
     pub fn acquire(&mut self, order_id: &str, exec_id: &str) -> Result<(), EngineError> {
         let l = self.locks.entry(order_id.to_string()).or_insert(OrderLock { held_by: None });
         if let Some(by) = &l.held_by {
-            // 자기 재획득은 멱등
             if by == exec_id {
                 return Ok(());
             }
             return Err(EngineError::LockHeld { order_id: order_id.into(), by: by.clone() });
         }
         l.held_by = Some(exec_id.to_string());
+        self.ops += 1;
+        self.observations.push(ExecObservation {
+            exec_id: exec_id.into(),
+            seq: self.ops,
+            wf_digest: self.wf_digest.clone(),
+            event_family: "wf.lock_acquired".into(),
+            from: OrderState::Unknown,
+            to: None,
+            guard: "-".into(),
+            outcome: Outcome::Applied,
+        });
         Ok(())
     }
 
-    /// G5: 실행을 digest에 결속 (획득 직후 1회).
-    pub fn bind_digest(&mut self, exec_id: &str, digest: &str) {
-        self.exec_bindings.insert(exec_id.into(), digest.into());
+    /// G5 (재작): 실행을 **문서 Merkle root**에 결속 — 획득 직후 필수.
+    /// 재결속 시도(덮어쓰기)는 거부한다 (astra: "optional, overwritable").
+    /// 인자는 문서 root여야 한다 — encoding digest가 아니라.
+    pub fn bind_root(&mut self, exec_id: &str, doc_root: &str) -> Result<(), EngineError> {
+        if let Some(prev) = self.exec_bindings.get(exec_id) {
+            if prev != doc_root {
+                return Err(EngineError::EncodingDrift {
+                    detail: format!(
+                        "exec {exec_id} already bound to {prev} — rebinding to {doc_root} refused (G5)"
+                    ),
+                });
+            }
+            return Ok(());
+        }
+        self.exec_bindings.insert(exec_id.into(), doc_root.into());
+        Ok(())
     }
 
-    /// G5: 실행의 결속 digest — 없으면 아직 미결속.
+    /// G5: 실행의 결속 root.
     pub fn binding_of(&self, exec_id: &str) -> Option<&str> {
         self.exec_bindings.get(exec_id).map(|s| s.as_str())
     }
 
-    /// B1 해제 — 보유자만.
+    /// G5: 엔진이 현재 서비스하는 활성 문서 root (문서 교체 시 갱신).
+    pub fn set_active_root(&mut self, root: &str) {
+        self.active_root = Some(root.to_string());
+    }
+
+    /// B1 해제 — 보유자만. 해제도 관측된다 (wf.lock_released).
     pub fn release(&mut self, order_id: &str, exec_id: &str) -> bool {
         match self.locks.get_mut(order_id) {
             Some(l) if l.held_by.as_deref() == Some(exec_id) => {
                 l.held_by = None;
+                self.ops += 1;
+                self.observations.push(ExecObservation {
+                    exec_id: exec_id.into(),
+                    seq: self.ops,
+                    wf_digest: self.wf_digest.clone(),
+                    event_family: "wf.lock_released".into(),
+                    from: OrderState::Unknown,
+                    to: None,
+                    guard: "-".into(),
+                    outcome: Outcome::Applied,
+                });
                 true
             }
             _ => false,
@@ -190,17 +235,19 @@ impl WorkflowEngine {
         // G5: 결속된 실행은 자기 시점의 digest로 완결 — 스킬/정책
         // 교체로 root가 바뀌어도 진행 중 실행은 옛 root를 고수하거나
         // 명시적으로 거부된다 (혼합 없음).
+        let active_root_now = self.active_root.clone();
         if let Some(bound) = self.exec_bindings.get(exec_id).cloned() {
-            if bound != self.wf_digest {
-                let _ = self.observe(exec_id, event, from_placeholder(), None, "-", Outcome::Refused {
-                    detail: "digest rebound mid-flight (G5: no mixing)".into(),
-                });
-                return Err(EngineError::EncodingDrift {
-                    detail: format!(
-                        "exec {exec_id} bound to {bound} but engine digest is {} — refuse to mix",
-                        self.wf_digest
-                    ),
-                });
+            if let Some(active) = &active_root_now {
+                if &bound != active {
+                    let _ = self.observe(exec_id, event, from_placeholder(), None, "-", Outcome::Refused {
+                        detail: "doc root changed mid-flight (G5: no mixing)".into(),
+                    });
+                    return Err(EngineError::EncodingDrift {
+                        detail: format!(
+                            "exec {exec_id} bound to {bound} but active root is {active} — refuse to mix"
+                        ),
+                    });
+                }
             }
         }
         // 상태 조회 (등록 필요)
@@ -211,8 +258,12 @@ impl WorkflowEngine {
             .ok_or_else(|| EngineError::EncodingDrift {
                 detail: format!("order {order_id} not enrolled"),
             })?;
-        // B2: 예산 — 이 실행의 관측 수가 상한이면 정지
-        let steps = self.observations.iter().filter(|o| &o.exec_id == exec_id).count() as u32;
+        // B2: 예산 — 노드 실행만 계수 (wf.lock_* 생명주기 관측은 제외:
+        // B2: 예산 — 노드 실행만 계수 (wf.lock_* 생명주기 관측은 제외:
+        // 잠금 획득이 예산을 소모하지 않는다).
+        let steps = self.observations.iter().filter(|o| {
+            &o.exec_id == exec_id && !o.event_family.starts_with("wf.lock_")
+        }).count() as u32;
         if steps >= self.budget.max_steps {
             let obs = self.observe(exec_id, event, from, None, "-", Outcome::BudgetStopped);
             let _ = obs;
@@ -222,16 +273,24 @@ impl WorkflowEngine {
                 cap: self.budget.max_steps,
             });
         }
-        // 입장허가: 부호화에 엣지가 있는가
+        // 입장허가: 부호화에 엣지가 있는가 — 가드를 만족하는 것으로 선택.
+        // (astra MAJOR "first event/from edge wins": DieFailed from Working
+        // has TWO edges (MAX / retry back-edge); .find() always took the
+        // first. Now the guard picks — guard_satisfied is advisory only;
+        // the destination cross-check below remains the authority.)
         let fam = edge_event_of(event);
-        let edge = self
+        let candidates: Vec<&_> = self
             .wf
             .edges
             .iter()
-            .find(|e| e.event == fam && e.from == from);
+            .filter(|e| e.event == fam && e.from == from)
+            .collect();
+        let edge = candidates
+            .iter()
+            .find(|e| foundry_domain::workflow_encoding::guard_satisfied(&e.guard, event, current_attempt_of(self.orders.get(order_id).unwrap())));
         let edge = match edge {
-            Some(e) => e.clone(),
-            None => {
+            Some(e) => (*e).clone(),
+            None if candidates.is_empty() => {
                 // 도메인도 거부해야 정상 (불일치=EncodingDrift)
                 let mut probe = self.orders.get(order_id).unwrap().clone();
                 let dom = probe.transition(event.clone(), event_attempt);
@@ -249,11 +308,54 @@ impl WorkflowEngine {
                     }
                 }
             }
+            None => {
+                // 엣지는 있으나 어느 가드도 만족하지 않는다 — 도메인도 거부해야
+                // 정상 (E7). 도메인이 수용하면 드리프트.
+                let mut probe = self.orders.get(order_id).unwrap().clone();
+                match probe.transition(event.clone(), event_attempt) {
+                    Err(_) => {
+                        let _ = self.observe(exec_id, event, from, None, "-", Outcome::Refused { detail: "no guard satisfied".into() });
+                        return Ok(Outcome::Refused { detail: "no guard satisfied (E7-consistent)".into() });
+                    }
+                    Ok(_) => {
+                        return Err(EngineError::EncodingDrift {
+                            detail: format!(
+                                "domain ACCEPTS {fam:?} from {from:?} but NO matching edge's guard is satisfied (E7 broken)"
+                            ),
+                        })
+                    }
+                }
+            }
         };
         // 도메인 승인 — 유일한 런타임 권위
         let order = self.orders.get_mut(order_id).unwrap();
+        let before = order.attempt();
         match order.transition(event.clone(), event_attempt) {
             Ok(to) => {
+                // astra MAJOR fix: the domain's REACHED destination must
+                // match the edge's destination (state AND token effect).
+                // The old code compared nothing after the first edge
+                // match — a tampered destination never drifted.
+                let edge_dest_ok = match &edge.to {
+                    // DieStarted의 claim 효과(attempt := max(before,1))는
+                    // 상태 엣지의 정당한 부수효과다 (도메인이 그렇게 정의).
+                    EdgeTarget::State(t) => {
+                        *t == to
+                            && (order.attempt() == before
+                                || (edge.event == foundry_domain::workflow_encoding::EdgeEvent::DieStarted
+                                    && order.attempt() == before.max(1)))
+                    }
+                    EdgeTarget::BackEdge { to: t, .. } => *t == to && order.attempt() == before + 1,
+                };
+                if !edge_dest_ok {
+                    return Err(EngineError::EncodingDrift {
+                        detail: format!(
+                            "domain reached {to:?} (attempt {before}->{}) but edge says {:?} — E1/E2 destination violated",
+                            order.attempt(),
+                            &edge.to
+                        ),
+                    });
+                }
                 let _ = self.observe(exec_id, event, from, Some(to), guard_name(&edge.guard).as_str(), Outcome::Applied);
                 Ok(Outcome::Applied)
             }
@@ -313,6 +415,10 @@ impl WorkflowEngine {
 
 fn from_placeholder() -> OrderState {
     OrderState::Unknown
+}
+
+fn current_attempt_of(o: &Order) -> u32 {
+    o.attempt()
 }
 
 /// 가드 이름 (관측용).
@@ -424,12 +530,15 @@ mod tests {
         e.enroll(order("o1"));
         e.acquire("o1", "ex").unwrap();
         e.dispatch("o1", "ex", &OrderEvent::Queued, 1).unwrap();
-        let obs = e.observations();
-        assert_eq!(obs.len(), 1);
-        assert!(obs[0].wf_digest.starts_with("wf-emb-"));
-        assert_eq!(obs[0].guard, "None");
-        assert_eq!(obs[0].outcome, Outcome::Applied);
-        assert_eq!(obs[0].to, Some(OrderState::Queued));
+        let all = e.observations();
+        // B1 생명주기 관측(lock_acquired) + 노드 관측 1
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].event_family, "wf.lock_acquired");
+        let obs = &all[1];
+        assert!(obs.wf_digest.starts_with("wf-emb-"));
+        assert_eq!(obs.guard, "None");
+        assert_eq!(obs.outcome, Outcome::Applied);
+        assert_eq!(obs.to, Some(OrderState::Queued));
     }
 
     /// G5: 참조 스킬 digest 변경 → 진행 중 실행은 옛 root로 완결하거나
@@ -440,13 +549,14 @@ mod tests {
         let mut e = WorkflowEngine::embedded_default();
         e.enroll(order("o1"));
         e.acquire("o1", "ex").unwrap();
-        let root1 = e.wf_digest.clone();
-        e.bind_digest("ex", &root1);
+        let root1 = "wf-root-doc-original".to_string();
+        e.bind_root("ex", &root1).unwrap();
+        e.set_active_root(&root1);
         // 결속 일치 — 정상 진행
         assert_eq!(e.dispatch("o1", "ex", &OrderEvent::Queued, 1).unwrap(), Outcome::Applied);
-        // 스킬 교체 등으로 문서가 바뀌어 새 엔진(새 digest)이 로드됨 —
-        // 시뮬레이션: 같은 실행이 새 digest로 결속 시도 없이, 엔진 digest 교체
-        e.wf_digest = "wf-root-changed".into();
+        // 스킬 교체 등으로 문서가 바뀌어 새 root가 로드됨 — 결속 재시도는 거부
+        assert!(e.bind_root("ex", "wf-root-changed").is_err(), "rebinding must be refused");
+        e.set_active_root("wf-root-changed");
         let r = e.dispatch("o1", "ex", &OrderEvent::DieStarted, 1);
         let detail = match &r {
             Err(EngineError::EncodingDrift { detail }) => detail.clone(),

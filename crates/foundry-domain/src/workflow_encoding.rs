@@ -1,51 +1,73 @@
-//! T51a — 상태머신→내장 워크플로 동등성 증명 + 부호화 (M6 C-W1).
+//! T51a-R — 상태머신→내장 워크플로 동등성 증명 + 부호화 (M6, 재작판).
 //!
-//! M6 계약의 선행 의무: "모든 전이·가드·정지 열거, 전체·구조 보존
-//! 부호화, '바이트 하위호환'의 조작적 정의(모든 M1-M5 주문을 내장
-//! 워크플로로 재생 → 저널 바이트열 동일). 증명 없으면 T51b 착수 불가."
+//! astra 중간검증(옵션 A) BLOCKER 수용: "E1/E2 never verify destinations/
+//! token effects; DieFailed guards omit stale-attempt conjunction;
+//! inspection retry omits non-no-op condition. Incorrect encodings can
+//! pass." 재작 내용:
+//! * 가드는 **연접(conjunction)** 표현 — DieFailed는 stale∧(MAX|재시도),
+//!   검사 재시도는 ¬no-op∧(MAX|재시도). 도메인 검사의 논리구조 그대로.
+//! * E1은 **목적지+토큰 효과**까지 대조 — 도달 상태와 시도 변화가
+//!   엣지 목적지와 일치해야 한다.
+//! * E2는 실현가능성 — 각 엣지가 자기 가드 하에서 실제로 실현된다.
+//! * E7 부정 프로브 — 가드를 위반하는 조합은 매칭 엣지 어느 것의
+//!   가드도 만족하지 않으면 도메인이 거부한다.
+//! * digest는 **schema_version 포함** (astra MAJOR: 버전 정체성).
 //!
-//! 설계 원칙:
-//! 1. **부호화는 번역이 아니라 산출** — EmbeddedWorkflow은 상태머신의
-//!    표를 *복사한 두 번째 진실*이 아니다. 각 엣지는 `Order::transition`
-//!    의 해당 매치 암(m_at)에 **결속**되고, 증명은 이 결속이 존재함을
-//!    정적으로 검증한다(쌍방향: 테이블의 모든 엣지에 암이 있고, 암의
-//!    모든 경로에 엣지가 있다).
-//! 2. **가드는 구조적** — attempt 일치 검사, no-op 분류, MAX_ATTEMPTS,
-//!    artifact_digest 비음은 가드 트리로 명시적 표현. 증명은 가드
-//!    조건을 `Order::transition` 소스의 실제 검사와 대응시킨다.
-//! 3. **정지는 전이가 아니다** — FurnaceHold/Unknown은 외부 재개를
-//!    동반하는 정지(hold)로 태그. DAG 단어는 버린다(M6 리뷰 C-W1).
-//!    표현: "bounded cycles with explicit re-entry tokens" — DieFailed
-//!    back-edge(Working→Queued)는 attempt 토큰 증가라는 명시적
-//!    재진입 토큰을 요구한다.
-//!
-//! 바이트 동등성(G1의 정식 근거): 워크플로 실행기가 이 부호화를
-//! 읽어 이벤트를 적용할 때, 적용 결과(상태·시도·버전)와 거부(에러
-//! 문자열 포함)는 `Order::transition`과 **완전히 동일**해야 한다.
-//! 증명의 실행판은 G1에서 저널 바이트열로 확장된다.
+//! 설계 원칙 (불변): 부호화는 번역이 아니라 결속 — 모든 엣지는
+//! `Order::transition`의 해당 매치 암에 결속. 정지(hold)는 전이가
+//! 아니다 — FurnaceHold/Unknown은 외부 재개를 동반하는 정지.
+//! "bounded cycles with explicit re-entry tokens".
 
 use crate::order::{OrderEvent, OrderState};
 
-/// 가드: 전이가 합법이기 위한 조건. `Order::transition`의 실제 검사와
-/// 1:1 대응하며, 증명(`verify_encoding`)이 이 대응을 검증한다.
+/// 가드: 전이가 합법이기 위한 조건의 논리식. 도메인 검사와 1:1.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Guard {
     /// DieStarted의 event_attempt == attempt.max(1)
     AttemptClaimMatches,
-    /// DieSucceeded/DieFailed의 attempt == 현재 attempt (stale fence)
+    /// Die 계열 payload attempt == 현재 attempt (stale fence)
     AttemptNotStale,
-    /// DieFailed && attempt >= MAX_ATTEMPTS → Failed, 아니면 back-edge
+    /// attempt >= MAX_ATTEMPTS
     MaxAttemptsExhausted,
-    /// DieFailed && attempt < MAX_ATTEMPTS → attempt+1 후 Queued (재진입 토큰)
+    /// attempt < MAX_ATTEMPTS
     RetriesRemain,
-    /// InspectionFailed.reason이 "no-op"으로 시작 → 종단 (T19: 재시도 불가)
+    /// InspectionFailed.reason이 "no-op"으로 시작 (T19: 종단)
     NoOpTaxonomy,
-    /// InspectionFailed && attempt >= MAX_ATTEMPTS → Failed
-    InspectionMaxAttempts,
+    /// InspectionFailed.reason이 "no-op"으로 시작하지 **않는다**
+    NoNoOp,
     /// Approved.artifact_digest 비어있지 않음 (§11 출처 결속)
     ApprovalBindsArtifact,
     /// 무가드 — 무조건 합법
     None,
+    /// 연접 — 전부 참이어야 한다 (도메인 검사 순서의 논리구조).
+    Conj(Vec<Guard>),
+}
+
+/// 가드 평가기 — 대표 조건 구성(E2)과 부정 프로브(E7) 전용.
+/// 최종 권위는 언제나 `Order::transition`이다.
+pub fn guard_satisfied(g: &Guard, ev: &OrderEvent, current_attempt: u32) -> bool {
+    match g {
+        Guard::AttemptClaimMatches => matches!(ev, OrderEvent::DieStarted),
+        Guard::AttemptNotStale => match ev {
+            OrderEvent::DieSucceeded { attempt } | OrderEvent::DieFailed { attempt, .. } => {
+                *attempt == current_attempt
+            }
+            _ => true,
+        },
+        Guard::MaxAttemptsExhausted => current_attempt >= crate::order::MAX_ATTEMPTS,
+        Guard::RetriesRemain => current_attempt < crate::order::MAX_ATTEMPTS,
+        Guard::NoOpTaxonomy => matches!(ev, OrderEvent::InspectionFailed { reason } if reason.starts_with("no-op")),
+        Guard::NoNoOp => match ev {
+            OrderEvent::InspectionFailed { reason } => !reason.starts_with("no-op"),
+            _ => true,
+        },
+        Guard::ApprovalBindsArtifact => match ev {
+            OrderEvent::Approved { artifact_digest, .. } => !artifact_digest.is_empty(),
+            _ => true,
+        },
+        Guard::None => true,
+        Guard::Conj(gs) => gs.iter().all(|g| guard_satisfied(g, ev, current_attempt)),
+    }
 }
 
 /// 정지(hold): 전이가 아니라 외부 재개를 동반하는 정지 상태.
@@ -53,12 +75,10 @@ pub enum Guard {
 pub enum Hold {
     /// 인간 승인 대기 (Approved/Rejected로 재개)
     FurnaceHold,
-    /// 발행 결과 불명 — 조정(reconcile)이 재판정 (PublishConfirmed/Rejected)
+    /// 발행 결과 불명 — 조정(reconcile)이 재판정
     UnknownOutcome,
 }
 
-/// 부호화된 엣지: (이벤트 패밀리, 원천 상태, 가드, 목적).
-/// 목적은 정상 상태 또는 hold-재개 결과이다.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EncodedEdge {
     pub event: EdgeEvent,
@@ -67,7 +87,7 @@ pub struct EncodedEdge {
     pub to: EdgeTarget,
 }
 
-/// 엣지가 담을 수 있는 이벤트 패밀리(페이로드 무시 — 가드가 검사).
+/// 엣지 이벤트 패밀리(페이로드 무시 — 가드가 검사).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum EdgeEvent {
     Queued,
@@ -88,7 +108,7 @@ pub enum EdgeEvent {
 #[derive(Debug, Clone, PartialEq)]
 pub enum EdgeTarget {
     State(OrderState),
-    /// back-edge: attempt 토큰을 증가시키고 재진입
+    /// back-edge: 재진입 토큰(attempt+1)을 소비하고 to로 복귀.
     BackEdge { token: &'static str, to: OrderState },
 }
 
@@ -101,7 +121,8 @@ pub struct EmbeddedWorkflow {
 }
 
 impl EmbeddedWorkflow {
-    /// 내장 부호화 (동결). `Order::transition`의 매치 암 전수 열거.
+    /// 내장 부호화 (동결). `Order::transition`의 매치 암 전수 열거 —
+    /// 가드는 도메인 검사의 논리구조(연접 포함)를 그대로 담는다.
     pub fn frozen_v1() -> Self {
         use EdgeEvent as E;
         use EdgeTarget as T;
@@ -114,19 +135,38 @@ impl EmbeddedWorkflow {
                 EncodedEdge { event: E::Queued, from: S::Received, guard: None, to: T::State(S::Queued) },
                 EncodedEdge { event: E::DieStarted, from: S::Queued, guard: AttemptClaimMatches, to: T::State(S::Working) },
                 EncodedEdge { event: E::DieSucceeded, from: S::Working, guard: AttemptNotStale, to: T::State(S::Inspecting) },
-                // DieFailed 이중 분기 (bounded cycle: 명시적 재진입 토큰)
-                EncodedEdge { event: E::DieFailed, from: S::Working, guard: MaxAttemptsExhausted, to: T::State(S::Failed) },
-                EncodedEdge { event: E::DieFailed, from: S::Working, guard: RetriesRemain, to: T::BackEdge { token: "attempt+1", to: S::Queued } },
-                // InspectionFailed 삼중 분기
+                // DieFailed: stale 펜스 ∧ (MAX | 재시도) — 연접 (astra BLOCKER)
+                EncodedEdge {
+                    event: E::DieFailed,
+                    from: S::Working,
+                    guard: Conj(vec![AttemptNotStale, MaxAttemptsExhausted]),
+                    to: T::State(S::Failed),
+                },
+                EncodedEdge {
+                    event: E::DieFailed,
+                    from: S::Working,
+                    guard: Conj(vec![AttemptNotStale, RetriesRemain]),
+                    to: T::BackEdge { token: "attempt+1", to: S::Queued },
+                },
                 EncodedEdge { event: E::InspectionPassed, from: S::Inspecting, guard: None, to: T::State(S::FurnaceHold) },
+                // InspectionFailed: no-op 즉시 종단; ¬no-op ∧ (MAX | 재시도)
                 EncodedEdge { event: E::InspectionFailed, from: S::Inspecting, guard: NoOpTaxonomy, to: T::State(S::Failed) },
-                EncodedEdge { event: E::InspectionFailed, from: S::Inspecting, guard: InspectionMaxAttempts, to: T::State(S::Failed) },
-                EncodedEdge { event: E::InspectionFailed, from: S::Inspecting, guard: RetriesRemain, to: T::BackEdge { token: "attempt+1", to: S::Queued } },
+                EncodedEdge {
+                    event: E::InspectionFailed,
+                    from: S::Inspecting,
+                    guard: Conj(vec![NoNoOp, MaxAttemptsExhausted]),
+                    to: T::State(S::Failed),
+                },
+                EncodedEdge {
+                    event: E::InspectionFailed,
+                    from: S::Inspecting,
+                    guard: Conj(vec![NoNoOp, RetriesRemain]),
+                    to: T::BackEdge { token: "attempt+1", to: S::Queued },
+                },
                 // hold: FurnaceHold (정지 — 외부 재개)
                 EncodedEdge { event: E::Approved, from: S::FurnaceHold, guard: ApprovalBindsArtifact, to: T::State(S::Publishing) },
                 EncodedEdge { event: E::Rejected, from: S::FurnaceHold, guard: None, to: T::State(S::Rejected) },
-                // approval → Shipped 직행 금지 (v3 비평 #1) — 부호화에
-                // Approved/FurnaceHold→Shipped 엣지가 존재하지 않는 것이 그 증명
+                // approval → Shipped 직행 금지 (v3 비평 #1): 엣지 부재가 증명
                 EncodedEdge { event: E::PublishConfirmed, from: S::Publishing, guard: None, to: T::State(S::Shipped) },
                 EncodedEdge { event: E::PublishUnknown, from: S::Publishing, guard: None, to: T::State(S::Unknown) },
                 // hold: UnknownOutcome (정지 — 조정이 재판정)
@@ -144,11 +184,13 @@ impl EmbeddedWorkflow {
         }
     }
 
-    /// 부호화의 콘텐츠 digest (워크플로 digest의 엣지 성분).
+    /// 부호화 콘텐츠 digest — **schema_version 포함** (astra MAJOR:
+    /// 버전 정체성 누락 시 v1/v2 동일 내용이 같은 digest 공유).
     pub fn digest(&self) -> String {
         use sha2::Digest as _;
         let mut h = sha2::Sha256::new();
         h.update(b"foundry-embedded-workflow-v1");
+        h.update(&(self.schema_version as u64).to_be_bytes());
         for e in &self.edges {
             for part in [
                 format!("{:?}", e.event),
@@ -167,6 +209,11 @@ impl EmbeddedWorkflow {
             h.update(format!("{hd:?}").as_bytes());
         }
         format!("wf-emb-{:.16x}", h.finalize())
+    }
+
+    /// (이벤트 패밀리, 원천) 매칭 엣지 전부 — 증명·엔진 공용.
+    pub fn edges_matching(&self, ev: &EdgeEvent, from: OrderState) -> Vec<&EncodedEdge> {
+        self.edges.iter().filter(|e| &e.event == ev && e.from == from).collect()
     }
 }
 
@@ -192,178 +239,230 @@ pub fn edge_event_of(ev: &OrderEvent) -> EdgeEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::order::{ExternalRef, Order, MAX_ATTEMPTS};
 
-    /// E1 완전성: Order::transition이 수용하는 (이벤트패밀리, 원천상태)
-    /// 조합 전부에 엣지가 있다. 전수 — 상태 12 × 이벤트 13 = 156 조합.
-    #[test]
-    fn e1_every_legal_transition_has_an_edge() {
-        let wf = EmbeddedWorkflow::frozen_v1();
-        let states = [
+    fn mk(s: OrderState, attempt: u32) -> Order {
+        let mut o = Order::new("x".into(), ExternalRef::cron("a", "b"), Default::default());
+        o.force_state_for_test(s, attempt);
+        o
+    }
+
+    fn states() -> Vec<OrderState> {
+        vec![
             OrderState::Received, OrderState::Queued, OrderState::Working,
             OrderState::Inspecting, OrderState::FurnaceHold, OrderState::Publishing,
             OrderState::Unknown, OrderState::Shipped, OrderState::Failed,
             OrderState::Rejected, OrderState::Canceling, OrderState::Canceled,
-        ];
-        let events = make_events();
+        ]
+    }
+
+    /// 탐색용 페이로드 풀 — payload attempt는 base로 정규화해 제공.
+    fn payloads(base: u32) -> Vec<(OrderEvent, u32)> {
+        vec![
+            (OrderEvent::Queued, 1),
+            (OrderEvent::DieStarted, base.max(1)),
+            (OrderEvent::DieSucceeded { attempt: base }, 1),
+            (OrderEvent::DieSucceeded { attempt: 0 }, 1), // stale 프로브
+            (OrderEvent::DieFailed { attempt: base, reason: "transient".into() }, 1),
+            (OrderEvent::DieFailed { attempt: base.saturating_sub(1), reason: "transient".into() }, 1), // stale 프로브
+            (OrderEvent::InspectionPassed, 1),
+            (OrderEvent::InspectionFailed { reason: "lint".into() }, 1),
+            (OrderEvent::InspectionFailed { reason: "no-op: empty".into() }, 1),
+            (OrderEvent::Approved { intent: "i".into(), artifact_digest: "d".into() }, 1),
+            (OrderEvent::Approved { intent: "i".into(), artifact_digest: String::new() }, 1),
+            (OrderEvent::Rejected { intent: "i".into() }, 1),
+            (OrderEvent::PublishConfirmed { pr_url: "u".into() }, 1),
+            (OrderEvent::PublishUnknown { operation_id: "op".into() }, 1),
+            (OrderEvent::CancelRequested { reason: "r".into() }, 1),
+            (OrderEvent::Canceled { reason: "r".into() }, 1),
+            (OrderEvent::CancelConfirmed, 1),
+        ]
+    }
+
+    /// **E1 (재작) 완전성+목적지+토큰**: 도메인이 수용하는 모든 전이에
+    /// 대해 매칭 엣지 중 목적지(도달 상태+시도 효과)까지 일치하는
+    /// 것이 존재한다. 존재만 보는 구식 E1과 달리 목적지 불일치=실패.
+    #[test]
+    fn e1_every_legal_transition_matches_destination_and_token() {
+        let wf = EmbeddedWorkflow::frozen_v1();
         let mut legal = 0;
-        // 시도 횟수 1과 3 양쪽에서 전수 (MaxAttemptsExhausted 등 가드 조건 포용)
-        for base_attempt in [1u32, 3u32] {
-            for s in states {
-                for ev in &events {
-                    let mut o = crate::order::Order::new("x".into(), crate::order::ExternalRef::cron("a", "b"), Default::default());
-                    o.force_state_for_test(s, base_attempt);
-                    // DieStarted는 현재 attempt를 주장해야 합법 (가드 규칙)
-                    let claim = match ev {
-                        OrderEvent::DieStarted => base_attempt.max(1),
-                        _ => 1,
-                    };
-                    if o.transition(ev.clone(), claim).is_ok() {
+        for base in [1u32, MAX_ATTEMPTS] {
+            for s in states() {
+                for (ev, claim) in payloads(base) {
+                    let mut o = mk(s, base);
+                    let before = o.attempt();
+                    if let Ok(reached) = o.transition(ev.clone(), claim) {
                         legal += 1;
-                        let fam = edge_event_of(ev);
+                        let fam = edge_event_of(&ev);
+                        let matching = wf.edges_matching(&fam, s);
                         assert!(
-                            wf.edges.iter().any(|e| e.event == fam && e.from == s),
-                            "legal transition {s:?} --{fam:?}--> (attempt {base_attempt}) has NO encoded edge"
+                            !matching.is_empty(),
+                            "legal {s:?} --{fam:?}--> {reached:?} has NO edge (E1 existence)"
+                        );
+                        let dest_ok = matching.iter().any(|e| match &e.to {
+                            EdgeTarget::State(t) => *t == reached && o.attempt() == before,
+                            EdgeTarget::BackEdge { to, .. } => {
+                                *to == reached && o.attempt() == before + 1
+                            }
+                        });
+                        assert!(
+                            dest_ok,
+                            "legal {s:?} --{fam:?}--> reached {reached:?} (attempt {before}->{}) but NO edge matches DESTINATION (E1 destination)",
+                            o.attempt()
                         );
                     }
                 }
             }
         }
-        assert!(legal >= 22, "sanity: expected at least 22 legal transitions, saw {legal}");
+        assert!(legal >= 22, "sanity: {legal} legal transitions");
     }
 
-    /// E2 반대편: 엣지의 모든 (패밀리, 원천)이 실제로 합법이다 —
-    /// 부호화가 상상의 전이를 발명하지 않았다.
+    /// **E2 (재작) 실현가능성**: 각 엣지에 대해 자기 가드를 만족하는
+    /// (페이로드, 베이스)가 존재하고, 그 조건에서 전이가 성공하며
+    /// 목적지(상태/백엣지+토큰)가 실현된다.
     #[test]
-    fn e2_every_edge_is_actually_legal() {
+    fn e2_every_edge_is_realizable_with_destination() {
         let wf = EmbeddedWorkflow::frozen_v1();
-        let mut illegal_edges = 0;
         for e in &wf.edges {
-            // 각 가드 조건을 만족하는 대표 (페이로드, 베이스 시도)로 시도
-            let ev = representative_event(&e.event, &e.guard);
-            let base = match e.guard {
-                Guard::MaxAttemptsExhausted | Guard::InspectionMaxAttempts => 3,
-                _ => 1,
-            };
-            let mut o = crate::order::Order::new("x".into(), crate::order::ExternalRef::cron("a", "b"), Default::default());
-            o.force_state_for_test(e.from, base);
-            if o.transition(ev, 1).is_err() {
-                illegal_edges += 1;
-                eprintln!("edge claims legality but transition refuses: {e:?}");
+            let mut realized = false;
+            'search: for base in [1u32, MAX_ATTEMPTS] {
+                for (ev, claim) in payloads(base) {
+                    if !guard_satisfied(&e.guard, &ev, base) {
+                        continue;
+                    }
+                    let mut o = mk(e.from, base);
+                    let before = o.attempt();
+                    if let Ok(reached) = o.transition(ev.clone(), claim) {
+                        let ok = match &e.to {
+                            EdgeTarget::State(t) => *t == reached && o.attempt() == before,
+                            EdgeTarget::BackEdge { to, .. } => *to == reached && o.attempt() == before + 1,
+                        };
+                        if ok {
+                            realized = true;
+                            break 'search;
+                        }
+                    }
+                }
             }
+            assert!(
+                realized,
+                "edge {e:?} NOT realizable under its own guard (E2 destination/token)"
+            );
         }
-        // 가드 조건 하에서 전부 합법이어야 한다
-        assert_eq!(illegal_edges, 0, "encoded edges must all be real transitions");
     }
 
-    /// E3 가드 대응: 각 가드의 존재 근거가 된다.
-    /// (전수 조합에서 가드가 거부를 설명하는지 — E1/E2의 대조 실험)
+    /// **E3 (강화) 연접 가드 하중**: 각 성분이 실제로 거부를 만든다.
     #[test]
-    fn e3_guards_are_load_bearing() {
-        // AttemptNotStale: DieSucceeded { attempt: 0 } on Working(현재 1)은 거부
+    fn e3_conjunction_guards_are_load_bearing() {
+        // stale DieFailed: 재시도 여지가 있어도(attempt 1 < MAX) 거부
         let mut o = mk(OrderState::Working, 1);
-        assert!(o.transition(OrderEvent::DieSucceeded { attempt: 0 }, 1).is_err());
-        // NoOpTaxonomy: no-op 사유는 종단
+        assert!(o.transition(OrderEvent::DieFailed { attempt: 0, reason: "x".into() }, 1).is_err());
+        // stale DieFailed: MAX여도(attempt 3, payload 2) 거부 — stale 성분
+        let mut o = mk(OrderState::Working, MAX_ATTEMPTS);
+        assert!(o
+            .transition(OrderEvent::DieFailed { attempt: MAX_ATTEMPTS - 1, reason: "x".into() }, 1)
+            .is_err());
+        // no-op: 재시도 여지가 있어도(attempt 1) 즉시 종단
         let mut o = mk(OrderState::Inspecting, 1);
-        assert!(matches!(o.transition(OrderEvent::InspectionFailed { reason: "no-op: empty diff".into() }, 1), Ok(OrderState::Failed)));
+        assert_eq!(
+            o.transition(OrderEvent::InspectionFailed { reason: "no-op: empty".into() }, 1).unwrap(),
+            OrderState::Failed
+        );
+        // 비 no-op MAX: 종단 (¬no-op ∧ MAX)
+        let mut o = mk(OrderState::Inspecting, MAX_ATTEMPTS);
+        assert_eq!(
+            o.transition(OrderEvent::InspectionFailed { reason: "lint".into() }, 1).unwrap(),
+            OrderState::Failed
+        );
+        // 비 no-op 재시도: 백엣지+토큰 (¬no-op ∧ 재시도)
+        let mut o = mk(OrderState::Inspecting, 1);
+        assert_eq!(
+            o.transition(OrderEvent::InspectionFailed { reason: "lint".into() }, 1).unwrap(),
+            OrderState::Queued
+        );
+        assert_eq!(o.attempt(), 2, "re-entry token: attempt+1");
         // ApprovalBindsArtifact: 빈 digest 거부
         let mut o = mk(OrderState::FurnaceHold, 1);
-        assert!(o.transition(OrderEvent::Approved { intent: "i".into(), artifact_digest: String::new() }, 1).is_err());
-        // MaxAttemptsExhausted는 시도 3에서 (1로는 불가 — E1이 커버)
+        assert!(o
+            .transition(OrderEvent::Approved { intent: "i".into(), artifact_digest: String::new() }, 1)
+            .is_err());
     }
 
-    /// E4 금지 전이 부재: v3 비평 #1 — Approved가 FurnaceHold 밖 또는
-    /// Shipped 직행을 만들지 않는다.
+    /// **E4 금지 전이 부재** (v3 비평 #1).
     #[test]
     fn e4_forbidden_edges_absent() {
         let wf = EmbeddedWorkflow::frozen_v1();
         assert!(!wf.edges.iter().any(|e|
-            e.event == EdgeEvent::Approved && matches!(e.to, EdgeTarget::State(OrderState::Shipped))),
-            "approval → Shipped direct must not exist");
+            e.event == EdgeEvent::Approved && matches!(e.to, EdgeTarget::State(OrderState::Shipped))));
         assert!(!wf.edges.iter().any(|e|
-            e.event == EdgeEvent::Approved && e.from == OrderState::Publishing),
-            "approval in Publishing must not exist");
+            e.event == EdgeEvent::Approved && e.from == OrderState::Publishing));
     }
 
-    /// E5 바이트 동등성 근거(결정성): 같은 이벤트 스트림은 같은 저널 모양.
+    /// **E5 결정성**: 같은 스트림 → 같은 전이 흔적.
     #[test]
     fn e5_deterministic_replay_shape() {
-        let evs = vec![
-            OrderEvent::Queued,
-            OrderEvent::DieStarted,
-            OrderEvent::DieSucceeded { attempt: 1 },
-            OrderEvent::InspectionPassed,
-            OrderEvent::Approved { intent: "i".into(), artifact_digest: "d".into() },
-            OrderEvent::PublishConfirmed { pr_url: "u".into() },
-        ];
         let run = |n: u64| {
-            let mut o = crate::order::Order::new(format!("o{n}"), crate::order::ExternalRef::cron("a", "b"), Default::default());
-            let mut trace = Vec::new();
-            for ev in &evs {
-                let r = o.transition(ev.clone(), 1);
-                trace.push(format!("{:?}", r.map(|s| format!("{s:?}")).map_err(|e| e.to_string())));
-            }
-            trace
+            let mut o = Order::new(format!("o{n}"), ExternalRef::cron("a", "b"), Default::default());
+            let evs = [
+                OrderEvent::Queued,
+                OrderEvent::DieStarted,
+                OrderEvent::DieSucceeded { attempt: 1 },
+                OrderEvent::InspectionPassed,
+                OrderEvent::Approved { intent: "i".into(), artifact_digest: "d".into() },
+                OrderEvent::PublishConfirmed { pr_url: "u".into() },
+            ];
+            evs.iter()
+                .map(|ev| {
+                    format!(
+                        "{:?}",
+                        o.transition(ev.clone(), 1).map(|s| format!("{s:?}")).map_err(|e| e.to_string())
+                    )
+                })
+                .collect::<Vec<_>>()
         };
-        assert_eq!(run(1), run(2), "same stream -> identical transition trace");
+        assert_eq!(run(1), run(2));
     }
 
-    fn mk(s: OrderState, attempt: u32) -> crate::order::Order {
-        let mut o = crate::order::Order::new("x".into(), crate::order::ExternalRef::cron("a", "b"), Default::default());
-        o.force_state_for_test(s, attempt);
-        o
-    }
-
-    fn make_events() -> Vec<OrderEvent> {
-        vec![
-            OrderEvent::Queued,
-            OrderEvent::DieStarted,
-            OrderEvent::DieSucceeded { attempt: 1 },
-            OrderEvent::DieFailed { attempt: 1, reason: "transient".into() },
-            OrderEvent::InspectionPassed,
-            OrderEvent::InspectionFailed { reason: "lint".into() },
-            OrderEvent::InspectionFailed { reason: "no-op: empty diff".into() },
-            OrderEvent::Approved { intent: "i".into(), artifact_digest: "d".into() },
-            OrderEvent::Approved { intent: "i".into(), artifact_digest: String::new() },
-            OrderEvent::Rejected { intent: "i".into() },
-            OrderEvent::PublishConfirmed { pr_url: "u".into() },
-            OrderEvent::PublishUnknown { operation_id: "op".into() },
-            OrderEvent::CancelRequested { reason: "r".into() },
-            OrderEvent::Canceled { reason: "r".into() },
-            OrderEvent::CancelConfirmed,
-        ]
-    }
-
-    fn representative_event(fam: &EdgeEvent, guard: &Guard) -> OrderEvent {
-        match (fam, guard) {
-            (EdgeEvent::DieFailed, Guard::MaxAttemptsExhausted) => OrderEvent::DieFailed { attempt: 3, reason: "x".into() },
-            (EdgeEvent::InspectionFailed, Guard::NoOpTaxonomy) => OrderEvent::InspectionFailed { reason: "no-op: empty".into() },
-            (_, _) => payload_for(fam),
-        }
-    }
-
+    /// **E6 (신규, astra MAJOR) digest는 schema_version을 덮는다**.
     #[test]
-    fn e2b_max_attempts_edge_legal_at_attempt3() {
-        // E2의 DieFailed/MaxAttemptsExhausted 엣지는 attempt>=3에서만 합법 —
-        // E2 본테스트는 attempt=1 베이스이므로 여기서 별도 입증.
-        let mut o = mk(OrderState::Working, 3);
-        assert!(matches!(o.transition(OrderEvent::DieFailed { attempt: 3, reason: "x".into() }, 1), Ok(OrderState::Failed)));
+    fn e6_digest_covers_schema_version() {
+        let v1 = EmbeddedWorkflow::frozen_v1();
+        let mut v2 = EmbeddedWorkflow::frozen_v1();
+        v2.schema_version = 2;
+        assert_ne!(v1.digest(), v2.digest(), "version identity must be covered");
+        assert_eq!(v1.digest(), EmbeddedWorkflow::frozen_v1().digest(), "idempotent");
+        let mut tampered = EmbeddedWorkflow::frozen_v1();
+        tampered.edges[3].guard = Guard::None;
+        assert_ne!(v1.digest(), tampered.digest(), "content change still covered");
     }
 
-    fn payload_for(fam: &EdgeEvent) -> OrderEvent {
-        match fam {
-            EdgeEvent::Queued => OrderEvent::Queued,
-            EdgeEvent::DieStarted => OrderEvent::DieStarted,
-            EdgeEvent::DieSucceeded => OrderEvent::DieSucceeded { attempt: 1 },
-            EdgeEvent::DieFailed => OrderEvent::DieFailed { attempt: 1, reason: "transient".into() },
-            EdgeEvent::InspectionPassed => OrderEvent::InspectionPassed,
-            EdgeEvent::InspectionFailed => OrderEvent::InspectionFailed { reason: "lint".into() },
-            EdgeEvent::Approved => OrderEvent::Approved { intent: "i".into(), artifact_digest: "d".into() },
-            EdgeEvent::Rejected => OrderEvent::Rejected { intent: "i".into() },
-            EdgeEvent::PublishConfirmed => OrderEvent::PublishConfirmed { pr_url: "u".into() },
-            EdgeEvent::PublishUnknown => OrderEvent::PublishUnknown { operation_id: "op".into() },
-            EdgeEvent::CancelRequested => OrderEvent::CancelRequested { reason: "r".into() },
-            EdgeEvent::Canceled => OrderEvent::Canceled { reason: "r".into() },
-            EdgeEvent::CancelConfirmed => OrderEvent::CancelConfirmed,
+    /// **E7 (신규) 부정 프로브**: 매칭 엣지들의 가드를 모두 위반하는
+    /// (이벤트, 상태) 조합은 도메인이 거부한다 — 부호화·도메인의
+    /// 거부 집합이 어긋나지 않는다는 증명.
+    #[test]
+    fn e7_guard_violations_are_refused_by_domain() {
+        let wf = EmbeddedWorkflow::frozen_v1();
+        let mut probes = 0;
+        for base in [1u32, MAX_ATTEMPTS] {
+            for s in states() {
+                for (ev, claim) in payloads(base) {
+                    let fam = edge_event_of(&ev);
+                    let matching = wf.edges_matching(&fam, s);
+                    if matching.is_empty() {
+                        continue; // E1 영역 밖 (엣지 없음 = 도메인도 거부해야 — E1이 이미 검증)
+                    }
+                    let any_guard_ok = matching.iter().any(|e| guard_satisfied(&e.guard, &ev, base));
+                    if !any_guard_ok {
+                        probes += 1;
+                        let mut o = mk(s, base);
+                        assert!(
+                            o.transition(ev.clone(), claim).is_err(),
+                            "{s:?} --{fam:?}--> violates EVERY matching guard yet the domain ACCEPTS (E7 leak at base {base})"
+                        );
+                    }
+                }
+            }
         }
+        assert!(probes > 0, "sanity: negative probes exercised ({probes})");
     }
 }
