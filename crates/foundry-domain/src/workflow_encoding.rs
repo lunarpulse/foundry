@@ -334,39 +334,8 @@ mod tests {
     fn e2_every_edge_is_realizable_with_destination() {
         let wf = EmbeddedWorkflow::frozen_v1();
         for e in &wf.edges {
-            let mut realized = false;
-            'search: for base in [1u32, MAX_ATTEMPTS] {
-                for (ev, claim) in payloads(base) {
-                    // astra BLOCKER (r2): the probe's EVENT FAMILY must equal
-                    // the edge's — otherwise a spurious 'Queued/Working→
-                    // Inspecting' edge is "realized" by a DieSucceeded probe.
-                    if edge_event_of(&ev) != e.event {
-                        continue;
-                    }
-                    if !guard_satisfied(&e.guard, &ev, base) {
-                        continue;
-                    }
-                    let mut o = mk(e.from, base);
-                    let before = o.attempt();
-                    if let Ok(reached) = o.transition(ev.clone(), claim) {
-                        let ok = match &e.to {
-                            EdgeTarget::State(t) => {
-                                *t == reached
-                                    && (o.attempt() == before
-                                        || (e.event == EdgeEvent::DieStarted
-                                            && o.attempt() == before.max(1)))
-                            }
-                            EdgeTarget::BackEdge { to, .. } => *to == reached && o.attempt() == before + 1,
-                        };
-                        if ok {
-                            realized = true;
-                            break 'search;
-                        }
-                    }
-                }
-            }
             assert!(
-                realized,
+                edge_realizable(e, &wf),
                 "edge {e:?} NOT realizable under its own guard (E2 destination/token)"
             );
         }
@@ -457,9 +426,11 @@ mod tests {
         assert_ne!(v1.digest(), tampered.digest(), "content change still covered");
     }
 
-    /// **E8 (신규, astra r2 BLOCKER의 회귀 핀)**: 위조 엣지 주입 —
-    /// 도메인에 없는 (Queued, Working) 엣지를 넣으면 E2가 반드시 실패한다.
-    /// (과거 E2는 패밀리를 안 걸러 DieSucceeded 프로브로 "실현"됐다.)
+    /// **E8 (r3 재작)**: 위조 엣지 주입 — **E2와 동일한 검사 루프**를
+    /// 함수로 추출해 그것을 통과시킨다 (astra r3: "E8's separate
+    /// hardcoded loop does not regression-test E2; removing E2's family
+    /// filter leaves E8 green"). 위조 (Queued, Working) 엣지는 이
+    /// 루프에서 반드시 unrealizable로 판정된다.
     #[test]
     fn e8_spurious_edge_is_rejected_by_the_proof() {
         let mut wf = EmbeddedWorkflow::frozen_v1();
@@ -469,24 +440,49 @@ mod tests {
             guard: Guard::None,
             to: EdgeTarget::State(OrderState::Inspecting),
         });
-        // 이 위조 엣지는 자기 가드(None) 하에 실현 불가능해야 한다:
-        // Queued 패밀리 프로브는 Working에서 도메인이 수용하지 않는다.
-        let mut realized = false;
+        // E2와 동일 논리 — edge_realizable()은 E2 본테스트가 쓰는 함수.
+        // 방향: 진짜 엣지 전부 realizable + 위조 엣지는 NOT realizable.
+        let spurious = wf.edges.pop().expect("injected spurious edge on top");
+        for e in &wf.edges {
+            assert!(
+                edge_realizable(e, &wf),
+                "genuine edge must be realizable: {e:?}"
+            );
+        }
+        assert!(
+            !edge_realizable(&spurious, &wf),
+            "spurious edge must be caught by the SAME check E2 runs: {spurious:?}"
+        );
+    }
+
+    /// E2의 실현가능성 검사 — E2 본테스트와 E8 회귀가 공유한다.
+    fn edge_realizable(e: &EncodedEdge, _wf: &EmbeddedWorkflow) -> bool {
         for base in [1u32, MAX_ATTEMPTS] {
             for (ev, claim) in payloads(base) {
-                if edge_event_of(&ev) != EdgeEvent::Queued {
+                if edge_event_of(&ev) != e.event {
                     continue;
                 }
-                if !guard_satisfied(&Guard::None, &ev, base) {
+                if !guard_satisfied(&e.guard, &ev, base) {
                     continue;
                 }
-                let mut o = mk(OrderState::Working, base);
-                if o.transition(ev.clone(), claim).is_ok() {
-                    realized = true;
+                let mut o = mk(e.from, base);
+                let before = o.attempt();
+                if let Ok(reached) = o.transition(ev.clone(), claim) {
+                    let ok = match &e.to {
+                        EdgeTarget::State(t) => {
+                            *t == reached
+                                && (o.attempt() == before
+                                    || (e.event == EdgeEvent::DieStarted && o.attempt() == before.max(1)))
+                        }
+                        EdgeTarget::BackEdge { to, .. } => *to == reached && o.attempt() == before + 1,
+                    };
+                    if ok {
+                        return true;
+                    }
                 }
             }
         }
-        assert!(!realized, "spurious Queued/Working edge must not be realizable — E2 catches it");
+        false
     }
 
     /// **E7 (신규) 부정 프로브**: 매칭 엣지들의 가드를 모두 위반하는

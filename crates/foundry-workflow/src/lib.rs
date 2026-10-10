@@ -105,8 +105,19 @@ pub struct WorkflowEngine {
     exec_bindings: HashMap<ExecId, String>,
     /// G5: 엔진이 서비스 중인 활성 문서 root.
     active_root: Option<String>,
-    /// B2: 예산 소진 래치 — 한 번 정지한 실행은 재디스패치 불가.
-    exhausted: std::collections::HashSet<ExecId>,
+    /// 정지한 실행 — 값은 정지 사유 (예산 소진 또는 치명 드리프트).
+    /// astra r3 MAJOR: every fatal drift path must latch (missing edge,
+    /// unsatisfied guard, destination mismatch — a drifted exec must
+    /// not be resumable). r3 MINOR: the latched CAUSE is preserved —
+    /// a drift-latched exec reports drift, not a fictitious budget
+    /// exhaustion.
+    halted: std::collections::HashMap<ExecId, HaltCause>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum HaltCause {
+    BudgetExhausted { steps: u32, cap: u32 },
+    EncodingDrift { detail: String },
 }
 
 impl WorkflowEngine {
@@ -122,7 +133,7 @@ impl WorkflowEngine {
             ops: 0,
             exec_bindings: HashMap::new(),
             active_root: None,
-            exhausted: Default::default(),
+            halted: Default::default(),
         }
     }
 
@@ -277,18 +288,21 @@ impl WorkflowEngine {
         // the same error without appending more stop records (the old
         // code double-counted prior BudgetStopped rows as steps and
         // appended a new stop record each time).
-        if self.exhausted.contains(exec_id) {
+        if let Some(HaltCause::EncodingDrift { detail }) = self.halted.get(exec_id) {
+            return Err(EngineError::EncodingDrift { detail: detail.clone() });
+        }
+        if let Some(HaltCause::BudgetExhausted { steps, cap }) = self.halted.get(exec_id) {
             return Err(EngineError::BudgetExhausted {
                 exec_id: exec_id.into(),
-                steps: self.budget.max_steps,
-                cap: self.budget.max_steps,
+                steps: *steps,
+                cap: *cap,
             });
         }
         let steps = self.observations.iter().filter(|o| {
             &o.exec_id == exec_id && !o.event_family.starts_with("wf.lock_")
         }).count() as u32;
         if steps >= self.budget.max_steps {
-            self.exhausted.insert(exec_id.into());
+            self.halted.insert(exec_id.into(), HaltCause::BudgetExhausted { steps, cap: self.budget.max_steps });
             let _ = self.observe(exec_id, event, from, None, "-", Outcome::BudgetStopped);
             return Err(EngineError::BudgetExhausted {
                 exec_id: exec_id.into(),
@@ -323,11 +337,12 @@ impl WorkflowEngine {
                         return Ok(Outcome::NoEdge);
                     }
                     Ok(_) => {
-                        return Err(EngineError::EncodingDrift {
-                            detail: format!(
-                                "domain ACCEPTS {fam:?} from {from:?} but encoding has no edge (E1 broken)"
-                            ),
-                        })
+                        let detail = format!(
+                            "domain ACCEPTS {fam:?} from {from:?} but encoding has no edge (E1 broken)"
+                        );
+                        self.halted.insert(exec_id.into(), HaltCause::EncodingDrift { detail: detail.clone() });
+                        let _ = self.observe(exec_id, event, from, None, "-", Outcome::Refused { detail: "encoding drift: no edge (exec latched)".into() });
+                        return Err(EngineError::EncodingDrift { detail });
                     }
                 }
             }
@@ -341,11 +356,12 @@ impl WorkflowEngine {
                         return Ok(Outcome::Refused { detail: "no guard satisfied (E7-consistent)".into() });
                     }
                     Ok(_) => {
-                        return Err(EngineError::EncodingDrift {
-                            detail: format!(
-                                "domain ACCEPTS {fam:?} from {from:?} but NO matching edge's guard is satisfied (E7 broken)"
-                            ),
-                        })
+                        let detail = format!(
+                            "domain ACCEPTS {fam:?} from {from:?} but NO matching edge's guard is satisfied (E7 broken)"
+                        );
+                        self.halted.insert(exec_id.into(), HaltCause::EncodingDrift { detail: detail.clone() });
+                        let _ = self.observe(exec_id, event, from, None, "-", Outcome::Refused { detail: "encoding drift: no guard satisfied (exec latched)".into() });
+                        return Err(EngineError::EncodingDrift { detail });
                     }
                 }
             }
@@ -380,11 +396,15 @@ impl WorkflowEngine {
                     let after = order.attempt();
                     let edge_repr = format!("{:?}", &edge.to);
                     drop(order);
-                    self.exhausted.insert(exec_id.into());
+                    self.halted.insert(exec_id.into(), HaltCause::EncodingDrift {
+                        detail: format!("destination mismatch: edge says {edge_repr}"),
+                    });
                     let _ = self.observe(exec_id, event, from, None, guard_name(&edge.guard).as_str(), Outcome::Refused { detail: "encoding drift: destination mismatch (exec latched)".into() });
+                    // 반환 문자열도 래치 사유와 동일 접두어로 통일 —
+                    // 재디스패치가 같은 형태를 재현하는지 테스트가 검증 가능.
                     return Err(EngineError::EncodingDrift {
                         detail: format!(
-                            "domain reached {to:?} (attempt {before}->{after}) but edge says {edge_repr} — E1/E2 destination violated (order ROLLED BACK, exec latched)"
+                            "destination mismatch: edge says {edge_repr} (domain reached {to:?}, attempt {before}->{after}) — E1/E2 violated; order ROLLED BACK, exec latched"
                         ),
                     });
                 }
@@ -602,6 +622,61 @@ mod tests {
         assert!(e.dispatch("o1", "ex2", &OrderEvent::DieStarted, 1).is_err(), "unbound dispatch must be refused");
         e.bind_root("ex2", "wf-root-changed").unwrap();
         assert_eq!(e.dispatch("o1", "ex2", &OrderEvent::DieStarted, 1).unwrap(), Outcome::Applied);
+    }
+
+    /// r3 MINOR 회귀: 변조 목적지 → 원자적 롤백 + 래치 + 사유 보존.
+    /// 엔진의 부호화에서 엣지 목적지를 찢으면 dispatch는 드리프트를
+    /// 내고, 주문은 전이 전 상태 그대로, 실행은 재디스패치 불가,
+    /// 재시도는 같은 드리프트 사유를 반환한다 (가짜 예산 아님).
+    #[test]
+    fn destination_drift_rolls_back_and_latches_with_cause() {
+        let mut e = WorkflowEngine::embedded_default();
+        e.enroll(order("o1"));
+        e.acquire("o1", "ex").unwrap();
+        e.dispatch("o1", "ex", &OrderEvent::Queued, 1).unwrap();
+        // 부호화 변조: Queued/Received 엣지의 목적지를 Failed로 찢는다
+        e.wf.edges[0].to = EdgeTarget::State(OrderState::Failed);
+        // 미결속 엔진(active_root 없음)에서도 목적지 드리프트는 치명 —
+        // 새 등록 주문으로 재현
+        e.enroll(order("o2"));
+        e.acquire("o2", "ex3").unwrap();
+        let r = e.dispatch("o2", "ex3", &OrderEvent::Queued, 1);
+        let detail = match &r {
+            Err(EngineError::EncodingDrift { detail }) => detail.clone(),
+            other => panic!("expected drift, got {other:?}"),
+        };
+        assert!(detail.contains("destination mismatch"), "{detail}");
+        // 주문은 Received 그대로 (롤백)
+        assert_eq!(e.order("o2").unwrap().state(), OrderState::Received);
+        // 래치: 재디스패치는 같은 사유
+        let r2 = e.dispatch("o2", "ex3", &OrderEvent::Queued, 1);
+        assert!(matches!(&r2, Err(EngineError::EncodingDrift { detail }) if detail.contains("destination mismatch")));
+        // 사유 보존: BudgetExhausted로 위장하지 않는다
+        assert!(!matches!(r2, Err(EngineError::BudgetExhausted { .. })));
+    }
+
+    /// r3 MINOR 회귀: 예산 소진은 정확히 한 번 관측되고 이후 디스패치는
+    /// 같은 에러를 반복한다 (stop record 증가 없음).
+    #[test]
+    fn budget_exhaustion_latches_with_single_stop_record() {
+        let mut e = WorkflowEngine::new(EmbeddedWorkflow::frozen_v1(), Budget { max_steps: 1 });
+        e.enroll(order("o1"));
+        e.acquire("o1", "ex").unwrap();
+        assert_eq!(e.dispatch("o1", "ex", &OrderEvent::Queued, 1).unwrap(), Outcome::Applied);
+        let stops_before = e.observations().iter()
+            .filter(|o| &o.exec_id == "ex" && o.outcome == Outcome::BudgetStopped).count();
+        assert_eq!(stops_before, 0);
+        // 초과 디스패치 3회 — 모두 같은 에러
+        for _ in 0..3 {
+            assert!(matches!(
+                e.dispatch("o1", "ex", &OrderEvent::DieStarted, 1),
+                Err(EngineError::BudgetExhausted { .. })
+            ));
+        }
+        // stop 관측은 정확히 1개 (반복 없음)
+        let stops_after = e.observations().iter()
+            .filter(|o| &o.exec_id == "ex" && o.outcome == Outcome::BudgetStopped).count();
+        assert_eq!(stops_after, 1, "exactly one durable stop record");
     }
 
     /// 잠금 없는 디스패치 = 계약 위반 거부.
