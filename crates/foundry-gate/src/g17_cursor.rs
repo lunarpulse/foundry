@@ -3,7 +3,7 @@
 //! ①무커서=입구 부재(원천 봉쇄) ②이벤트 치환 ③유효핀+위조접미 ④핀 범위 외
 //! seq ⑤재정렬 ⑥커밋먼트 범위 밖 발급 거부.
 
-use crate::common::{actor, file_journal, terminal_commitment};
+use crate::common::{actor, file_journal, terminal_commitment, terminal_commitment_from};
 use foundry_domain::order::{ExternalRef, Order};
 use foundry_domain::OrderEvent;
 use foundry_domain::ports::Ledger as _;
@@ -125,6 +125,46 @@ fn g17_case6_issuance_outside_commitment_refused() {
         issue_replay_cursor(&all, &commit, "g17-o", 3),
         Err(CursorError::OutsideTrustedScope { requested: 3, committed: 2 })
     ));
+}
+
+/// (astra T56 r3 MAJOR 회귀) 역사 커서: seq &lt; max_seq 인 커서도
+/// 발급·재생이 일관되게 성공해야 한다 (터미널 헤드 핀이 아니라
+/// 커서 위치 핀).
+#[test]
+fn g17_historical_cursor_seq_below_max_issues_and_replays() {
+    let (mut journal, _p) = file_journal("g17-hist");
+    seed(&mut journal);
+    let rows = journal.read_all().unwrap();
+    let commit = terminal_commitment_from(&rows);
+    assert!(commit.max_seq >= 3, "seeded 3 rows");
+    // seq 1 (역사) 발급 — 성공해야.
+    let c = issue_replay_cursor(&rows, &commit, "g17-o", 1).unwrap();
+    let (_, cseq, crowd, cpind) = c.parts();
+    assert_eq!(cseq, 1);
+    assert_eq!(crowd, rows[0].hash, "row digest binds row 1");
+    assert_eq!(cpind, rows[0].hash, "cursor-position pin (chain head AT seq 1)");
+    // 역사 커서로 재생 — 결속 대조도 통과해야 (행 1 존재·해시 일치·핀 일치).
+    let mut e = WorkflowEngine::embedded_default();
+    let mut o = foundry_domain::order::Order::new(
+        "g17-o".into(),
+        foundry_domain::order::ExternalRef::cron("s", "r"),
+        chrono::Utc::now(),
+    );
+    // Received 상태에서 Queued 를 역사 커서로 재생.
+    e.enroll(o.clone());
+    e.acquire("g17-o", "ex").unwrap();
+    let ctx = foundry_workflow::replay::ReplayContext { cursor: c };
+    let out = e.dispatch_replay_ctx(
+        "g17-o", "ex",
+        &foundry_domain::OrderEvent::Queued, 1, &ctx, &journal,
+    );
+    match out {
+        Ok(_) | Err(foundry_workflow::EngineError::LockHeld { .. }) => {}
+        // LockHeld: 이미 enroll 로 자동 획득된 경우 등 환경 의존 — 결속
+        // 검증 통과 자체가 관심사이므로 EncodingDrift 만 아니면 된다.
+        other => panic!("historical cursor must pass binding: {other:?}"),
+    }
+    let _ = &mut o;
 }
 
 /// 발급된 커서로 신규 엔진 재구축 — 상태 동등 (전수주기 축소판).

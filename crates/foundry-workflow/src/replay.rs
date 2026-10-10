@@ -111,11 +111,16 @@ pub fn issue_replay_cursor(
         .iter()
         .find(|r| r.seq == seq && r.order_id == order_id)
         .ok_or(CursorError::RowNotFound { order_id: order_id.into(), seq })?;
+    // **커서 위치 핀** (astra T56 r3 MAJOR): pin 은 커밋먼트 터미널 헤드가
+    // 아니라 **커서가 가리키는 행 시점의 체인 헤드**(=요청 행 해시)다 —
+    // 발급과 dispatch 의 검증 의미론이 일치해야 한다(터미널 헤드를 쓰면
+    // seq<max_seq 인 유효 역사 커서가 전부 거부된다). 커밋먼트의 역할은
+    // 발급 시점의 접두사 재검산(위 (ii))으로 유지된다.
     Ok(VerifiedReplayCursor {
         order_id: order_id.into(),
         seq,
         row_digest: row.hash.clone(),
-        pin_digest: commitment.chain_head.clone(),
+        pin_digest: row.hash.clone(),
     })
 }
 
