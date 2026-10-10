@@ -276,7 +276,8 @@ const GATE_FAMILIES: &[EdgeEvent] = &[EdgeEvent::Approved, EdgeEvent::Rejected];
 
 /// **전분기 도달성 분석** (플랜 v6 F): Prepare 노드까지의 스텝열을 따라
 /// 도달 가능한 상태 집합을 계산하고, 그 상태들의 만족 가능한 출발 엣지가
-/// **전부** 승인 소비 패밀리인지 확인한다. 유한 상태공간+방문 집합 → 종결.
+/// **전부** 게이트 패밀리(승인 소비 또는 안전한 종단)인지 확인한다.
+/// 유한 상태공간+방문 집합 → 종결.
 /// 프로덕션 코드 — force_state_for_test 없이 순수 (엣지, 가드) 그래프 분석.
 fn prepare_placement_ok(doc: &WorkflowDoc, encoding: &EmbeddedWorkflow, node_ref: &str) -> PreparePlacement {
     // node_ref 미해결이면 이미 node_ref_unresolved 오류가 push되었다 —
@@ -324,7 +325,9 @@ fn prepare_placement_ok(doc: &WorkflowDoc, encoding: &EmbeddedWorkflow, node_ref
         }
     }
 
-    // 검사: 도달 상태마다 만족 가능한 출발 엣지가 전부 승인 소비 패밀리인가.
+    // 검사: 도달 상태마다 만족 가능한 출발 엣지가 전부 게이트 패밀리인가
+    // (승인 없이 진행하는 출구가 하나도 없어야 — Approved는 인간 승인을
+    // 소비하고, Rejected는 출하 없는 안전한 종단이다).
     for &s in &states {
         let satisfiable: Vec<_> = encoding
             .edges
@@ -509,9 +512,10 @@ mod tests {
         );
     }
 
-    // (7) Prepare 합법 배치 — 승인 소비 지점(FurnaceHold)에 도달하는 노드.
+    // (7) Prepare 합법 배치 — 게이트 지점(FurnaceHold)에 도달하는 노드.
     // 실측: Inspecting --InspectionPassed--> FurnaceHold이고 FurnaceHold의
-    // 출구는 {Approved, Rejected} 전부 승인 소비 — 전분기 규칙 만족.
+    // 출구는 {Approved, Rejected} 전부 게이트 패밀리(인간 승인 소개 또는
+    // 안전한 종단) — 전분기 규칙 만족.
     #[test]
     fn g3_case7_prepare_legal_placement_passes() {
         let enc = EmbeddedWorkflow::frozen_v1();
@@ -574,6 +578,11 @@ mod tests {
         let mut changed = d.clone();
         changed.policy_digest = "pol-CHANGED".into();
         assert_ne!(merkle_root(&changed), base, "v1 policy_digest change must change root");
+        // 조합 공격 (astra T54-r2): policy가 주입된 상태에서 policy_digest까지
+        // 바꾸면 — 버전이 지배하므로 리프는 policy_digest → base와 달라야.
+        let mut combo = with_policy.clone();
+        combo.policy_digest = "pol-CHANGED".into();
+        assert_ne!(merkle_root(&combo), base, "combined policy-injection + digest-change must NOT reproduce the base root");
     }
 
     // (astra T54 MAJOR 3) 게이트 의미론 — Rejected는 안전한 종단으로 인정되고
