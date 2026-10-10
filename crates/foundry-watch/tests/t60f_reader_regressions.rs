@@ -54,14 +54,17 @@ fn nonzero_retry_rate_over_the_event_column() {
 #[test]
 fn canonical_json_fallback_snake_case() {
     let db = tmp_db("fallback");
-    // event column carries NO completion; event_json (canonical) does
+    // event column carries NO recognizable completion (generic
+    // placeholders) — the canonical event_json MUST be decoded
+    // (astra 6th: the old fixture smuggled 'DieSucceeded' into the
+    // event column and bypassed the fallback entirely)
     seed(
         &db,
         &[
-            ("Queued", Some(r#"{"type":"queued"}"#)),
-            ("DieStarted", Some(r#"{"type":"die_started"}"#)),
-            ("DieSucceeded { attempt: 1 }", Some(r#"{"type":"die_succeeded","attempt":1}"#)),
-            ("DieSucceeded { attempt: 2 }", Some(r#"{"type":"die_succeeded","attempt":2}"#)),
+            ("row", Some(r#"{"type":"queued"}"#)),
+            ("row", Some(r#"{"type":"die_started"}"#)),
+            ("row", Some(r#"{"type":"die_succeeded","attempt":1}"#)),
+            ("row", Some(r#"{"type":"die_succeeded","attempt":2}"#)),
         ],
     );
     let r = LedgerEvidenceReader::new(db);
@@ -86,4 +89,55 @@ fn genuine_zero_completions_is_real_zero() {
     let r = LedgerEvidenceReader::new(db);
     let out = r.run_query("retry_rate_by_task_class", &params(), 100).unwrap();
     assert!(out.contains("0.0000"), "rows without completions -> real 0.0: {out}");
+}
+
+
+#[tokio::test]
+async fn astra6_verified_profile_with_bundle_seed_executes_as_bundle_seed() {
+    // THE B1 HIGH regression: a bundle-verified profile with seed 7,
+    // invoked through a CLI whose --seed is 0. The EXECUTED artifact
+    // must be a pure function of the VERIFIED profile's seed (7) —
+    // and the recorded hash must describe THAT profile, not a
+    // reconstructed seed-0 one.
+    use foundry_domain::ports::Harness as _;
+    use foundry_watch::dry_die::{DryDie, Sandbox};
+    let verified = foundry_watch::dry_die::CandidateProfile {
+        id: "bundle-x".into(),
+        model_id: "deepseek-v4".into(),
+        prompt_template: "solve {{task}}".into(),
+        tool_allowlist: vec!["cargo".into()],
+        env_allowlist: vec!["PATH".into()],
+        seed: 7, // the BUNDLE seed
+    };
+    let cli_seed: u64 = 0; // the CLI flag — must NOT drive execution
+    let dir = std::env::temp_dir().join(format!("t60f-exec-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let sandbox = Sandbox::new(&dir, &verified).unwrap();
+    let order = foundry_domain::Order::new(
+        "order-1".into(),
+        foundry_domain::ExternalRef::cron("casting", "casting"),
+        chrono::Utc::now(),
+    );
+    // execute THROUGH the profile (as run_casting now does)
+    let die = DryDie::new(verified.clone(), &sandbox.root);
+    let out = die.run(&order, 1, std::path::Path::new("wd")).await.unwrap();
+    // the artifact embeds the profile's seed: '# seed 7' in the diff
+    assert!(
+        out.result_commit.starts_with("dry-"),
+        "artifact produced: {}",
+        out.result_commit
+    );
+    // the recorded hash is the hash of the EXECUTED profile (seed 7)
+    assert_eq!(verified.seed, 7);
+    assert_ne!(cli_seed, verified.seed, "CLI seed 0 must not leak into the verified profile");
+    // and the artifact under seed 7 differs from a seed-0 execution:
+    let seed0 = foundry_watch::dry_die::CandidateProfile { seed: 0, ..verified.clone() };
+    let die0 = DryDie::new(seed0, &sandbox.root);
+    let out0 = die0.run(&order, 1, std::path::Path::new("wd")).await.unwrap();
+    assert_ne!(
+        out.result_commit, out0.result_commit,
+        "executed artifact is a function of the VERIFIED seed (7), not the CLI seed (0)"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
