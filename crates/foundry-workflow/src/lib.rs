@@ -25,6 +25,7 @@
 //! 같은 이벤트 스트림 → 같은 관측 바이트열.
 
 pub mod dsl;
+pub mod skill;
 
 use foundry_domain::order::{Order, OrderEvent, OrderState};
 use foundry_domain::ports::Ledger;
