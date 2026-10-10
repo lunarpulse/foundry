@@ -311,7 +311,11 @@ impl ApprovalLedger {
 
         let fence = match existing {
             Some((exec, seq, fence)) if exec == exec_id && seq as u64 == dispatch_seq => {
-                // 멱등 재호출 — 같은 fence.
+                // 멱등 재호출 — 같은 fence. 단 Applying은 제외: 적용이
+                // 이미 확정됐으므로 새 진입은 거부 (astra r3).
+                if g.2 == "applying" {
+                    return Err(LedgerError::AlreadyConsumed { grant_id: grant_id.into() });
+                }
                 fence as u64
             }
             Some((exec, seq, _)) => {
@@ -354,6 +358,16 @@ impl ApprovalLedger {
     /// fence) 확인 → state=Applying 전환 → 커밋. 커밋 후에는 회복조차
     /// 릴리즈 불가(회복은 APPLYING을 CONSUMED로 완결). verify의 TOCTOU
     /// 창(원장 밖 SELECT) 폐쇄 — 검증과 상태 전환이 한 트랜잭션.
+    ///
+    /// **크래시 시말 계약 (astra r3 MAJOR — fail-closed 명시)**: begin_apply
+    /// 커밋과 도메인 전이 적용 사이에 프로세스가 죽으면 그 grant는
+    /// 회복에서 CONSUMED로 완결된다 — **전이가 실제로는 나지 않았더라도**.
+    /// 이는 의도된 손실 정책이다: (i) begin_apply는 "전이가 날 것"의
+    /// 엔진 확약이라 소비가 먼저 확정되고 (ii) 미적용 전이는 저널 재생
+    /// (G1·감사 봉투)으로만 정정되며 grant 재발급은 인간 승인 절차를
+    /// 다시 밟는다. "grant 1건 인가적 손실 vs 무인가 이중 소비"의 트레이드
+    /// 오프에서 전자를 택한다 — fail-closed. (엔진은 begin_apply 직후
+    /// 곧바로 dispatch_inner를 호출하므로 실전 창은 명령 1개 폭.)
     pub fn begin_apply(
         &mut self,
         grant_id: &str,
@@ -434,16 +448,23 @@ impl ApprovalLedger {
     }
 
     fn release_inner(tx: &rusqlite::Transaction, grant_id: &str, exec_id: &str, dispatch_seq: u64) -> Result<(), LedgerError> {
-        let owned: Option<i64> = tx
+        // (grant, exec, seq)와 그 시점의 state를 함께 조회 — astra r3
+        // BLOCKER: Applying은 절대 해제 불가(전이가 났거나 곧 난다).
+        let owned: Option<(i64, String)> = tx
             .query_row(
-                "SELECT fence_token FROM reservations WHERE grant_id = ?1 AND exec_id = ?2 AND dispatch_seq = ?3",
+                "SELECT r.fence_token, g.state FROM reservations r JOIN grants g ON g.grant_id = r.grant_id
+                 WHERE r.grant_id = ?1 AND r.exec_id = ?2 AND r.dispatch_seq = ?3",
                 params![grant_id, exec_id, dispatch_seq as i64],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
             .map_err(|e| LedgerError::Db(e.to_string()))?;
         match owned {
             None => Ok(()), // 멱등 — 이미 없음.
+            Some((_, st)) if st == "applying" => {
+                // 적용 시작 후에는 어떤 경로도 Issued로 되돌리지 않는다.
+                Err(LedgerError::AlreadyConsumed { grant_id: grant_id.into() })
+            }
             Some(_) => {
                 // fence 무효화 (옛 소유자의 확정 시도 영구 거부) + 상태 복귀.
                 tx.execute(
@@ -980,6 +1001,25 @@ mod tests {
             Err(LedgerError::FenceStale { .. })
         ));
         assert_eq!(l.get_grant("g-1").unwrap().state, GrantState::Issued);
+    }
+
+    // (astra r3 BLOCKER) Applying은 어떤 공개 경로로도 Issued로 되돌아가지
+    // 않는다 — begin_apply 후 같은 키 release 시도 거부.
+    #[test]
+    fn t53r3_applying_never_returns_to_issued_via_release() {
+        let mut l = ledger();
+        l.issue_grant("g-1", "tok-1", &scope_a()).unwrap();
+        let r = l.reserve_grant("g-1", &scope_a(), "ex-1", 3).unwrap();
+        l.begin_apply("g-1", "ex-1", 3, r.fence_token).unwrap();
+        // 동일 키 release — 거부 (Applying은 소비 확정).
+        let err = l.release_reservation("g-1", "ex-1", 3).unwrap_err();
+        assert!(matches!(err, LedgerError::AlreadyConsumed { .. }), "{err:?}");
+        assert_eq!(l.get_grant("g-1").unwrap().state, GrantState::Applying, "still APPLYING");
+        // 재예약도 불가.
+        assert!(matches!(
+            l.reserve_grant("g-1", &scope_a(), "ex-1", 3),
+            Err(LedgerError::AlreadyConsumed { .. })
+        ));
     }
 
     // 정규 스코프 — 키 순서 무관 동결 비교.

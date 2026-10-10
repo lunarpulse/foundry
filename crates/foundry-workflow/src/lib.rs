@@ -295,6 +295,29 @@ impl WorkflowEngine {
             };
             match reservation {
                 Ok(fence) => {
+                    // 사전 엣지 검증 (astra r3): NoEdge/거부가 예정된
+                    // 디스패치에 begin_apply를 내면 Applying이 해제 불가로
+                    // 남는다. 부호화에 (패밀리, from) 엣지 존재 + 가드 만족
+                    // 가능을 먼저 확인 — 순수 읽기, 전이가 안 날 경로는
+                    // 인가를 소비하지 않는다.
+                    let from_state = self.orders.get(order_id).map(|o| o.state()).unwrap_or(OrderState::Received);
+                    let fam = foundry_domain::workflow_encoding::edge_event_of(event);
+                    let edge_exists = self
+                        .wf
+                        .edges
+                        .iter()
+                        .any(|e| e.event == fam && e.from == from_state);
+                    if !edge_exists {
+                        // 전이가 날 수 없다 — begin_apply 없이 NoEdge 경로로.
+                        let out = self.dispatch_inner(order_id, exec_id, event, event_attempt);
+                        if !matches!(&out, Ok(Outcome::Applied)) {
+                            if let Some(g) = grant {
+                                let _ = approval.release(g.grant_id.clone(), exec_id.to_string(), seq);
+                            }
+                        }
+                        return out;
+                    }
+
                     // apply 직전 **원자적 적용 시작** (astra r2 BLOCKER):
                     // 즉시 쓰기 트랜잭션에서 소유권 검증+Applying 전환이
                     // 함께 커밋 — 검증↔전이 사이 회복 끼임 불가.
@@ -318,9 +341,16 @@ impl WorkflowEngine {
                         // (astra MAJOR: NoEdge가 grant를 소비하던 결함 폐쇄.)
                         if let Some(g) = grant {
                             if let Err(cleanup) = approval.release(g.grant_id.clone(), exec_id.to_string(), seq) {
-                                return Err(EngineError::EncodingDrift {
-                                    detail: format!("grant {} release FAILED after refusal: {cleanup} — recovery_scan will reconcile", g.grant_id),
-                                });
+                                // astra r3 MAJOR: 클린업 실패도 래치 — 방치된
+                                // 예약은 회복이 정리하되 실행은 정지시킨다.
+                                let detail = format!(
+                                    "grant {} release FAILED after refusal: {cleanup} — recovery_scan will reconcile; exec halted",
+                                    g.grant_id
+                                );
+                                if !self.halted.contains_key(exec_id) {
+                                    self.halted.insert(exec_id.into(), HaltCause::EncodingDrift { detail: detail.clone() });
+                                }
+                                return Err(EngineError::EncodingDrift { detail });
                             }
                         }
                     } else if let Some(g) = grant {
@@ -372,6 +402,10 @@ impl WorkflowEngine {
         event: &OrderEvent,
         event_attempt: u32,
     ) -> Result<Outcome, EngineError> {
+        // astra r3 MAJOR: 재생 진입도 halted 최선위 (사유 보존의 경로 무관성).
+        if self.halted.contains_key(exec_id) {
+            return Err(self.halted_error(exec_id));
+        }
         self.dispatch_inner(order_id, exec_id, event, event_attempt)
     }
 
@@ -437,6 +471,9 @@ impl WorkflowEngine {
 
     /// 기존 공개 디스패치 — **재생 의미** (dispatch_replay와 동일).
     /// G1 테스트·레거시 경로가 사용한다. 라이브 승인은 dispatch_live.
+    /// astra r3 MAJOR: halted 최선위 — 래치된 실행은 잠금 상태와 무관하게
+    /// 최초 사유를 재생한다 (래치→release→후속 획득 후 LockHeld가 최초
+    /// 사유를 가리던 불일치 폐쇄).
     pub fn dispatch(
         &mut self,
         order_id: &str,
@@ -444,6 +481,9 @@ impl WorkflowEngine {
         event: &OrderEvent,
         event_attempt: u32,
     ) -> Result<Outcome, EngineError> {
+        if self.halted.contains_key(exec_id) {
+            return Err(self.halted_error(exec_id));
+        }
         self.dispatch_inner(order_id, exec_id, event, event_attempt)
     }
 
