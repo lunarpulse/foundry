@@ -317,9 +317,16 @@ impl WorkflowEngine {
                             return false;
                         }
                         // root 결속 — active root 엔진은 실행 결속 필수
-                        // (dispatch_inner의 G5 검사와 동일 — astra r5 MAJOR).
-                        if self.active_root.is_some() && !self.exec_bindings.contains_key(exec_id) {
-                            return false;
+                        // (dispatch_inner의 G5 검사와 동일 — astra r5 MAJOR)
+                        // **및** 결속 root가 active root와 일치 (astra r6
+                        // 조건: stale-bound 실행의 라이브 승인이 Applying을
+                        // 좌초시키던 갭 폐쇄).
+                        if let Some(active) = &self.active_root {
+                            match self.exec_bindings.get(exec_id) {
+                                None => return false,
+                                Some(bound) if bound != active => return false,
+                                _ => {}
+                            }
                         }
                         // 엣지 — 부호화에 (패밀리, from) 존재.
                         let from_state = self.orders.get(order_id).map(|o| o.state()).unwrap_or(OrderState::Received);
@@ -1260,6 +1267,30 @@ mod tests {
         assert!(matches!(r, Err(EngineError::EncodingDrift { .. })), "{r:?}");
         assert_eq!(hook.0.get_grant("g-u").unwrap().state, foundry_approval::GrantState::Issued, "root refusal must not strand Applying");
         assert_eq!(e.order("r5-u").unwrap().state(), OrderState::FurnaceHold);
+    }
+
+    /// (astra r6 조건) stale-bound 실행의 라이브 승인 — precheck에서
+    /// 결격(root 불일치) → Applying 없이 거부, grant 무사.
+    #[test]
+    fn t53r6_stale_binding_root_mismatch_preserves_grant() {
+        let mut e = WorkflowEngine::embedded_default();
+        e.set_active_root("wf-root-NEW");
+        let mut o = order("r6-o");
+        o.force_state_for_test(OrderState::FurnaceHold, 1);
+        e.enroll(o);
+        e.acquire("r6-o", "ex").unwrap();
+        e.bind_root("ex", "wf-root-OLD").unwrap(); // 결속은 있으나 active와 불일치
+        let mut ledger = foundry_approval::ApprovalLedger::open_in_memory().unwrap();
+        let sc = serde_json::json!({
+            "order_id": "r6-o", "intent": "ship", "artifact_digest": "dig-1", "root_scope": "wf-root-NEW",
+        });
+        ledger.issue_grant("g-r6", "tok-r6", &sc).unwrap();
+        let mut hook = LedgerHook(ledger);
+        let grant = GrantRef { grant_id: "g-r6".into() };
+        let r = e.dispatch_live("r6-o", "ex", &g3_approval_event(), 1, Some(&grant), &mut hook);
+        assert!(matches!(r, Err(EngineError::EncodingDrift { .. })), "{r:?}");
+        assert_eq!(hook.0.get_grant("g-r6").unwrap().state, foundry_approval::GrantState::Issued, "stale-binding refusal must not consume");
+        assert_eq!(e.order("r6-o").unwrap().state(), OrderState::FurnaceHold);
     }
 
     /// 비승인 이벤트는 라이브여도 grant 불요 — 자율 구간.
