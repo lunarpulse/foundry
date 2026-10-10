@@ -117,7 +117,7 @@ impl ApprovalLedger {
         Self::init(conn)
     }
 
-    #[cfg(test)]
+    /// 인메모리 원장 — 테스트·임베디드 진단용 (프로덕션은 open).
     pub fn open_in_memory() -> Result<Self, LedgerError> {
         let conn = Connection::open_in_memory().map_err(|e| LedgerError::Db(e.to_string()))?;
         Self::init(conn)

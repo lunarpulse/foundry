@@ -49,6 +49,24 @@ pub enum EngineError {
     BudgetExhausted { exec_id: ExecId, steps: u32, cap: u32 },
     /// 도메인 가드 거부 (stale attempt 등) — 상태 불변.
     DomainRefusal { detail: String },
+    /// T53a (v6): 라이브 승인 디스패치의 인가 실패 — 도메인 전이 미발생,
+    /// 주문 저널 미기록, 실행 래치. 인가는 승인 원장이 소유한다.
+    AuthorizationRefused { exec_id: ExecId, grant_id: Option<String>, reason: String },
+}
+
+/// 라이브 디스패치가 제시하는 grant 참조 (T53a).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GrantRef {
+    pub grant_id: String,
+}
+
+/// 승인 원장 훅 — 엔진이 원장과 대화하는 유일한 경계 (스토어 분리).
+/// 구현체(foundry-approval)가 소유: 예약·해제·확정의 실제 원자성은
+/// 원장 트랜잭션이 보장한다. Err(String)은 인가 거부 사유.
+pub trait ApprovalLedgerHook {
+    fn reserve(&mut self, grant_id: String, scope: serde_json::Value, exec_id: String, dispatch_seq: u64) -> Result<u64, String>;
+    fn release(&mut self, grant_id: String, exec_id: String, dispatch_seq: u64) -> Result<(), String>;
+    fn finalize(&mut self, grant_id: String, exec_id: String, dispatch_seq: u64, fence: u64) -> Result<(), String>;
 }
 
 /// B2 실행 예산.
@@ -119,6 +137,9 @@ pub struct WorkflowEngine {
 pub enum HaltCause {
     BudgetExhausted { steps: u32, cap: u32 },
     EncodingDrift { detail: String },
+    /// T53a (v6 E): 승인 계열 이벤트의 라이브 디스패치가 유효 grant
+    /// 예약에 실패 — 실행 래치. detail은 바이트 동일 재생.
+    AuthorizationRefused { grant_id: Option<String>, reason: String },
 }
 
 impl WorkflowEngine {
@@ -224,12 +245,118 @@ impl WorkflowEngine {
         self.orders.entry(order.id.clone()).or_insert(order);
     }
 
+    /// **라이브 디스패치 (T53a, v6 B)** — 승인 계열 이벤트
+    /// (Approved/Rejected)는 `grant` 제시가 필수다. grant는 (grant_id,
+    /// scope) 쌍이며 엔진은 예약(reserve)을 **승인 원장 훅**에 위임한다 —
+    /// 훅이 Err면 AuthorizationRefused 래치 (도메인 전이 미발생·주문
+    /// 저널 미기록). 성공하면 확정(finalize) 훅이 전이 적용 직후 불린다.
+    ///
+    /// 승인 원장 자체(foundry-approval)는 엔진에 의존하지 않는다 — 엔진은
+    /// 트레잇 훅으로만 대화한다 (스토어 분리 원칙 유지).
+    pub fn dispatch_live<L>(
+        &mut self,
+        order_id: &str,
+        exec_id: &str,
+        event: &OrderEvent,
+        event_attempt: u32,
+        grant: Option<&GrantRef>,
+        approval: &mut L,
+    ) -> Result<Outcome, EngineError>
+    where
+        L: ApprovalLedgerHook,
+    {
+        // 승인 계열 이벤트 판별 — 인가가 필요한 전이만.
+        let needs_authority = matches!(event, OrderEvent::Approved { .. } | OrderEvent::Rejected { .. });
+        if needs_authority {
+            let scope_json = self.scope_for(order_id, event);
+            let reservation = match grant {
+                None => Err("no grant presented (live approval dispatch requires a GrantRef)".to_string()),
+                Some(g) => approval
+                    .reserve(g.grant_id.clone(), scope_json, exec_id.to_string(), self.next_dispatch_seq(exec_id)),
+            };
+            match reservation {
+                Ok(_fence) => {
+                    // 예약 보유 — 잔여 검증 체인 진행 (드리프트/예산 실패 시
+                    // 해제는 호출자 책임: release_reservation).
+                    let out = self.dispatch_inner(order_id, exec_id, event, event_attempt);
+                    if out.is_err() || matches!(out, Ok(Outcome::Refused { .. })) {
+                        // 검증 실패 — 예약은 소비되지 않는다 (해제).
+                        if let Some(g) = grant {
+                            let _ = approval.release(g.grant_id.clone(), exec_id.to_string(), self.next_dispatch_seq(exec_id).saturating_sub(1));
+                        }
+                    } else if let Some(g) = grant {
+                        // 전이 적용 성공 직후 — 확정.
+                        let _ = approval.finalize(g.grant_id.clone(), exec_id.to_string(), self.next_dispatch_seq(exec_id).saturating_sub(1), _fence);
+                    }
+                    out
+                }
+                Err(reason) => {
+                    let grant_id = grant.map(|g| g.grant_id.clone());
+                    let detail = reason.clone();
+                    // 래치 + 관측 — 도메인 전이 미발생, 주문 상태 불변.
+                    self.halted.insert(
+                        exec_id.into(),
+                        HaltCause::AuthorizationRefused { grant_id: grant_id.clone(), reason: detail.clone() },
+                    );
+                    let _ = self.observe(exec_id, event, from_placeholder(), None, "-", Outcome::Refused { detail: "authorization refused (exec latched)".into() });
+                    return Err(EngineError::AuthorizationRefused { exec_id: exec_id.into(), grant_id, reason: detail });
+                }
+            }
+        } else {
+            self.dispatch_inner(order_id, exec_id, event, event_attempt)
+        }
+    }
+
+    /// **재생 디스패치 (T53a, v6 B)** — 인증된 감사 봉투 하의 재생 전용.
+    /// 커서는 이 타입 계통에는 등장하지 않는다 (타입 격리): 재생은
+    /// ReplayContext(foundry-workflow replay 모듈 예정)에서만 가능하며,
+    /// 이 내부 진입점은 G1 동등성·M1-M5 재생이 그대로 사용한다 — grant 불요.
+    pub fn dispatch_replay(
+        &mut self,
+        order_id: &str,
+        exec_id: &str,
+        event: &OrderEvent,
+        event_attempt: u32,
+    ) -> Result<Outcome, EngineError> {
+        self.dispatch_inner(order_id, exec_id, event, event_attempt)
+    }
+
+    /// 이 실행의 다음 디스패치 일련번호 (연산 정체성 — 예약 키).
+    fn next_dispatch_seq(&self, exec_id: &str) -> u64 {
+        self.observations.iter().filter(|o| o.exec_id == exec_id).count() as u64 + 1
+    }
+
+    /// 승인 이벤트의 grant 스코프 — 주문 상태에서 유도.
+    fn scope_for(&self, order_id: &str, event: &OrderEvent) -> serde_json::Value {
+        match event {
+            OrderEvent::Approved { intent, artifact_digest } => serde_json::json!({
+                "order_id": order_id, "intent": intent, "artifact_digest": artifact_digest,
+            }),
+            OrderEvent::Rejected { intent } => serde_json::json!({
+                "order_id": order_id, "intent": intent, "artifact_digest": "",
+            }),
+            _ => unreachable!("scope_for is only called for approval events"),
+        }
+    }
+
+    /// 기존 공개 디스패치 — **재생 의미** (dispatch_replay와 동일).
+    /// G1 테스트·레거시 경로가 사용한다. 라이브 승인은 dispatch_live.
+    pub fn dispatch(
+        &mut self,
+        order_id: &str,
+        exec_id: &str,
+        event: &OrderEvent,
+        event_attempt: u32,
+    ) -> Result<Outcome, EngineError> {
+        self.dispatch_inner(order_id, exec_id, event, event_attempt)
+    }
+
     /// 핵심: 단일 이벤트 디스패치 — G1 동등성의 실행 단위.
     ///
     /// 순서 (C-W4): 입장허가(엣지) → 예산 검사 → 도메인 승인
     /// (`Order::transition`) → 관측 기록. 도메인이 최종 권위다.
     #[allow(clippy::too_many_arguments)]
-    pub fn dispatch(
+    fn dispatch_inner(
         &mut self,
         order_id: &str,
         exec_id: &str,
@@ -297,6 +424,13 @@ impl WorkflowEngine {
                 exec_id: exec_id.into(),
                 steps: *steps,
                 cap: *cap,
+            });
+        }
+        if let Some(HaltCause::AuthorizationRefused { grant_id, reason }) = self.halted.get(exec_id) {
+            return Err(EngineError::AuthorizationRefused {
+                exec_id: exec_id.into(),
+                grant_id: grant_id.clone(),
+                reason: reason.clone(),
             });
         }
         let steps = self.observations.iter().filter(|o| {
@@ -719,6 +853,122 @@ mod tests {
         let stops_after = e.observations().iter()
             .filter(|o| &o.exec_id == "ex" && o.outcome == Outcome::BudgetStopped).count();
         assert_eq!(stops_after, 1, "exactly one durable stop record");
+    }
+
+    // ------------------------------------------------------------------
+    // G3 실행 케이스 (T53a) — 실제 승인 원장으로 dispatch_live 집행.
+    // ② 무grant ③ 타스코프 grant ④ 유효 인간 승인 대조군.
+    // ------------------------------------------------------------------
+
+    /// 원장 훅 어댑터 — foundry-approval의 ApprovalLedger를 엔진 트레잇에.
+    struct LedgerHook(foundry_approval::ApprovalLedger);
+
+    impl ApprovalLedgerHook for LedgerHook {
+        fn reserve(&mut self, grant_id: String, scope: serde_json::Value, exec_id: String, dispatch_seq: u64) -> Result<u64, String> {
+            self.0.reserve_grant(&grant_id, &scope, &exec_id, dispatch_seq).map(|r| r.fence_token).map_err(|e| e.to_string())
+        }
+        fn release(&mut self, grant_id: String, exec_id: String, dispatch_seq: u64) -> Result<(), String> {
+            self.0.release_reservation(&grant_id, &exec_id, dispatch_seq).map_err(|e| e.to_string())
+        }
+        fn finalize(&mut self, grant_id: String, exec_id: String, dispatch_seq: u64, fence: u64) -> Result<(), String> {
+            self.0.finalize_grant(&grant_id, &exec_id, dispatch_seq, fence).map_err(|e| e.to_string())
+        }
+    }
+
+    fn g3_engine() -> WorkflowEngine {
+        let mut e = WorkflowEngine::embedded_default();
+        let mut o = order("g3-o");
+        // FurnaceHold까지 직행 — 승인 게이트 앞에 세운다.
+        o.force_state_for_test(OrderState::FurnaceHold, 1);
+        e.enroll(o);
+        e
+    }
+
+    fn g3_approval_event() -> OrderEvent {
+        OrderEvent::Approved { intent: "ship".into(), artifact_digest: "dig-1".into() }
+    }
+
+    /// ② 무grant → AuthorizationRefused: 상태 불변·래치·재디스패치 동일 사유.
+    #[test]
+    fn g3_live_no_grant_is_authorization_refused() {
+        let mut e = g3_engine();
+        e.acquire("g3-o", "ex").unwrap();
+        let mut hook = LedgerHook(foundry_approval::ApprovalLedger::open_in_memory().unwrap());
+        let r = e.dispatch_live("g3-o", "ex", &g3_approval_event(), 1, None, &mut hook);
+        let (gid, reason) = match &r {
+            Err(EngineError::AuthorizationRefused { grant_id, reason, .. }) => (grant_id.clone(), reason.clone()),
+            other => panic!("expected AuthorizationRefused, got {other:?}"),
+        };
+        assert_eq!(gid, None);
+        assert!(reason.contains("no grant"), "{reason}");
+        // 상태 불변 (도메인 전이 미발생).
+        assert_eq!(e.order("g3-o").unwrap().state(), OrderState::FurnaceHold);
+        // 래치 — 재디스패치는 동일 사유 (다른 합법 이벤트도).
+        let r2 = e.dispatch_live("g3-o", "ex", &g3_approval_event(), 1, None, &mut hook);
+        assert_eq!(r, r2, "redispatch replays the identical authorization failure");
+    }
+
+    /// ③ 유효하지만 다른 스코프의 grant → 거부 (전 스코프 매칭).
+    #[test]
+    fn g3_live_wrong_scope_grant_refused() {
+        let mut e = g3_engine();
+        e.acquire("g3-o", "ex").unwrap();
+        let mut ledger = foundry_approval::ApprovalLedger::open_in_memory().unwrap();
+        // 다른 artifact_digest 스코프로 발급된 (진짜 인간) grant.
+        let wrong_scope = serde_json::json!({
+            "order_id": "g3-o", "intent": "ship", "artifact_digest": "dig-OTHER",
+        });
+        ledger.issue_grant("g-wrong", "tok-1", &wrong_scope).unwrap();
+        let mut hook = LedgerHook(ledger);
+        let grant = GrantRef { grant_id: "g-wrong".into() };
+        let r = e.dispatch_live("g3-o", "ex", &g3_approval_event(), 1, Some(&grant), &mut hook);
+        assert!(
+            matches!(&r, Err(EngineError::AuthorizationRefused { grant_id: Some(g), reason, .. }) if g == "g-wrong" && reason.contains("scope")),
+            "{r:?}"
+        );
+        assert_eq!(e.order("g3-o").unwrap().state(), OrderState::FurnaceHold, "state unchanged");
+    }
+
+    /// ④ 유효 인간 승인 대조군 — grant 소비로 전이 성공.
+    #[test]
+    fn g3_live_valid_grant_applies_and_consumes() {
+        let mut e = g3_engine();
+        e.acquire("g3-o", "ex").unwrap();
+        let mut ledger = foundry_approval::ApprovalLedger::open_in_memory().unwrap();
+        let right = serde_json::json!({
+            "order_id": "g3-o", "intent": "ship", "artifact_digest": "dig-1",
+        });
+        ledger.issue_grant("g-right", "tok-9", &right).unwrap();
+        let mut hook = LedgerHook(ledger);
+        let grant = GrantRef { grant_id: "g-right".into() };
+        let out = e.dispatch_live("g3-o", "ex", &g3_approval_event(), 1, Some(&grant), &mut hook);
+        assert_eq!(out.unwrap(), Outcome::Applied);
+        assert_eq!(e.order("g3-o").unwrap().state(), OrderState::Publishing);
+        // grant는 CONSUMED — 재사용 불가 (래치된 게 아니라 소비됨).
+        assert_eq!(hook.0.get_grant("g-right").unwrap().state, foundry_approval::GrantState::Consumed);
+    }
+
+    /// 재생 경로는 grant 불요 — G1 하위호환 (승인 이벤트도 커서 없는
+    /// 내부 디스패치로 재생된다: M1-M5 재생 불변).
+    #[test]
+    fn g3_replay_needs_no_grant() {
+        let mut e = g3_engine();
+        e.acquire("g3-o", "ex").unwrap();
+        let mut hook = LedgerHook(foundry_approval::ApprovalLedger::open_in_memory().unwrap());
+        let _ = &mut hook;
+        let out = e.dispatch_replay("g3-o", "ex", &g3_approval_event(), 1);
+        assert_eq!(out.unwrap(), Outcome::Applied, "replay of a journaled approval needs no grant (envelope owns integrity)");
+    }
+
+    /// 비승인 이벤트는 라이브여도 grant 불요 — 자율 구간.
+    #[test]
+    fn g3_live_non_approval_event_needs_no_grant() {
+        let mut e = WorkflowEngine::embedded_default();
+        e.enroll(order("g3-n"));
+        e.acquire("g3-n", "ex").unwrap();
+        let mut hook = LedgerHook(foundry_approval::ApprovalLedger::open_in_memory().unwrap());
+        let out = e.dispatch_live("g3-n", "ex", &OrderEvent::Queued, 1, None, &mut hook);
+        assert_eq!(out.unwrap(), Outcome::Applied);
     }
 
     /// 잠금 없는 디스패치 = 계약 위반 거부.

@@ -9,3 +9,9 @@ sha2 = "0.10"
 thiserror.workspace = true
 serde.workspace = true
 chrono.workspace = true
+
+[features]
+## proof-fixture: 비프로덕션 프로브가 Order 강제 상태를 쓸 수 있게 —
+## 외부 크레이트 테스트가 도달성/게이트 시나리오를 구성한다 (검증된
+## cfg(test) 확장이며 프로덕션 빌드에는 포함되지 않는다).
+proof-fixture = []
