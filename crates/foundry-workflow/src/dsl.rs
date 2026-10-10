@@ -180,9 +180,16 @@ pub fn merkle_root(doc: &WorkflowDoc) -> String {
     let l3 = leaf("routing", &routing_s);
     // v3 (플랜 v6): 리프 5 = 내장 PolicyDoc의 canonical 직렬화.
     // v1/v2: 기존 policy_digest 문자열 — 레거시 root 불변.
-    let policy_s = match &doc.policy {
-        Some(p) => serde_json::to_string(p).unwrap(),
-        None => doc.policy_digest.clone(),
+    // astra T54 MAJOR: 리프 선택은 **schema_version 기준** (Option 존재
+    // 유무가 아님) — v1/v2 문서에 policy를 주입해도 리프는 policy_digest로
+    // 고정된다. v3에 policy가 없으면(구조 오류) 직렬화로는 불가능하지만
+    // 방어적으로 빈 문자열 → root가 policy_digest=None과 구별됨.
+    let policy_s = match doc.schema_version {
+        3 => doc.policy
+            .as_ref()
+            .map(|p| serde_json::to_string(p).unwrap())
+            .unwrap_or_default(),
+        _ => doc.policy_digest.clone(),
     };
     let l4 = leaf("policy", &policy_s);
     let mut root = sha2::Sha256::new();

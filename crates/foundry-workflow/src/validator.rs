@@ -49,6 +49,9 @@ pub struct ValidationOutcome {
     pub warnings: Vec<Diagnostic>,
 }
 
+/// PolicyDoc 스키마 버전 — 동결 (v1만 지원, G12와 동일 규율).
+pub const POLICY_SCHEMA_VERSIONS: &[u32] = &[1];
+
 /// **검증기** — 작성 시 1회 전수 검사. 성공은 런타임 권위 부여가 아니다:
 /// 런타임 인가는 도메인 승인 원장(T53a)이 소유한다.
 pub fn validate(doc: &WorkflowDoc, encoding: &EmbeddedWorkflow) -> Result<ValidationOutcome, Vec<Diagnostic>> {
@@ -170,7 +173,20 @@ fn validate_policy(
             ));
             return;
         }
-        Some(p) => p,
+        Some(p) => {
+            // astra T54 MAJOR: 지원 정책 스키마만 — 99/0은 거부.
+            if !POLICY_SCHEMA_VERSIONS.contains(&p.schema_version) {
+                errors.push(Diagnostic::err(
+                    "policy_schema_version",
+                    format!(
+                        "PolicyDoc schema_version {} not supported (known: {:?})",
+                        p.schema_version, POLICY_SCHEMA_VERSIONS
+                    ),
+                ));
+                return;
+            }
+            p
+        }
     };
 
     // Waive = 금지 선언 — 존재 자체가 오류 (G3).
@@ -249,10 +265,14 @@ enum PreparePlacement {
     MixedBranches { non_approval: String },
 }
 
-/// **승인 소비 패밀리** — FurnaceHold의 출구 엣지들은 {Approved, Rejected}
-/// 전부 인간 판정을 소비한다 (실측). Prepare의 전분기 규칙은 이 두
-/// 패밀리를 "게이트"로 인정한다.
-const APPROVAL_CONSUMING: &[EdgeEvent] = &[EdgeEvent::Approved, EdgeEvent::Rejected];
+/// **게이트 패밀리** — FurnaceHold의 출구 엣지들 (실측):
+/// * `Approved`: 인간 판정을 소비한다 (Line::approve가 ApprovalToken 검증).
+/// * `Rejected`: 무조건 출구지만 **안전한 종단**이다 — 출하 없이 주문을
+///   종결시킨다 (astra T54 MAJOR: "인간 판정 소비"가 아니라는 점을 정확히
+///   기술한다. 승인 없이 진행 가능한 갈래가 아님은 보장된다).
+/// Prepare의 전분기 규칙: 도달 상태의 만족 가능한 출구가 전부 이 집합
+/// (승인 소비 또는 안전한 종단)이어야 한다.
+const GATE_FAMILIES: &[EdgeEvent] = &[EdgeEvent::Approved, EdgeEvent::Rejected];
 
 /// **전분기 도달성 분석** (플랜 v6 F): Prepare 노드까지의 스텝열을 따라
 /// 도달 가능한 상태 집합을 계산하고, 그 상태들의 만족 가능한 출발 엣지가
@@ -317,7 +337,7 @@ fn prepare_placement_ok(doc: &WorkflowDoc, encoding: &EmbeddedWorkflow, node_ref
             return PreparePlacement::NoOutgoingEdges;
         }
         for e in &satisfiable {
-            if !APPROVAL_CONSUMING.contains(&e.event) {
+            if !GATE_FAMILIES.contains(&e.event) {
                 return PreparePlacement::MixedBranches {
                     non_approval: format!("{:?}", e.event),
                 };
@@ -522,6 +542,60 @@ mod tests {
         assert!(errs.iter().any(|e| matches!(e, Diagnostic::Error { code, .. } if code == "schema_version")));
         // 그리고 v1 인터프리터로는 여전히 해석된다 (레거시 재생 불변).
         assert!(interpreter_v1::interpret(&d, &enc).is_ok());
+    }
+
+    // (astra T54 MAJOR 1) PolicyDoc 지원되지 않는 버전 → 거부.
+    #[test]
+    fn t54_policy_schema_version_checked() {
+        let enc = EmbeddedWorkflow::frozen_v1();
+        let mut d = v3_doc();
+        d.policy = Some(PolicyDoc { schema_version: 99, approvals: vec![] });
+        let errs = validate(&d, &enc).unwrap_err();
+        assert!(errs.iter().any(|e| matches!(e, Diagnostic::Error { code, .. } if code == "policy_schema_version")));
+        let mut d = v3_doc();
+        d.policy = Some(PolicyDoc { schema_version: 0, approvals: vec![] });
+        let errs = validate(&d, &enc).unwrap_err();
+        assert!(errs.iter().any(|e| matches!(e, Diagnostic::Error { code, .. } if code == "policy_schema_version")));
+    }
+
+    // (astra T54 MAJOR 2) v1 문서에 policy 주입 + policy_digest 변경 —
+    // 리프는 policy_digest 기준 (버전이 지배) → root는 정상 변환.
+    #[test]
+    fn t54_legacy_merkle_leaf_is_version_selected() {
+        let mut d = v3_doc();
+        d.schema_version = 1;
+        d.policy = None;
+        let base = merkle_root(&d);
+        // policy 주입 (버전 1이므로 리프는 policy_digest 그대로)
+        let mut with_policy = d.clone();
+        with_policy.policy = Some(PolicyDoc { schema_version: 1, approvals: vec![] });
+        assert_eq!(merkle_root(&with_policy), base, "v1 leaf selection must IGNORE injected policy (version governs)");
+        // policy_digest를 바꾸면 root 변화 (리프가 실제로 policy_digest임을 증명)
+        let mut changed = d.clone();
+        changed.policy_digest = "pol-CHANGED".into();
+        assert_ne!(merkle_root(&changed), base, "v1 policy_digest change must change root");
+    }
+
+    // (astra T54 MAJOR 3) 게이트 의미론 — Rejected는 안전한 종단으로 인정되고
+    // 그 사실이 상수 문서에 정확히 기술되어 있는지 (인간 판정 소비가 아님).
+    // 동작 회귀: FurnaceHold 도달 Prepare는 합법 유지 (Approved+Rejected 전부
+    // 게이트 집합), Working 도달은 혼합 분기 오류 유지.
+    #[test]
+    fn t54_gate_families_documented_as_safe_terminal() {
+        let enc = EmbeddedWorkflow::frozen_v1();
+        // 합법: FurnaceHold 도달 (출구 Approved/Rejected 전부 게이트)
+        let mut d = v3_doc();
+        d.body.steps = vec![
+            StepSpec { id: "q".into(), event: "Queued".into(), skill: Some("die".into()) },
+            StepSpec { id: "w".into(), event: "DieStarted".into(), skill: Some("die".into()) },
+            StepSpec { id: "d".into(), event: "DieSucceeded".into(), skill: Some("die".into()) },
+            StepSpec { id: "p".into(), event: "InspectionPassed".into(), skill: None },
+        ];
+        d.policy = Some(PolicyDoc {
+            schema_version: 1,
+            approvals: vec![PolicyApproval { node_ref: "p".into(), level: PolicyLevel::Prepare }],
+        });
+        assert!(validate(&d, &enc).is_ok());
     }
 
     // (9) 검증기 통과는 런타임 권위를 부여하지 않는다 — merkle root 산출만.
