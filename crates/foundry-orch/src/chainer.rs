@@ -347,18 +347,62 @@ impl<'o, 'a> Chainer<'o, 'a> {
         };
         let scope: serde_json::Value = serde_json::from_str(&grant.scope_json)
             .map_err(|e| ChainerError::Ledger(format!("{e:?}")))?;
-        let rejected = scope
+        // (astra r8) **정확한 outcome 문자열** 요구 — missing/invalid 는
+        // 승인 아님(부정확한 스코프가 CONSUMED 라도).
+        let outcome = scope
             .get("sizing_outcome")
             .and_then(|v| v.as_str())
-            .map(|s| s == "rejected")
-            .unwrap_or(false);
-        if rejected {
-            return Ok(Some(SizingVerdict::Rejected));
-        }
-        match grant.state {
-            foundry_approval::GrantState::Consumed => Ok(Some(SizingVerdict::Approved)),
+            .unwrap_or("");
+        match outcome {
+            "rejected" => Ok(Some(SizingVerdict::Rejected)),
+            "approved" if grant.state == foundry_approval::GrantState::Consumed => {
+                Ok(Some(SizingVerdict::Approved))
+            }
             _ => Ok(None),
         }
+    }
+
+    /// (astra r8) preset_bound 의 **유일한 작성 경로** — 원장 CONSUMED
+    /// 증거 검증 후 멱등 append(이미 같은 sizing_order 결속이 있으면
+    /// 재append 없이 Ok). 인간 사이징 게이트 통과 산출물만 결속된다.
+    pub fn bind_preset_from_ledger(
+        &self,
+        sizing_order: &str,
+        selected_root: &str,
+        spawn_plan: &str,
+    ) -> Result<(), ChainerError> {
+        // 원장에서 승인 산출 — Approved 여야.
+        match self.sizing_verdict_from_ledger(sizing_order)? {
+            Some(SizingVerdict::Approved) => {}
+            _ => return Err(ChainerError::SizingRejected { order: sizing_order.into() }),
+        }
+        // 승인 digest — 그랜트 스코프의 artifact_digest.
+        let grant = self
+            .ledger
+            .get_grant(&format!("sizing-{sizing_order}"))
+            .map_err(|e| ChainerError::Ledger(format!("{e:?}")))?;
+        let scope: serde_json::Value = serde_json::from_str(&grant.scope_json)
+            .map_err(|e| ChainerError::Ledger(format!("{e:?}")))?;
+        let digest = scope
+            .get("artifact_digest")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ChainerError::SizingRejected { order: sizing_order.into() })?
+            .to_string();
+        // 멱등 — 같은 sizing_order 결속이 있으면 재append 없음.
+        let rows = self
+            .log
+            .read_all()
+            .map_err(|e| ChainerError::Log(format!("{e:?}")))?;
+        let already = rows.iter().any(|r| match &r.kind {
+            OrchestrationKind::PresetBound { sizing_order: s0, .. } => s0 == sizing_order,
+            _ => false,
+        });
+        if !already {
+            self.log
+                .append_preset_bound(sizing_order, selected_root, &digest, spawn_plan)
+                .map_err(|e| ChainerError::Log(format!("{e:?}")))?;
+        }
+        Ok(())
     }
 
     /// 바인딩 준수 발행 검사 (H절) — 승인 상태는 원장에서 산출.
@@ -785,6 +829,49 @@ mod tests {
         assert!(matches!(
             ch.reenter("o-bad", "ext:x", Some("s-2"), Some("dig-x"), "plan-2", "root-x", true),
             Err(ChainerError::DeclarationMissing { .. })
+        ));
+    }
+
+    /// (astra r8) preset_bound 유일 작성 경로 — 원장 승인 검증+멱등.
+    #[test]
+    fn bind_preset_from_ledger_gates() {
+        let (_d, log, mut ledger) = setup("bindpreset");
+        // 미승인(그랜트 부재) — 결속 거부.
+        let ch = Chainer::new(&log, &ledger);
+        assert!(matches!(
+            ch.bind_preset_from_ledger("s-none", "root", "plan"),
+            Err(ChainerError::SizingRejected { .. })
+        ));
+        // 승인 그랜트 — CONSUMED (ch 재생성 앞에 완료).
+        let sscope = serde_json::json!({
+            "order_id": "s-9", "intent": "sizing", "artifact_digest": "dig-9",
+            "sizing_outcome": "approved", "root_scope": "intake",
+        });
+        ledger.issue_grant("sizing-s-9", "tok-9", &sscope).unwrap();
+        let r0 = ledger.reserve_grant("sizing-s-9", &sscope, "ex-9", 1).unwrap();
+        ledger.begin_apply("sizing-s-9", "ex-9", 1, r0.fence_token).unwrap();
+        ledger.finalize_grant("sizing-s-9", "ex-9", 1, r0.fence_token).unwrap();
+        // 거부된 사이징 그랜트.
+        let rscope = serde_json::json!({
+            "order_id": "s-rej9", "intent": "sizing", "artifact_digest": "d",
+            "sizing_outcome": "rejected", "root_scope": "intake",
+        });
+        ledger.issue_grant("sizing-s-rej9", "tok-r9", &rscope).unwrap();
+        let ch = Chainer::new(&log, &ledger);
+        // 결속 성공 — digest 는 그랜트 스코프에서.
+        ch.bind_preset_from_ledger("s-9", "root-9", "plan-9").unwrap();
+        // 멱등 — 재호출 이중 행 없음.
+        ch.bind_preset_from_ledger("s-9", "root-9", "plan-9").unwrap();
+        let rows = log.read_all().unwrap();
+        let bounds = rows
+            .iter()
+            .filter(|r| matches!(&r.kind, OrchestrationKind::PresetBound { sizing_order, .. } if sizing_order == "s-9"))
+            .count();
+        assert_eq!(bounds, 1, "idempotent single preset_bound row");
+        // 거부된 사이징 — 결속 거부.
+        assert!(matches!(
+            ch.bind_preset_from_ledger("s-rej9", "root", "plan"),
+            Err(ChainerError::SizingRejected { .. })
         ));
     }
 }

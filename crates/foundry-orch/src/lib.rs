@@ -493,9 +493,11 @@ impl OrchestrationLog {
         Ok((row, manifest))
     }
 
-    /// 사이즈 결속 (H절 — 발행 권한의 근거 행). 코디네이터만 호출
-    /// (astra r2: 공개 진입점 누락 폐쇄).
-    pub fn append_preset_bound(
+    /// 사이즈 결속 (H절 — 발행 권한의 근거 행). (astra r8) **크레이트
+    /// 내부 전용** — 원장 CONSUMED 증거 검증은 chainer 의
+    /// bind_preset_from_ledger 이 수행하고, 그 경유 append 만 허용된다.
+    /// 외부 직접 append 는 임의 PresetBound 위조 경로이므로 차단.
+    pub(crate) fn append_preset_bound(
         &self,
         sizing_order: &str,
         selected_root: &str,
