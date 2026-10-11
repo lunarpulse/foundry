@@ -498,6 +498,25 @@ impl OrchestrationLog {
         dest_order: &str,
         artifact_digest: &str,
     ) -> Result<(OrchRow, String), OrchError> {
+        // (M7.1 리뷰 B1) **멱등 결속** — 동일 source, dest, digest 의
+        // 기존 행을 재사용(라이브 재시도가 새 매니페스트를 만들어
+        // 그랜트 스코프를 무효화하지 않는다).
+        {
+            let conn = self.conn.lock().unwrap();
+            let rows_now = read_all_locked(&conn)?;
+            if let Some(prev) = rows_now.into_iter().rev().find(|r| {
+                matches!(&r.kind,
+                    OrchestrationKind::HandoffBound {
+                        source_order: s, dest_order: d, artifact_digest: a,
+                    } if s == source_order && d == dest_order && a == artifact_digest)
+            }) {
+                let manifest = handoff_manifest_digest(
+                    source_order, dest_order, artifact_digest, prev.seq,
+                )
+                .map_err(|_| OrchError::FieldTooLarge)?;
+                return Ok((prev, manifest));
+            }
+        }
         let row = self.append(OrchestrationKind::HandoffBound {
             source_order: source_order.into(),
             dest_order: dest_order.into(),

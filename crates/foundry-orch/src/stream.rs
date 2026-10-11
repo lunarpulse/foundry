@@ -193,6 +193,8 @@ pub struct StreamRuntime {
     /// (astra r9 P1) 사이즈 바인딩 검증용 승인 원장 — dispatch가
     /// Chainer 게이트를 실제 호출한다(unsized-spawn 원천 차단).
     approval: Mutex<Option<&'static foundry_approval::ApprovalLedger>>,
+    /// (M7.1 리뷰 B1) 원장 경로 — 라이브 핸드오프의 소유권 재오픈용.
+    approval_path: Mutex<Option<std::path::PathBuf>>,
     streams: Mutex<Vec<Arc<Stream>>>,
     /// (astra r1 결합) 입장 차단 — 코디네이터가 소유.
     admission_blocked: std::sync::atomic::AtomicBool,
@@ -203,6 +205,7 @@ impl StreamRuntime {
         Self {
             orch: Arc::new(orch),
             approval: Mutex::new(None),
+            approval_path: Mutex::new(None),
             streams: Mutex::new(Vec::new()),
             admission_blocked: std::sync::atomic::AtomicBool::new(false),
         }
@@ -214,6 +217,9 @@ impl StreamRuntime {
         &self,
         ledger: foundry_approval::ApprovalLedger,
     ) -> Result<(), String> {
+        // (M7.1 리뷰 B1) 경로 보존 — 라이브 핸드오프가 소유권 있는
+        // 원장 인스턴스로 재오픈할 수 있다.
+        *self.approval_path.lock().unwrap() = ledger.db_path().map(|p| p.to_path_buf());
         let leaked: &'static foundry_approval::ApprovalLedger = Box::leak(Box::new(ledger));
         *self.approval.lock().unwrap() = Some(leaked);
         Ok(())
@@ -238,6 +244,69 @@ impl StreamRuntime {
         }
         g.push(Arc::new(stream));
         Ok(())
+    }
+
+    /// (M7.1 리뷰 B1) **라이브 핸드오프 정문** — 산출물 인계 승인을
+    /// 엔진의 라이브 경로(dispatch_live)로 소비한다. 그랜트 스코프는
+    /// scope_for 4필드 + handoff_manifest 결속(chainer.confirm_handoff
+    /// 검증). 테스트 직접 소비를 대체하는 유일한 경로.
+    pub fn dispatch_handoff(
+        &self,
+        source_order: &str,
+        dest_order: &str,
+        artifact_digest: &str,
+        grant_id: &str,
+    ) -> Result<(), String> {
+        // ① 체이너로 핸드오프 제안+결속(bind_handoff) — 매니페스트 획득.
+        let orch = &self.orch;
+        let (row, manifest) = orch
+            .bind_handoff(source_order, dest_order, artifact_digest)
+            .map_err(|e| format!("bind_handoff: {e:?}"))?;
+        // ② 그랜트 라이브 소비 — 원장 어댑터로 dispatch_live.
+        //    핸드오프 승인 이벤트 = Approved(intent="handoff")를
+        //    source_order 엔진에 적용(스코프 4필드 + manifest 는
+        //    그랜트 스코프의 6필드 규약과 confirm_handoff 가 정합).
+        let Some((_, sid)) = self.assignment_of(source_order)? else {
+            return Err(format!("order {source_order} has no assignment"));
+        };
+        let stream = self.stream(&sid).ok_or(format!("stream {sid} not registered"))?;
+        let mut eng = stream.engine_if_unfenced()?;
+        let ap = foundry_approval::ApprovalLedger::open(
+            self.approval_path.lock().unwrap().clone()
+                .ok_or("approval ledger not bound (fail-closed)")?,
+        )
+        .map_err(|e| format!("approval reopen: {e:?}"))?;
+        let mut hook = foundry_workflow::ApprovalLedgerAdapter(ap);
+        let grant = foundry_workflow::GrantRef { grant_id: grant_id.into() };
+        // (M7.1 B1) exec_id 는 호출마다 고유 — 첫 실패의 실행 래치가
+        // 후속 재시도를 오염시키지 않는다. 실행 락 획득이 dispatch 전제.
+        let exec = format!("handoff-{}-{}-{}", source_order, grant_id, manifest.chars().rev().take(8).collect::<String>());
+        eng.acquire(source_order, &exec).map_err(|e| format!("acquire: {e:?}"))?;
+        let out = eng
+            .dispatch_live(
+                source_order,
+                &exec,
+                &foundry_domain::OrderEvent::Approved {
+                    intent: "handoff".into(),
+                    artifact_digest: manifest.clone(),
+                },
+                1,
+                Some(&grant),
+                &mut hook,
+            );
+        // (M7.1 B1) 실패 경로 락 해제 — 승인 거부는 상태 불변이므로
+        // 실행 락도 반환한다(성공은 소유권이 그랜트로 이전).
+        if out.is_err() {
+            let _ = eng.release(source_order, &exec);
+        }
+        let out = out.map_err(|e| format!("handoff live dispatch: {e:?}"))?;
+        let _ = row;
+        match out {
+            foundry_workflow::Outcome::Applied => Ok(()),
+            other => Err(format!(
+                "handoff {source_order}->{dest_order} not applied: {other:?}"
+            )),
+        }
     }
 
     pub fn stream(&self, id: &str) -> Option<Arc<Stream>> {

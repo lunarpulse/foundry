@@ -112,6 +112,8 @@ pub struct Reservation {
 /// 트랜잭션 안 상태 변이 **앞에** — astra implementation-sized 지침).
 pub struct ApprovalLedger {
     conn: Connection,
+    /// (M7.1 리뷰 B1) 원본 경로 — 라이브 핸드오프 재오픈용(in_memory 는 None).
+    path: Option<std::path::PathBuf>,
 }
 
 impl ApprovalLedger {
@@ -136,9 +138,16 @@ impl ApprovalLedger {
         Ok(())
     }
 
+    /// (M7.1 리뷰 B1) 원장 경로 — 라이브 핸드오프 재오픈용.
+    pub fn db_path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LedgerError> {
-        let conn = Connection::open(path).map_err(|e| LedgerError::Db(e.to_string()))?;
-        Self::init(conn)
+        let conn = Connection::open(&path).map_err(|e| LedgerError::Db(e.to_string()))?;
+        let mut s = Self::init(conn)?;
+        s.path = Some(path.as_ref().to_path_buf());
+        Ok(s)
     }
 
     /// 인메모리 원장 — 테스트·임베디드 진단용 (프로덕션은 open).
@@ -200,7 +209,7 @@ impl ApprovalLedger {
         // 마이그레이션(astra r2 MAJOR): 기존 activations에 token_id UNIQUE가
         // 없으면 CREATE IF NOT EXISTS로는 못 붙인다 — 재구축(멱등).
         Self::migrate_activations_unique(&conn)?;
-        Ok(Self { conn })
+        Ok(Self { conn, path: None })
     }
 
     // ------------------------------------------------------------------

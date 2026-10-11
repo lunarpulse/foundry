@@ -379,6 +379,96 @@ fn t61_end_to_end_reentry_bypass_crash_rebuild() {
     assert_eq!(rows2.len(), rows.len(), "rebuild sees identical log");
 }
 
+/// (M7.1 리뷰 B1) 라이브 핸드오프 정문 — 그랜트가 라이브 경로로 소비되고
+/// 로그에 HandoffBound 행이 남는다(테스트 직접 소비 대체).
+#[test]
+fn t61_live_handoff_front_door() {
+    let d = tmpdir("handoff");
+    let orch = OrchestrationLog::open(&d.join("orch.db")).unwrap();
+    // 두 주문 선언 — t-h1(소스) → t-h2(목적지), 같은 스트림.
+    orch.declare_plan(
+        "plan-h",
+        vec![
+            ("t-h1".into(), vec![]),
+            ("t-h2".into(), vec![]),
+        ],
+        vec![
+            ("t-h1".into(), "s-h".into()),
+            ("t-h2".into(), "s-h".into()),
+        ],
+    )
+    .unwrap();
+    // preset_bound — 발행 권한(테스트 간소화: 사이징 승인 직접 결속).
+    let mut ap = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
+    {
+        let digest = crate::chainer::sizing_digest("approved", "bmad-epic-build", "plan-h");
+        ap.issue_grant("sizing-sz-h", "tok-h", &serde_json::json!({
+            "order_id": "sz-h", "intent": "sizing", "artifact_digest": digest, "root_scope": "",
+        }))
+        .unwrap();
+        let sr = ap.reserve_grant("sizing-sz-h", &serde_json::json!({
+            "order_id": "sz-h", "intent": "sizing",
+            "artifact_digest": crate::chainer::sizing_digest("approved", "bmad-epic-build", "plan-h"),
+            "root_scope": "",
+        }), "h", 1).unwrap();
+        ap.begin_apply("sizing-sz-h", "h", 1, sr.fence_token).unwrap();
+        ap.finalize_grant("sizing-sz-h", "h", 1, sr.fence_token).unwrap();
+        let ch = Chainer::new(&orch, &ap);
+        ch.bind_preset_from_ledger("sz-h", "bmad-epic-build", "plan-h").unwrap();
+    }
+    let rt = StreamRuntime::new(OrchestrationLog::open(&d.join("orch.db")).unwrap());
+    rt.add_stream(Stream::new_with_root("s-h", &d, "bmad-epic-build").unwrap()).unwrap();
+    rt.bind_approval_ledger(
+        foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
+    )
+    .unwrap();
+    rt.dispatch("t-h1", mkorder("t-h1", false)).unwrap();
+    rt.dispatch("t-h2", mkorder("t-h2", false)).unwrap();
+    // t-h1 을 게이트까지 진행(승인 대기 상태).
+    autonomous_to_gate(&rt, "s-h", "t-h1", "t61h");
+    // 게이트 후 실행 락 해제 — 핸드오프 정문이 자체 acquire.
+    {
+        let e = rt.stream("s-h").unwrap();
+        let mut eng = e.engine_if_unfenced().unwrap();
+        assert!(eng.release("t-h1", "t61h"), "gate exec lock released");
+    }
+    // (M7.1 B1) 정문은 bind_handoff 가 **멱등**(동일 튜플 재사용)이므로:
+    // ① 위조 매니페스트 그랜트는 라이브 소비 거부(스코프 결속).
+    // ② 정문 매니페스트 그랜트는 통과 — 로그에 행이 남고 그랜트 소비.
+    let orch = rt.orch.clone();
+    let mut ap2 = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
+    ap2.issue_grant("handoff-bad", "tok-bad", &serde_json::json!({
+        "order_id": "t-h1", "intent": "handoff",
+        "artifact_digest": "forged-manifest", "root_scope": "",
+    }))
+    .unwrap();
+    // 가시성 확인 — 별도 커넥션에서 두 그랜트가 보이는가.
+    {
+        let apv = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
+        assert!(apv.get_grant("handoff-bad").is_ok(), "handoff-bad visible");
+    }
+    let refused = rt.dispatch_handoff("t-h1", "t-h2", "art-h", "handoff-bad");
+    assert!(refused.is_err(), "forged-manifest handoff grant refused live");
+    let (row, manifest) = orch.bind_handoff("t-h1", "t-h2", "art-h").unwrap();
+    ap2.issue_grant("handoff-ok", "tok-ok", &serde_json::json!({
+        "order_id": "t-h1", "intent": "handoff", "artifact_digest": manifest, "root_scope": "",
+    }))
+    .unwrap();
+    {
+        let apv = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
+        let g = apv.get_grant("handoff-ok").expect("handoff-ok visible before dispatch");
+        eprintln!("DBG scope stored: {}", g.scope_json);
+    }
+    rt.dispatch_handoff("t-h1", "t-h2", "art-h", "handoff-ok")
+        .unwrap_or_else(|e| panic!("live handoff front door: {e}"));
+    let rows = orch.read_all().unwrap();
+    assert!(rows.iter().any(|r| r.seq == row.seq
+        && matches!(&r.kind, OrchestrationKind::HandoffBound { .. })));
+    let ap_check = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
+    let g = ap_check.get_grant("handoff-ok").unwrap();
+    assert!(g.state == foundry_approval::GrantState::Consumed, "handoff grant consumed on the live path");
+}
+
 /// (M7.1 리뷰 B2) 스트림 루트 결속 — 다른 루트로 결속된 사이징 승인을
 /// 이 스트림의 부트스트랩에 사용하면 거부.
 #[test]
