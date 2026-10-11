@@ -70,16 +70,11 @@ pub struct OrchRow {
 
 const GENESIS: &str = "GENESIS";
 
-/// (T61 astra r5) 테스트 전용 크래시 훅 — INSERT 직후(COMMIT 전) 호출.
-/// 크래시 주입 테스트만 설정; 프로덕션 경로는 항상 None.
+/// (T61 astra r5/r6) 테스트 전용 크래시 훅 — INSERT 직후(COMMIT 전)
+/// 호출. **atomic 플래그**(락 없음 — fork 자식에서 뮤텍스 상속 경합
+/// 원천 차단). 크래시 주입 테스트만 설정; 프로덕션 경로는 항상 false.
 #[cfg(test)]
-fn test_crash_hook() -> Option<std::sync::Arc<dyn Fn() + Send + Sync>> {
-    TEST_CRASH_HOOK.lock().unwrap().clone()
-}
-
-#[cfg(test)]
-static TEST_CRASH_HOOK: std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>> =
-    std::sync::Mutex::new(None);
+static TEST_CRASH_NOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 const DOMAIN_LABEL: &[u8] = b"foundry-orch-chain-v1\0";
 
 fn row_hash(seq: i64, prev: &str, kind_json: &str) -> String {
@@ -306,10 +301,10 @@ impl OrchestrationLog {
             .query_row("SELECT last_insert_rowid()", [], |r| r.get(0))
             .map_err(|e| OrchError::Io(e.to_string()))?;
         // (T61 astra r5) 테스트 전용 크래시 훅 — INSERT 후 커밋 전 창.
-        // cfg(test) 로만 존재(프로덕션 바이너리에 부재).
+        // cfg(test) 로만 존재(프로덕션 바이너리에 부재). atomic — 락 없음.
         #[cfg(test)]
-        if let Some(hook) = test_crash_hook() {
-            hook();
+        if TEST_CRASH_NOW.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            unsafe { libc::kill(libc::getpid(), libc::SIGKILL); }
         }
         let hash = row_hash(seq, &prev, &payload);
         conn.execute(

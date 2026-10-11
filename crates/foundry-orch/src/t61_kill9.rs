@@ -6,7 +6,6 @@
 //! ④ 재 append 성공.
 
 use crate::{OrchestrationKind, OrchestrationLog};
-use std::sync::Arc;
 
 #[test]
 fn t61_kill9_mid_append_rolls_back() {
@@ -20,15 +19,14 @@ fn t61_kill9_mid_append_rolls_back() {
         log.declare_plan("p0", vec![("o-0".into(), vec![])], vec![("o-0".into(), "s".into())])
             .unwrap();
     }
-    // 자식: 훅 설정 후 append — INSERT 직후 SIGKILL.
+    // 자식: 훅 설정 후 append — INSERT 직후 SIGKILL. 부모는 플래그 클리어.
+    crate::TEST_CRASH_NOW.store(false, std::sync::atomic::Ordering::SeqCst);
     let child = unsafe { libc::fork() };
     assert!(child >= 0, "fork failed");
     if child == 0 {
+        // (astra r6) atomic 플래그 — fork 자식에서 락 없이 안전.
+        crate::TEST_CRASH_NOW.store(true, std::sync::atomic::Ordering::SeqCst);
         let log = OrchestrationLog::open(&db).unwrap();
-        let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(|| unsafe {
-            libc::kill(libc::getpid(), libc::SIGKILL);
-        });
-        *crate::TEST_CRASH_HOOK.lock().unwrap() = Some(hook);
         let _ = log.declare_plan(
             "p-crash",
             vec![("o-crash".into(), vec![])],
