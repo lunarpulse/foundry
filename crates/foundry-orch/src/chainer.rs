@@ -376,7 +376,10 @@ impl<'o, 'a> Chainer<'o, 'a> {
             Some(SizingVerdict::Approved) => {}
             _ => return Err(ChainerError::SizingRejected { order: sizing_order.into() }),
         }
-        // 승인 digest — 그랜트 스코프의 artifact_digest.
+        // 승인 digest — 그랜트 스코프의 artifact_digest. 그리고
+        // (astra r11 P1) **선택 목적지도 스코프에 인코딩돼 있다**(H절:
+        // "스코프의 digest 안에 선택 목적지 인코딩") — 호출자가 제시한
+        // root/plan 은 스코프 기록과 일치해야 한다(승인 리다이렉션 차단).
         let grant = self
             .ledger
             .get_grant(&format!("sizing-{sizing_order}"))
@@ -388,6 +391,28 @@ impl<'o, 'a> Chainer<'o, 'a> {
             .and_then(|v| v.as_str())
             .ok_or_else(|| ChainerError::SizingRejected { order: sizing_order.into() })?
             .to_string();
+        let scope_root = scope
+            .get("selected_root")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ChainerError::SizingRejected { order: sizing_order.into() })?;
+        if scope_root != selected_root {
+            return Err(ChainerError::DestinationMismatch {
+                order: sizing_order.into(),
+                expected: scope_root.into(),
+                got: selected_root.into(),
+            });
+        }
+        let scope_plan = scope
+            .get("spawn_plan")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ChainerError::SizingRejected { order: sizing_order.into() })?;
+        if scope_plan != spawn_plan {
+            return Err(ChainerError::DestinationMismatch {
+                order: sizing_order.into(),
+                expected: scope_plan.into(),
+                got: spawn_plan.into(),
+            });
+        }
         // 멱등 — 같은 sizing_order 결속이 있으면 재append 없음.
         let rows = self
             .log
@@ -846,6 +871,7 @@ mod tests {
         let sscope = serde_json::json!({
             "order_id": "s-9", "intent": "sizing", "artifact_digest": "dig-9",
             "sizing_outcome": "approved", "root_scope": "intake",
+            "selected_root": "root-9", "spawn_plan": "plan-9",
         });
         ledger.issue_grant("sizing-s-9", "tok-9", &sscope).unwrap();
         let r0 = ledger.reserve_grant("sizing-s-9", &sscope, "ex-9", 1).unwrap();
