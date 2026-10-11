@@ -261,10 +261,25 @@ impl<'o, 'a> Chainer<'o, 'a> {
             .log
             .row_at(p.log_seq)
             .map_err(|e| ChainerError::Log(format!("{e:?}")))?;
-        let OrchestrationKind::HandoffBound { source_order, dest_order, .. } = &row.kind
+        let OrchestrationKind::HandoffBound { source_order, dest_order, artifact_digest: encoded } =
+            &row.kind
         else {
             return Err(ChainerError::ThreeWayMismatch { proposal_id: proposal_id.into() });
         };
+        // (astra r4) 3자 완성 — 로그 행에서 매니페스트 **재계산** 후 그
+        // 매니페스트가 그랜트 스코프에 결속돼 있는지까지 확인. 매니페스트는
+        // 행 seq 를 포함하므로 제안별 유일 — 동일 스코프/발급자의 별개
+        // 제안이 하나의 소비된 그랜트를 재사용할 수 없다.
+        let recomputed = crate::handoff_manifest_digest(
+            source_order,
+            dest_order,
+            encoded,
+            row.seq,
+        )
+        .map_err(ChainerError::Log)?;
+        if recomputed != p.manifest {
+            return Err(ChainerError::ThreeWayMismatch { proposal_id: proposal_id.into() });
+        }
         let scope: serde_json::Value =
             serde_json::from_str(&grant.scope_json).map_err(|e| ChainerError::Ledger(format!("{e:?}")))?;
         let scope_str = |k: &str| {
@@ -275,8 +290,10 @@ impl<'o, 'a> Chainer<'o, 'a> {
             ("dest_order_id", dest_order.clone()),
             ("intent", "handoff".to_string()),
             ("artifact_digest", p.artifact_digest.clone()),
-            // (astra r3) 핸드오프 그랜트의 root 는 비어야 — 발급이 임의
-            // 스코프를 수용하므로 이 약속을 확정이 강제한다.
+            // (astra r4) 매니페스트 결속 — 스코프가 지목한 승인이 바로
+            // 이 제안(이 행)이다.
+            ("handoff_manifest", recomputed),
+            // (astra r3) 핸드오프 그랜트의 root 는 비어야.
             ("root_scope", String::new()),
         ];
         for (k, want) in pairs {
@@ -528,9 +545,11 @@ mod tests {
         let p1 = ch.propose_handoff("hp-1", "o-a", "o-b", "dig-1", "tok-issuer-1").unwrap();
         assert!(p1.manifest.starts_with("fh1:"));
 
-        // 발급 그랜트 — issuer 토큰 일치·digest 결속. CONSUMED 완결.
+        // 발급 그랜트 — issuer 토큰 일치·digest+**매니페스트** 결속.
+        let manifest1 = p1.manifest.clone();
         let scope1 = serde_json::json!({
-            "order_id": "o-a", "dest_order_id": "o-b", "intent": "handoff", "artifact_digest": "dig-1", "root_scope": "",
+            "order_id": "o-a", "dest_order_id": "o-b", "intent": "handoff",
+            "artifact_digest": "dig-1", "handoff_manifest": manifest1, "root_scope": "",
         });
         ledger.issue_grant("g-1", "tok-issuer-1", &scope1).unwrap();
         let res = ledger.reserve_grant("g-1", &scope1, "ex-1", 1).unwrap();
