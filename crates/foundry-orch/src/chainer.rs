@@ -80,19 +80,44 @@ pub struct Chainer<'o, 'a> {
 }
 
 /// 제안의 내구 표현 — HandoffBound 행 + issuer 결속. issuer 결속은
-/// artifact_digest 필드에 "pid:<proposal_id>|tok:<issuer>" 프리앰블을
-/// 포함해 저장(체인 해시에 포함 — 변조 감지).
-const PROPOSE_PREAMBLE_SEP: &str = "|tok:";
+/// artifact_digest 필드에 **len-prefix 구조화 인코딩**으로 저장(체인
+/// 해시에 포함 — 변조 감지). 고정폭 16진 len-prefix 로 필드 경계가
+/// 항상 유일 — 구분자 주입("|tok:" 등을 포함한 id)으로 identity 를
+/// 바꾸는 공격이 원천 불가능하다 (astra r2 MAJOR).
+const PROPOSAL_ENCODING_LABEL: &str = "fp1";
 
 fn encode_proposal_digest(proposal_id: &str, issuer_token: &str, artifact: &str) -> String {
-    format!("pid:{proposal_id}{PROPOSE_PREAMBLE_SEP}{issuer_token}|dig:{artifact}")
+    let mut out = format!("{PROPOSAL_ENCODING_LABEL}:").into_bytes();
+    for part in [proposal_id, issuer_token, artifact] {
+        out.extend_from_slice(format!("{:04x}:", part.len()).as_bytes());
+        out.extend_from_slice(part.as_bytes());
+    }
+    String::from_utf8(out).expect("hex prefix + utf8 parts")
 }
 
 fn decode_proposal_digest(encoded: &str) -> Option<(String, String, String)> {
-    let rest = encoded.strip_prefix("pid:")?;
-    let (pid, rest) = rest.split_once(PROPOSE_PREAMBLE_SEP)?;
-    let (tok, dig) = rest.split_once("|dig:")?;
-    Some((pid.into(), tok.into(), dig.into()))
+    let mut rest = encoded.strip_prefix(format!("{PROPOSAL_ENCODING_LABEL}:").as_str())?.as_bytes();
+    let mut parts = Vec::new();
+    for _ in 0..3 {
+        // 4 hex + ':'.
+        if rest.len() < 5 {
+            return None;
+        }
+        let len = usize::from_str_radix(std::str::from_utf8(&rest[..4]).ok()?, 16).ok()?;
+        if rest[4] != b':' || rest.len() < 5 + len {
+            return None;
+        }
+        parts.push(String::from_utf8(rest[5..5 + len].to_vec()).ok()?);
+        rest = &rest[5 + len..];
+    }
+    if !rest.is_empty() {
+        return None;
+    }
+    let mut it = parts.into_iter();
+    let pid = it.next()?;
+    let tok = it.next()?;
+    let dig = it.next()?;
+    Some((pid, tok, dig))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -111,15 +136,21 @@ impl<'o, 'a> Chainer<'o, 'a> {
 
     /// 로그에서 제안 전체 재생 (크래시 창 멱등의 근거).
     fn replay_proposals(&self) -> Result<Vec<ProposalView>, ChainerError> {
+        // (astra r2) 경합으로 동일 proposal_id 행이 2개 append 돼도
+        // 재생은 seq 순 첫 행만 취급 — 멱등 유지(나중 행은 사본).
+        let mut seen = std::collections::BTreeSet::new();
         let mut out = Vec::new();
         for row in self.log.read_all().map_err(|e| ChainerError::Log(format!("{e:?}")))? {
-            if let OrchestrationKind::HandoffBound { artifact_digest, source_order, dest_order } =
+            if let OrchestrationKind::HandoffBound { artifact_digest, source_order: s0, dest_order: d0 } =
                 &row.kind
             {
                 if let Some((pid, tok, dig)) = decode_proposal_digest(artifact_digest) {
+                    if !seen.insert(pid.clone()) {
+                        continue; // 사본 행 — 첫 행이 권위.
+                    }
                     let manifest = crate::handoff_manifest_digest(
-                        source_order,
-                        dest_order,
+                        s0,
+                        d0,
                         artifact_digest,
                         row.seq,
                     )
@@ -143,15 +174,29 @@ impl<'o, 'a> Chainer<'o, 'a> {
     pub fn propose_handoff(
         &self,
         proposal_id: &str,
-        source_order: &str,
-        dest_order: &str,
+        source_order_param: &str,
+        dest_order_param: &str,
         artifact_digest: &str,
         issuer_token: &str,
     ) -> Result<ProposalView, ChainerError> {
-        // 재생 우선 — 기존 제안이면 멱등 반환.
+        // 재생 우선 — 기존 제안이면 멱등 반환. 파라미터 전부 비교
+        // (astra r2: source/dest 도 — 재시도가 다른 경로를 덮지 못하게).
         for p in self.replay_proposals()? {
             if p.proposal_id == proposal_id {
                 if p.issuer_token != issuer_token || p.artifact_digest != artifact_digest {
+                    return Err(ChainerError::ThreeWayMismatch {
+                        proposal_id: proposal_id.into(),
+                    });
+                }
+                let row = self
+                    .log
+                    .row_at(p.log_seq)
+                    .map_err(|e| ChainerError::Log(format!("{e:?}")))?;
+                let OrchestrationKind::HandoffBound { source_order, dest_order, .. } = &row.kind
+                else {
+                    return Err(ChainerError::ThreeWayMismatch { proposal_id: proposal_id.into() });
+                };
+                if source_order != source_order_param || dest_order != dest_order_param {
                     return Err(ChainerError::ThreeWayMismatch {
                         proposal_id: proposal_id.into(),
                     });
@@ -162,7 +207,7 @@ impl<'o, 'a> Chainer<'o, 'a> {
         let encoded = encode_proposal_digest(proposal_id, issuer_token, artifact_digest);
         let (row, manifest) = self
             .log
-            .bind_handoff(source_order, dest_order, &encoded)
+            .bind_handoff(source_order_param, dest_order_param, &encoded)
             .map_err(|e| ChainerError::Log(format!("{e:?}")))?;
         Ok(ProposalView {
             proposal_id: proposal_id.into(),
@@ -196,26 +241,49 @@ impl<'o, 'a> Chainer<'o, 'a> {
         if grant.token_id != p.issuer_token {
             return Err(ChainerError::IssuerMismatch { proposal_id: proposal_id.into() });
         }
-        // 스코프 파싱 — artifact_digest 결속 확인(정규 JSON).
+        // (astra r2 BLOCKER) 스토프 **전체** 결속 — digest 뿐 아니라
+        // source/dest 주문·intent·root_scope 가 그랜트 스코프와 일치해야
+        // 한다(같은 digest 로 무관 경로 승인 차단).
+        let row = self
+            .log
+            .row_at(p.log_seq)
+            .map_err(|e| ChainerError::Log(format!("{e:?}")))?;
+        let OrchestrationKind::HandoffBound { source_order, dest_order, .. } = &row.kind
+        else {
+            return Err(ChainerError::ThreeWayMismatch { proposal_id: proposal_id.into() });
+        };
         let scope: serde_json::Value =
             serde_json::from_str(&grant.scope_json).map_err(|e| ChainerError::Ledger(format!("{e:?}")))?;
-        let ledger_digest = scope
-            .get("artifact_digest")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ChainerError::ThreeWayMismatch {
-                proposal_id: proposal_id.into(),
-            })?;
-        // ③ 원장 digest ↔ 제안 artifact.
-        if ledger_digest != p.artifact_digest {
-            return Err(ChainerError::ThreeWayMismatch { proposal_id: proposal_id.into() });
+        let scope_str = |k: &str| {
+            scope.get(k).and_then(|v| v.as_str()).map(|s| s.to_string())
+        };
+        let pairs = [
+            ("order_id", source_order.clone()),
+            ("dest_order_id", dest_order.clone()),
+            ("intent", "handoff".to_string()),
+            ("artifact_digest", p.artifact_digest.clone()),
+        ];
+        for (k, want) in pairs {
+            match scope_str(k) {
+                Some(got) if got == want => {}
+                _ => {
+                    return Err(ChainerError::ThreeWayMismatch {
+                        proposal_id: proposal_id.into(),
+                    })
+                }
+            }
         }
-        // 승인 성립 증거 — 그랜트가 소비(CONSUMED/Pending/Applying) 상태면
-        // 인간 게이트 통과. Issued 면 아직 미승인.
+        // (astra r2 MAJOR) 승인 성립 증거 — **소비 완료(CONSUMED)** 만
+        // 인간 게이트 통과. Pending 은 되돌릴 수 있고(reservation release),
+        // Applying 은 확정 전이다. 회복이 APPLYING→CONSUMED 를 완결하므로
+        // CONSUMED 가 유일한 내구 증거.
         match grant.state {
-            GrantState::Consumed | GrantState::Pending | GrantState::Applying => Ok(p),
-            GrantState::Issued => Err(ChainerError::ThreeWayMismatch {
-                proposal_id: proposal_id.into(),
-            }),
+            GrantState::Consumed => Ok(p),
+            GrantState::Issued | GrantState::Pending | GrantState::Applying => {
+                Err(ChainerError::ThreeWayMismatch {
+                    proposal_id: proposal_id.into(),
+                })
+            }
         }
     }
 
@@ -446,7 +514,7 @@ mod tests {
 
         // 발급 그랜트 — issuer 토큰 일치·digest 결속. CONSUMED 완결.
         let scope1 = serde_json::json!({
-            "order_id": "o-a", "intent": "handoff", "artifact_digest": "dig-1", "root_scope": "",
+            "order_id": "o-a", "dest_order_id": "o-b", "intent": "handoff", "artifact_digest": "dig-1", "root_scope": "",
         });
         ledger.issue_grant("g-1", "tok-issuer-1", &scope1).unwrap();
         let res = ledger.reserve_grant("g-1", &scope1, "ex-1", 1).unwrap();
