@@ -24,11 +24,17 @@ use std::sync::{Arc, Mutex};
 
 /// 스트림 핸들 — 저널 파일과 엔진을 1:1로 소유.
 pub struct Stream {
+    /// 불변 identity — 생성 후 재배정 불가(필드는 pub여도 String 교체는
+    /// 소유자만 가능; 등록 이후 Stream은 Arc 로만 공유되므로 재결속 경로
+    /// 없다). (astra r3: add_stream 이후 재등록은 id 유일 검사가 차단).
     pub stream_id: String,
+    /// 불변 저널 경로 — id 에서만 파생.
     pub journal_path: PathBuf,
     engine: Mutex<WorkflowEngine>,
     /// 이 스트림이 디스패치한 주문 (이중 디스패치 방지).
     dispatched: Mutex<BTreeSet<String>>,
+    /// (astra r3) 펜스 — 회복 실패 스트림의 enroll 차단(fail-closed).
+    fenced: std::sync::atomic::AtomicBool,
 }
 
 impl Stream {
@@ -64,12 +70,33 @@ impl Stream {
             journal_path,
             engine: Mutex::new(engine),
             dispatched: Mutex::new(BTreeSet::new()),
+            fenced: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// 펜스 — 회복 실패한 스트림은 디스패치를 거부한다(다음 회복 성공
+    /// 시 해제).
+    pub fn fence(&self) {
+        self.fenced.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn unfence(&self) {
+        self.fenced.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn is_fenced(&self) -> bool {
+        self.fenced.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// 주문 등록 — **order.id 본체**로 keyed (astra r1: checked-id 우회
     /// 제거). 이중 디스패치 거부.
     pub fn enroll(&self, order: Order) -> Result<(), String> {
+        if self.is_fenced() {
+            return Err(format!(
+                "stream '{}' is fenced — recovery failed; dispatch refused until next recovery succeeds",
+                self.stream_id
+            ));
+        }
         let oid = order.id.clone();
         let mut disp = self.dispatched.lock().unwrap();
         if disp.contains(&oid) {
@@ -90,6 +117,24 @@ impl Stream {
             .map_err(|e| format!("{e:?}"))?
             .read_all()
             .map_err(|e| format!("{e:?}"))
+    }
+
+    /// (astra r3 BLOCKER) 재구축 엔진 **재배선** — 같은 저널/액터/시계로
+    /// 새 엔진을 만들어 저널 결속을 회복한다. rebuild 가 복원하는 것은
+    /// 상태·attempt 뿐이므로 설치 전에 이 재배선이 필수다.
+    pub fn rebuilt_engine(&self) -> Result<WorkflowEngine, String> {
+        let ledger: &'static mut foundry_ledger::SqliteLedger = Box::leak(Box::new(
+            foundry_ledger::SqliteLedger::open(&self.journal_path)
+                .map_err(|e| format!("{e:?}"))?,
+        ));
+        let mut engine = WorkflowEngine::embedded_default();
+        engine.set_ledger(ledger, foundry_domain::ActorId {
+            kind: foundry_domain::ActorKind::Agent,
+            source: "stream".into(),
+            id: self.stream_id.clone(),
+        });
+        engine.set_clock(chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap());
+        Ok(engine)
     }
 
     /// 주문의 Shipped 종단 여부 (저널 증거).
@@ -312,31 +357,55 @@ impl<'r> RecoveryCoordinator<'r> {
         // 설치**(astra r2 BLOCKER: 검사만 하고 버리는 게 아니라 재획득).
         // 하나라도 실패하면: 실패 스트림까지의 결과를 들고 실패 보고 —
         // 입장은 재개하되 해당 스트림은 기존 엔진 유지(다음 회복이 재시도).
+        // (astra r3) 두번째 원장 open 실패도 전파 — 묵칙 Completed 금지.
+        let mut ap2 = match foundry_approval::ApprovalLedger::open(approval_db) {
+            Ok(ap) => ap,
+            Err(e) => {
+                // 전역 실패 — 전 스트림 펜스 후 재개 보고.
+                let streams = self.runtime.streams.lock().unwrap().clone();
+                for s in &streams {
+                    s.fence();
+                }
+                self.runtime.resume_admission();
+                return RecoveryOutcome::Failed {
+                    stage: format!("ledger reopen: {e:?}"),
+                    streams_rebuilt: 0,
+                    invalidated_reservations: invalidated,
+                };
+            }
+        };
         let streams = self.runtime.streams.lock().unwrap().clone();
         let mut rebuilt = 0usize;
         let mut first_failure: Option<String> = None;
-        if let Ok(mut ap2) = foundry_approval::ApprovalLedger::open(approval_db) {
-            for s in &streams {
-                let Ok(jr) = foundry_ledger::SqliteLedger::open(&s.journal_path) else {
-                    first_failure = Some(format!("journal open: {}", s.journal_path.display()));
-                    continue;
-                };
-                let mut fresh = WorkflowEngine::embedded_default();
-                match RecoveryRunner::run(&mut ap2, &jr, &mut fresh) {
-                    Ok(rep) if rep.journal_verified => {
-                        // 재구축 엔진 설치 — 스트림의 활성 엔진을 교체.
-                        let mut guard = s.engine.lock().unwrap();
-                        *guard = fresh;
-                        drop(guard);
-                        rebuilt += 1;
-                    }
-                    Ok(_) => {
-                        first_failure =
-                            Some(format!("journal verify failed: {}", s.journal_path.display()));
-                    }
-                    Err(e) => {
-                        first_failure = Some(format!("rebuild: {e:?}"));
-                    }
+        for s in &streams {
+            let Ok(jr) = foundry_ledger::SqliteLedger::open(&s.journal_path) else {
+                first_failure = Some(format!("journal open: {}", s.journal_path.display()));
+                s.fence(); // (astra r3) 실패 스트림 펜스 — 디스패치 차단.
+                continue;
+            };
+            // 재배선 엔진 (BLOCKER: 저널 결속 회복 후 rebuild).
+            let Ok(mut fresh) = s.rebuilt_engine() else {
+                first_failure =
+                    Some(format!("journal rewire: {}", s.journal_path.display()));
+                s.fence();
+                continue;
+            };
+            match RecoveryRunner::run(&mut ap2, &jr, &mut fresh) {
+                Ok(rep) if rep.journal_verified => {
+                    let mut guard = s.engine.lock().unwrap();
+                    *guard = fresh;
+                    drop(guard);
+                    s.unfence();
+                    rebuilt += 1;
+                }
+                Ok(_) => {
+                    first_failure =
+                        Some(format!("journal verify failed: {}", s.journal_path.display()));
+                    s.fence();
+                }
+                Err(e) => {
+                    first_failure = Some(format!("rebuild: {e:?}"));
+                    s.fence();
                 }
             }
         }

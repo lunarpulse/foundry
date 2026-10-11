@@ -170,7 +170,9 @@ pub fn entry_for(code: RefusalCode) -> RefusalEntry {
         RefusalCode::NotReady => (
             "선행 주문이 아직 출하되지 않았습니다",
             "의존성 그래프의 선행 주문이 Shipped 여야 합니다",
-            RemediationKind::DeclarePlan,
+            // (astra r3 정정) 선언 추가는 선행을 출하시키지 않는다 —
+            // 선행 완료 대기 또는 인간 개입.
+            RemediationKind::Escalate,
         ),
         RefusalCode::CheckedIdMismatch => (
             "디스패치 요청 id가 주문 실제 id와 일치하지 않습니다",
