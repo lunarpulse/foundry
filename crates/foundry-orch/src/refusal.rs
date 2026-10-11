@@ -12,7 +12,7 @@
 use crate::OrchestrationKind;
 
 /// 거부 코드 — 인간 대면 거부 경로가 방출할 수 있는 전 집합.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RefusalCode {
     /// 사이징 승인(preset_bound) 없는 발행.
     UnsizedSpawn,
@@ -34,6 +34,8 @@ pub enum RefusalCode {
 
 impl RefusalCode {
     /// 전집 — registry 전수성 검증의 기준 (수동 유지, 게이트가 대조).
+    /// (astra r2 M4) 전수성 회귀가 이 목록과 entry_for 의 match 를
+    /// 양방향 대조한다 — 어느 쪽이 새 코드를 놓쳐도 테스트 실패.
     pub const VARIANTS: &'static [RefusalCode] = &[
         RefusalCode::UnsizedSpawn,
         RefusalCode::UndeclaredOrder,
@@ -177,13 +179,28 @@ pub fn readme_diagnostic_rows() -> Vec<String> {
 mod tests {
     use super::*;
 
-    /// 전수성 — registry 가 모든 코드를 커버 (새 코드 추가 시 실패).
+    /// 전수성 — registry 가 모든 코드를 커버 (양방향: VARIANTS ↔ match).
     #[test]
     fn registry_covers_all_codes() {
         let all = registry();
         assert_eq!(all.len(), RefusalCode::VARIANTS.len());
         for code in RefusalCode::VARIANTS {
             assert!(all.iter().any(|e| e.code == *code), "{code:?} missing");
+        }
+        // 중복 없음 — VARIANTS 가 같은 코드를 두 번 나열해도 잡음.
+        let mut seen = std::collections::HashSet::new();
+        for e in &all {
+            assert!(seen.insert(e.code), "{:?} duplicated", e.code);
+        }
+    }
+
+    /// (astra r2 M4) README 파생 — 문서 생성기가 모든 코드의 행을 만든다.
+    #[test]
+    fn readme_diagnostic_rows_cover_all() {
+        let rows = readme_diagnostic_rows();
+        assert_eq!(rows.len(), RefusalCode::VARIANTS.len());
+        for r in &rows {
+            assert!(r.starts_with("| `") && r.contains('|'), "malformed row: {r}");
         }
     }
 

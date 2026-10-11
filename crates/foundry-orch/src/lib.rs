@@ -135,10 +135,15 @@ impl<'c> TxGuard<'c> {
         Ok(Self { conn, active: true })
     }
 
-    /// 커밋 — 성공 시 active 해제(Drop 중복 방지), 실패는 호출자 전파.
+    /// 커밋 — **성공 후에만** active 해제(astra r2 M5): COMMIT 실패
+    /// (SQLITE_BUSY 등) 시 트랜잭션이 열려 있으므로 Drop 이 ROLLBACK
+    /// 하도록 둔다.
     fn commit(mut self) -> Result<(), OrchError> {
-        self.active = false;
-        self.conn.execute_batch("COMMIT").map_err(|e| OrchError::Io(e.to_string()))
+        let r = self.conn.execute_batch("COMMIT").map_err(|e| OrchError::Io(e.to_string()));
+        if r.is_ok() {
+            self.active = false;
+        }
+        r
     }
 }
 
@@ -223,8 +228,21 @@ impl OrchestrationLog {
     /// 롤백. hash 는 seq 포함이므로 INSERT(빈 해시) → seq 확보 → UPDATE
     /// 채움을 같은 트랜잭션에서 수행(원자).
     fn append(&self, kind: OrchestrationKind) -> Result<OrchRow, OrchError> {
+        self.append_validated(kind, |_| Ok(()))
+    }
+
+    /// (astra r2 M1) 검증+append 를 단일 BEGIN IMMEDIATE 안에서 — 쓰기
+    /// 잠금 선점 후 검증이 직렬화되어 동시 선언의 유일성 검사 경쟁
+    /// (TOCTOU)을 원천 차단한다. 검증 클로저는 잠긴 커넥션의 행
+    /// 스냅샷을 받는다(뮤텍스 재진입 교착 방지).
+    fn append_validated<F>(&self, kind: OrchestrationKind, validate: F) -> Result<OrchRow, OrchError>
+    where
+        F: FnOnce(&[OrchRow]) -> Result<(), OrchError>,
+    {
         let conn = self.conn.lock().unwrap();
         let guard = TxGuard::begin(&conn)?;
+        let rows_now = read_all_locked(&conn)?;
+        validate(&rows_now)?;
         let prev: String = conn
             .query_row(
                 "SELECT hash FROM orch ORDER BY seq DESC LIMIT 1",
@@ -262,34 +280,11 @@ impl OrchestrationLog {
     /// 전 행 조회 (체인 무결성 검증 포함).
     pub fn read_all(&self) -> Result<Vec<OrchRow>, OrchError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT seq, payload, prev_hash, hash FROM orch ORDER BY seq")
-            .map_err(|e| OrchError::Io(e.to_string()))?;
-        let rows = stmt
-            .query_map([], |r| {
-                let seq: i64 = r.get(0)?;
-                let payload: String = r.get(1)?;
-                let prev_hash: String = r.get(2)?;
-                let hash: String = r.get(3)?;
-                Ok((seq, payload, prev_hash, hash))
-            })
-            .map_err(|e| OrchError::Io(e.to_string()))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| OrchError::Io(e.to_string()))?;
-        let mut out = Vec::with_capacity(rows.len());
-        let mut expect_prev = GENESIS.to_string();
-        for (seq, payload, prev_hash, hash) in rows {
-            let idx = out.len() as i64;
-            if seq != idx + 1 || prev_hash != expect_prev || row_hash(seq, &prev_hash, &payload) != hash {
-                return Err(OrchError::ChainBroken { at_seq: seq });
-            }
-            let kind = serde_json::from_str(&payload)
-                .map_err(|e| OrchError::Io(format!("payload decode: {e}")))?;
-            expect_prev = hash.clone();
-            out.push(OrchRow { seq, kind, prev_hash, hash });
-        }
-        Ok(out)
+        read_all_locked(&conn)
     }
+
+    fn __removed_marker(&self) {}
+
 
     /// 체인 검증만 (read_all 가 내부 수행 — 명시적 진입점).
     pub fn verify_chain(&self) -> Result<bool, OrchError> {
@@ -381,11 +376,35 @@ impl OrchestrationLog {
                 )));
             }
         }
-        self.append(OrchestrationKind::PlanDeclared {
-            plan_id: plan_id.into(),
-            edges,
-            streams,
-        })
+        // (astra r2 M1) 트랜잭션 내 최종 재검증 — 경쟁 창 제거.
+        let plan_id_c = plan_id.to_string();
+        let edges_c = edges.clone();
+        self.append_validated(
+            OrchestrationKind::PlanDeclared {
+                plan_id: plan_id.into(),
+                edges,
+                streams,
+            },
+            move |now| {
+                if now.iter().any(|r| {
+                    matches!(&r.kind, OrchestrationKind::PlanDeclared { plan_id: p, .. } if *p == plan_id_c)
+                }) {
+                    return Err(OrchError::DuplicateDeclaration { plan_id: plan_id_c });
+                }
+                for (order, _) in &edges_c {
+                    if now.iter().any(|r| {
+                        matches!(&r.kind, OrchestrationKind::PlanDeclared { edges, .. }
+                            if edges.iter().any(|(o, _)| o == order))
+                    }) {
+                        return Err(OrchError::DuplicateOrder {
+                            order: order.clone(),
+                            in_plan: plan_id_c.clone(),
+                        });
+                    }
+                }
+                Ok(())
+            },
+        )
     }
 
     /// 발행 기록 — 선언되지 않은 주문의 발행은 거부 (unsized-spawn 계약).
@@ -447,6 +466,23 @@ impl OrchestrationLog {
         Ok((row, manifest))
     }
 
+    /// 사이즈 결속 (H절 — 발행 권한의 근거 행). 코디네이터만 호출
+    /// (astra r2: 공개 진입점 누락 폐쇄).
+    pub fn append_preset_bound(
+        &self,
+        sizing_order: &str,
+        selected_root: &str,
+        approved_digest: &str,
+        spawn_plan: &str,
+    ) -> Result<OrchRow, OrchError> {
+        self.append(OrchestrationKind::PresetBound {
+            sizing_order: sizing_order.into(),
+            selected_root: selected_root.into(),
+            approved_digest: approved_digest.into(),
+            spawn_plan: spawn_plan.into(),
+        })
+    }
+
     /// 선언 증거 — refusal 행은 배제 (선언 순수성).
     pub fn declaration_rows(&self) -> Result<Vec<OrchRow>, OrchError> {
         Ok(self
@@ -463,6 +499,37 @@ impl OrchestrationLog {
             .find(|r| r.seq == seq)
             .ok_or(OrchError::NoRow { seq })
     }
+}
+
+/// 커넥션 직접 읽기 — 체인 무결성 검증 포함 (락 보유 중 호출용).
+fn read_all_locked(conn: &rusqlite::Connection) -> Result<Vec<OrchRow>, OrchError> {
+        let mut stmt = conn
+            .prepare("SELECT seq, payload, prev_hash, hash FROM orch ORDER BY seq")
+            .map_err(|e| OrchError::Io(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |r| {
+                let seq: i64 = r.get(0)?;
+                let payload: String = r.get(1)?;
+                let prev_hash: String = r.get(2)?;
+                let hash: String = r.get(3)?;
+                Ok((seq, payload, prev_hash, hash))
+            })
+            .map_err(|e| OrchError::Io(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| OrchError::Io(e.to_string()))?;
+        let mut out = Vec::with_capacity(rows.len());
+        let mut expect_prev = GENESIS.to_string();
+        for (seq, payload, prev_hash, hash) in rows {
+            let idx = out.len() as i64;
+            if seq != idx + 1 || prev_hash != expect_prev || row_hash(seq, &prev_hash, &payload) != hash {
+                return Err(OrchError::ChainBroken { at_seq: seq });
+            }
+            let kind = serde_json::from_str(&payload)
+                .map_err(|e| OrchError::Io(format!("payload decode: {e}")))?;
+            expect_prev = hash.clone();
+            out.push(OrchRow { seq, kind, prev_hash, hash });
+        }
+        Ok(out)
 }
 
 /// DFS 사이클 검출 — 발견 시 사이클 노드 하나 반환.
@@ -515,7 +582,7 @@ pub struct Projection {
     pub plans: Vec<(String, Vec<(String, Vec<String>)>, Vec<(String, String)>)>,
     pub spawned: Vec<(String, String, String)>,
     pub handoffs: Vec<(String, String, String, i64)>,
-    pub preset_bounds: Vec<(String, String, String)>,
+    pub preset_bounds: Vec<(String, String, String, String)>,
 }
 
 pub fn project(rows: &[OrchRow]) -> Projection {
@@ -531,8 +598,8 @@ pub fn project(rows: &[OrchRow]) -> Projection {
             OrchestrationKind::HandoffBound { source_order, dest_order, artifact_digest } => {
                 p.handoffs.push((source_order.clone(), dest_order.clone(), artifact_digest.clone(), r.seq))
             }
-            OrchestrationKind::PresetBound { sizing_order, selected_root, approved_digest, .. } => {
-                p.preset_bounds.push((sizing_order.clone(), selected_root.clone(), approved_digest.clone()))
+            OrchestrationKind::PresetBound { sizing_order, selected_root, approved_digest, spawn_plan } => {
+                p.preset_bounds.push((sizing_order.clone(), selected_root.clone(), approved_digest.clone(), spawn_plan.clone()))
             }
             OrchestrationKind::Refusal { .. } => {
                 // 선언 순수성: 거부 행은 투영에 기여하지 않는다.
@@ -827,6 +894,67 @@ mod tests {
         log.spawn_order("o-a", "p1", "s").unwrap();
         assert!(log.verify_chain().unwrap());
         assert_eq!(log.read_all().unwrap().len(), 2);
+    }
+
+    /// (astra r2 M1 회귀) 동시 declare_plan — 검증이 BEGIN IMMEDIATE 안에서
+    /// 직렬화되어 경쟁 창이 없다. 단일 Mutex 커넥션이 물리적 직렬화를
+    /// 제공하므로 스레드 경쟁에서도 유일성이 유지됨을 단정.
+    #[test]
+    fn concurrent_declarations_stay_unique() {
+        let path = tmp("concurrent");
+        let log = std::sync::Arc::new(OrchestrationLog::open(&path).unwrap());
+        let mut handles = Vec::new();
+        for i in 0..4 {
+            let l = std::sync::Arc::clone(&log);
+            handles.push(std::thread::spawn(move || {
+                l.declare_plan(
+                    &format!("p{i}"),
+                    vec![(format!("o-t{i}"), vec![])],
+                    vec![(format!("o-t{i}"), "s".into())],
+                )
+            }));
+        }
+        let ok = handles
+            .into_iter()
+            .map(|h| h.join().unwrap().is_ok())
+            .filter(|r| *r)
+            .count();
+        assert_eq!(ok, 4, "distinct plans must all succeed");
+        let rows = log.read_all().unwrap();
+        assert_eq!(rows.len(), 4);
+        // 같은 주문 id 로 경쟁 — 정확히 1개만 성공.
+        let mut handles = Vec::new();
+        for i in 0..4 {
+            let l = std::sync::Arc::clone(&log);
+            handles.push(std::thread::spawn(move || {
+                l.declare_plan(
+                    &format!("p-dup{i}"),
+                    vec![("o-race".into(), vec![])],
+                    vec![("o-race".into(), "s".into())],
+                )
+            }));
+        }
+        let ok2 = handles
+            .into_iter()
+            .map(|h| h.join().unwrap().is_ok())
+            .filter(|r| *r)
+            .count();
+        assert_eq!(ok2, 1, "only one racer may claim a globally-unique order id");
+        assert!(log.verify_chain().unwrap());
+    }
+
+    /// (astra r2 M5 회귀) preset_bound 공개 진입점 + 투영 4필드 보존.
+    #[test]
+    fn preset_bound_projection_preserves_all_fields() {
+        let log = OrchestrationLog::open(&tmp("pb")).unwrap();
+        log.declare_plan("p1", vec![("o-a".into(), vec![])], vec![("o-a".into(), "s".into())]).unwrap();
+        log.append_preset_bound("o-size", "root-x", "dig-abc", "plan-epic-1").unwrap();
+        let p = project(&log.read_all().unwrap());
+        assert_eq!(p.preset_bounds.len(), 1);
+        assert_eq!(
+            p.preset_bounds[0],
+            ("o-size".to_string(), "root-x".to_string(), "dig-abc".to_string(), "plan-epic-1".to_string())
+        );
     }
 
     #[test]
