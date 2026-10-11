@@ -100,3 +100,42 @@ fn delete_is_blocked() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
+// ── (M7 G.B4) 트랜잭션화 append 회귀 ───────────────────────────────
+
+/// B4: 연속 append 가 트랜잭션 가드로 오염되지 않고 체인이 유지된다.
+#[test]
+fn b4_sequential_appends_with_tx_guard_keep_chain() {
+    let path = temp_path("b4a");
+    let mut l = SqliteLedger::open(&path).unwrap();
+    for (ev, from, to) in [
+        (OrderEvent::Queued, OrderState::Received, OrderState::Queued),
+        (OrderEvent::DieStarted, OrderState::Queued, OrderState::Working),
+        (OrderEvent::DieSucceeded { attempt: 1 }, OrderState::Working, OrderState::Inspecting),
+    ] {
+        l.append("o-b4", &ev, from, to, &actor(), chrono::Utc::now()).unwrap();
+    }
+    let rows = l.read_all().unwrap();
+    assert_eq!(rows.len(), 3);
+    assert!(SqliteLedger::verify_rows(&rows), "chain verifies after sequential tx appends");
+    let seqs: Vec<i64> = rows.iter().map(|r| r.seq).collect();
+    assert_eq!(seqs, vec![1, 2, 3]);
+}
+
+/// B4: 재오픈한 두 번째 핸들이 이어 append 해도 체인 정합 (커밋 확정 단정).
+#[test]
+fn b4_reopened_handle_extends_committed_chain() {
+    let path = temp_path("b4b");
+    {
+        let mut l1 = SqliteLedger::open(&path).unwrap();
+        l1.append("o-x", &OrderEvent::Queued, OrderState::Received, OrderState::Queued, &actor(), chrono::Utc::now()).unwrap();
+    }
+    {
+        let mut l2 = SqliteLedger::open(&path).unwrap();
+        l2.append("o-x", &OrderEvent::DieStarted, OrderState::Queued, OrderState::Working, &actor(), chrono::Utc::now()).unwrap();
+    }
+    let l3 = SqliteLedger::open(&path).unwrap();
+    let rows = l3.read_all().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(SqliteLedger::verify_rows(&rows), "prev_hash linkage across handles — COMMIT actually persisted");
+}

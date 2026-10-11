@@ -319,6 +319,11 @@ impl SqliteLedger {
         at: DateTime<Utc>,
     ) -> PortResult<()> {
         let conn = self.conn.lock().unwrap();
+        // (M7 G.B4) head 읽기 + INSERT 를 단일 트랜잭션으로 — 단일 연결
+        // 소유 전제 하에서도 원자성을 자체 보장한다 (방어 강화).
+        // BEGIN IMMEDIATE: 쓰기 잠금을 트랜잭션 시작 시점에 획득해
+        // head-읽기와 INSERT 사이에 다른 쓰기가 끼어들 여지를 제거.
+        let _tx_guard = TxGuard::begin_immediate(&conn)?;
         let prev_hash: String = conn
             .query_row(
                 "SELECT hash FROM ledger ORDER BY seq DESC LIMIT 1",
@@ -381,6 +386,44 @@ impl SqliteLedger {
             ],
         )
         .map_err(port_err)?;
+        // (M7 G.B4) 트랜잭션 확정 — 실패는 호출자에 전파(호출자는 append
+        // 실패=스냅샷 롤백 계약을 따름). 가드를 먼저 소진시켜 Drop 의
+        // 이중 커밋을 막는다.
+        let guard = _tx_guard;
+        guard.commit()?;
         Ok(())
+    }
+}
+
+/// (M7 G.B4) 트랜잭션 가드 — DROP 시 COMMIT (정상 경로) / 패닉이면
+/// 커넥션 저수준 상태를 ROLLBACK 로 복구. 러스트 예외 경로에서 열린
+/// 트랜잭션이 다음 쿼리를 오염시키지 않게 한다.
+struct TxGuard<'c> {
+    conn: &'c rusqlite::Connection,
+    active: bool,
+}
+
+impl<'c> TxGuard<'c> {
+    fn begin_immediate(conn: &'c rusqlite::Connection) -> PortResult<Self> {
+        conn.execute_batch("BEGIN IMMEDIATE").map_err(port_err)?;
+        Ok(Self { conn, active: true })
+    }
+
+    /// 트랜잭션 확정 — 성공 시 active 해제(Drop 중복 방지).
+    fn commit(mut self) -> PortResult<()> {
+        self.active = false;
+        self.conn.execute_batch("COMMIT").map_err(port_err)
+    }
+}
+
+impl Drop for TxGuard<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            // COMMIT 실패 시(예: 디스크) ROLLBACK 으로라도 종결 — 오류는
+            // 전파 불가(Drop)지만 상태를 남기지 않는다.
+            if self.conn.execute_batch("COMMIT").is_err() {
+                let _ = self.conn.execute_batch("ROLLBACK");
+            }
+        }
     }
 }

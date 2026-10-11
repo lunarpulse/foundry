@@ -15,6 +15,21 @@
 //! * **misroute 복구 reroute**: 승인-게이트 전이. `reroute`는 이미 진행
 //!   중인 주문을 새 워크플로 digest에 결속 직전 상태에서 이동시키는
 //!   명시적 조작이다 (C-W1의 무단 이주 금지 예외 — 인간 승인 필요).
+//!
+//! ## 멀티프리셋 경계 (M6 보강 B3 — 스케일 실증 74f94be 교훈)
+//!
+//! 각 프리셋의 routing 테이블은 **자기완결 우주**다: `default_route` 는
+//! 반드시 자기 workflow id(검증기 `default_route_mismatch` 강제). 교차
+//! 프리셋 default는 거부된다.
+//!
+//! 소스 패턴으로 **여러 프리셋 중 선택**하는 것은 이 라우터의 규칙
+//! 매칭이 아니라, 각 프리셋이 자기 테이블에 서로 다른 소스 패턴을
+//! 선언하는 방식으로 이루어진다(예: quickfix:*→quickloop, feature:*→
+//! feature-prd). **플릿 수준의 통합 라우팅 테이블(패턴 우선순위 병합)은
+//! 존재하지 않는다** — 그 계층은 M7 오케스트레이션 로그의 preset_bound
+//! 선언이 소유한다(사이즈 라우팅: 인테이크 부트스트랩 → 인간 사이징
+//! 게이트 → preset_bound → 발행).
+
 
 use crate::dsl::{RouteRule, RoutingRules};
 use serde::{Deserialize, Serialize};
