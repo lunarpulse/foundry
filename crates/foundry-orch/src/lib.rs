@@ -243,9 +243,11 @@ impl OrchestrationLog {
         self.append_validated(kind, |_| Ok(()))
     }
 
-    /// (T59 astra r5) 공개 진입점 — 외부(체이너)가 검증+append 를
-    /// 단일 트랜잭션으로 수행한다(재디에이션 연결의 원자성).
-    pub fn append_with_validation<F>(
+    /// (T59 astra r6) **크레이트 내부 전용** — 체이너의 원자적 검증+append.
+    /// 외부 공개 시 임의 행(예: 미선언 OrderSpawned)을 우회 append 할 수
+    /// 있어 pub(crate)로 제한한다(외부 정문은 declare_plan/spawn_order/
+    /// bind_handoff/append_preset_bound 뿐).
+    pub(crate) fn append_with_validation<F>(
         &self,
         kind: OrchestrationKind,
         validate: F,
