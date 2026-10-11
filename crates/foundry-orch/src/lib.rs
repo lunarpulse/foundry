@@ -14,6 +14,7 @@
 //!   "fh1:" 가시 태그, 99,999,999 바이트 상한 — 구분자/길이스트림
 //!   모호성 원천 불가 (astra r4-r6 폐쇄).
 
+pub mod chainer;
 pub mod refusal;
 pub mod stream;
 
