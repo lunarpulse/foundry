@@ -126,10 +126,11 @@ mod t60_scale3_epic {
     }
 
     fn mkorder(id: &str, intake: bool) -> Order {
-        let mut ext = ExternalRef::cron("src", "t60");
-        if intake {
-            ext.external_id = format!("intake:{id}");
-        }
+        let ext = if intake {
+            ExternalRef::intake(id, &format!("dedup:{id}"))
+        } else {
+            ExternalRef::cron("src", "t60")
+        };
         let mut o = Order::new(id.into(), ext, chrono::Utc::now());
         o.force_state_for_test(OrderState::Received, 1);
         o

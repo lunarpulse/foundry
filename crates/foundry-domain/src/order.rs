@@ -25,6 +25,10 @@ pub enum Source {
     Cron,
     GitHub,
     Jira,
+    /// (T61) 인테이크 부트스트랩 전용 — 사이징 주문의 최초 진입 경로.
+    /// 문자열 접두("intake:") 규약의 타입화: 이 변형만이 preset_bound
+    /// 없는 발행(부트스트랩) 자격을 갖는다.
+    Intake,
 }
 
 impl ExternalRef {
@@ -33,6 +37,15 @@ impl ExternalRef {
             source: Source::Cron,
             external_id: format!("{job}/{target}"),
             dedup_key: format!("cron:{job}:{target}:{}", Utc::now().format("%Y-%m-%d")),
+        }
+    }
+
+    /// (T61) 인테이크 부트스트랩 — 사이징 주문 전용 소스.
+    pub fn intake(external_id: &str, dedup: &str) -> Self {
+        Self {
+            source: Source::Intake,
+            external_id: external_id.into(),
+            dedup_key: dedup.into(),
         }
     }
 

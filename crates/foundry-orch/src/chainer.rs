@@ -616,10 +616,10 @@ impl<'o, 'a> Chainer<'o, 'a> {
         approval_digest: Option<&str>,
         dest_plan: &str,
         dest_root: &str,
-        declared: bool,
     ) -> Result<(), ChainerError> {
-        // 선언 재검사 — 현재 로그에 이 주문의 선언이 있는가.
-        if declared {
+        // (T61 remainder ①) 선언 재검사 — **항상**, 로그에서 직접 파생
+        // (호출자 플래그 제거 — 우회 불가).
+        {
             let rows = self
                 .log
                 .read_all()
@@ -866,17 +866,29 @@ mod tests {
         ledger.begin_apply("sizing-s-2", "ex-s2", 1, r0.fence_token).unwrap();
         ledger.finalize_grant("sizing-s-2", "ex-s2", 1, r0.fence_token).unwrap();
         let ch = Chainer::new(&log, &ledger);
-        // 사이징 승인(A 수리) — 그러나 preset_bound 미등록(B).
-        let r = ch.reenter("o-bad", "ext:x", Some("s-2"), Some("dig-x"), "plan-2", "root-x", false);
+        // (T61) 전량 재평가 순서: ①선언 없음 → DeclarationMissing.
+        assert!(matches!(
+            ch.reenter("o-bad", "ext:x", Some("s-2"), Some("dig-x"), "plan-2", "root-x"),
+            Err(ChainerError::DeclarationMissing { .. })
+        ));
+        log.declare_plan(
+            "plan-2",
+            vec![("o-bad".into(), vec![])],
+            vec![("o-bad".into(), "s-x".into())],
+        )
+        .unwrap();
+        // ②사이징 승인(A 수리) — 그러나 preset_bound 미등록(B) → 여전히 거부.
+        let r = ch.reenter("o-bad", "ext:x", Some("s-2"), Some("dig-x"), "plan-2", "root-x");
         assert!(matches!(r, Err(ChainerError::Unsized { .. })), "A repaired, B refuses");
-        // preset_bound 등록 — 통과.
+        // ③preset_bound 등록 — 통과.
         log.append_preset_bound("s-2", "root-x", "dig-x", "plan-2").unwrap();
         assert!(ch
-            .reenter("o-bad", "ext:x", Some("s-2"), Some("dig-x"), "plan-2", "root-x", false)
+            .reenter("o-bad", "ext:x", Some("s-2"), Some("dig-x"), "plan-2", "root-x")
             .is_ok());
         // 선언 재검사 — declared=true 인데 로그에 없으면 거부(새 B).
+        // (T61) 미선언 주문의 재입장 — 항상 DeclarationMissing.
         assert!(matches!(
-            ch.reenter("o-bad", "ext:x", Some("s-2"), Some("dig-x"), "plan-2", "root-x", true),
+            ch.reenter("o-undeclared", "ext:x", Some("s-2"), Some("dig-x"), "plan-2", "root-x"),
             Err(ChainerError::DeclarationMissing { .. })
         ));
     }
