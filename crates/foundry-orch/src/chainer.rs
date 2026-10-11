@@ -37,6 +37,8 @@ pub enum ChainerError {
     DestinationMismatch { order: String, expected: String, got: String },
     /// 사이징이 거부됨(Rejected) — 같은 사이징 주문으로 발행 불가.
     SizingRejected { order: String },
+    /// (astra r3) 재입장 선언 재검사 실패 — 전용 사유(Unsized 와 구분).
+    DeclarationMissing { order: String },
     /// 부트스트랩 위반 — 인테이크 소스 패턴 아닌 주문의 예외 주장.
     BootstrapViolation { order: String },
     /// 미제안 확정 시도.
@@ -86,13 +88,25 @@ pub struct Chainer<'o, 'a> {
 /// 바꾸는 공격이 원천 불가능하다 (astra r2 MAJOR).
 const PROPOSAL_ENCODING_LABEL: &str = "fp1";
 
-fn encode_proposal_digest(proposal_id: &str, issuer_token: &str, artifact: &str) -> String {
+/// 인코딩 필드 상한 — 4자리 hex len-prefix 의 표현 한계.
+const PROPOSAL_FIELD_CAP: usize = 0xFFFF;
+
+fn encode_proposal_digest(proposal_id: &str, issuer_token: &str, artifact: &str) -> Result<String, ChainerError> {
+    // (astra r3) 4자리 초과 필드는 인코딩 불가 — append 전 거부(재생에서
+    // 침묵 누락되는 사고 방지).
+    for (label, part) in [("proposal_id", proposal_id), ("issuer", issuer_token), ("artifact", artifact)] {
+        if part.len() > PROPOSAL_FIELD_CAP {
+            return Err(ChainerError::Log(format!(
+                "{label} exceeds {PROPOSAL_FIELD_CAP} bytes"
+            )));
+        }
+    }
     let mut out = format!("{PROPOSAL_ENCODING_LABEL}:").into_bytes();
     for part in [proposal_id, issuer_token, artifact] {
         out.extend_from_slice(format!("{:04x}:", part.len()).as_bytes());
         out.extend_from_slice(part.as_bytes());
     }
-    String::from_utf8(out).expect("hex prefix + utf8 parts")
+    Ok(String::from_utf8(out).expect("hex prefix + utf8 parts"))
 }
 
 fn decode_proposal_digest(encoded: &str) -> Option<(String, String, String)> {
@@ -204,18 +218,17 @@ impl<'o, 'a> Chainer<'o, 'a> {
                 return Ok(p);
             }
         }
-        let encoded = encode_proposal_digest(proposal_id, issuer_token, artifact_digest);
-        let (row, manifest) = self
+        let encoded = encode_proposal_digest(proposal_id, issuer_token, artifact_digest)?;
+        let _ = self
             .log
             .bind_handoff(source_order_param, dest_order_param, &encoded)
             .map_err(|e| ChainerError::Log(format!("{e:?}")))?;
-        Ok(ProposalView {
-            proposal_id: proposal_id.into(),
-            manifest,
-            log_seq: row.seq,
-            issuer_token: issuer_token.into(),
-            artifact_digest: artifact_digest.into(),
-        })
+        // (astra r3) append 후 **재생 재조회** — 경합에서 이 append 가
+        // 루저(사본 행)면 승자(첫 행)를 반환한다. 호출자는 항상 권위 행을 본다.
+        self.replay_proposals()?
+            .into_iter()
+            .find(|p| p.proposal_id == proposal_id)
+            .ok_or(ChainerError::Log("proposal vanished after append".into()))
     }
 
     /// 핸드오프 **확정** — 전이 전 3자 일치 (원장 앵커):
@@ -262,6 +275,9 @@ impl<'o, 'a> Chainer<'o, 'a> {
             ("dest_order_id", dest_order.clone()),
             ("intent", "handoff".to_string()),
             ("artifact_digest", p.artifact_digest.clone()),
+            // (astra r3) 핸드오프 그랜트의 root 는 비어야 — 발급이 임의
+            // 스코프를 수용하므로 이 약속을 확정이 강제한다.
+            ("root_scope", String::new()),
         ];
         for (k, want) in pairs {
             match scope_str(k) {
@@ -457,7 +473,7 @@ impl<'o, 'a> Chainer<'o, 'a> {
                 _ => false,
             });
             if !is_declared {
-                return Err(ChainerError::Unsized { order: order_id.into() });
+                return Err(ChainerError::DeclarationMissing { order: order_id.into() });
             }
         }
         // 바인딩 전량 재검사.
@@ -691,7 +707,7 @@ mod tests {
                 Some(SizingVerdict::Approved),
                 true
             ),
-            Err(ChainerError::Unsized { .. })
+            Err(ChainerError::DeclarationMissing { .. })
         ));
     }
 }
