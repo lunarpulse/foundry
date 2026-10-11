@@ -362,17 +362,14 @@ impl StreamRuntime {
                 let ch = crate::chainer::Chainer::new(&self.orch, ap);
                 // 주문 소스 — 인테이크 부트스트랩 판별. 소스가 없으면
                 // 비부트스트랩(보수).
-                let source = match order.external.source {
-                    foundry_domain::order::Source::Cron => format!(
-                        "intake:{}",
-                        order.external.external_id
-                    ),
-                    foundry_domain::order::Source::GitHub => {
-                        format!("ext:{}", order.external.external_id)
-                    }
-                    foundry_domain::order::Source::Jira => {
-                        format!("ext:{}", order.external.external_id)
-                    }
+                // (astra r10 P1-b) Cron 을 무조건 부트스트랩으로 보지
+                // 않는다 — 부트스트랩은 external_id 가 "intake:" 접두로
+                // 시작할 때만(인테이크 전용 경로). 그 외 전부 외부.
+                let source = format!("ext:{}", order.external.external_id);
+                let source = if order.external.external_id.starts_with("intake:") {
+                    order.external.external_id.clone()
+                } else {
+                    source
                 };
                 let r = ch.check_spawn_binding(
                     order_id,
@@ -585,7 +582,10 @@ mod tests {
     }
 
     fn mkorder(id: &str) -> Order {
-        let mut o = Order::new(id.into(), ExternalRef::cron("s", "r"), chrono::Utc::now());
+        // (astra r10) 인테이크 부트스트랩 소스 — external_id "intake:" 접두.
+        let mut ext = ExternalRef::cron("s", "r");
+        ext.external_id = format!("intake:{id}");
+        let mut o = Order::new(id.into(), ext, chrono::Utc::now());
         o.force_state_for_test(OrderState::Received, 1);
         o
     }

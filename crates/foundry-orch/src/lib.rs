@@ -245,8 +245,8 @@ impl OrchestrationLog {
 
     /// (T59 astra r6) **크레이트 내부 전용** — 체이너의 원자적 검증+append.
     /// 외부 공개 시 임의 행(예: 미선언 OrderSpawned)을 우회 append 할 수
-    /// 있어 pub(crate)로 제한한다(외부 정문은 declare_plan/spawn_order/
-    /// bind_handoff/append_preset_bound 뿐).
+    /// 있어 pub(crate)로 제한한다(외부 정문은 declare_plan/bind_handoff
+    /// 뿐 — spawn_order/append_preset_bound 도 내부).
     pub(crate) fn append_with_validation<F>(
         &self,
         kind: OrchestrationKind,
@@ -435,7 +435,10 @@ impl OrchestrationLog {
     }
 
     /// 발행 기록 — 선언되지 않은 주문의 발행은 거부 (unsized-spawn 계약).
-    pub fn spawn_order(
+    /// (astra r10 P1) **크레이트 내부 전용** — 발행 기록의 유일 경로는
+    /// StreamRuntime::dispatch (사이즈 바인딩 게이트 통과 후) 이다.
+    /// 외부 직접 spawn_order 는 사이즈 검사 우회 append 이므로 차단.
+    pub(crate) fn spawn_order(
         &self,
         order_id: &str,
         plan_id: &str,
