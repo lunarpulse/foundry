@@ -899,5 +899,14 @@ mod tests {
             ch.bind_preset_from_ledger("s-rej9", "root", "plan"),
             Err(ChainerError::SizingRejected { .. })
         ));
+        // (astra r12 P3) 리다이렉션 회귀 — 잘못된 root/plan 결속 거부.
+        assert!(matches!(
+            ch.bind_preset_from_ledger("s-9", "root-WRONG", "plan-9"),
+            Err(ChainerError::DestinationMismatch { .. })
+        ));
+        assert!(matches!(
+            ch.bind_preset_from_ledger("s-9", "root-9", "plan-WRONG"),
+            Err(ChainerError::DestinationMismatch { .. })
+        ));
     }
 }
