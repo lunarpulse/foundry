@@ -331,7 +331,37 @@ impl<'o, 'a> Chainer<'o, 'a> {
         self.replay_proposals()
     }
 
-    /// 바인딩 준수 발행 검사 (H절).
+    /// (astra r7) 사이징 승인 상태를 **원장에서 직접 산출** — 호출자
+    /// 제시 Approved 는 신뢰하지 않는다(위조 차단). 사이징 그랜트 규약:
+    /// id "sizing-<order>", 스코프 sizing_outcome("approved"/"rejected").
+    ///   - CONSUMED + approved → Approved
+    ///   - sizing_outcome=rejected → Rejected (상태 무관 — 인간 거부 판정)
+    ///   - 그 외(미소비/부재) → None (미승인)
+    fn sizing_verdict_from_ledger(
+        &self,
+        sizing_order: &str,
+    ) -> Result<Option<SizingVerdict>, ChainerError> {
+        let grant_id = format!("sizing-{sizing_order}");
+        let Ok(grant) = self.ledger.get_grant(&grant_id) else {
+            return Ok(None);
+        };
+        let scope: serde_json::Value = serde_json::from_str(&grant.scope_json)
+            .map_err(|e| ChainerError::Ledger(format!("{e:?}")))?;
+        let rejected = scope
+            .get("sizing_outcome")
+            .and_then(|v| v.as_str())
+            .map(|s| s == "rejected")
+            .unwrap_or(false);
+        if rejected {
+            return Ok(Some(SizingVerdict::Rejected));
+        }
+        match grant.state {
+            foundry_approval::GrantState::Consumed => Ok(Some(SizingVerdict::Approved)),
+            _ => Ok(None),
+        }
+    }
+
+    /// 바인딩 준수 발행 검사 (H절) — 승인 상태는 원장에서 산출.
     pub fn check_spawn_binding(
         &self,
         order_id: &str,
@@ -340,10 +370,9 @@ impl<'o, 'a> Chainer<'o, 'a> {
         approval_digest: Option<&str>,
         dest_plan: &str,
         dest_root: &str,
-        sizing_verdict: Option<SizingVerdict>,
     ) -> Result<(), ChainerError> {
-        match (sizing_order, sizing_verdict) {
-            (None, _) => {
+        match sizing_order {
+            None => {
                 // 부트스트랩 — 인테이크 소스 패턴만.
                 if is_intake_bootstrap(order_source) {
                     Ok(())
@@ -351,57 +380,55 @@ impl<'o, 'a> Chainer<'o, 'a> {
                     Err(ChainerError::BootstrapViolation { order: order_id.into() })
                 }
             }
-            (Some(s), Some(SizingVerdict::Rejected)) => {
-                Err(ChainerError::SizingRejected { order: s.into() })
-            }
-            (Some(s), Some(SizingVerdict::Approved)) => {
-                let Some(d) = approval_digest else {
-                    return Err(ChainerError::Unsized { order: order_id.into() });
-                };
-                let rows = self
-                    .log
-                    .read_all()
-                    .map_err(|e| ChainerError::Log(format!("{e:?}")))?;
-                let bound = rows.iter().find_map(|r| match &r.kind {
-                    OrchestrationKind::PresetBound {
-                        sizing_order,
-                        selected_root,
-                        approved_digest,
-                        spawn_plan,
-                    } if sizing_order == s => {
-                        Some((approved_digest.clone(), spawn_plan.clone(), selected_root.clone()))
+            Some(s) => match self.sizing_verdict_from_ledger(s)? {
+                Some(SizingVerdict::Rejected) => Err(ChainerError::SizingRejected { order: s.into() }),
+                Some(SizingVerdict::Approved) => {
+                    let Some(d) = approval_digest else {
+                        return Err(ChainerError::Unsized { order: order_id.into() });
+                    };
+                    let rows = self
+                        .log
+                        .read_all()
+                        .map_err(|e| ChainerError::Log(format!("{e:?}")))?;
+                    let bound = rows.iter().find_map(|r| match &r.kind {
+                        OrchestrationKind::PresetBound {
+                            sizing_order,
+                            selected_root,
+                            approved_digest,
+                            spawn_plan,
+                        } if sizing_order == s => {
+                            Some((approved_digest.clone(), spawn_plan.clone(), selected_root.clone()))
+                        }
+                        _ => None,
+                    });
+                    let Some((expected_digest, expected_plan, expected_root)) = bound else {
+                        return Err(ChainerError::Unsized { order: order_id.into() });
+                    };
+                    if expected_digest != d {
+                        return Err(ChainerError::DigestMismatch {
+                            order: order_id.into(),
+                            expected: expected_digest,
+                            got: d.into(),
+                        });
                     }
-                    _ => None,
-                });
-                let Some((expected_digest, expected_plan, expected_root)) = bound else {
-                    return Err(ChainerError::Unsized { order: order_id.into() });
-                };
-                if expected_digest != d {
-                    return Err(ChainerError::DigestMismatch {
-                        order: order_id.into(),
-                        expected: expected_digest,
-                        got: d.into(),
-                    });
+                    if expected_plan != dest_plan {
+                        return Err(ChainerError::DestinationMismatch {
+                            order: order_id.into(),
+                            expected: expected_plan,
+                            got: dest_plan.into(),
+                        });
+                    }
+                    if expected_root != dest_root {
+                        return Err(ChainerError::DestinationMismatch {
+                            order: order_id.into(),
+                            expected: expected_root,
+                            got: dest_root.into(),
+                        });
+                    }
+                    Ok(())
                 }
-                // 목적지 일치 — plan.
-                if expected_plan != dest_plan {
-                    return Err(ChainerError::DestinationMismatch {
-                        order: order_id.into(),
-                        expected: expected_plan,
-                        got: dest_plan.into(),
-                    });
-                }
-                // 목적지 일치 — root.
-                if expected_root != dest_root {
-                    return Err(ChainerError::DestinationMismatch {
-                        order: order_id.into(),
-                        expected: expected_root,
-                        got: dest_root.into(),
-                    });
-                }
-                Ok(())
-            }
-            (Some(_), None) => Err(ChainerError::Unsized { order: order_id.into() }),
+                None => Err(ChainerError::Unsized { order: order_id.into() }),
+            },
         }
     }
 
@@ -500,7 +527,6 @@ impl<'o, 'a> Chainer<'o, 'a> {
         approval_digest: Option<&str>,
         dest_plan: &str,
         dest_root: &str,
-        sizing_verdict: Option<SizingVerdict>,
         declared: bool,
     ) -> Result<(), ChainerError> {
         // 선언 재검사 — 현재 로그에 이 주문의 선언이 있는가.
@@ -519,7 +545,7 @@ impl<'o, 'a> Chainer<'o, 'a> {
                 return Err(ChainerError::DeclarationMissing { order: order_id.into() });
             }
         }
-        // 바인딩 전량 재검사.
+        // 바인딩 전량 재검사 — 승인 상태는 원장에서 재산출(전량 재평가).
         self.check_spawn_binding(
             order_id,
             order_source,
@@ -527,7 +553,6 @@ impl<'o, 'a> Chainer<'o, 'a> {
             approval_digest,
             dest_plan,
             dest_root,
-            sizing_verdict,
         )
     }
 }
@@ -624,47 +649,72 @@ mod tests {
     }
 
     /// (게이트 5) 바인딩 — unsized·부트스트랩 소스 패턴·거부된 사이징·
-    /// digest·목적지 plan/root 일치.
+    /// digest·목적지 plan/root 일치 — 승인 상태는 원장에서 산출.
     #[test]
     fn spawn_binding_gates() {
-        let (_d, log, ledger) = setup("bind");
+        let (_d, log, mut ledger) = setup("bind");
+        // (astra r7) 사이징 승인 그랜트(규약 id "sizing-s-1") — CONSUMED.
+        let sscope = serde_json::json!({
+            "order_id": "s-1", "intent": "sizing", "artifact_digest": "dig-approv",
+            "sizing_outcome": "approved", "root_scope": "intake",
+        });
+        ledger.issue_grant("sizing-s-1", "tok-sizing", &sscope).unwrap();
+        let r0 = ledger.reserve_grant("sizing-s-1", &sscope, "ex-s", 1).unwrap();
+        ledger.begin_apply("sizing-s-1", "ex-s", 1, r0.fence_token).unwrap();
+        ledger.finalize_grant("sizing-s-1", "ex-s", 1, r0.fence_token).unwrap();
+        // 사이징 거부 그랜트 — sizing_outcome: rejected.
+        let rscope = serde_json::json!({
+            "order_id": "s-rej", "intent": "sizing", "artifact_digest": "d",
+            "sizing_outcome": "rejected", "root_scope": "intake",
+        });
+        ledger.issue_grant("sizing-s-rej", "tok-r", &rscope).unwrap();
+        // (astra r7 회귀용) 미소비 그랜트 — Issued 상태로 방치.
+        let iscope = serde_json::json!({
+            "order_id": "s-issued", "intent": "sizing", "artifact_digest": "dig-i",
+            "sizing_outcome": "approved", "root_scope": "intake",
+        });
+        ledger.issue_grant("sizing-s-issued", "tok-i", &iscope).unwrap();
         let ch = Chainer::new(&log, &ledger);
         // unsized — 비인테이크 소스.
         assert!(matches!(
-            ch.check_spawn_binding("o-1", "ext:webhook", None, None, "p-any", "r-any", None),
+            ch.check_spawn_binding("o-1", "ext:webhook", None, None, "p-any", "r-any"),
             Err(ChainerError::BootstrapViolation { .. })
         ));
         // 부트스트랩 — 인테이크 소스 패턴.
         assert!(ch
-            .check_spawn_binding("o-boot", "intake:ticket-1", None, None, "p-x", "r-x", None)
+            .check_spawn_binding("o-boot", "intake:ticket-1", None, None, "p-x", "r-x")
             .is_ok());
-        // 사이징 거부 후 발행.
+        // 사이징 거부 후 발행 — 원장 sizing_outcome=rejected 에서 산출.
         assert!(matches!(
-            ch.check_spawn_binding("o-2", "intake:t", Some("s-1"), Some("dig"), "p", "r", Some(SizingVerdict::Rejected)),
+            ch.check_spawn_binding("o-2", "intake:t", Some("s-rej"), Some("dig"), "p", "r"),
             Err(ChainerError::SizingRejected { .. })
         ));
         // 승인 + preset_bound 일치.
         log.append_preset_bound("s-1", "root-quick", "dig-approv", "plan-1").unwrap();
         assert!(ch
-            .check_spawn_binding("o-3", "ext:x", Some("s-1"), Some("dig-approv"), "plan-1", "root-quick", Some(SizingVerdict::Approved))
+            .check_spawn_binding("o-3", "ext:x", Some("s-1"), Some("dig-approv"), "plan-1", "root-quick")
             .is_ok());
         // digest 불일치.
         assert!(matches!(
-            ch.check_spawn_binding("o-4", "ext:x", Some("s-1"), Some("dig-other"), "plan-1", "root-quick", Some(SizingVerdict::Approved)),
+            ch.check_spawn_binding("o-4", "ext:x", Some("s-1"), Some("dig-other"), "plan-1", "root-quick"),
             Err(ChainerError::DigestMismatch { .. })
         ));
         // 목적지 plan 불일치.
         assert!(matches!(
-            ch.check_spawn_binding("o-5", "ext:x", Some("s-1"), Some("dig-approv"), "plan-OTHER", "root-quick", Some(SizingVerdict::Approved)),
+            ch.check_spawn_binding("o-5", "ext:x", Some("s-1"), Some("dig-approv"), "plan-OTHER", "root-quick"),
             Err(ChainerError::DestinationMismatch { .. })
         ));
         // 목적지 root 불일치.
         assert!(matches!(
-            ch.check_spawn_binding("o-6", "ext:x", Some("s-1"), Some("dig-approv"), "plan-1", "root-OTHER", Some(SizingVerdict::Approved)),
+            ch.check_spawn_binding("o-6", "ext:x", Some("s-1"), Some("dig-approv"), "plan-1", "root-OTHER"),
             Err(ChainerError::DestinationMismatch { .. })
         ));
-    }
 
+        assert!(matches!(
+            ch.check_spawn_binding("o-7", "ext:x", Some("s-issued"), Some("dig-i"), "p", "r"),
+            Err(ChainerError::Unsized { .. })
+        ), "unconsumed sizing grant is not approval evidence");
+    }
     /// (게이트 6) 재디에이션 — 제안 1회(로그 멱등·인스턴스 무관)·깊이 1.
     #[test]
     fn remediation_once_depth1() {
@@ -712,46 +762,28 @@ mod tests {
     /// (게이트 7) 재입장 전량 재평가 — A 수리돼도 B 거부.
     #[test]
     fn reentry_full_reevaluation() {
-        let (_d, log, ledger) = setup("reentry");
+        let (_d, log, mut ledger) = setup("reentry");
+        // (astra r7) 사이징 승인 그랜트(규약 id "sizing-s-2") — CONSUMED.
+        let sscope = serde_json::json!({
+            "order_id": "s-2", "intent": "sizing", "artifact_digest": "dig-x",
+            "sizing_outcome": "approved", "root_scope": "intake",
+        });
+        ledger.issue_grant("sizing-s-2", "tok-s2", &sscope).unwrap();
+        let r0 = ledger.reserve_grant("sizing-s-2", &sscope, "ex-s2", 1).unwrap();
+        ledger.begin_apply("sizing-s-2", "ex-s2", 1, r0.fence_token).unwrap();
+        ledger.finalize_grant("sizing-s-2", "ex-s2", 1, r0.fence_token).unwrap();
         let ch = Chainer::new(&log, &ledger);
         // 사이징 승인(A 수리) — 그러나 preset_bound 미등록(B).
-        let r = ch.reenter(
-            "o-bad",
-            "ext:x",
-            Some("s-2"),
-            Some("dig-x"),
-            "plan-2",
-            "root-x",
-            Some(SizingVerdict::Approved),
-            false,
-        );
+        let r = ch.reenter("o-bad", "ext:x", Some("s-2"), Some("dig-x"), "plan-2", "root-x", false);
         assert!(matches!(r, Err(ChainerError::Unsized { .. })), "A repaired, B refuses");
         // preset_bound 등록 — 통과.
         log.append_preset_bound("s-2", "root-x", "dig-x", "plan-2").unwrap();
         assert!(ch
-            .reenter(
-                "o-bad",
-                "ext:x",
-                Some("s-2"),
-                Some("dig-x"),
-                "plan-2",
-                "root-x",
-                Some(SizingVerdict::Approved),
-                false
-            )
+            .reenter("o-bad", "ext:x", Some("s-2"), Some("dig-x"), "plan-2", "root-x", false)
             .is_ok());
         // 선언 재검사 — declared=true 인데 로그에 없으면 거부(새 B).
         assert!(matches!(
-            ch.reenter(
-                "o-bad",
-                "ext:x",
-                Some("s-2"),
-                Some("dig-x"),
-                "plan-2",
-                "root-x",
-                Some(SizingVerdict::Approved),
-                true
-            ),
+            ch.reenter("o-bad", "ext:x", Some("s-2"), Some("dig-x"), "plan-2", "root-x", true),
             Err(ChainerError::DeclarationMissing { .. })
         ));
     }
