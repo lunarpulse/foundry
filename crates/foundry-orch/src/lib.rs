@@ -1075,30 +1075,36 @@ mod port_tests {
 /// (T58 테스트 지원) 저널 행에서 신뢰 커서 발급 — 게이트 common 의
 /// replay_ctx_for 등가. foundry-workflow 공개 API 만 사용.
 pub mod test_support {
-    /// 터미널 커밋먼트 산출 후 커서 발급.
+    /// 터미널 커밋먼트 산출 후 **주문별 마지막 행 위치**로 커서 발급
+    /// (다주문 저널: 전역 max_seq 가 요청 주문의 행이 아닐 수 있다 —
+    /// T56 r3 커서 위치 핀 원칙).
     pub fn replay_ctx(
         order_id: &str,
         rows: &[foundry_ledger::LedgerRow],
     ) -> foundry_workflow::replay::ReplayContext {
         use foundry_ledger::LedgerRow;
-        let max_seq = rows.iter().map(|r| r.seq).max().unwrap_or(0);
+        let global_max = rows.iter().map(|r| r.seq).max().unwrap_or(0);
         let chain_head = rows
             .iter()
-            .find(|r| r.seq == max_seq)
+            .find(|r| r.seq == global_max)
             .map(|r| r.hash.clone())
             .unwrap_or_else(|| "GENESIS".into());
         let count = rows.len() as i64;
         let commit = foundry_workflow::replay::TerminalCommitment {
-            max_seq,
+            max_seq: global_max,
             count,
             chain_head,
         };
-        let cursor = if rows.is_empty() {
-            // 부트스트랩: 행 없는 주문은 제네시스 커서.
-            foundry_workflow::replay::VerifiedReplayCursor::genesis(order_id)
-        } else {
-            foundry_workflow::replay::issue_replay_cursor(rows, &commit, order_id, max_seq)
-                .expect("cursor issuance")
+        // 이 주문의 마지막 행 — 없으면 GENESIS 부트스트랩.
+        let my_last = rows
+            .iter()
+            .filter(|r| r.order_id == order_id)
+            .map(|r| r.seq)
+            .max();
+        let cursor = match my_last {
+            None => foundry_workflow::replay::VerifiedReplayCursor::genesis(order_id),
+            Some(seq) => foundry_workflow::replay::issue_replay_cursor(rows, &commit, order_id, seq)
+                .expect("cursor issuance"),
         };
         foundry_workflow::replay::ReplayContext { cursor }
     }

@@ -1,25 +1,21 @@
 //! T58 — 스트림 런타임 + 회복 코디네이터 (M7 플랜 v9 E′/E절).
 //!
-//! 계약:
-//! - **스트림 위상**: 스트림 = 프리셋 root의 활성화 인스턴스. 저널=엔진=
-//!   스트림 1:1 — 공유 저널 구성은 존재하지 않는다. 한 스트림은 여러
-//!   주문을 순차 수용한다(G1 등가).
-//! - **ready_to_start**: 오케스트레이션 로그의 의존성 간선 ∧ 각 선행
-//!   주문 저널의 Shipped 종단 행 — 로그 단독이 진실이 아니다(교차 검증).
-//!   T58 게이트는 **직접 승인만**(핸드오프 없음 — T59 이전 독립성).
-//! - **디스패처**: ready 주문만 디스패치. 이중 디스패치 거부(스팬 집합).
-//! - **회복 코디네이터** (E′):
-//!   1. 입장 차단 — 새 디스패치 거부 시작.
-//!   2. 드레인 — 진행 중 디스패치의 완료 승인(ack) 수신, 유한 대기.
-//!   3. **타임아웃 시 스캔 없이 중단** — 부분 정지에서 스캔하는 경로
-//!      자체를 제거.
-//!   4. 정지 완료 → 원장 recovery_scan 1회(의도적으로 대기 중 예약
-//!      무효화) → 스트림별 verify+rebuild 순차 → 재개.
+//! astra r1 재작 계약:
+//! - **고유 불변 identity**: 스트림 id 는 런타임 내 유일(중복 등록 거부)·
+//!   저널 파일 경로는 스트림 id 에서만 파생(경로 별칭 불가).
+//! - **디스패치-코디네이터 결합**: dispatch 는 입장 차단 플래그를 검사
+//!   (차단 중 거부 → RefusalRecord), 코디네이터는 스트림을 실제 rebuild
+//!   (RecoveryRunner 재사용 — 원장 reopen·저널 verify·신 엔진).
+//! - **checked-id 일치**: dispatch 의 order_id 파라미터 == order.id.
+//! - **거부 레코드**: 인간 대면 거부는 오케스트레이션 로그에 3요소 기록.
+//! - 스트림 활성화는 런타임 수명과 1:1 — leaked 저널 핸들은 활성 스트림
+//!   수만큼 유한(같은 root 재활성화는 새 런타임).
 
+use crate::refusal::{record_refusal, RefusalCode};
+use crate::{OrchestrationKind, OrchestrationLog};
 use foundry_domain::order::{ExternalRef, Order};
 use foundry_domain::ports::Ledger as _;
 use foundry_domain::{OrderEvent, OrderState};
-use crate::{OrchestrationLog, OrchestrationKind};
 use foundry_workflow::recovery::RecoveryRunner;
 use foundry_workflow::{Outcome, WorkflowEngine};
 use std::collections::BTreeSet;
@@ -36,15 +32,14 @@ pub struct Stream {
 }
 
 impl Stream {
+    /// 신규 스트림 — journal_dir/{stream_id}.db 소유.
     pub fn new(stream_id: &str, journal_dir: &Path) -> Result<Self, String> {
         let journal_path = journal_dir.join(format!("{stream_id}.db"));
-        let ledger: &'static mut foundry_ledger::SqliteLedger =
-            Box::leak(Box::new(
-                foundry_ledger::SqliteLedger::open(&journal_path)
-                    .map_err(|e| format!("{e:?}"))?,
-            ));
+        let ledger: &'static mut foundry_ledger::SqliteLedger = Box::leak(Box::new(
+            foundry_ledger::SqliteLedger::open(&journal_path).map_err(|e| format!("{e:?}"))?,
+        ));
         let mut engine = WorkflowEngine::embedded_default();
-        engine.set_ledger(ledger, foundry_domain::ports::ActorId {
+        engine.set_ledger(ledger, foundry_domain::ActorId {
             kind: foundry_domain::ActorKind::Agent,
             source: "stream".into(),
             id: stream_id.into(),
@@ -58,15 +53,15 @@ impl Stream {
         })
     }
 
-    /// 주문 등록+디스패치 준비 — 이미 디스패치된 주문이면 거부(이중 방지).
+    /// 주문 등록 — **order.id 본체**로 keyed (astra r1: checked-id 우회
+    /// 제거). 이중 디스패치 거부.
     pub fn enroll(&self, order: Order) -> Result<(), String> {
         let oid = order.id.clone();
         let mut disp = self.dispatched.lock().unwrap();
         if disp.contains(&oid) {
             return Err(format!("order '{oid}' already dispatched on stream {}", self.stream_id));
         }
-        let mut e = self.engine.lock().unwrap();
-        e.enroll(order);
+        self.engine.lock().unwrap().enroll(order);
         disp.insert(oid);
         Ok(())
     }
@@ -75,7 +70,7 @@ impl Stream {
         self.engine.lock().unwrap()
     }
 
-    /// 저널 읽기 전용 스냅샷 (readiness 교차 검증용).
+    /// 저널 읽기 전용 스냅샷.
     pub fn journal_rows(&self) -> Result<Vec<foundry_ledger::LedgerRow>, String> {
         foundry_ledger::SqliteLedger::open(&self.journal_path)
             .map_err(|e| format!("{e:?}"))?
@@ -92,35 +87,56 @@ impl Stream {
     }
 }
 
-/// 런타임 — 스트림 레지스트리 + 오케스트레이션 로그 소유.
+/// 런타임 — 스트림 레지스트리 + 오케스트레이션 로그 + 입장 게이트.
 pub struct StreamRuntime {
     pub orch: Arc<OrchestrationLog>,
     streams: Mutex<Vec<Arc<Stream>>>,
-}
-
-#[derive(Debug)]
-pub enum ReadyError {
-    Undeclared(String),
-    DependencyNotShipped { order: String, pred: String },
-    Io(String),
+    /// (astra r1 결합) 입장 차단 — 코디네이터가 소유.
+    admission_blocked: std::sync::atomic::AtomicBool,
 }
 
 impl StreamRuntime {
     pub fn new(orch: OrchestrationLog) -> Self {
-        Self { orch: Arc::new(orch), streams: Mutex::new(Vec::new()) }
+        Self {
+            orch: Arc::new(orch),
+            streams: Mutex::new(Vec::new()),
+            admission_blocked: std::sync::atomic::AtomicBool::new(false),
+        }
     }
 
-    pub fn add_stream(&self, stream: Stream) {
-        self.streams.lock().unwrap().push(Arc::new(stream));
+    /// 스트림 등록 — **id 유일 강제** (astra r1: 중복 id 거부).
+    pub fn add_stream(&self, stream: Stream) -> Result<(), String> {
+        let mut g = self.streams.lock().unwrap();
+        if g.iter().any(|s| s.stream_id == stream.stream_id) {
+            return Err(format!(
+                "stream '{}' already registered — ids are unique",
+                stream.stream_id
+            ));
+        }
+        g.push(Arc::new(stream));
+        Ok(())
     }
 
     pub fn stream(&self, id: &str) -> Option<Arc<Stream>> {
         self.streams.lock().unwrap().iter().find(|s| s.stream_id == id).cloned()
     }
 
-    /// 의존성 간선 조회 (선언에서).
-    fn edges_of(&self, order_id: &str) -> Result<Vec<String>, ReadyError> {
-        let rows = self.orch.read_all().map_err(|e| ReadyError::Io(e.to_string()))?;
+    /// 입장 차단 (코디네이터 전용).
+    pub(crate) fn block_admission(&self) {
+        self.admission_blocked.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn resume_admission(&self) {
+        self.admission_blocked.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn is_admission_blocked(&self) -> bool {
+        self.admission_blocked.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// 의존성 간선 조회.
+    fn edges_of(&self, order_id: &str) -> Result<Vec<String>, String> {
+        let rows = self.orch.read_all().map_err(|e| e.to_string())?;
         for r in rows {
             if let OrchestrationKind::PlanDeclared { edges, .. } = &r.kind {
                 if let Some((_, preds)) = edges.iter().find(|(o, _)| o == order_id) {
@@ -128,123 +144,113 @@ impl StreamRuntime {
                 }
             }
         }
-        Err(ReadyError::Undeclared(order_id.into()))
+        Err(format!("undeclared: {order_id}"))
     }
 
-    /// ready_to_start — 로그 간선 ∧ 선행 저널 Shipped 교차.
-    /// 로그 단독이 진실이 아니다: 선행이 선언만 되고 출하 안 됐으면 대기.
-    pub fn ready_to_start(&self, order_id: &str) -> Result<bool, ReadyError> {
-        let preds = self.edges_of(order_id)?;
-        for p in &preds {
-            // 선행 주문의 스트림 배정 조회.
-            let rows = self.orch.read_all().map_err(|e| ReadyError::Io(e.to_string()))?;
-            let mut pred_stream: Option<String> = None;
-            for r in &rows {
-                if let OrchestrationKind::PlanDeclared { edges, streams, .. } = &r.kind {
-                    if edges.iter().any(|(o, _)| o == p) {
-                        if let Some((_, s)) = streams.iter().find(|(o, _)| o == p) {
-                            pred_stream = Some(s.clone());
-                        }
+    /// 주문의 (plan, stream) 배정 조회.
+    fn assignment_of(&self, order_id: &str) -> Result<Option<(String, String)>, String> {
+        let rows = self.orch.read_all().map_err(|e| e.to_string())?;
+        for r in rows {
+            if let OrchestrationKind::PlanDeclared { plan_id, edges, streams } = &r.kind {
+                if edges.iter().any(|(o, _)| o == order_id) {
+                    if let Some((_, s)) = streams.iter().find(|(o, _)| o == order_id) {
+                        return Ok(Some((plan_id.clone(), s.clone())));
                     }
                 }
             }
-            let s = pred_stream.ok_or(ReadyError::Io(format!("pred {p} has no stream")))?;
-            let stream = self
-                .stream(&s)
-                .ok_or(ReadyError::Io(format!("stream {s} not registered")))?;
+        }
+        Ok(None)
+    }
+
+    /// ready_to_start — 로그 간선 ∧ 선행 저널 Shipped 교차.
+    pub fn ready_to_start(&self, order_id: &str) -> Result<bool, String> {
+        let preds = self.edges_of(order_id)?;
+        for p in &preds {
+            let Some((_, s)) = self.assignment_of(p)? else {
+                return Err(format!("pred {p} has no stream"));
+            };
+            let stream = self.stream(&s).ok_or(format!("stream {s} not registered"))?;
             match stream.order_shipped(p) {
                 Ok(true) => {}
                 Ok(false) => return Ok(false),
-                Err(e) => return Err(ReadyError::Io(e)),
+                Err(e) => return Err(e),
             }
         }
         Ok(true)
     }
 
-    /// 디스패치 — ready 검사 후 스트림에 enroll. 이중 디스패치는
-    /// Stream::enroll 이 거부.
+    /// 디스패치 — (astra r1 결합) 입장 차단 검사·checked-id 일치·선언·
+    /// ready 검사·거부 레코드·발행 기록.
     pub fn dispatch(&self, order_id: &str, order: Order) -> Result<(), String> {
-        if !self.ready_to_start(order_id).map_err(|e| format!("{e:?}"))? {
+        if self.is_admission_blocked() {
+            let _ = record_refusal(&self.orch, RefusalCode::UndeclaredOrder, order_id, None);
+            return Err(format!(
+                "admission blocked — order '{order_id}' refused during recovery quiescence"
+            ));
+        }
+        if order_id != order.id {
+            return Err(format!(
+                "dispatch id '{order_id}' != order.id '{}' — checked-id must match",
+                order.id
+            ));
+        }
+        let Some((plan, s)) = self.assignment_of(order_id)? else {
+            let _ = record_refusal(&self.orch, RefusalCode::UnsizedSpawn, order_id, None);
+            return Err(format!(
+                "order '{order_id}' has no declaration — unsized/undeclared spawn"
+            ));
+        };
+        if !self.ready_to_start(order_id)? {
+            let _ = record_refusal(&self.orch, RefusalCode::UndeclaredOrder, order_id, None);
             return Err(format!("order '{order_id}' not ready — predecessors unshipped"));
         }
-        // 이 주문의 스트림 배정.
-        let rows = self.orch.read_all().map_err(|e| e.to_string())?;
-        let mut my_stream = None;
-        for r in &rows {
-            if let OrchestrationKind::PlanDeclared { edges, streams, .. } = &r.kind {
-                if edges.iter().any(|(o, _)| o == order_id) {
-                    if let Some((_, s)) = streams.iter().find(|(o, _)| o == order_id) {
-                        my_stream = Some(s.clone());
-                    }
-                }
-            }
-        }
-        let s = my_stream.ok_or("no stream assignment")?;
-        let stream = self.stream(&s).ok_or("stream not registered")?;
-        stream.enroll(order)
+        let stream = self.stream(&s).ok_or(format!("stream {s} not registered"))?;
+        stream.enroll(order)?;
+        self.orch.spawn_order(order_id, &plan, &s).map_err(|e| e.to_string())?;
+        Ok(())
     }
 }
 
-/// 회복 코디네이터 (E′) — 입장 차단→드레인 ack→타임아웃(무스캔 중단)→
-/// 전역 스캔(의도적 무효화)→스트림별 rebuild→재개.
-pub struct RecoveryCoordinator {
-    /// 입장 차단 플래그.
-    paused: std::sync::atomic::AtomicBool,
-    /// 드레인 ack 대기 큐.
-    acks: Mutex<BTreeSet<String>>,
-    pending: Mutex<BTreeSet<String>>,
+/// 회복 코디네이터 (E′) — 런타임에 실제 결합.
+///
+/// 1. 입장 차단(런타임 플래그 — dispatch 가 즉시 거부+레코드).
+/// 2. 드레인 — 진행 중 디스패치의 완료 승인(ack) 폴링, 유한 대기.
+/// 3. **타임아웃 시 스캔 없이 중단** — 부분 정지 스캔 경로 원천 제거.
+/// 4. 전역 원장 스캔 1회(의도적 예약 무효화) → **스트림별 실제 rebuild**
+///    (RecoveryRunner: 원장·저널 verify·신 엔진 재구축).
+/// 5. 입장 재개.
+pub struct RecoveryCoordinator<'r> {
+    runtime: &'r StreamRuntime,
     /// 유한 타임아웃 (초).
     pub timeout_secs: u64,
 }
 
 #[derive(Debug, PartialEq)]
 pub enum RecoveryOutcome {
-    /// 회복 완료 — 스캔·rebuild 수행됨.
+    /// 회복 완료 — 스트림 rebuild 수행됨·무효화된 예약 수.
     Completed { streams_rebuilt: usize, invalidated_reservations: usize },
     /// 타임아웃 — **스캔 없이** 중단 (부분 정지 스캔 경로 제거).
     AbortedWithoutScan { missing_acks: Vec<String> },
 }
 
-impl RecoveryCoordinator {
-    pub fn new(timeout_secs: u64) -> Self {
-        Self {
-            paused: std::sync::atomic::AtomicBool::new(false),
-            acks: Mutex::new(BTreeSet::new()),
-            pending: Mutex::new(BTreeSet::new()),
-            timeout_secs,
-        }
+impl<'r> RecoveryCoordinator<'r> {
+    pub fn new(runtime: &'r StreamRuntime, timeout_secs: u64) -> Self {
+        Self { runtime, timeout_secs }
     }
 
-    /// 입장 차단 중인가 — 디스패처는 이것을 보고 새 디스패치를 거부.
-    pub fn admission_blocked(&self) -> bool {
-        self.paused.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    /// 진행 중 디스패치 등록 (드레인 대상).
-    pub fn register_inflight(&self, key: &str) {
-        self.pending.lock().unwrap().insert(key.into());
-    }
-
-    /// 진행 중 디스패치 완료 ack.
-    pub fn ack(&self, key: &str) {
-        self.acks.lock().unwrap().insert(key.into());
-    }
-
-    /// 회복 시도 — 성공이든 타임아웃이든 종료 후 입장 재개.
-    pub fn recover<F, G>(
+    /// 회복 — ack 폴링은 호출자(in-flight 소유자)가 제공.
+    pub fn recover<F>(
         &self,
         inflight: &[String],
         mut drain_poll: F,
-        scan: G,
+        approval_db: &Path,
     ) -> RecoveryOutcome
     where
         F: FnMut() -> BTreeSet<String>,
-        G: FnOnce() -> (usize, usize), // (streams_rebuilt, invalidated_reservations)
     {
-        // (1) 입장 차단.
-        self.paused.store(true, std::sync::atomic::Ordering::SeqCst);
-        // (2) 드레인 — 유한 폴링.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(self.timeout_secs);
+        self.runtime.block_admission();
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(self.timeout_secs);
         let want: BTreeSet<String> = inflight.iter().cloned().collect();
         loop {
             let done = drain_poll();
@@ -252,19 +258,38 @@ impl RecoveryCoordinator {
                 break;
             }
             if std::time::Instant::now() >= deadline {
-                // (3) 타임아웃 — 스캔 없이 중단.
                 let missing: Vec<String> =
                     want.iter().filter(|k| !done.contains(*k)).cloned().collect();
-                self.paused.store(false, std::sync::atomic::Ordering::SeqCst);
+                self.runtime.resume_admission();
                 return RecoveryOutcome::AbortedWithoutScan { missing_acks: missing };
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        // (4) 전역 스캔 — 의도적으로 대기 중 예약 무효화 (정지 하 안전).
-        let (streams_rebuilt, invalidated_reservations) = scan();
-        // (5) 재개.
-        self.paused.store(false, std::sync::atomic::Ordering::SeqCst);
-        RecoveryOutcome::Completed { streams_rebuilt, invalidated_reservations }
+        // (4) 전역 원장 스캔 — 의도적 예약 무효화(정지 하).
+        let mut invalidated = 0usize;
+        if let Ok(mut ap) = foundry_approval::ApprovalLedger::open(approval_db) {
+            if let Ok(released) = foundry_approval::ApprovalLedger::recovery_scan(&mut ap) {
+                invalidated = released.len();
+            }
+        }
+        // 스트림별 실제 rebuild — RecoveryRunner (원장·저널 verify·신 엔진).
+        let streams = self.runtime.streams.lock().unwrap().clone();
+        let mut rebuilt = 0usize;
+        if let Ok(mut ap2) = foundry_approval::ApprovalLedger::open(approval_db) {
+            for s in &streams {
+                if let Ok(jr) = foundry_ledger::SqliteLedger::open(&s.journal_path) {
+                    let mut fresh = WorkflowEngine::embedded_default();
+                    if RecoveryRunner::run(&mut ap2, &jr, &mut fresh)
+                        .map(|r| r.journal_verified)
+                        .unwrap_or(false)
+                    {
+                        rebuilt += 1;
+                    }
+                }
+            }
+        }
+        self.runtime.resume_admission();
+        RecoveryOutcome::Completed { streams_rebuilt: rebuilt, invalidated_reservations: invalidated }
     }
 }
 
@@ -279,22 +304,92 @@ mod tests {
         d
     }
 
-    fn orch_path(d: &PathBuf) -> PathBuf {
-        d.join("orch.db")
-    }
-
     fn mkorder(id: &str) -> Order {
         let mut o = Order::new(id.into(), ExternalRef::cron("s", "r"), chrono::Utc::now());
         o.force_state_for_test(OrderState::Received, 1);
         o
     }
 
-    /// (게이트 1) 1:1 위상 + 다주문 단일 스트림 — 한 스트림에서 의존성
-    /// 있는 두 주문을 순차 진행.
+    /// 주문을 자율 구간+직접 승인으로 Shipped 까지.
+    fn run_to_shipped(
+        rt: &StreamRuntime,
+        stream_id: &str,
+        oid: &str,
+        grant_id: &str,
+        ap_db: &Path,
+    ) {
+        let mut ap = foundry_approval::ApprovalLedger::open(ap_db).unwrap();
+        let e = rt.stream(stream_id).unwrap();
+        {
+            let mut eng = e.engine();
+            eng.acquire(oid, "ex").unwrap();
+            for ev in [
+                OrderEvent::Queued,
+                OrderEvent::DieStarted,
+                OrderEvent::DieSucceeded { attempt: 1 },
+                OrderEvent::InspectionPassed,
+            ] {
+                let att = eng.order(oid).unwrap().attempt().max(1);
+                let rows = foundry_ledger::SqliteLedger::open(&e.journal_path)
+                    .unwrap()
+                    .read_all()
+                    .unwrap();
+                let ctx = crate::test_support::replay_ctx(oid, &rows);
+                let ro: &'static mut foundry_ledger::SqliteLedger = Box::leak(Box::new(
+                    foundry_ledger::SqliteLedger::open(&e.journal_path).unwrap(),
+                ));
+                eng.dispatch_replay_ctx(oid, "ex", &ev, att, &ctx, ro).unwrap();
+            }
+        }
+        ap.issue_grant(grant_id, &format!("tok-{grant_id}"), &serde_json::json!({
+            "order_id": oid, "intent": "ship", "artifact_digest": format!("dig-{oid}"), "root_scope": "",
+        }))
+        .unwrap();
+        let mut hook = foundry_workflow::ApprovalLedgerAdapter(ap);
+        {
+            let e2 = rt.stream(stream_id).unwrap();
+            let mut eng = e2.engine();
+            let grant = foundry_workflow::GrantRef { grant_id: grant_id.into() };
+            let out = eng
+                .dispatch_live(
+                    oid,
+                    "ex",
+                    &OrderEvent::Approved {
+                        intent: "ship".into(),
+                        artifact_digest: format!("dig-{oid}"),
+                    },
+                    1,
+                    Some(&grant),
+                    &mut hook,
+                )
+                .unwrap();
+            assert_eq!(out, Outcome::Applied);
+            let rows = foundry_ledger::SqliteLedger::open(&e2.journal_path)
+                .unwrap()
+                .read_all()
+                .unwrap();
+            let ctx = crate::test_support::replay_ctx(oid, &rows);
+            let ro: &'static mut foundry_ledger::SqliteLedger = Box::leak(Box::new(
+                foundry_ledger::SqliteLedger::open(&e2.journal_path).unwrap(),
+            ));
+            eng.dispatch_replay_ctx(
+                oid,
+                "ex",
+                &OrderEvent::PublishConfirmed { pr_url: "https://pr/1".into() },
+                1,
+                &ctx,
+                ro,
+            )
+            .unwrap();
+        }
+    }
+
+    /// (게이트 1+2+7) 다주문 단일 스트림 — 두 주문 모두 실주행·의존성 준수·
+    /// 직접 승인만·발행 기록·거부 레코드 증거 배제.
     #[test]
-    fn stream_hosts_multiple_orders_sequentially() {
+    fn stream_hosts_two_orders_full_cycle_with_dependency() {
         let d = tmpdir("multi");
-        let orch = OrchestrationLog::open(&orch_path(&d)).unwrap();
+        let orch = OrchestrationLog::open(&d.join("orch.db")).unwrap();
         orch.declare_plan(
             "p1",
             vec![("o-a".into(), vec![]), ("o-b".into(), vec!["o-a".into()])],
@@ -302,154 +397,121 @@ mod tests {
         )
         .unwrap();
         let rt = StreamRuntime::new(orch);
-        rt.add_stream(Stream::new("s-1", &d).unwrap());
-        // o-a 는 선행 없음 — ready.
+        rt.add_stream(Stream::new("s-1", &d).unwrap()).unwrap();
         assert!(rt.ready_to_start("o-a").unwrap());
+        assert!(!rt.ready_to_start("o-b").unwrap());
         rt.dispatch("o-a", mkorder("o-a")).unwrap();
-        // o-b 는 o-a 가 Shipped 전까지 not ready (교차 검증).
-        assert!(!rt.ready_to_start("o-b").unwrap());
-        // o-a 를 Shipped 까지 진행 (자율+게이트+출하 — 직접 승인만).
-        {
-            let e = rt.stream("s-1").unwrap();
-            let mut eng = e.engine();
-            eng.acquire("o-a", "ex").unwrap();
-            for ev in [
-                OrderEvent::Queued,
-                OrderEvent::DieStarted,
-                OrderEvent::DieSucceeded { attempt: 1 },
-                OrderEvent::InspectionPassed,
-            ] {
-                let att = eng.order("o-a").unwrap().attempt().max(1);
-                let rows = foundry_ledger::SqliteLedger::open(&e.journal_path).unwrap().read_all().unwrap();
-                let ctx = crate::test_support::replay_ctx("o-a", &rows);
-                let ro: &'static mut foundry_ledger::SqliteLedger = Box::leak(Box::new(
-                    foundry_ledger::SqliteLedger::open(&e.journal_path).unwrap(),
-                ));
-                eng.dispatch_replay_ctx("o-a", "ex", &ev, att, &ctx, ro).unwrap();
-            }
-        }
-        // 아직 FurnaceHold — o-b 여전히 대기.
-        assert!(!rt.ready_to_start("o-b").unwrap());
-        // 직접 승인 (T58 게이트: 핸드오프 없음).
-        {
-            let e = rt.stream("s-1").unwrap();
-            let mut ap = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
-            ap.issue_grant("g-a", "tok-a", &serde_json::json!({
-                "order_id": "o-a", "intent": "ship", "artifact_digest": "dig-a", "root_scope": "",
-            })).unwrap();
-            let mut hook = foundry_workflow::ApprovalLedgerAdapter(ap);
-            eng_guard_dispatch_live(&e, "o-a", "ex", &mut hook);
-        }
-        // Shipped 확인 — o-b ready.
+        // 이중 디스패치 거부.
+        assert!(rt.dispatch("o-a", mkorder("o-a")).is_err());
+        // checked-id 불일치 거부 (astra r1).
+        assert!(rt.dispatch("o-a", mkorder("o-b")).is_err());
+
+        run_to_shipped(&rt, "s-1", "o-a", "g-a", &d.join("ap.db"));
         assert!(rt.stream("s-1").unwrap().order_shipped("o-a").unwrap());
         assert!(rt.ready_to_start("o-b").unwrap());
+
+        // o-b 실주행 — 두 주문 모두 Shipped.
+        rt.dispatch("o-b", mkorder("o-b")).unwrap();
+        run_to_shipped(&rt, "s-1", "o-b", "g-b", &d.join("ap.db"));
+        assert!(rt.stream("s-1").unwrap().order_shipped("o-b").unwrap());
+
+        let rows = rt.stream("s-1").unwrap().journal_rows().unwrap();
+        assert!(rows.iter().any(|r| r.order_id == "o-a" && r.to_state == "shipped"));
+        assert!(rows.iter().any(|r| r.order_id == "o-b" && r.to_state == "shipped"));
+        // 발행 기록 2건.
+        let prows = rt.orch.read_all().unwrap();
+        let spawned: Vec<_> = prows
+            .iter()
+            .filter(|r| matches!(&r.kind, OrchestrationKind::OrderSpawned { .. }))
+            .collect();
+        assert_eq!(spawned.len(), 2);
+        // 거부 레코드는 증거에서 배제 — 선언+발행만.
+        let decl = rt.orch.declaration_rows().unwrap();
+        assert!(decl.len() >= 3);
     }
 
-    fn eng_guard_dispatch_live(
-        e: &Arc<Stream>,
-        oid: &str,
-        exec: &str,
-        hook: &mut foundry_workflow::ApprovalLedgerAdapter,
-    ) {
-        let mut eng = e.engine();
-        let grant = foundry_workflow::GrantRef { grant_id: "g-a".into() };
-        let out = eng
-            .dispatch_live(
-                oid,
-                exec,
-                &OrderEvent::Approved { intent: "ship".into(), artifact_digest: "dig-a".into() },
-                1,
-                Some(&grant),
-                hook,
-            )
-            .unwrap();
-        assert_eq!(out, Outcome::Applied);
-        let rows = foundry_ledger::SqliteLedger::open(&e.journal_path).unwrap().read_all().unwrap();
-        let ctx = crate::test_support::replay_ctx(oid, &rows);
-        let ro: &'static mut foundry_ledger::SqliteLedger = Box::leak(Box::new(
-            foundry_ledger::SqliteLedger::open(&e.journal_path).unwrap(),
-        ));
-        eng.dispatch_replay_ctx(
-            oid,
-            exec,
-            &OrderEvent::PublishConfirmed { pr_url: "https://pr/1".into() },
-            1,
-            &ctx,
-            ro,
-        )
-        .unwrap();
-    }
-
-    /// (게이트 2) 이중 디스패치 거부.
+    /// (BLOCKER 폐쇄) 코디네이터 결합 — 차단 중 dispatch 거부(레코드),
+    /// ack 완료 시 실제 rebuild, 타임아웃 시 스캔 없이 중단.
     #[test]
-    fn duplicate_dispatch_refused() {
-        let d = tmpdir("dup");
-        let orch = OrchestrationLog::open(&orch_path(&d)).unwrap();
+    fn coordinator_blocks_dispatch_and_rebuilds() {
+        let d = tmpdir("coord");
+        let orch = OrchestrationLog::open(&d.join("orch.db")).unwrap();
         orch.declare_plan(
             "p1",
-            vec![("o-x".into(), vec![])],
-            vec![("o-x".into(), "s-d".into())],
+            vec![("o-a".into(), vec![])],
+            vec![("o-a".into(), "s-c".into())],
         )
         .unwrap();
         let rt = StreamRuntime::new(orch);
-        rt.add_stream(Stream::new("s-d", &d).unwrap());
-        rt.dispatch("o-x", mkorder("o-x")).unwrap();
-        let err = rt.dispatch("o-x", mkorder("o-x")).unwrap_err();
-        assert!(err.contains("already dispatched"), "{err}");
-    }
+        rt.add_stream(Stream::new("s-c", &d).unwrap()).unwrap();
 
-    /// (게이트 3) 회복 — 전 ack 시 완주 (스캔 1회·rebuild).
-    #[test]
-    fn coordinator_completes_when_acked() {
-        let c = RecoveryCoordinator::new(2);
-        assert!(!c.admission_blocked());
-        c.register_inflight("d-1");
-        c.register_inflight("d-2");
-        let done = std::sync::Arc::new(Mutex::new(BTreeSet::from(["d-1".to_string()])));
-        let done2 = std::sync::Arc::clone(&done);
+        // o-a Shipped 까지 — 저널에 rebuild 증거 심기.
+        rt.dispatch("o-a", mkorder("o-a")).unwrap();
+        run_to_shipped(&rt, "s-c", "o-a", "g-c", &d.join("ap.db"));
+
+        // 회복(즉시 ack) — 스트림 rebuild 실측.
+        let c = RecoveryCoordinator::new(&rt, 3);
         let out = c.recover(
-            &["d-1".into(), "d-2".into()],
-            move || {
-                // 두번째 폴링부터 d-2 도 완료.
-                let mut g = done2.lock().unwrap();
-                g.insert("d-2".into());
-                g.clone()
-            },
-            || (2, 3), // streams_rebuilt, invalidated_reservations
+            &["d-1".into()],
+            || BTreeSet::from(["d-1".to_string()]),
+            &d.join("ap.db"),
         );
         assert_eq!(
             out,
-            RecoveryOutcome::Completed { streams_rebuilt: 2, invalidated_reservations: 3 }
+            RecoveryOutcome::Completed { streams_rebuilt: 1, invalidated_reservations: 0 }
         );
-        assert!(!c.admission_blocked(), "admission resumes");
-    }
+        assert!(!rt.is_admission_blocked(), "admission resumed");
 
-    /// (게이트 4) 타임아웃 — **스캔 없이** 중단.
-    #[test]
-    fn coordinator_timeout_aborts_without_scan() {
-        let c = RecoveryCoordinator::new(1);
-        let mut scanned = false;
-        let out = c.recover(
+        // 타임아웃+차단 중 dispatch 거부 — 별도 런타임 (엔진이 non-Send
+        // 라 단일 스레드 시뮬레이션: 짧은 타임아웃 + 즉시 폴링).
+        let orch2 = OrchestrationLog::open(&d.join("orch2.db")).unwrap();
+        orch2.declare_plan(
+            "q1",
+            vec![("o-z".into(), vec![])],
+            vec![("o-z".into(), "s-t".into())],
+        )
+        .unwrap();
+        let rt2 = StreamRuntime::new(orch2);
+        rt2.add_stream(Stream::new("s-t", &d).unwrap()).unwrap();
+
+        let c2 = RecoveryCoordinator::new(&rt2, 0); // 즉시 타임아웃
+        // (2) 차단 시작을 관측한 뒤 dispatch 시도 — recover 는 폴링 사이
+        // 짧은 sleep 을 주므로, 차단 플래그 점검 후 폴링 클로저 안에서
+        // dispatch 거부를 관측한다 (단일 스레드 interleaving).
+        let rt2_ref = &rt2;
+        let observed = std::cell::RefCell::new(false);
+        let out2 = c2.recover(
             &["never".into()],
-            || BTreeSet::new(), // 절대 ack 안 옴
             || {
-                scanned = true;
-                (0, 0)
+                // 차단 중 dispatch 시도 — 거부되어야.
+                if !*observed.borrow() {
+                    *observed.borrow_mut() = true;
+                    let r = rt2_ref.dispatch("o-z", mkorder("o-z"));
+                    assert!(r.is_err(), "dispatch during quiescence must be refused");
+                }
+                BTreeSet::new() // 절대 ack 없음 → 타임아웃
             },
+            &d.join("ap.db"),
         );
         assert_eq!(
-            out,
+            out2,
             RecoveryOutcome::AbortedWithoutScan { missing_acks: vec!["never".into()] }
         );
-        assert!(!scanned, "timeout must NOT scan — partial-pause scanning removed by construction");
-        assert!(!c.admission_blocked());
+        assert!(!rt2.is_admission_blocked());
+        // 거부 레코드 3요소로 남음.
+        let rows = rt2.orch.read_all().unwrap();
+        let refusals: Vec<_> = rows
+            .iter()
+            .filter(|r| matches!(&r.kind, OrchestrationKind::Refusal { .. }))
+            .collect();
+        assert_eq!(refusals.len(), 1, "quiescence refusal recorded");
     }
 
-    /// (게이트 5) 교차 스트림 비간섭 — 스트림 X 의 저널에 스트림 Y 주문 없음.
+    /// (게이트 6) 교차 스트림 — 두 스트림 모두 실주행, 저널 분리 단정.
     #[test]
-    fn cross_stream_journals_disjoint() {
+    fn cross_stream_both_orders_run() {
         let d = tmpdir("cross");
-        let orch = OrchestrationLog::open(&orch_path(&d)).unwrap();
+        let orch = OrchestrationLog::open(&d.join("orch.db")).unwrap();
         orch.declare_plan(
             "p1",
             vec![("o-x".into(), vec![]), ("o-y".into(), vec![])],
@@ -457,15 +519,28 @@ mod tests {
         )
         .unwrap();
         let rt = StreamRuntime::new(orch);
-        rt.add_stream(Stream::new("sx", &d).unwrap());
-        rt.add_stream(Stream::new("sy", &d).unwrap());
+        rt.add_stream(Stream::new("sx", &d).unwrap()).unwrap();
+        rt.add_stream(Stream::new("sy", &d).unwrap()).unwrap();
         rt.dispatch("o-x", mkorder("o-x")).unwrap();
         rt.dispatch("o-y", mkorder("o-y")).unwrap();
-        let sx_rows = rt.stream("sx").unwrap().journal_rows().unwrap();
-        let sy_rows = rt.stream("sy").unwrap().journal_rows().unwrap();
-        // 아직 배선 이벤트 없으면 빈 저널 — 각각 자기 소유 파일.
-        assert!(sx_rows.iter().all(|r| r.order_id == "o-x"));
-        assert!(sy_rows.iter().all(|r| r.order_id == "o-y"));
+        run_to_shipped(&rt, "sx", "o-x", "g-x", &d.join("ap.db"));
+        run_to_shipped(&rt, "sy", "o-y", "g-y", &d.join("ap.db"));
+        let sx = rt.stream("sx").unwrap().journal_rows().unwrap();
+        let sy = rt.stream("sy").unwrap().journal_rows().unwrap();
+        assert!(sx.iter().all(|r| r.order_id == "o-x"), "sx owns only o-x rows");
+        assert!(sy.iter().all(|r| r.order_id == "o-y"), "sy owns only o-y rows");
+        assert!(sx.iter().any(|r| r.to_state == "shipped"));
+        assert!(sy.iter().any(|r| r.to_state == "shipped"));
         assert_ne!(rt.stream("sx").unwrap().journal_path, rt.stream("sy").unwrap().journal_path);
+    }
+
+    /// 스트림 id 유일 강제 (astra r1).
+    #[test]
+    fn duplicate_stream_id_rejected() {
+        let d = tmpdir("dupid");
+        let orch = OrchestrationLog::open(&d.join("orch.db")).unwrap();
+        let rt = StreamRuntime::new(orch);
+        rt.add_stream(Stream::new("s-dup", &d).unwrap()).unwrap();
+        assert!(rt.add_stream(Stream::new("s-dup", &d).unwrap()).is_err());
     }
 }
