@@ -76,25 +76,29 @@ pub struct RefusalEntry {
 /// enum 변형 추가 시 이 match 가 누락을 강제하고, VARIANTS 는 이
 /// 함수와 별도로 대조 검증된다(순환 없음).
 pub fn all_codes_exhaustive() -> Vec<RefusalCode> {
-    match RefusalCode::UnsizedSpawn {
-        RefusalCode::UnsizedSpawn
-        | RefusalCode::UndeclaredOrder
-        | RefusalCode::DeclarationCycle
-        | RefusalCode::MissingPredecessor
-        | RefusalCode::DuplicateDeclaration
-        | RefusalCode::HandoffMismatch
-        | RefusalCode::GateBypass
-        | RefusalCode::PresetInvalid => vec![
-            RefusalCode::UnsizedSpawn,
-            RefusalCode::UndeclaredOrder,
-            RefusalCode::DeclarationCycle,
-            RefusalCode::MissingPredecessor,
-            RefusalCode::DuplicateDeclaration,
-            RefusalCode::HandoffMismatch,
-            RefusalCode::GateBypass,
-            RefusalCode::PresetInvalid,
-        ],
+    // (astra r4 최종) 컴파일러 전수 강제 + 나열 일체형: 매크로로 각
+    // 변형을 한 번만 언급 — 더미 match 가 비전수면 컴파일 오류, vec!
+    // 나열은 같은 매크로 토큰에서 생성(분리된 두 목록이 아님).
+    macro_rules! codes {
+        ($($v:ident),* $(,)?) => {{
+            fn assert_exhaustive(c: RefusalCode) {
+                match c {
+                    $(RefusalCode::$v => ()),*
+                }
+            }
+            vec![$(RefusalCode::$v),*]
+        }};
     }
+    codes!(
+        UnsizedSpawn,
+        UndeclaredOrder,
+        DeclarationCycle,
+        MissingPredecessor,
+        DuplicateDeclaration,
+        HandoffMismatch,
+        GateBypass,
+        PresetInvalid,
+    )
 }
 
 /// registry — all_codes_exhaustive 에서 파생.
@@ -237,12 +241,11 @@ mod tests {
             .join("presets/README.md");
         let md = std::fs::read_to_string(&path).unwrap();
         for r in &rows {
-            // 각 코드의 행이 README 에 존재 (전체 표가 아닌 행 단위 대조 —
-            // README 가 표를 재배열할 자유는 둔다).
-            let code = r.split('|').nth(1).unwrap().trim().to_string();
+            // (astra r4 강화) 전체 행 대조 — 이유·조건·재디에이션까지
+            // 드리프트하면 실패 (코드 셀만이 아니라).
             assert!(
-                md.contains(&format!("| {code} |")),
-                "README.md missing diagnostics row for {code} — regenerate from readme_diagnostic_rows()"
+                md.contains(r.as_str()),
+                "README.md missing full diagnostics row '{r}' — regenerate from readme_diagnostic_rows()"
             );
         }
     }
