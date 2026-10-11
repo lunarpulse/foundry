@@ -69,6 +69,17 @@ pub struct OrchRow {
 }
 
 const GENESIS: &str = "GENESIS";
+
+/// (T61 astra r5) 테스트 전용 크래시 훅 — INSERT 직후(COMMIT 전) 호출.
+/// 크래시 주입 테스트만 설정; 프로덕션 경로는 항상 None.
+#[cfg(test)]
+fn test_crash_hook() -> Option<std::sync::Arc<dyn Fn() + Send + Sync>> {
+    TEST_CRASH_HOOK.lock().unwrap().clone()
+}
+
+#[cfg(test)]
+static TEST_CRASH_HOOK: std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>> =
+    std::sync::Mutex::new(None);
 const DOMAIN_LABEL: &[u8] = b"foundry-orch-chain-v1\0";
 
 fn row_hash(seq: i64, prev: &str, kind_json: &str) -> String {
@@ -294,6 +305,12 @@ impl OrchestrationLog {
         let seq: i64 = conn
             .query_row("SELECT last_insert_rowid()", [], |r| r.get(0))
             .map_err(|e| OrchError::Io(e.to_string()))?;
+        // (T61 astra r5) 테스트 전용 크래시 훅 — INSERT 후 커밋 전 창.
+        // cfg(test) 로만 존재(프로덕션 바이너리에 부재).
+        #[cfg(test)]
+        if let Some(hook) = test_crash_hook() {
+            hook();
+        }
         let hash = row_hash(seq, &prev, &payload);
         conn.execute(
             "UPDATE orch SET hash = ?1 WHERE seq = ?2",
