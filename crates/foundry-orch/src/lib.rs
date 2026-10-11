@@ -243,6 +243,19 @@ impl OrchestrationLog {
         self.append_validated(kind, |_| Ok(()))
     }
 
+    /// (T59 astra r5) 공개 진입점 — 외부(체이너)가 검증+append 를
+    /// 단일 트랜잭션으로 수행한다(재디에이션 연결의 원자성).
+    pub fn append_with_validation<F>(
+        &self,
+        kind: OrchestrationKind,
+        validate: F,
+    ) -> Result<OrchRow, OrchError>
+    where
+        F: FnOnce(&[OrchRow]) -> Result<(), OrchError>,
+    {
+        self.append_validated(kind, validate)
+    }
+
     /// (astra r2 M1) 검증+append 를 단일 BEGIN IMMEDIATE 안에서 — 쓰기
     /// 잠금 선점 후 검증이 직렬화되어 동시 선언의 유일성 검사 경쟁
     /// (TOCTOU)을 원천 차단한다. 검증 클로저는 잠긴 커넥션의 행

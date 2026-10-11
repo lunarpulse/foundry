@@ -452,15 +452,41 @@ impl<'o, 'a> Chainer<'o, 'a> {
         let code = parse_refusal_code(refusal_code);
         let entry = crate::refusal::entry_for(code);
         let proposal_id = format!("rem-{refusal_seq}");
-        // 연결의 내구화 — 같은 코드의 자기-거부 형태가 아닌, 전용 표식
-        // 거부 행으로 기록(증거 배제는 선언 순수성이 유지 — refusal 행).
-        crate::refusal::record_refusal(
-            self.log,
-            code,
-            &format!("rem-link-{refusal_seq}"),
-            Some(&proposal_id),
-        )
-        .map_err(|e| ChainerError::Log(format!("{e:?}")))?;
+        // (astra r5) 연결의 내구화 — **원자적 검증+append**: BEGIN IMMEDIATE
+        // 안에서 연결 부재를 재확인 후 append — 동시 재디에이션 호출이
+        // 둘 다 성립하는 경쟁을 차단한다.
+        let link_req = format!("rem-link-{refusal_seq}");
+        self.log
+            .append_with_validation(
+                crate::OrchestrationKind::Refusal {
+                    refused_request: link_req,
+                    refusal_code: format!("{code:?}"),
+                    reason_text: entry.reason_text.into(),
+                    acceptance_condition: entry.acceptance_condition.into(),
+                    remediation_proposal_id: Some(proposal_id.clone()),
+                },
+                |rows_now| {
+                    // 트랜잭션 내 재검증 — 연결 행·원 행의 직접 연결 부재.
+                    let already = rows_now.iter().any(|r| match &r.kind {
+                        crate::OrchestrationKind::Refusal {
+                            refused_request, ..
+                        } => refused_request == &format!("rem-link-{refusal_seq}"),
+                        _ => false,
+                    });
+                    if already {
+                        return Err(crate::OrchError::DuplicateDeclaration {
+                            plan_id: format!("remediation already linked: {refusal_seq}"),
+                        });
+                    }
+                    Ok(())
+                },
+            )
+            .map_err(|e| match e {
+                crate::OrchError::DuplicateDeclaration { .. } => {
+                    ChainerError::RemediationAlreadyProposed { refusal_seq }
+                }
+                other => ChainerError::Log(format!("{other:?}")),
+            })?;
         Ok((proposal_id, entry.remediation))
     }
 
