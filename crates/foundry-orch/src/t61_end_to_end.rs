@@ -198,19 +198,22 @@ fn t61_end_to_end_reentry_bypass_crash_rebuild() {
     ));
 
     // "수락 → 작업 수행" — **재디에이션 작업 자체가 Foundry 주문**:
-    // RunSizing = 새 사이징 주문 sz-2 를 정문(dispatch)으로 실행.
+    // RunSizing = 새 사이징 주문을 정문(dispatch)으로 실행. 주문 id 는
+    // **제안 pid("rem-…")** — 재디에이션 작업 주문 자신이 깊이 규율의
+    // 대상이다(그 주문의 거부는 재제안 불가).
+    let rem_order_id = pid.clone(); // "rem-{refusal_seq}"
     orch.declare_plan(
         "plan-rem-work",
-        vec![("sz-2".into(), vec![])],
-        vec![("sz-2".into(), "s-sizing".into())],
+        vec![(rem_order_id.clone(), vec![])],
+        vec![(rem_order_id.clone(), "s-sizing".into())],
     )
     .unwrap();
-    rt.dispatch("sz-2", mkorder("sz-2", true)).unwrap();
-    autonomous_to_gate(&rt, "s-sizing", "sz-2", "t61-rw");
+    rt.dispatch(&rem_order_id, mkorder(&rem_order_id, true)).unwrap();
+    autonomous_to_gate(&rt, "s-sizing", &rem_order_id, "t61-rw");
     {
         let mut ap2 = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
-        ap2.issue_grant("sizing-sz-2", "tok-human2", &serde_json::json!({
-            "order_id": "sz-2", "intent": "sizing", "artifact_digest": digest, "root_scope": "",
+        ap2.issue_grant(&format!("sizing-{rem_order_id}"), "tok-human2", &serde_json::json!({
+            "order_id": rem_order_id.clone(), "intent": "sizing", "artifact_digest": digest, "root_scope": "",
         }))
         .unwrap();
     }
@@ -220,10 +223,10 @@ fn t61_end_to_end_reentry_bypass_crash_rebuild() {
         let mut hook = foundry_workflow::ApprovalLedgerAdapter(
             foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
         );
-        let grant = foundry_workflow::GrantRef { grant_id: "sizing-sz-2".into() };
+        let grant = foundry_workflow::GrantRef { grant_id: format!("sizing-{rem_order_id}") };
         let out = eng
             .dispatch_live(
-                "sz-2",
+                &rem_order_id,
                 "t61-rw",
                 &OrderEvent::Approved { intent: "sizing".into(), artifact_digest: digest.clone() },
                 1,
@@ -233,15 +236,15 @@ fn t61_end_to_end_reentry_bypass_crash_rebuild() {
             .unwrap();
         assert_eq!(out, Outcome::Applied, "remediation work order approved live");
     }
-    // 재디에이션 작업 완결 — sz-2 승인(새 증거)으로 preset_bound 결속.
-    ch.bind_preset_from_ledger("sz-2", "bmad-epic-build", "plan-epic").unwrap();
+    // 재디에이션 작업 완결 — rem 작업 승인(새 증거)으로 preset_bound 결속.
+    ch.bind_preset_from_ledger(&rem_order_id, "bmad-epic-build", "plan-epic").unwrap();
 
     // 재입장 — **같은 원 요청(t-1)을 같은 정문(dispatch)으로 재시도**,
     // 전량 재평가(선언·바인딩·목적지) 통과.
     ch.reenter(
         "t-1",
         "ext:src/t61",
-        Some("sz-2"),
+        Some(&rem_order_id),
         Some(&digest),
         "plan-epic",
         "bmad-epic-build",
@@ -249,9 +252,19 @@ fn t61_end_to_end_reentry_bypass_crash_rebuild() {
     .unwrap();
     // A 고쳐도 B — 미선언 주문의 재입장은 여전히 거부(DeclarationMissing).
     assert!(matches!(
-        ch.reenter("t-undeclared", "ext:x", Some("sz-2"), Some(&digest), "plan-epic", "bmad-epic-build"),
+        ch.reenter("t-undeclared", "ext:x", Some(&rem_order_id), Some(&digest), "plan-epic", "bmad-epic-build"),
         Err(ChainerError::DeclarationMissing { .. })
     ));
+
+    // (깊이 규율 종단) 재디에이션 작업 주문 자신의 거부 — 재제안 불가.
+    crate::refusal::record_refusal(&orch, RefusalCode::NotReady, &rem_order_id, None).unwrap();
+    let rem_ref_seq = orch.read_all().unwrap().iter()
+        .find(|r| matches!(&r.kind, OrchestrationKind::Refusal { refused_request, .. } if refused_request == &rem_order_id))
+        .unwrap().seq;
+    assert!(matches!(
+        ch.propose_remediation(rem_ref_seq),
+        Err(ChainerError::RemediationDepth { .. })
+    ), "remediation of a remediation refused (depth 1)");
 
     // ── (5) 방화벽 — 종단에서도 재생 Approved 거부 (t-1 게이트에서).
     rt.dispatch("t-1", mkorder("t-1", false)).unwrap();
@@ -351,7 +364,7 @@ fn t61_end_to_end_reentry_bypass_crash_rebuild() {
     ch2.reenter(
         "t-1",
         "ext:src/t61",
-        Some("sz-2"),
+        Some(&rem_order_id),
         Some(&digest),
         "plan-epic",
         "bmad-epic-build",
@@ -360,7 +373,7 @@ fn t61_end_to_end_reentry_bypass_crash_rebuild() {
     // 거부 행·preset_bound·재디에이션 연결이 재생에서 보존.
     let rows2 = orch2.read_all().unwrap();
     assert!(rows2.iter().any(|r| matches!(&r.kind, OrchestrationKind::Refusal { refusal_code, .. } if refusal_code == "UnsizedSpawn")));
-    assert!(rows2.iter().any(|r| matches!(&r.kind, OrchestrationKind::PresetBound { sizing_order, .. } if sizing_order == "sz-2")));
+    assert!(rows2.iter().any(|r| matches!(&r.kind, OrchestrationKind::PresetBound { sizing_order, .. } if sizing_order == &rem_order_id)));
     // read_all 자체가 체인 검증 포함 — 변조 없음이 곧 동등 증명.
     // 행 수 동일.
     assert_eq!(rows2.len(), rows.len(), "rebuild sees identical log");
