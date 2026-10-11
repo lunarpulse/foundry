@@ -174,13 +174,21 @@ impl StreamRuntime {
         }
     }
 
-    /// 스트림 등록 — **id 유일 강제** (astra r1: 중복 id 거부).
+    /// 스트림 등록 — **id 유일 ∧ 저널 경로 유일** 강제. (astra r7 b):
+    /// 생성 후 id 를 바꿔 같은 저널 파일을 공유하는 우회는 파일 경로
+    /// 단위 검사가 차단한다.
     pub fn add_stream(&self, stream: Stream) -> Result<(), String> {
         let mut g = self.streams.lock().unwrap();
         if g.iter().any(|s| s.stream_id == stream.stream_id) {
             return Err(format!(
                 "stream '{}' already registered — ids are unique",
                 stream.stream_id
+            ));
+        }
+        if g.iter().any(|s| s.journal_path == stream.journal_path) {
+            return Err(format!(
+                "journal '{}' already owned by another stream — journals are 1:1",
+                stream.journal_path.display()
             ));
         }
         g.push(Arc::new(stream));
@@ -697,6 +705,23 @@ mod tests {
         }
         s.unfence();
         assert!(s.engine_if_unfenced().is_ok());
+    }
+
+    /// (astra r7 b) 저널 경로 유일 — 생성 후 id 를 바꿔 같은 저널을
+    /// 공유하려는 등록 거부.
+    #[test]
+    fn renamed_stream_sharing_journal_rejected() {
+        let d = tmpdir("alias");
+        let orch = OrchestrationLog::open(&d.join("orch.db")).unwrap();
+        let rt = StreamRuntime::new(orch);
+        let mut a = Stream::new("a", &d).unwrap();
+        rt.add_stream(a).unwrap();
+        // 'a' 로 만든 뒤 id 를 'b' 로 바꿔 재등록 — 같은 저널 파일 공유 시도.
+        let mut b = Stream::new("a", &d).unwrap();
+        b.stream_id = "b".into();
+        let err = rt.add_stream(b);
+        assert!(err.is_err(), "journal aliasing must be rejected");
+        assert!(err.unwrap_err().contains("1:1"));
     }
 
     /// 스트림 id 유일 강제 (astra r1).
