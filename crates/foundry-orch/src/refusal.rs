@@ -72,9 +72,34 @@ pub struct RefusalEntry {
     pub remediation: RemediationKind,
 }
 
-/// 전수 조회 — entry_for (전수 match) 에서 파생 (astra r1 M4: 단일 소스).
+/// 전수 조회 — **전수 match 가 단일 정의** (astra r3 M4: 순환 제거).
+/// enum 변형 추가 시 이 match 가 누락을 강제하고, VARIANTS 는 이
+/// 함수와 별도로 대조 검증된다(순환 없음).
+pub fn all_codes_exhaustive() -> Vec<RefusalCode> {
+    match RefusalCode::UnsizedSpawn {
+        RefusalCode::UnsizedSpawn
+        | RefusalCode::UndeclaredOrder
+        | RefusalCode::DeclarationCycle
+        | RefusalCode::MissingPredecessor
+        | RefusalCode::DuplicateDeclaration
+        | RefusalCode::HandoffMismatch
+        | RefusalCode::GateBypass
+        | RefusalCode::PresetInvalid => vec![
+            RefusalCode::UnsizedSpawn,
+            RefusalCode::UndeclaredOrder,
+            RefusalCode::DeclarationCycle,
+            RefusalCode::MissingPredecessor,
+            RefusalCode::DuplicateDeclaration,
+            RefusalCode::HandoffMismatch,
+            RefusalCode::GateBypass,
+            RefusalCode::PresetInvalid,
+        ],
+    }
+}
+
+/// registry — all_codes_exhaustive 에서 파생.
 pub fn registry() -> Vec<RefusalEntry> {
-    RefusalCode::VARIANTS.iter().map(|c| entry_for(*c)).collect()
+    all_codes_exhaustive().into_iter().map(entry_for).collect()
 }
 
 /// 코드로 항목 조회 — **전수 match** (astra r1 M4): 새 코드 추가 시
@@ -192,15 +217,33 @@ mod tests {
         for e in &all {
             assert!(seen.insert(e.code), "{:?} duplicated", e.code);
         }
+        // (astra r3 M4) 비순환 대조 — 수동 VARIANTS 와 전수 match 나열이
+        // 정확히 일치(양쪽 집합 동일). 어느 한쪽만 새 코드를 추가해도 실패.
+        let exhaustive: std::collections::HashSet<RefusalCode> =
+            all_codes_exhaustive().into_iter().collect();
+        let manual: std::collections::HashSet<RefusalCode> =
+            RefusalCode::VARIANTS.iter().copied().collect();
+        assert_eq!(exhaustive, manual, "VARIANTS and exhaustive match must agree");
     }
 
-    /// (astra r2 M4) README 파생 — 문서 생성기가 모든 코드의 행을 만든다.
+    /// (astra r3 M4) README 실배선 — presets/README.md 의 거부 코드 진단
+    /// 표가 레지스트리 생성과 일치해야 한다(드리프트 감지).
     #[test]
-    fn readme_diagnostic_rows_cover_all() {
+    fn readme_refusal_table_matches_registry() {
         let rows = readme_diagnostic_rows();
-        assert_eq!(rows.len(), RefusalCode::VARIANTS.len());
+        assert_eq!(rows.len(), all_codes_exhaustive().len());
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap()
+            .join("presets/README.md");
+        let md = std::fs::read_to_string(&path).unwrap();
         for r in &rows {
-            assert!(r.starts_with("| `") && r.contains('|'), "malformed row: {r}");
+            // 각 코드의 행이 README 에 존재 (전체 표가 아닌 행 단위 대조 —
+            // README 가 표를 재배열할 자유는 둔다).
+            let code = r.split('|').nth(1).unwrap().trim().to_string();
+            assert!(
+                md.contains(&format!("| {code} |")),
+                "README.md missing diagnostics row for {code} — regenerate from readme_diagnostic_rows()"
+            );
         }
     }
 

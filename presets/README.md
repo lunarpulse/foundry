@@ -79,3 +79,20 @@ feature-prd의 `prd-review`.
 5. policy_digest: `""` (v3는 policy 객체 사용)
 6. 검증: `load_preset` → `validate(frozen_v1)` 통과 확인
 7. 배포: preset_pin.rs에 핀 추가 + 게이트 통과
+
+## 거부 코드 진단 (M7 — foundry-orch refusal 레지스트리에서 생성)
+
+거부는 진단이다: 모든 인간 대면 거부는 이유·수락 조건·재디에이션을 동반한다.
+이 표는 `foundry_orch::refusal::readme_diagnostic_rows()` 생성값과 일치해야 한다
+(테스트 `readme_refusal_table_matches_registry`가 대조).
+
+| 코드 | 이유 | 수락 조건 | 재디에이션 |
+|---|---|---|---|
+| `UnsizedSpawn` | 사이징 승인 없이 발행된 주문입니다 | 사이징 게이트에서 프리셋이 확정되어야 합니다 (preset_bound) | `RunSizing` |
+| `UndeclaredOrder` | 계획 선언 없는 주문입니다 | plan_declared 행이 이 주문을 포함해야 합니다 | `DeclarePlan` |
+| `DeclarationCycle` | 선언의 의존성에 사이클이 있습니다 | 의존성 간선이 비순환이어야 합니다 | `Escalate` |
+| `MissingPredecessor` | 존재하지 않는 선행 주문을 참조합니다 | 선행 주문이 (같은 선언 안에) 먼저 선언되어야 합니다 | `DeclarePlan` |
+| `DuplicateDeclaration` | 같은 계획이 두 번 선언되었습니다 | 기존 선언을 갱신하거나 새 plan id 를 사용해야 합니다 | `DeclarePlan` |
+| `HandoffMismatch` | 핸드오프 매니페스트가 로그·원장과 일치하지 않습니다 | 매니페스트가 가리키는 로그 행 기준으로 재결속되어야 합니다 | `RebindHandoff` |
+| `GateBypass` | 승인이 게이트를 우회하려 했습니다 (방화벽) | 인간 게이트(dispatch_live + grant)가 유일한 승인 경로입니다 | `Escalate` |
+| `PresetInvalid` | 프리셋이 검증기를 통과하지 못했습니다 | 검증기 진단(예: Prepare 배치·default_route)이 해소되어야 합니다 | `Escalate` |

@@ -156,6 +156,16 @@ impl Drop for TxGuard<'_> {
 }
 
 /// 로그 — sqlite 해시체인 저장소.
+///
+/// ## 쓰기 모델 (astra r3 조건 문서화)
+/// 모든 공개 쓰기 진입점은 **오케스트레이션 코디네이터(단일 소유자)**
+/// 를 통해서만 호출된다 — declare_plan/spawn_order/bind_handoff/
+/// append_preset_bound 의 외부 검증(트랜잭션 밖 사전 검사)은 이
+/// 단일-작성자 전제 하에 안전하다(선언은 불변·주문 id 전역 유일이라
+/// 사전 검사와 append 사이에 무효화되는 전제가 없다). declare_plan 의
+/// 유일성 재검증은 BEGIN IMMEDIATE 안에서 트랜잭션적으로 수행된다.
+/// 다중 작성자가 필요해지면 모든 쓰기를 append_validated 경유로
+/// 이관해야 한다.
 pub struct OrchestrationLog {
     conn: std::sync::Mutex<rusqlite::Connection>,
 }
