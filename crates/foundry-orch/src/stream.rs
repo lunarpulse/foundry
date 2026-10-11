@@ -24,12 +24,11 @@ use std::sync::{Arc, Mutex};
 
 /// 스트림 핸들 — 저널 파일과 엔진을 1:1로 소유.
 pub struct Stream {
-    /// 불변 identity — 생성 후 재배정 불가(필드는 pub여도 String 교체는
-    /// 소유자만 가능; 등록 이후 Stream은 Arc 로만 공유되므로 재결속 경로
-    /// 없다). (astra r3: add_stream 이후 재등록은 id 유일 검사가 차단).
-    pub stream_id: String,
-    /// 불변 저널 경로 — id 에서만 파생.
-    pub journal_path: PathBuf,
+    /// (astra r8) 불변 identity — **비공개**, 생성자에서만 설정. 접근은
+    /// id()/journal() 접근자로만(재지정·경로 스왑 우회 원천 차단).
+    stream_id: String,
+    /// (astra r8) 불변 저널 경로 — 비공개, id 에서만 파생.
+    journal_path: PathBuf,
     engine: Mutex<WorkflowEngine>,
     /// 이 스트림이 디스패치한 주문 (이중 디스패치 방지).
     dispatched: Mutex<BTreeSet<String>>,
@@ -72,6 +71,16 @@ impl Stream {
             dispatched: Mutex::new(BTreeSet::new()),
             fenced: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// 불변 identity 접근자.
+    pub fn id(&self) -> &str {
+        &self.stream_id
+    }
+
+    /// 불변 저널 경로 접근자.
+    pub fn journal(&self) -> &Path {
+        &self.journal_path
     }
 
     /// 펜스 — 회복 실패한 스트림은 디스패치를 거부한다(다음 회복 성공
@@ -678,7 +687,7 @@ mod tests {
         assert!(sy.iter().all(|r| r.order_id == "o-y"), "sy owns only o-y rows");
         assert!(sx.iter().any(|r| r.to_state == "shipped"));
         assert!(sy.iter().any(|r| r.to_state == "shipped"));
-        assert_ne!(rt.stream("sx").unwrap().journal_path, rt.stream("sy").unwrap().journal_path);
+        assert_ne!(rt.stream("sx").unwrap().journal(), rt.stream("sy").unwrap().journal());
     }
 
     /// (astra r4) 펜스 — 실패 스트림의 실행 경로 차단·해제.
@@ -707,21 +716,22 @@ mod tests {
         assert!(s.engine_if_unfenced().is_ok());
     }
 
-    /// (astra r7 b) 저널 경로 유일 — 생성 후 id 를 바꿔 같은 저널을
-    /// 공유하려는 등록 거부.
+    /// (astra r7 b + r8) 저널 1:1 — identity/경로 필드는 비공개 불변이므로
+    /// 생성 후 리네임·스왑 자체가 불가능하다. 런타임 회귀: 같은 디렉토리에서
+    /// 같은 id 로 재생성한 스트림 재등록은 id·경로 유일 검사가 모두 차단.
     #[test]
     fn renamed_stream_sharing_journal_rejected() {
         let d = tmpdir("alias");
         let orch = OrchestrationLog::open(&d.join("orch.db")).unwrap();
         let rt = StreamRuntime::new(orch);
-        let mut a = Stream::new("a", &d).unwrap();
-        rt.add_stream(a).unwrap();
-        // 'a' 로 만든 뒤 id 를 'b' 로 바꿔 재등록 — 같은 저널 파일 공유 시도.
-        let mut b = Stream::new("a", &d).unwrap();
-        b.stream_id = "b".into();
-        let err = rt.add_stream(b);
-        assert!(err.is_err(), "journal aliasing must be rejected");
-        assert!(err.unwrap_err().contains("1:1"));
+        rt.add_stream(Stream::new("a", &d).unwrap()).unwrap();
+        // 같은 id 재생성 — id 유일 검사가 차단.
+        let dup_id = rt.add_stream(Stream::new("a", &d).unwrap());
+        assert!(dup_id.is_err());
+        // journal() 접근자는 불변 참조 — 경로 스왑 불가(컴파일러 보장).
+        let a = rt.stream("a").unwrap();
+        assert!(a.journal().ends_with("a.db"));
+        assert_eq!(a.id(), "a");
     }
 
     /// 스트림 id 유일 강제 (astra r1).
