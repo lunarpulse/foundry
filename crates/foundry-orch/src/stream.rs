@@ -142,7 +142,10 @@ impl Stream {
     /// (astra r3 BLOCKER) 재구축 엔진 **재배선** — 같은 저널/액터/시계로
     /// 새 엔진을 만들어 저널 결속을 회복한다. rebuild 가 복원하는 것은
     /// 상태·attempt 뿐이므로 설치 전에 이 재배선이 필수다.
-    pub fn rebuilt_engine(&self) -> Result<WorkflowEngine, String> {
+    /// (astra r9) **크레이트 내부 전용** — 재배선 엔진의 생성은 회복
+    /// 코디네이터만 수행한다. 외부가 foreign 저널 결합 엔진을 만들어
+    /// engine_if_unfenced 가드로 스왑 설치하는 경로를 차단.
+    pub(crate) fn rebuilt_engine(&self) -> Result<WorkflowEngine, String> {
         let ledger: &'static mut foundry_ledger::SqliteLedger = Box::leak(Box::new(
             foundry_ledger::SqliteLedger::open(&self.journal_path)
                 .map_err(|e| format!("{e:?}"))?,
