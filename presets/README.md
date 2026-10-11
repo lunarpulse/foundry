@@ -96,3 +96,6 @@ feature-prd의 `prd-review`.
 | `HandoffMismatch` | 핸드오프 매니페스트가 로그·원장과 일치하지 않습니다 | 매니페스트가 가리키는 로그 행 기준으로 재결속되어야 합니다 | RebindHandoff |
 | `GateBypass` | 승인이 게이트를 우회하려 했습니다 (방화벽) | 인간 게이트(dispatch_live + grant)가 유일한 승인 경로입니다 | Escalate |
 | `PresetInvalid` | 프리셋이 검증기를 통과하지 못했습니다 | 검증기 진단(예: Prepare 배치·default_route)이 해소되어야 합니다 | Escalate |
+| `QuiescenceBlocked` | 회복 정지(quiescence) 중입니다 — 새 디스패치가 차단되었습니다 | 회복 코디네이터의 재개(드레인 완료 또는 타임아웃)를 기다려야 합니다 | Escalate |
+| `NotReady` | 선행 주문이 아직 출하되지 않았습니다 | 의존성 그래프의 선행 주문이 Shipped 여야 합니다 | DeclarePlan |
+| `CheckedIdMismatch` | 디스패치 요청 id가 주문 실제 id와 일치하지 않습니다 | 요청 id와 order.id 가 동일해야 합니다 | Escalate |

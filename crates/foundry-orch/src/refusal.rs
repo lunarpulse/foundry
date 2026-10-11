@@ -30,6 +30,12 @@ pub enum RefusalCode {
     GateBypass,
     /// 프리셋 검증 실패 (v9: 워크플로 문서 계층).
     PresetInvalid,
+    /// (T58 astra r2) 회복 정지 중 입장 차단.
+    QuiescenceBlocked,
+    /// (T58 astra r2) 선행 주문 미출하로 not ready.
+    NotReady,
+    /// (T58 astra r2) dispatch 파라미터 id ≠ order.id.
+    CheckedIdMismatch,
 }
 
 impl RefusalCode {
@@ -45,6 +51,9 @@ impl RefusalCode {
         RefusalCode::HandoffMismatch,
         RefusalCode::GateBypass,
         RefusalCode::PresetInvalid,
+        RefusalCode::QuiescenceBlocked,
+        RefusalCode::NotReady,
+        RefusalCode::CheckedIdMismatch,
     ];
 }
 
@@ -98,6 +107,9 @@ pub fn all_codes_exhaustive() -> Vec<RefusalCode> {
         HandoffMismatch,
         GateBypass,
         PresetInvalid,
+        QuiescenceBlocked,
+        NotReady,
+        CheckedIdMismatch,
     )
 }
 
@@ -148,6 +160,21 @@ pub fn entry_for(code: RefusalCode) -> RefusalEntry {
         RefusalCode::PresetInvalid => (
             "프리셋이 검증기를 통과하지 못했습니다",
             "검증기 진단(예: Prepare 배치·default_route)이 해소되어야 합니다",
+            RemediationKind::Escalate,
+        ),
+        RefusalCode::QuiescenceBlocked => (
+            "회복 정지(quiescence) 중입니다 — 새 디스패치가 차단되었습니다",
+            "회복 코디네이터의 재개(드레인 완료 또는 타임아웃)를 기다려야 합니다",
+            RemediationKind::Escalate,
+        ),
+        RefusalCode::NotReady => (
+            "선행 주문이 아직 출하되지 않았습니다",
+            "의존성 그래프의 선행 주문이 Shipped 여야 합니다",
+            RemediationKind::DeclarePlan,
+        ),
+        RefusalCode::CheckedIdMismatch => (
+            "디스패치 요청 id가 주문 실제 id와 일치하지 않습니다",
+            "요청 id와 order.id 가 동일해야 합니다",
             RemediationKind::Escalate,
         ),
     };

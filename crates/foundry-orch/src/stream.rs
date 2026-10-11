@@ -34,7 +34,21 @@ pub struct Stream {
 impl Stream {
     /// 신규 스트림 — journal_dir/{stream_id}.db 소유.
     pub fn new(stream_id: &str, journal_dir: &Path) -> Result<Self, String> {
-        let journal_path = journal_dir.join(format!("{stream_id}.db"));
+        // (astra r2 identity) id 검증 — 경로 세포 문자/별칭 차단.
+        if stream_id.is_empty()
+            || stream_id.len() > 128
+            || !stream_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(format!(
+                "invalid stream id '{stream_id}' — [A-Za-z0-9_-] up to 128 chars only"
+            ));
+        }
+        let journal_path = journal_dir
+            .canonicalize()
+            .unwrap_or_else(|_| journal_dir.to_path_buf())
+            .join(format!("{stream_id}.db"));
         let ledger: &'static mut foundry_ledger::SqliteLedger = Box::leak(Box::new(
             foundry_ledger::SqliteLedger::open(&journal_path).map_err(|e| format!("{e:?}"))?,
         ));
@@ -183,12 +197,13 @@ impl StreamRuntime {
     /// ready 검사·거부 레코드·발행 기록.
     pub fn dispatch(&self, order_id: &str, order: Order) -> Result<(), String> {
         if self.is_admission_blocked() {
-            let _ = record_refusal(&self.orch, RefusalCode::UndeclaredOrder, order_id, None);
+            let _ = record_refusal(&self.orch, RefusalCode::QuiescenceBlocked, order_id, None);
             return Err(format!(
                 "admission blocked — order '{order_id}' refused during recovery quiescence"
             ));
         }
         if order_id != order.id {
+            let _ = record_refusal(&self.orch, RefusalCode::CheckedIdMismatch, order_id, None);
             return Err(format!(
                 "dispatch id '{order_id}' != order.id '{}' — checked-id must match",
                 order.id
@@ -201,7 +216,7 @@ impl StreamRuntime {
             ));
         };
         if !self.ready_to_start(order_id)? {
-            let _ = record_refusal(&self.orch, RefusalCode::UndeclaredOrder, order_id, None);
+            let _ = record_refusal(&self.orch, RefusalCode::NotReady, order_id, None);
             return Err(format!("order '{order_id}' not ready — predecessors unshipped"));
         }
         let stream = self.stream(&s).ok_or(format!("stream {s} not registered"))?;
@@ -227,10 +242,13 @@ pub struct RecoveryCoordinator<'r> {
 
 #[derive(Debug, PartialEq)]
 pub enum RecoveryOutcome {
-    /// 회복 완료 — 스트림 rebuild 수행됨·무효화된 예약 수.
+    /// 회복 완료 — 재구축 엔진 설치됨·무효화된 예약 수.
     Completed { streams_rebuilt: usize, invalidated_reservations: usize },
     /// 타임아웃 — **스캔 없이** 중단 (부분 정지 스캔 경로 제거).
     AbortedWithoutScan { missing_acks: Vec<String> },
+    /// (astra r2) 스캔/rebuild 실패 — 부분 결과 동반(성공 스트림은
+    /// 이미 교체됨). 입장은 재개됐다.
+    Failed { stage: String, streams_rebuilt: usize, invalidated_reservations: usize },
 }
 
 impl<'r> RecoveryCoordinator<'r> {
@@ -265,30 +283,71 @@ impl<'r> RecoveryCoordinator<'r> {
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        // (4) 전역 원장 스캔 — 의도적 예약 무효화(정지 하).
+        // (4) 전역 원장 스캔 — **1회만**(astra r2: 스트림마다 반복 금지),
+        // 의도적 예약 무효화(정지 하).
         let mut invalidated = 0usize;
-        if let Ok(mut ap) = foundry_approval::ApprovalLedger::open(approval_db) {
-            if let Ok(released) = foundry_approval::ApprovalLedger::recovery_scan(&mut ap) {
-                invalidated = released.len();
+        match foundry_approval::ApprovalLedger::open(approval_db) {
+            Ok(mut ap) => match foundry_approval::ApprovalLedger::recovery_scan(&mut ap) {
+                Ok(released) => invalidated = released.len(),
+                Err(e) => {
+                    // 스캔 실패 — 안전한 상태로 재개하고 실패 보고.
+                    self.runtime.resume_admission();
+                    return RecoveryOutcome::Failed {
+                        stage: format!("scan: {e:?}"),
+                        streams_rebuilt: 0,
+                        invalidated_reservations: 0,
+                    };
+                }
+            },
+            Err(e) => {
+                self.runtime.resume_admission();
+                return RecoveryOutcome::Failed {
+                    stage: format!("ledger open: {e:?}"),
+                    streams_rebuilt: 0,
+                    invalidated_reservations: 0,
+                };
             }
         }
-        // 스트림별 실제 rebuild — RecoveryRunner (원장·저널 verify·신 엔진).
+        // 스트림별 rebuild — RecoveryRunner 로 **재구축 엔진을 스트림에
+        // 설치**(astra r2 BLOCKER: 검사만 하고 버리는 게 아니라 재획득).
+        // 하나라도 실패하면: 실패 스트림까지의 결과를 들고 실패 보고 —
+        // 입장은 재개하되 해당 스트림은 기존 엔진 유지(다음 회복이 재시도).
         let streams = self.runtime.streams.lock().unwrap().clone();
         let mut rebuilt = 0usize;
+        let mut first_failure: Option<String> = None;
         if let Ok(mut ap2) = foundry_approval::ApprovalLedger::open(approval_db) {
             for s in &streams {
-                if let Ok(jr) = foundry_ledger::SqliteLedger::open(&s.journal_path) {
-                    let mut fresh = WorkflowEngine::embedded_default();
-                    if RecoveryRunner::run(&mut ap2, &jr, &mut fresh)
-                        .map(|r| r.journal_verified)
-                        .unwrap_or(false)
-                    {
+                let Ok(jr) = foundry_ledger::SqliteLedger::open(&s.journal_path) else {
+                    first_failure = Some(format!("journal open: {}", s.journal_path.display()));
+                    continue;
+                };
+                let mut fresh = WorkflowEngine::embedded_default();
+                match RecoveryRunner::run(&mut ap2, &jr, &mut fresh) {
+                    Ok(rep) if rep.journal_verified => {
+                        // 재구축 엔진 설치 — 스트림의 활성 엔진을 교체.
+                        let mut guard = s.engine.lock().unwrap();
+                        *guard = fresh;
+                        drop(guard);
                         rebuilt += 1;
+                    }
+                    Ok(_) => {
+                        first_failure =
+                            Some(format!("journal verify failed: {}", s.journal_path.display()));
+                    }
+                    Err(e) => {
+                        first_failure = Some(format!("rebuild: {e:?}"));
                     }
                 }
             }
         }
         self.runtime.resume_admission();
+        if let Some(stage) = first_failure {
+            return RecoveryOutcome::Failed {
+                stage,
+                streams_rebuilt: rebuilt,
+                invalidated_reservations: invalidated,
+            };
+        }
         RecoveryOutcome::Completed { streams_rebuilt: rebuilt, invalidated_reservations: invalidated }
     }
 }
