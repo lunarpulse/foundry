@@ -127,6 +127,19 @@ impl Stream {
         if disp.contains(&oid) {
             return Err(format!("order '{oid}' already dispatched on stream {}", self.stream_id));
         }
+        // (M7.1 리뷰 MAJOR-1) **내구 이중 디스패치 방지** — dispatched 는
+        // 인메모리(크래시 후 소실)이므로 저널 증거로 보강: 이 주문의
+        // 행이 저널에 이미 있으면 재구축 후에도 재디스패치 거부.
+        let journaled = self
+            .journal_rows()
+            .map(|rows| rows.iter().any(|r| r.order_id == oid))
+            .unwrap_or(false);
+        if journaled {
+            return Err(format!(
+                "order '{oid}' already dispatched on stream {} (journal evidence)",
+                self.stream_id
+            ));
+        }
         self.engine.lock().unwrap().enroll(order);
         disp.insert(oid);
         Ok(())

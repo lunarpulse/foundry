@@ -379,6 +379,54 @@ fn t61_end_to_end_reentry_bypass_crash_rebuild() {
     assert_eq!(rows2.len(), rows.len(), "rebuild sees identical log");
 }
 
+/// (M7.1 리뷰 MAJOR-1) 내구 이중 디스패치 — 새 런타임(재구축)에서도
+/// 저널 증거로 재디스패치 거부.
+#[test]
+fn t61_post_rebuild_redispatch_refused() {
+    let d = tmpdir("redispatch");
+    let orch = OrchestrationLog::open(&d.join("orch.db")).unwrap();
+    orch.declare_plan(
+        "plan-rd",
+        vec![("t-rd".into(), vec![])],
+        vec![("t-rd".into(), "s-rd".into())],
+    )
+    .unwrap();
+    let mut ap = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
+    {
+        let digest = crate::chainer::sizing_digest("approved", "bmad-quickloop", "plan-rd");
+        ap.issue_grant("sizing-sz-rd", "tok-rd", &serde_json::json!({
+            "order_id": "sz-rd", "intent": "sizing", "artifact_digest": digest, "root_scope": "",
+        }))
+        .unwrap();
+        let sr = ap.reserve_grant("sizing-sz-rd", &serde_json::json!({
+            "order_id": "sz-rd", "intent": "sizing", "artifact_digest": digest, "root_scope": "",
+        }), "rd", 1).unwrap();
+        ap.begin_apply("sizing-sz-rd", "rd", 1, sr.fence_token).unwrap();
+        ap.finalize_grant("sizing-sz-rd", "rd", 1, sr.fence_token).unwrap();
+        let ch = Chainer::new(&orch, &ap);
+        ch.bind_preset_from_ledger("sz-rd", "bmad-quickloop", "plan-rd").unwrap();
+    }
+    // 1세대 런타임 — dispatch + 게이트 진행(저널에 행 생김).
+    let rt = StreamRuntime::new(OrchestrationLog::open(&d.join("orch.db")).unwrap());
+    rt.add_stream(Stream::new_with_root("s-rd", &d, "bmad-quickloop").unwrap()).unwrap();
+    rt.bind_approval_ledger(
+        foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
+    )
+    .unwrap();
+    rt.dispatch("t-rd", mkorder("t-rd", true)).unwrap();
+    rt.advance_to_gate("s-rd", "t-rd", "exec-rd1").unwrap();
+    // 크래시 — 같은 저널로 2세대 런타임(dispatched 세트 공백).
+    let rt2 = StreamRuntime::new(OrchestrationLog::open(&d.join("orch.db")).unwrap());
+    rt2.add_stream(Stream::new_with_root("s-rd", &d, "bmad-quickloop").unwrap()).unwrap();
+    rt2.bind_approval_ledger(
+        foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
+    )
+    .unwrap();
+    // 재디스패치 — 저널 증거로 거부.
+    let dup = rt2.dispatch("t-rd", mkorder("t-rd", true));
+    assert!(dup.is_err(), "post-rebuild redispatch refused via journal evidence");
+}
+
 /// (M7.1 리뷰 B3) 실행 진입점 — advance_to_gate 가 프로덕션 경로로
 /// 주문을 게이트(승인 대기)에 둔다.
 #[test]
