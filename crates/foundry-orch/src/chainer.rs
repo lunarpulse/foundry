@@ -68,6 +68,25 @@ pub enum SizingVerdict {
 /// 인테이크 부트스트랩 소스 패턴 (H절 — 최초 사이징 주문만).
 pub const INTAKE_SOURCE_PATTERN: &str = "intake:";
 
+/// (T60) 사이징 digest 규약 — "szv1:<outcome>:<root>:<plan>".
+/// 목적지·판정이 승인의 결속 대상(플랜 v9: 프리셋 선택 = 해시 결속).
+/// 라이브 소비(scope_for 4필드 스코프)와 양립하는 유일한 인코딩 자리.
+pub fn sizing_digest(outcome: &str, selected_root: &str, spawn_plan: &str) -> String {
+    format!("szv1:{outcome}:{selected_root}:{spawn_plan}")
+}
+
+fn parse_sizing_digest(digest: &str) -> Option<(String, String, String)> {
+    let rest = digest.strip_prefix("szv1:")?;
+    let mut it = rest.splitn(3, ':');
+    let outcome = it.next()?.to_string();
+    let root = it.next()?.to_string();
+    let plan = it.next()?.to_string();
+    if outcome.is_empty() || root.is_empty() || plan.is_empty() {
+        return None;
+    }
+    Some((outcome, root, plan))
+}
+
 fn is_intake_bootstrap(order_source: &str) -> bool {
     order_source.starts_with(INTAKE_SOURCE_PATTERN)
 }
@@ -347,13 +366,18 @@ impl<'o, 'a> Chainer<'o, 'a> {
         };
         let scope: serde_json::Value = serde_json::from_str(&grant.scope_json)
             .map_err(|e| ChainerError::Ledger(format!("{e:?}")))?;
-        // (astra r8) **정확한 outcome 문자열** 요구 — missing/invalid 는
-        // 승인 아님(부정확한 스코프가 CONSUMED 라도).
-        let outcome = scope
-            .get("sizing_outcome")
+        // (T60 astra r1) digest 사전이미지에서 판정 파생 — 승인은
+        // dispatch_live 를 통해서만 소비되고, 그 스코프는 scope_for 의
+        // 4필드와 정확 일치해야 한다. 따라서 목적지·판정은 digest 안에
+        // 인코딩된다(플랜 v9: "프리셋 선택 자체가 해시 결속 대상").
+        let digest = scope
+            .get("artifact_digest")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        match outcome {
+        let Some((outcome, _root, _plan)) = parse_sizing_digest(digest) else {
+            return Ok(None);
+        };
+        match outcome.as_str() {
             "rejected" => Ok(Some(SizingVerdict::Rejected)),
             "approved" if grant.state == foundry_approval::GrantState::Consumed => {
                 Ok(Some(SizingVerdict::Approved))
@@ -376,10 +400,11 @@ impl<'o, 'a> Chainer<'o, 'a> {
             Some(SizingVerdict::Approved) => {}
             _ => return Err(ChainerError::SizingRejected { order: sizing_order.into() }),
         }
-        // 승인 digest — 그랜트 스코프의 artifact_digest. 그리고
-        // (astra r11 P1) **선택 목적지도 스코프에 인코딩돼 있다**(H절:
-        // "스코프의 digest 안에 선택 목적지 인코딩") — 호출자가 제시한
-        // root/plan 은 스코프 기록과 일치해야 한다(승인 리다이렉션 차단).
+        // 승인 digest — 그랜트 스코프의 artifact_digest. (T60 astra r1)
+        // 목적지는 **digest 사전이미지**에 인코딩 — 라이브 소비 경로
+        // (scope_for 4필드)와 양립하면서 선택이 해시 결속된다. 호출자
+        // 제시 root/plan 은 digest 파생값과 일치해야(리다이렉션 차단,
+        // astra r11 계약 승계).
         let grant = self
             .ledger
             .get_grant(&format!("sizing-{sizing_order}"))
@@ -391,25 +416,20 @@ impl<'o, 'a> Chainer<'o, 'a> {
             .and_then(|v| v.as_str())
             .ok_or_else(|| ChainerError::SizingRejected { order: sizing_order.into() })?
             .to_string();
-        let scope_root = scope
-            .get("selected_root")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ChainerError::SizingRejected { order: sizing_order.into() })?;
-        if scope_root != selected_root {
+        let Some((_outcome, dig_root, dig_plan)) = parse_sizing_digest(&digest) else {
+            return Err(ChainerError::SizingRejected { order: sizing_order.into() });
+        };
+        if dig_root != selected_root {
             return Err(ChainerError::DestinationMismatch {
                 order: sizing_order.into(),
-                expected: scope_root.into(),
+                expected: dig_root,
                 got: selected_root.into(),
             });
         }
-        let scope_plan = scope
-            .get("spawn_plan")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ChainerError::SizingRejected { order: sizing_order.into() })?;
-        if scope_plan != spawn_plan {
+        if dig_plan != spawn_plan {
             return Err(ChainerError::DestinationMismatch {
                 order: sizing_order.into(),
-                expected: scope_plan.into(),
+                expected: dig_plan,
                 got: spawn_plan.into(),
             });
         }
@@ -724,8 +744,9 @@ mod tests {
         let (_d, log, mut ledger) = setup("bind");
         // (astra r7) 사이징 승인 그랜트(규약 id "sizing-s-1") — CONSUMED.
         let sscope = serde_json::json!({
-            "order_id": "s-1", "intent": "sizing", "artifact_digest": "dig-approv",
-            "sizing_outcome": "approved", "root_scope": "intake",
+            "order_id": "s-1", "intent": "sizing",
+            "artifact_digest": crate::chainer::sizing_digest("approved", "root-quick", "plan-1"),
+            "root_scope": "intake",
         });
         ledger.issue_grant("sizing-s-1", "tok-sizing", &sscope).unwrap();
         let r0 = ledger.reserve_grant("sizing-s-1", &sscope, "ex-s", 1).unwrap();
@@ -733,14 +754,16 @@ mod tests {
         ledger.finalize_grant("sizing-s-1", "ex-s", 1, r0.fence_token).unwrap();
         // 사이징 거부 그랜트 — sizing_outcome: rejected.
         let rscope = serde_json::json!({
-            "order_id": "s-rej", "intent": "sizing", "artifact_digest": "d",
-            "sizing_outcome": "rejected", "root_scope": "intake",
+            "order_id": "s-rej", "intent": "sizing",
+            "artifact_digest": crate::chainer::sizing_digest("rejected", "r", "p"),
+            "root_scope": "intake",
         });
         ledger.issue_grant("sizing-s-rej", "tok-r", &rscope).unwrap();
         // (astra r7 회귀용) 미소비 그랜트 — Issued 상태로 방치.
         let iscope = serde_json::json!({
-            "order_id": "s-issued", "intent": "sizing", "artifact_digest": "dig-i",
-            "sizing_outcome": "approved", "root_scope": "intake",
+            "order_id": "s-issued", "intent": "sizing",
+            "artifact_digest": crate::chainer::sizing_digest("approved", "ri", "pi"),
+            "root_scope": "intake",
         });
         ledger.issue_grant("sizing-s-issued", "tok-i", &iscope).unwrap();
         let ch = Chainer::new(&log, &ledger);
@@ -834,8 +857,9 @@ mod tests {
         let (_d, log, mut ledger) = setup("reentry");
         // (astra r7) 사이징 승인 그랜트(규약 id "sizing-s-2") — CONSUMED.
         let sscope = serde_json::json!({
-            "order_id": "s-2", "intent": "sizing", "artifact_digest": "dig-x",
-            "sizing_outcome": "approved", "root_scope": "intake",
+            "order_id": "s-2", "intent": "sizing",
+            "artifact_digest": crate::chainer::sizing_digest("approved", "root-x", "plan-2"),
+            "root_scope": "intake",
         });
         ledger.issue_grant("sizing-s-2", "tok-s2", &sscope).unwrap();
         let r0 = ledger.reserve_grant("sizing-s-2", &sscope, "ex-s2", 1).unwrap();
@@ -869,9 +893,9 @@ mod tests {
         ));
         // 승인 그랜트 — CONSUMED (ch 재생성 앞에 완료).
         let sscope = serde_json::json!({
-            "order_id": "s-9", "intent": "sizing", "artifact_digest": "dig-9",
-            "sizing_outcome": "approved", "root_scope": "intake",
-            "selected_root": "root-9", "spawn_plan": "plan-9",
+            "order_id": "s-9", "intent": "sizing",
+            "artifact_digest": crate::chainer::sizing_digest("approved", "root-9", "plan-9"),
+            "root_scope": "intake",
         });
         ledger.issue_grant("sizing-s-9", "tok-9", &sscope).unwrap();
         let r0 = ledger.reserve_grant("sizing-s-9", &sscope, "ex-9", 1).unwrap();
@@ -879,8 +903,9 @@ mod tests {
         ledger.finalize_grant("sizing-s-9", "ex-9", 1, r0.fence_token).unwrap();
         // 거부된 사이징 그랜트.
         let rscope = serde_json::json!({
-            "order_id": "s-rej9", "intent": "sizing", "artifact_digest": "d",
-            "sizing_outcome": "rejected", "root_scope": "intake",
+            "order_id": "s-rej9", "intent": "sizing",
+            "artifact_digest": crate::chainer::sizing_digest("rejected", "r9", "p9"),
+            "root_scope": "intake",
         });
         ledger.issue_grant("sizing-s-rej9", "tok-r9", &rscope).unwrap();
         let ch = Chainer::new(&log, &ledger);

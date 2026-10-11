@@ -158,38 +158,53 @@ mod t60_scale3_epic {
         .unwrap();
         rt.dispatch("sz-1", mkorder("sz-1", true)).unwrap();
 
-        // 사이징 주문 게이트 도달 — 별도 엔진으로 라이프사이클 구동.
-        let jr: &'static mut foundry_ledger::SqliteLedger = Box::leak(Box::new(
-            foundry_ledger::SqliteLedger::open(&d.join("s-sizing.db")).unwrap(),
-        ));
-        let mut eng = WorkflowEngine::embedded_default();
-        eng.set_ledger(jr, foundry_domain::ActorId {
-            kind: foundry_domain::ActorKind::Agent,
-            source: "t60".into(),
-            id: "sizing".into(),
-        });
-        eng.set_clock(chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap());
-        eng.enroll(mkorder("sz-1", true));
-        eng.acquire("sz-1", "t60-sizing").unwrap();
-        sizing_to_gate(&mut eng, "sz-1", &d.join("s-sizing.db"));
+        // (T60 astra r1 MINOR) 사이징 주문은 **런타임 소유 엔진**으로 구동 —
+        // 메모리 상태·저널이 스트림 소유 그대로다.
+        {
+            let e = rt.stream("s-sizing").unwrap();
+            let mut eng = e.engine_if_unfenced().unwrap();
+            eng.acquire("sz-1", "t60-sizing").unwrap();
+            sizing_to_gate(&mut eng, "sz-1", &d.join("s-sizing.db"));
+        }
 
         // ── (2) 인간 사이징 게이트 — 스케일 3 승인.
         // 그랜트 스코프: 판정 digest + 선택 목적지(root/plan) 인코딩(H절).
         let mut ap = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
-        let sizing_digest = "H(scale3|bmad-epic-build|epic-42)";
-        ap.issue_grant("sizing-sz-1", "tok-sizing-human", &serde_json::json!({
+        // (T60 astra r1) 목적지 인코딩 digest — 라이브 소비 스코프(4필드)와
+        // 양립하는 유일한 인코딩 자리.
+        let sizing_digest = crate::chainer::sizing_digest(
+            "approved", "bmad-epic-build", "plan-epic-42",
+        );
+        // root_scope 는 scope_for 기본("")와 일치 — 라이브 소비용.
+        let sscope = serde_json::json!({
             "order_id": "sz-1", "intent": "sizing", "artifact_digest": sizing_digest,
-            "sizing_outcome": "approved", "root_scope": "intake",
-            "selected_root": "bmad-epic-build", "spawn_plan": "plan-epic-42",
-        }))
-        .unwrap();
-        let sr = ap.reserve_grant("sizing-sz-1", &serde_json::json!({
-            "order_id": "sz-1", "intent": "sizing", "artifact_digest": sizing_digest,
-            "sizing_outcome": "approved", "root_scope": "intake",
-            "selected_root": "bmad-epic-build", "spawn_plan": "plan-epic-42",
-        }), "t60-sizing", 1).unwrap();
-        ap.begin_apply("sizing-sz-1", "t60-sizing", 1, sr.fence_token).unwrap();
-        ap.finalize_grant("sizing-sz-1", "t60-sizing", 1, sr.fence_token).unwrap();
+            "root_scope": "",
+        });
+        ap.issue_grant("sizing-sz-1", "tok-sizing-human", &sscope).unwrap();
+        // **라이브 인간 게이트** — 사이징 주문 FurnaceHold 에서 dispatch_live
+        // 로 승인(그랜트가 정상 경로로 소비된다 — 원장 직접 조작 아님).
+        {
+            let e2 = rt.stream("s-sizing").unwrap();
+            let mut eng = e2.engine_if_unfenced().unwrap();
+            let mut hook = foundry_workflow::ApprovalLedgerAdapter(
+                foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
+            );
+            let grant = foundry_workflow::GrantRef { grant_id: "sizing-sz-1".into() };
+            let out = eng
+                .dispatch_live(
+                    "sz-1",
+                    "t60-sizing",
+                    &OrderEvent::Approved {
+                        intent: "sizing".into(),
+                        artifact_digest: sizing_digest.clone(),
+                    },
+                    1,
+                    Some(&grant),
+                    &mut hook,
+                )
+                .unwrap();
+            assert_eq!(out, Outcome::Applied, "live human sizing approval applies");
+        }
 
         // ── (3) preset_bound — 체이너의 유일 경로(원장 검증+멱등).
         let ch = Chainer::new(&orch, &ap);
@@ -224,11 +239,14 @@ mod t60_scale3_epic {
             "t-2",
             "ext:x",
             Some("sz-1"),
-            Some("WRONG-digest"),
+            Some(&crate::chainer::sizing_digest("approved", "bmad-epic-build", "plan-OTHER")),
             "plan-epic-42",
             "bmad-epic-build",
         );
-        assert!(matches!(r2, Err(ChainerError::DigestMismatch { .. })), "gate2: digest mismatch refused");
+        assert!(
+        matches!(r2, Err(ChainerError::DigestMismatch { .. })),
+        "gate2: digest (destination) mismatch refused"
+    );
 
         // ── (6) 티켓 완주 — t1 후 t2·t3 병렬, 전부 후 t4.
         ticket_to_shipped(&rt, "s-epic", "t-1", "g-t1", &d.join("ap.db"));
@@ -256,6 +274,60 @@ mod t60_scale3_epic {
         assert_eq!(spawned.len(), 5, "sz-1 + 4 tickets spawned");
     }
 
+    /// (T60 astra r1 MAJOR-②) 스케일 1·2·3 **사이징 선택 경로** 실증 —
+    /// 각 스케일로 같은 파이프라인: 그랜트(라이브 소비 스코프) → 체이너
+    /// 결속(원장 검증·digest 목적지 일치) → 발행 허용. 스케일 3 종단은
+    /// 위 대형 시나리오가 담당.
+    #[test]
+    fn sizing_selection_paths_for_all_scales() {
+        for (scale, root, plan) in [
+            ("1", "bmad-quickloop", "plan-scale1"),
+            ("2", "bmad-feature-prd", "plan-scale2"),
+            ("3", "bmad-epic-build", "plan-scale3"),
+        ] {
+            let d = tmpdir(&format!("sel{scale}"));
+            let orch = OrchestrationLog::open(&d.join("orch.db")).unwrap();
+            let mut ap = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
+            let sid = format!("sz-scale{scale}");
+            let digest = crate::chainer::sizing_digest("approved", root, plan);
+            let sscope = serde_json::json!({
+                "order_id": sid.clone(), "intent": "sizing",
+                "artifact_digest": digest.clone(), "root_scope": "",
+            });
+            ap.issue_grant(&format!("sizing-{sid}"), &format!("tok-{scale}"), &sscope).unwrap();
+            let sr = ap.reserve_grant(&format!("sizing-{sid}"), &sscope, "sel", 1).unwrap();
+            ap.begin_apply(&format!("sizing-{sid}"), "sel", 1, sr.fence_token).unwrap();
+            ap.finalize_grant(&format!("sizing-{sid}"), "sel", 1, sr.fence_token).unwrap();
+            // 결속 — 목적지 일치(root/plan).
+            let ch = Chainer::new(&orch, &ap);
+            ch.bind_preset_from_ledger(&sid, root, plan)
+                .unwrap_or_else(|e| panic!("scale {scale} binding failed: {e:?}"));
+            // 발행 허용 — digest(=목적지) 일치.
+            ch.check_spawn_binding(
+                &format!("order-scale{scale}"),
+                "ext:x",
+                Some(&sid),
+                Some(&digest),
+                plan,
+                root,
+            )
+            .unwrap_or_else(|e| panic!("scale {scale} spawn gate failed: {e:?}"));
+            // 목적지 불일치 — 다른 스케일 root 로 발행 시도 거부.
+            let wrong = ch.check_spawn_binding(
+                &format!("order-scale{scale}"),
+                "ext:x",
+                Some(&sid),
+                Some(&digest),
+                plan,
+                "bmad-other-root",
+            );
+            assert!(
+                matches!(wrong, Err(ChainerError::DestinationMismatch { .. })),
+                "scale {scale}: cross-scale redirection refused"
+            );
+        }
+    }
+
     /// 게이트 ③ — 거부된 사이징 후 발행 시도 거부.
     #[test]
     fn rejected_sizing_blocks_epic_spawn() {
@@ -264,9 +336,9 @@ mod t60_scale3_epic {
         let mut ap = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
         // 인간 사이징 거부 — sizing_outcome: rejected.
         ap.issue_grant("sizing-sz-rej", "tok-rej", &serde_json::json!({
-            "order_id": "sz-rej", "intent": "sizing", "artifact_digest": "d",
-            "sizing_outcome": "rejected", "root_scope": "intake",
-            "selected_root": "bmad-epic-build", "spawn_plan": "plan-r",
+            "order_id": "sz-rej", "intent": "sizing",
+            "artifact_digest": crate::chainer::sizing_digest("rejected", "bmad-epic-build", "plan-r"),
+            "root_scope": "",
         }))
         .unwrap();
         let ch = Chainer::new(&orch, &ap);
@@ -277,7 +349,14 @@ mod t60_scale3_epic {
         ));
         // preset_bound 없음 → 발행도 거부(unsized).
         assert!(matches!(
-            ch.check_spawn_binding("t-x", "ext:x", Some("sz-rej"), Some("d"), "plan-r", "bmad-epic-build"),
+            ch.check_spawn_binding(
+            "t-x",
+            "ext:x",
+            Some("sz-rej"),
+            Some(&crate::chainer::sizing_digest("rejected", "bmad-epic-build", "plan-r")),
+            "plan-r",
+            "bmad-epic-build",
+        ),
             Err(ChainerError::SizingRejected { .. })
         ));
         // 로그에 preset_bound 행 없음 단정.
