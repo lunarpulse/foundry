@@ -176,6 +176,9 @@ impl Stream {
 /// 런타임 — 스트림 레지스트리 + 오케스트레이션 로그 + 입장 게이트.
 pub struct StreamRuntime {
     pub orch: Arc<OrchestrationLog>,
+    /// (astra r9 P1) 사이즈 바인딩 검증용 승인 원장 — dispatch가
+    /// Chainer 게이트를 실제 호출한다(unsized-spawn 원천 차단).
+    approval: Mutex<Option<&'static foundry_approval::ApprovalLedger>>,
     streams: Mutex<Vec<Arc<Stream>>>,
     /// (astra r1 결합) 입장 차단 — 코디네이터가 소유.
     admission_blocked: std::sync::atomic::AtomicBool,
@@ -185,9 +188,21 @@ impl StreamRuntime {
     pub fn new(orch: OrchestrationLog) -> Self {
         Self {
             orch: Arc::new(orch),
+            approval: Mutex::new(None),
             streams: Mutex::new(Vec::new()),
             admission_blocked: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// (astra r9 P1) 승인 원장 결속 — 프로세스 수명 원장을 leak 해
+    /// 등록한다(전역 단일 원장 계약, T58과 동일 패턴).
+    pub fn bind_approval_ledger(
+        &self,
+        ledger: foundry_approval::ApprovalLedger,
+    ) -> Result<(), String> {
+        let leaked: &'static foundry_approval::ApprovalLedger = Box::leak(Box::new(ledger));
+        *self.approval.lock().unwrap() = Some(leaked);
+        Ok(())
     }
 
     /// 스트림 등록 — **id 유일 ∧ 저널 경로 유일** 강제. (astra r7 b):
@@ -226,6 +241,44 @@ impl StreamRuntime {
 
     pub fn is_admission_blocked(&self) -> bool {
         self.admission_blocked.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// (astra r9) plan 의 preset_bound 역산 — spawn_plan 이 이 plan 인
+    /// 결속의 sizing_order.
+    fn sizing_of_plan(&self, plan: &str) -> Option<String> {
+        let rows = self.orch.read_all().ok()?;
+        rows.iter().find_map(|r| match &r.kind {
+            OrchestrationKind::PresetBound { sizing_order, spawn_plan, .. }
+                if spawn_plan == plan =>
+            {
+                Some(sizing_order.clone())
+            }
+            _ => None,
+        })
+    }
+
+    fn digest_of_sizing(&self, sizing: &str) -> Option<String> {
+        let rows = self.orch.read_all().ok()?;
+        rows.iter().find_map(|r| match &r.kind {
+            OrchestrationKind::PresetBound { sizing_order, approved_digest, .. }
+                if sizing_order == sizing =>
+            {
+                Some(approved_digest.clone())
+            }
+            _ => None,
+        })
+    }
+
+    fn root_of_sizing(&self, sizing: &str) -> Option<String> {
+        let rows = self.orch.read_all().ok()?;
+        rows.iter().find_map(|r| match &r.kind {
+            OrchestrationKind::PresetBound { sizing_order, selected_root, .. }
+                if sizing_order == sizing =>
+            {
+                Some(selected_root.clone())
+            }
+            _ => None,
+        })
     }
 
     /// 의존성 간선 조회.
@@ -295,6 +348,70 @@ impl StreamRuntime {
                 "order '{order_id}' has no declaration — unsized/undeclared spawn"
             ));
         };
+        // (astra r9 P1) **사이즈 바인딩 게이트** — 발행 전 Chainer 검사.
+        // 원장 미결합이면 fail-closed(바인딩 검증 없는 발행 불가).
+        let ap_guard = self.approval.lock().unwrap();
+        match *ap_guard {
+            None => {
+                let _ = record_refusal(&self.orch, RefusalCode::UnsizedSpawn, order_id, None);
+                return Err(format!(
+                    "order '{order_id}' refused — approval ledger not bound (fail-closed)"
+                ));
+            }
+            Some(ap) => {
+                let ch = crate::chainer::Chainer::new(&self.orch, ap);
+                // 주문 소스 — 인테이크 부트스트랩 판별. 소스가 없으면
+                // 비부트스트랩(보수).
+                let source = match order.external.source {
+                    foundry_domain::order::Source::Cron => format!(
+                        "intake:{}",
+                        order.external.external_id
+                    ),
+                    foundry_domain::order::Source::GitHub => {
+                        format!("ext:{}", order.external.external_id)
+                    }
+                    foundry_domain::order::Source::Jira => {
+                        format!("ext:{}", order.external.external_id)
+                    }
+                };
+                let r = ch.check_spawn_binding(
+                    order_id,
+                    &source,
+                    None, // sizing_order 후보: 로그 preset_bound 에서 역산
+                    None,
+                    &plan,
+                    "preset",
+                );
+                // sizing_order 역산 — 이 plan 의 preset_bound 찾기.
+                let sizing = self.sizing_of_plan(&plan);
+                let r = match sizing {
+                    Some(so) => ch.check_spawn_binding(
+                        order_id,
+                        &source,
+                        Some(&so),
+                        self.digest_of_sizing(&so).as_deref(),
+                        &plan,
+                        self.root_of_sizing(&so).as_deref().unwrap_or("preset"),
+                    ),
+                    None => r,
+                };
+                if let Err(e) = r {
+                    let code = match &e {
+                        crate::chainer::ChainerError::Unsized { .. }
+                        | crate::chainer::ChainerError::BootstrapViolation { .. } => {
+                            RefusalCode::UnsizedSpawn
+                        }
+                        crate::chainer::ChainerError::SizingRejected { .. } => {
+                            RefusalCode::UnsizedSpawn
+                        }
+                        _ => RefusalCode::UnsizedSpawn,
+                    };
+                    let _ = record_refusal(&self.orch, code, order_id, None);
+                    return Err(format!("order '{order_id}' failed sizing binding: {e:?}"));
+                }
+            }
+        }
+        drop(ap_guard);
         if !self.ready_to_start(order_id)? {
             let _ = record_refusal(&self.orch, RefusalCode::NotReady, order_id, None);
             return Err(format!("order '{order_id}' not ready — predecessors unshipped"));
@@ -561,6 +678,10 @@ mod tests {
         .unwrap();
         let rt = StreamRuntime::new(orch);
         rt.add_stream(Stream::new("s-1", &d).unwrap()).unwrap();
+        rt.bind_approval_ledger(
+            foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
+        )
+        .unwrap();
         assert!(rt.ready_to_start("o-a").unwrap());
         assert!(!rt.ready_to_start("o-b").unwrap());
         rt.dispatch("o-a", mkorder("o-a")).unwrap();
@@ -607,6 +728,10 @@ mod tests {
         .unwrap();
         let rt = StreamRuntime::new(orch);
         rt.add_stream(Stream::new("s-c", &d).unwrap()).unwrap();
+        rt.bind_approval_ledger(
+            foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
+        )
+        .unwrap();
 
         // o-a Shipped 까지 — 저널에 rebuild 증거 심기.
         rt.dispatch("o-a", mkorder("o-a")).unwrap();
@@ -684,6 +809,10 @@ mod tests {
         let rt = StreamRuntime::new(orch);
         rt.add_stream(Stream::new("sx", &d).unwrap()).unwrap();
         rt.add_stream(Stream::new("sy", &d).unwrap()).unwrap();
+        rt.bind_approval_ledger(
+            foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
+        )
+        .unwrap();
         rt.dispatch("o-x", mkorder("o-x")).unwrap();
         rt.dispatch("o-y", mkorder("o-y")).unwrap();
         run_to_shipped(&rt, "sx", "o-x", "g-x", &d.join("ap.db"));
