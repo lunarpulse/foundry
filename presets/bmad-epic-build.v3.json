@@ -1,0 +1,78 @@
+{
+  "schema_version": 3,
+  "id": "bmad-epic-build",
+  "body": {
+    "encoding_digest": "enc-frozen-v1",
+    "steps": [
+      {
+        "id": "epic-sm",
+        "event": "Queued",
+        "skill": "sm"
+      },
+      {
+        "id": "epic-po",
+        "event": "DieStarted",
+        "skill": "po"
+      },
+      {
+        "id": "epic-dev",
+        "event": "DieSucceeded",
+        "skill": "dev"
+      },
+      {
+        "id": "epic-qa",
+        "event": "InspectionPassed",
+        "skill": "qa"
+      },
+      {
+        "id": "epic-review",
+        "event": "InspectionPassed"
+      },
+      {
+        "id": "ship-gate",
+        "event": "Approved"
+      }
+    ]
+  },
+  "skills": [
+    {
+      "id": "sm",
+      "digest": "sha256:bmad-sm-1",
+      "kind": "role"
+    },
+    {
+      "id": "po",
+      "digest": "sha256:bmad-po-1",
+      "kind": "role"
+    },
+    {
+      "id": "dev",
+      "digest": "sha256:bmad-dev-1",
+      "kind": "role"
+    },
+    {
+      "id": "qa",
+      "digest": "sha256:bmad-qa-1",
+      "kind": "role"
+    }
+  ],
+  "routing": {
+    "rules": [
+      {
+        "source_pattern": "epic:*",
+        "workflow_id": "bmad-epic-build"
+      }
+    ],
+    "default_route": "bmad-epic-build"
+  },
+  "policy_digest": "",
+  "policy": {
+    "schema_version": 1,
+    "approvals": [
+      {
+        "node_ref": "epic-qa",
+        "level": "prepare"
+      }
+    ]
+  }
+}

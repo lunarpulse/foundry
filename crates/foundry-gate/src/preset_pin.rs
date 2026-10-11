@@ -9,6 +9,8 @@ const BMAD_INTAKE_POOL_SHA256: &str = "9000fa16fd28bcb620738227109ecbb02b469b72f
 const BMAD_QUICKLOOP_SHA256: &str = "7df2e0eb21b2fddc44f867c218af2ad8a4faff0ba38c59ea86fa083468338239";
 /// (B2) 스케일 2 — feature-prd 실측 핀 (74f94be 배포).
 const BMAD_FEATURE_PRD_SHA256: &str = "dfc041578692968eb7ae9e4b5ef0af10c91389b3bf7eb9195fae9c3238af5cee";
+/// (T60) 스케일 3 — epic-build 실측 핀.
+const BMAD_EPIC_BUILD_SHA256: &str = "7bb2bb7c60b3c598e040168c139890898b009db145c51cb86bd1553c62fea907";
 
 fn preset_path() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -50,6 +52,11 @@ fn preset_pin_bmad_quickloop_v3_bytes_frozen() {
 #[test]
 fn preset_pin_bmad_feature_prd_v3_bytes_frozen() {
     assert_preset_pinned("bmad-feature-prd.v3.json", BMAD_FEATURE_PRD_SHA256);
+}
+
+#[test]
+fn preset_pin_bmad_epic_build_v3_bytes_frozen() {
+    assert_preset_pinned("bmad-epic-build.v3.json", BMAD_EPIC_BUILD_SHA256);
 }
 
 #[test]

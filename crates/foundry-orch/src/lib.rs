@@ -642,6 +642,9 @@ pub fn project(rows: &[OrchRow]) -> Projection {
 }
 
 #[cfg(test)]
+mod t60_scale3_epic;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
