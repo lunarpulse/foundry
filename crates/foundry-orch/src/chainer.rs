@@ -635,14 +635,33 @@ impl<'o, 'a> Chainer<'o, 'a> {
             }
         }
         // 바인딩 전량 재검사 — 승인 상태는 원장에서 재산출(전량 재평가).
-        self.check_spawn_binding(
+        // (M7.1 리뷰 MAJOR-3) 결과를 **로그에 기록** — 입장/거부가
+        // 저널 증거로 남는다(검증만 하고 흔적 없는 재입장 폐지).
+        match self.check_spawn_binding(
             order_id,
             order_source,
             sizing_order,
             approval_digest,
             dest_plan,
             dest_root,
-        )
+        ) {
+            Ok(()) => {
+                self.log
+                    .append(OrchestrationKind::ReentryAdmitted {
+                        order: order_id.into(),
+                        dest_plan: dest_plan.into(),
+                    })
+                    .map_err(|e| ChainerError::Log(format!("{e:?}")))?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.log.append(OrchestrationKind::ReentryRefused {
+                    order: order_id.into(),
+                    reason: format!("{e:?}"),
+                });
+                Err(e)
+            }
+        }
     }
 }
 

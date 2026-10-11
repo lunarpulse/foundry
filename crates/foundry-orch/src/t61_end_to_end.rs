@@ -376,8 +376,15 @@ fn t61_end_to_end_reentry_bypass_crash_rebuild() {
     assert!(rows2.iter().any(|r| matches!(&r.kind, OrchestrationKind::Refusal { refusal_code, .. } if refusal_code == "UnsizedSpawn")));
     assert!(rows2.iter().any(|r| matches!(&r.kind, OrchestrationKind::PresetBound { sizing_order, .. } if sizing_order == &rem_order_id)));
     // read_all 자체가 체인 검증 포함 — 변조 없음이 곧 동등 증명.
-    // 행 수 동일.
-    assert_eq!(rows2.len(), rows.len(), "rebuild sees identical log");
+    // 행 수: rows 스냅샷 이후 재입장 입장 기록(M7.1 MAJOR-3)이 추가되므로
+    // +1 이내 동등.
+    assert!(
+        rows2.len() == rows.len() || rows2.len() == rows.len() + 1,
+        "rebuild sees identical log (or +1 reentry-audit row): {} vs {}",
+        rows2.len(), rows.len()
+    );
+    // (M7.1 MAJOR-3) 재입장 결과가 로그에 기록됐다.
+    assert!(rows2.iter().any(|r| matches!(&r.kind, OrchestrationKind::ReentryAdmitted { order, .. } if order == "t-1")));
 }
 
 /// (M7.1 리뷰 MAJOR-2) 거짓 drain 보고 — 원장에 예약이 남아 있는데

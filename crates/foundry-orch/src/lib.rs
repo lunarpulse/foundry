@@ -37,6 +37,16 @@ pub enum OrchestrationKind {
     /// 체이너의 주문 발행 기록.
     OrderSpawned { order_id: String, plan_id: String, stream: String },
     /// 산출물 인계 (매니페스트 digest 는 이 행을 가리킨다).
+    /// (M7.1 리뷰 MAJOR-3) 재입장 입장 기록 — 전량 재평가 통과 증거.
+    ReentryAdmitted {
+        order: String,
+        dest_plan: String,
+    },
+    /// (M7.1 리뷰 MAJOR-3) 재입장 거부 기록 — 사유 동반(감사 가능).
+    ReentryRefused {
+        order: String,
+        reason: String,
+    },
     HandoffBound {
         source_order: String,
         dest_order: String,
@@ -675,6 +685,9 @@ pub fn project(rows: &[OrchRow]) -> Projection {
             }
             OrchestrationKind::OrderSpawned { order_id, plan_id, stream } => {
                 p.spawned.push((order_id.clone(), plan_id.clone(), stream.clone()))
+            }
+            OrchestrationKind::ReentryAdmitted { .. } | OrchestrationKind::ReentryRefused { .. } => {
+                // (M7.1 MAJOR-3) 감사 행 — 프로젝션 대상 아님(원장 행 원문 유지).
             }
             OrchestrationKind::HandoffBound { source_order, dest_order, artifact_digest } => {
                 p.handoffs.push((source_order.clone(), dest_order.clone(), artifact_digest.clone(), r.seq))
