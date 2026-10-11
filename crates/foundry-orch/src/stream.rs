@@ -107,13 +107,9 @@ impl Stream {
         Ok(())
     }
 
-    /// 엔진 접근 — 펜스 시 거부(astra r4: 펜스는 enroll 뿐 아니라 기존
-    /// 주문의 실행 경로(engine 접근)도 차단해 fail-closed 를 완성한다).
-    pub fn engine(&self) -> std::sync::MutexGuard<'_, WorkflowEngine> {
-        self.engine.lock().unwrap()
-    }
-
-    /// 펜스 검사 포함 실행 진입 — 기존 주문의 dispatch_live 등 실행 경로.
+    /// (astra r5) 펜스 검사 포함 실행 진입 — 유일한 엔진 접근 경로.
+    /// 펜스 시 거부: 회복 실패 스트림의 구 엔진이 dispatch_live 등을
+    /// 수행하는 경로를 원천 차단한다(fail-closed).
     pub fn engine_if_unfenced(&self) -> Result<std::sync::MutexGuard<'_, WorkflowEngine>, String> {
         if self.is_fenced() {
             return Err(format!(
@@ -462,7 +458,7 @@ mod tests {
         let mut ap = foundry_approval::ApprovalLedger::open(ap_db).unwrap();
         let e = rt.stream(stream_id).unwrap();
         {
-            let mut eng = e.engine();
+            let mut eng = e.engine_if_unfenced().unwrap();
             eng.acquire(oid, "ex").unwrap();
             for ev in [
                 OrderEvent::Queued,
@@ -489,7 +485,7 @@ mod tests {
         let mut hook = foundry_workflow::ApprovalLedgerAdapter(ap);
         {
             let e2 = rt.stream(stream_id).unwrap();
-            let mut eng = e2.engine();
+            let mut eng = e2.engine_if_unfenced().unwrap();
             let grant = foundry_workflow::GrantRef { grant_id: grant_id.into() };
             let out = eng
                 .dispatch_live(
