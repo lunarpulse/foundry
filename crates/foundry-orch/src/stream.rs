@@ -100,8 +100,9 @@ impl Stream {
     }
 
     /// 주문 등록 — **order.id 본체**로 keyed (astra r1: checked-id 우회
-    /// 제거). 이중 디스패치 거부.
-    pub fn enroll(&self, order: Order) -> Result<(), String> {
+    /// 제거). 이중 디스패치 거부. (T61 astra r1) **크레이트 내부 전용** —
+    /// 등록은 dispatch 정문(입장 차단·사이즈 게이트 경유)만 가능.
+    pub(crate) fn enroll(&self, order: Order) -> Result<(), String> {
         if self.is_fenced() {
             return Err(format!(
                 "stream '{}' is fenced — recovery failed; dispatch refused until next recovery succeeds",

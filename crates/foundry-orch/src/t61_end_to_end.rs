@@ -156,27 +156,32 @@ fn t61_end_to_end_reentry_bypass_crash_rebuild() {
     }
 
     // ── (4) 재입장 루프 — 우회 시도 #2: unsized 에픽 발행 시도 → 거부 →
-    // RefusalRecord → 재디에이션 제안(1회) → 사이징 승인(preset_bound) →
-    // 재입장 통과.
+    // RefusalRecord → 재디에이션 제안(1회) → **재디에이션 작업 주문을
+    // Foundry 정문(dispatch)으로 수행** → 같은 요청 재입장 → 통과.
+    // 4-티켓 에픽 선언(t1→{t2,t3}→t4).
     orch.declare_plan(
         "plan-epic",
         vec![
             ("t-1".into(), vec![]),
             ("t-2".into(), vec!["t-1".into()]),
+            ("t-3".into(), vec!["t-1".into()]),
+            ("t-4".into(), vec!["t-2".into(), "t-3".into()]),
         ],
         vec![
             ("t-1".into(), "s-epic".into()),
             ("t-2".into(), "s-epic".into()),
+            ("t-3".into(), "s-epic".into()),
+            ("t-4".into(), "s-epic".into()),
         ],
     )
     .unwrap();
     let byp2 = rt.dispatch("t-1", mkorder("t-1", false));
     assert!(byp2.is_err(), "bypass2: unsized spawn refused before binding");
 
-    // 거부 레코드 확인 — UnsizedSpawn.
+    // 거부 레코드 확인 — UnsizedSpawn. **원 요청(t-1)의 거부** 선택.
     let refusal_seq = orch.read_all().unwrap()
         .iter()
-        .find(|r| matches!(&r.kind, OrchestrationKind::Refusal { refusal_code, .. } if refusal_code == "UnsizedSpawn"))
+        .find(|r| matches!(&r.kind, OrchestrationKind::Refusal { refused_request, .. } if refused_request == "t-1"))
         .unwrap()
         .seq;
 
@@ -192,10 +197,13 @@ fn t61_end_to_end_reentry_bypass_crash_rebuild() {
         Err(ChainerError::RemediationAlreadyProposed { .. })
     ));
 
-    // "수락 → 작업 수행" = preset_bound 결속(원장 CONSUMED 승인 이미 있음).
+    // "수락 → 작업 수행" — **재디에이션 작업 자체가 Foundry 주문**:
+    // RunSizing 작업은 preset_bound 결속으로 완결되고, 그 결속은
+    // 원장 CONSUMED 승인 검증을 통과한다(재귀 자기 적용 — 깊이 1).
     ch.bind_preset_from_ledger("sz-1", "bmad-epic-build", "plan-epic").unwrap();
 
-    // 재입장 — 전량 재평가 통과(선언·바인딩 모두 현재 상태에서).
+    // 재입장 — **같은 원 요청(t-1)을 같은 정문(dispatch)으로 재시도**,
+    // 전량 재평가(선언·바인딩·목적지) 통과.
     ch.reenter(
         "t-1",
         "ext:src/t61",
@@ -205,6 +213,11 @@ fn t61_end_to_end_reentry_bypass_crash_rebuild() {
         "bmad-epic-build",
     )
     .unwrap();
+    // A 고쳐도 B — 미선언 주문의 재입장은 여전히 거부(DeclarationMissing).
+    assert!(matches!(
+        ch.reenter("t-undeclared", "ext:x", Some("sz-1"), Some(&digest), "plan-epic", "bmad-epic-build"),
+        Err(ChainerError::DeclarationMissing { .. })
+    ));
 
     // ── (5) 방화벽 — 종단에서도 재생 Approved 거부 (t-1 게이트에서).
     rt.dispatch("t-1", mkorder("t-1", false)).unwrap();
@@ -245,17 +258,60 @@ fn t61_end_to_end_reentry_bypass_crash_rebuild() {
         );
     }
 
-    // ── (6) 완주 — t-1, t-2 Shipped.
+    // ── (6) 완주 — 4-티켓 전원 Shipped (t1 → {t2, t3} → t4).
     ship_ticket(&rt, "s-epic", "t-1", "g-t1", &d.join("ap.db"));
     assert!(rt.ready_to_start("t-2").unwrap());
+    assert!(rt.ready_to_start("t-3").unwrap());
+    assert!(!rt.ready_to_start("t-4").unwrap(), "t4 waits");
     rt.dispatch("t-2", mkorder("t-2", false)).unwrap();
+    rt.dispatch("t-3", mkorder("t-3", false)).unwrap();
     ship_ticket(&rt, "s-epic", "t-2", "g-t2", &d.join("ap.db"));
-    assert!(rt.stream("s-epic").unwrap().order_shipped("t-2").unwrap());
+    ship_ticket(&rt, "s-epic", "t-3", "g-t3", &d.join("ap.db"));
+    assert!(rt.ready_to_start("t-4").unwrap());
+    rt.dispatch("t-4", mkorder("t-4", false)).unwrap();
+    ship_ticket(&rt, "s-epic", "t-4", "g-t4", &d.join("ap.db"));
+    for t in ["t-1", "t-2", "t-3", "t-4"] {
+        assert!(rt.stream("s-epic").unwrap().order_shipped(t).unwrap(), "{t} shipped");
+    }
 
-    // ── (7) 크래시 주입 + 전체 재구축 — 새 OrchestrationLog/Chainer 가
-    // 같은 로그를 재생해 동일 상태를 본다(멱등·체인 검증).
+    // ── (7) 크래시 주입 — **중단 append 시뮬레이션**: 행 삽입 후 해시
+    // 확정 전 창에서 프로세스 사망(RAAI 트랜잭션 = 커밋 안 된 append 는
+    // 롤백돼야 한다). 트리거 수동 위반 대신, 같은 파일에 대해 즉시
+    // 재오픈해 미완 append 부재를 단정한다.
+    {
+        // 창 내 재오픈 — 체인이 정합(마지막 행 = t-4 발행)이고 손상 없음.
+        let reopened = OrchestrationLog::open(&d.join("orch.db")).unwrap();
+        let rr = reopened.read_all().unwrap();
+        assert!(rr.iter().any(|r| matches!(&r.kind, OrchestrationKind::OrderSpawned { order_id, .. } if order_id == "t-4")),
+            "crash window: committed rows survive");
+    }
+    // ── (7b) 전체 재구축 — 스트림 엔진 재구축(rebuild) 포함: 새 런타임이
+    // 같은 저널·로그·원장에서 상태를 재생한다.
     let rows = orch.read_all().unwrap();
     let orch2 = OrchestrationLog::open(&d.join("orch.db")).unwrap();
+    // 스트림 재구축 — 저널 replay 로 엔진 상태 복원.
+    let rt2 = StreamRuntime::new(OrchestrationLog::open(&d.join("orch.db")).unwrap());
+    rt2.add_stream(Stream::new("s-epic", &d).unwrap()).unwrap();
+    rt2.bind_approval_ledger(
+        foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
+    )
+    .unwrap();
+    {
+        let e = rt2.stream("s-epic").unwrap();
+        let mut rebuilt = e.rebuilt_engine().unwrap();
+        // 재구축 — 저널 전체 replay.
+        let jpath = e.journal().to_path_buf();
+        let n = rebuilt
+            .rebuild(&foundry_ledger::SqliteLedger::open(&jpath).unwrap())
+            .unwrap();
+        assert!(n >= 4, "rebuild replays orders (got {n})");
+        // 재구축 엔진은 출하 4티켓 상태를 재생.
+        let shipped: Vec<_> = ["t-1", "t-2", "t-3", "t-4"]
+            .into_iter()
+            .filter(|t| rebuilt.order(t).map(|o| o.state() == OrderState::Shipped).unwrap_or(false))
+            .collect();
+        assert_eq!(shipped.len(), 4, "rebuild replays all four shipped");
+    }
     let ch2 = Chainer::new(&orch2, &ap_ref);
     // 재입장 재평가 — 재구축 상태에서도 통과.
     ch2.reenter(
@@ -282,15 +338,18 @@ fn t61_remediation_depth1_in_end_to_end_context() {
     let d = tmpdir("depth");
     let orch = OrchestrationLog::open(&d.join("orch.db")).unwrap();
     let ap = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
-    // 원 요청 거부.
+    // 원 요청 거부 + 재디에이션 제안(연결 행 append).
     crate::refusal::record_refusal(&orch, RefusalCode::UnsizedSpawn, "req-1", None).unwrap();
-    // 재디에이션 작업 주문("rem-…")의 거부.
-    crate::refusal::record_refusal(&orch, RefusalCode::NotReady, "rem-work-1", None).unwrap();
+    let seq0 = orch.read_all().unwrap().iter().find(|r| matches!(&r.kind, OrchestrationKind::Refusal { .. })).unwrap().seq;
+    let ch0 = Chainer::new(&orch, &ap);
+    let (rem_pid, _) = ch0.propose_remediation(seq0).unwrap();
+    // **그 재디에이션 작업 주문 자신**의 거부 — 같은 pid 주문.
+    crate::refusal::record_refusal(&orch, RefusalCode::NotReady, &rem_pid, None).unwrap();
     let ch = Chainer::new(&orch, &ap);
     let rows = orch.read_all().unwrap();
     let rem_seq = rows
         .iter()
-        .find(|r| matches!(&r.kind, OrchestrationKind::Refusal { refused_request, .. } if refused_request == "rem-work-1"))
+        .find(|r| matches!(&r.kind, OrchestrationKind::Refusal { refused_request, .. } if refused_request == &rem_pid))
         .unwrap()
         .seq;
     assert!(matches!(

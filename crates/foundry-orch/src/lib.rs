@@ -170,6 +170,8 @@ impl Drop for TxGuard<'_> {
 /// 이관해야 한다.
 pub struct OrchestrationLog {
     conn: std::sync::Mutex<rusqlite::Connection>,
+    /// (T61 astra r1) 회복 정지 래치 — 코디네이터 소유.
+    quiescent: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug)]
@@ -232,7 +234,10 @@ impl OrchestrationLog {
                  BEGIN SELECT RAISE(ABORT, 'orchestration log is append-only'); END;",
         )
         .map_err(|e| OrchError::Io(e.to_string()))?;
-        Ok(Self { conn: std::sync::Mutex::new(conn) })
+        Ok(Self {
+            conn: std::sync::Mutex::new(conn),
+            quiescent: std::sync::atomic::AtomicBool::new(false),
+        })
     }
 
     /// 행 append — 체인 연장. **비공개** (astra r1 M2): 검증 통과
@@ -496,10 +501,18 @@ impl OrchestrationLog {
         Ok((row, manifest))
     }
 
+    /// (T61 astra r1) 오케스트레이션 정지 래치 — 회복 코디네이터 소유.
+    /// 정지 중 preset_bound append 불가(결속도 정지 규율 공유 — 플랜 v9
+    /// H절 "preset_bound append도 그 정지 규율을 공유한다").
+    pub fn set_quiescent(&self, on: bool) {
+        self.quiescent.store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// 사이즈 결속 (H절 — 발행 권한의 근거 행). (astra r8) **크레이트
     /// 내부 전용** — 원장 CONSUMED 증거 검증은 chainer 의
     /// bind_preset_from_ledger 이 수행하고, 그 경유 append 만 허용된다.
     /// 외부 직접 append 는 임의 PresetBound 위조 경로이므로 차단.
+    /// (T61 astra r1) 정지 중 거부 — 코디네이터 회복 경계 준수.
     pub(crate) fn append_preset_bound(
         &self,
         sizing_order: &str,
@@ -507,6 +520,11 @@ impl OrchestrationLog {
         approved_digest: &str,
         spawn_plan: &str,
     ) -> Result<OrchRow, OrchError> {
+        if self.quiescent.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(OrchError::Io(
+                "orchestration quiescent — preset append refused until recovery completes".into(),
+            ));
+        }
         self.append(OrchestrationKind::PresetBound {
             sizing_order: sizing_order.into(),
             selected_root: selected_root.into(),
