@@ -39,7 +39,7 @@ mod t60_scale3_epic {
     }
 
     /// 사이징 주문 하나를 FurnaceHold(인간 게이트)까지 진행.
-    fn sizing_to_gate(e: &mut WorkflowEngine, oid: &str, journal_path: &std::path::Path) {
+    fn sizing_to_gate(e: &mut WorkflowEngine, exec: &str, oid: &str, journal_path: &std::path::Path) {
         for ev in [
             OrderEvent::Queued,
             OrderEvent::DieStarted,
@@ -55,7 +55,7 @@ mod t60_scale3_epic {
             let ro: &'static mut foundry_ledger::SqliteLedger = Box::leak(Box::new(
                 foundry_ledger::SqliteLedger::open(journal_path).unwrap(),
             ));
-            e.dispatch_replay_ctx(oid, "t60-sizing", &ev, att, &ctx, ro).unwrap();
+            e.dispatch_replay_ctx(oid, exec, &ev, att, &ctx, ro).unwrap();
         }
         assert_eq!(e.order(oid).unwrap().state(), OrderState::FurnaceHold);
     }
@@ -164,7 +164,7 @@ mod t60_scale3_epic {
             let e = rt.stream("s-sizing").unwrap();
             let mut eng = e.engine_if_unfenced().unwrap();
             eng.acquire("sz-1", "t60-sizing").unwrap();
-            sizing_to_gate(&mut eng, "sz-1", &d.join("s-sizing.db"));
+            sizing_to_gate(&mut eng, "t60-sizing", "sz-1", &d.join("s-sizing.db"));
         }
 
         // ── (2) 인간 사이징 게이트 — 스케일 3 승인.
@@ -287,19 +287,58 @@ mod t60_scale3_epic {
         ] {
             let d = tmpdir(&format!("sel{scale}"));
             let orch = OrchestrationLog::open(&d.join("orch.db")).unwrap();
-            let mut ap = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
+            // 스케일 공통: 사이징 주문을 런타임으로 FurnaceHold 까지 구동 후
+            // **라이브 승인**(dispatch_live)으로 그랜트 소비.
+            orch.declare_plan(
+                &format!("plan-sizing-{scale}"),
+                vec![(format!("sz-scale{scale}"), vec![])],
+                vec![(format!("sz-scale{scale}"), format!("s-sel{scale}"))],
+            )
+            .unwrap();
+            let rt = StreamRuntime::new(orch);
+            rt.add_stream(Stream::new(&format!("s-sel{scale}"), &d).unwrap()).unwrap();
+            rt.bind_approval_ledger(
+                foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
+            )
+            .unwrap();
+            rt.dispatch(&format!("sz-scale{scale}"), mkorder(&format!("sz-scale{scale}"), true))
+                .unwrap_or_else(|e| panic!("scale {scale} dispatch: {e:?}"));
             let sid = format!("sz-scale{scale}");
+            {
+                let e = rt.stream(&format!("s-sel{scale}")).unwrap();
+                let mut eng = e.engine_if_unfenced().unwrap();
+                eng.acquire(&sid, "sel").unwrap();
+                sizing_to_gate(&mut eng, "sel", &sid, &d.join(format!("s-sel{scale}.db")));
+            }
+            let mut ap = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
             let digest = crate::chainer::sizing_digest("approved", root, plan);
             let sscope = serde_json::json!({
                 "order_id": sid.clone(), "intent": "sizing",
                 "artifact_digest": digest.clone(), "root_scope": "",
             });
             ap.issue_grant(&format!("sizing-{sid}"), &format!("tok-{scale}"), &sscope).unwrap();
-            let sr = ap.reserve_grant(&format!("sizing-{sid}"), &sscope, "sel", 1).unwrap();
-            ap.begin_apply(&format!("sizing-{sid}"), "sel", 1, sr.fence_token).unwrap();
-            ap.finalize_grant(&format!("sizing-{sid}"), "sel", 1, sr.fence_token).unwrap();
+            // 라이브 인간 승인 — FurnaceHold 에서 dispatch_live.
+            {
+                let e2 = rt.stream(&format!("s-sel{scale}")).unwrap();
+                let mut eng = e2.engine_if_unfenced().unwrap();
+                let mut hook = foundry_workflow::ApprovalLedgerAdapter(
+                    foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
+                );
+                let grant = foundry_workflow::GrantRef { grant_id: format!("sizing-{sid}") };
+                let out = eng
+                    .dispatch_live(
+                        &sid,
+                        "sel",
+                        &OrderEvent::Approved { intent: "sizing".into(), artifact_digest: digest.clone() },
+                        1,
+                        Some(&grant),
+                        &mut hook,
+                    )
+                    .unwrap_or_else(|e| panic!("scale {scale} live approval: {e:?}"));
+                assert_eq!(out, Outcome::Applied);
+            }
             // 결속 — 목적지 일치(root/plan).
-            let ch = Chainer::new(&orch, &ap);
+            let ch = Chainer::new(&rt.orch, &ap);
             ch.bind_preset_from_ledger(&sid, root, plan)
                 .unwrap_or_else(|e| panic!("scale {scale} binding failed: {e:?}"));
             // 발행 허용 — digest(=목적지) 일치.
