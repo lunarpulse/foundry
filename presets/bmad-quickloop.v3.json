@@ -1,0 +1,71 @@
+{
+  "schema_version": 3,
+  "id": "bmad-quickloop",
+  "body": {
+    "encoding_digest": "enc-frozen-v1",
+    "steps": [
+      {
+        "id": "quick-triage",
+        "event": "Queued",
+        "skill": "analyst"
+      },
+      {
+        "id": "quick-dev",
+        "event": "DieStarted",
+        "skill": "dev"
+      },
+      {
+        "id": "quick-verify",
+        "event": "DieSucceeded"
+      },
+      {
+        "id": "quick-inspect",
+        "event": "InspectionPassed"
+      },
+      {
+        "id": "ship-gate",
+        "event": "Approved"
+      }
+    ]
+  },
+  "skills": [
+    {
+      "id": "analyst",
+      "digest": "sha256:bmad-analyst-1",
+      "kind": "role"
+    },
+    {
+      "id": "dev",
+      "digest": "sha256:bmad-dev-1",
+      "kind": "role"
+    },
+    {
+      "id": "review",
+      "digest": "sha256:bmad-review-1",
+      "kind": "advisory"
+    }
+  ],
+  "routing": {
+    "rules": [
+      {
+        "source_pattern": "quickfix:*",
+        "workflow_id": "bmad-quickloop"
+      },
+      {
+        "source_pattern": "hotfix:*",
+        "workflow_id": "bmad-quickloop"
+      }
+    ],
+    "default_route": "bmad-quickloop"
+  },
+  "policy_digest": "",
+  "policy": {
+    "schema_version": 1,
+    "approvals": [
+      {
+        "node_ref": "quick-inspect",
+        "level": "prepare"
+      }
+    ]
+  }
+}

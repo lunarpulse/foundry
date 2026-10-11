@@ -15,3 +15,4 @@ pub mod aprime_crash;
 pub mod dprime_identity;
 pub mod preset_pin;
 pub mod full_cycle;
+pub mod scale_presets;

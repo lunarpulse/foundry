@@ -1,0 +1,77 @@
+{
+  "schema_version": 3,
+  "id": "bmad-feature-prd",
+  "body": {
+    "encoding_digest": "enc-frozen-v1",
+    "steps": [
+      {
+        "id": "prd-pm",
+        "event": "Queued",
+        "skill": "pm"
+      },
+      {
+        "id": "prd-architect",
+        "event": "DieStarted",
+        "skill": "architect"
+      },
+      {
+        "id": "prd-ux",
+        "event": "DieSucceeded",
+        "skill": "ux"
+      },
+      {
+        "id": "prd-review",
+        "event": "InspectionPassed"
+      },
+      {
+        "id": "ship-gate",
+        "event": "Approved"
+      }
+    ]
+  },
+  "skills": [
+    {
+      "id": "pm",
+      "digest": "sha256:bmad-pm-1",
+      "kind": "role"
+    },
+    {
+      "id": "architect",
+      "digest": "sha256:bmad-architect-1",
+      "kind": "role"
+    },
+    {
+      "id": "ux",
+      "digest": "sha256:bmad-ux-1",
+      "kind": "role"
+    },
+    {
+      "id": "review",
+      "digest": "sha256:bmad-review-1",
+      "kind": "advisory"
+    }
+  ],
+  "routing": {
+    "rules": [
+      {
+        "source_pattern": "feature:*",
+        "workflow_id": "bmad-feature-prd"
+      },
+      {
+        "source_pattern": "prd:*",
+        "workflow_id": "bmad-feature-prd"
+      }
+    ],
+    "default_route": "bmad-feature-prd"
+  },
+  "policy_digest": "",
+  "policy": {
+    "schema_version": 1,
+    "approvals": [
+      {
+        "node_ref": "prd-review",
+        "level": "prepare"
+      }
+    ]
+  }
+}
