@@ -231,13 +231,16 @@ impl StreamRuntime {
         self.streams.lock().unwrap().iter().find(|s| s.stream_id == id).cloned()
     }
 
-    /// 입장 차단 (코디네이터 전용).
+    /// 입장 차단 (코디네이터 전용). (T61 astra r2) 오케스트레이션 정지
+    /// 래치와 **결합** — 회복 경계에서 preset append 도 함께 멈춘다.
     pub(crate) fn block_admission(&self) {
         self.admission_blocked.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.orch.set_quiescent(true);
     }
 
     pub(crate) fn resume_admission(&self) {
         self.admission_blocked.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.orch.set_quiescent(false);
     }
 
     pub fn is_admission_blocked(&self) -> bool {

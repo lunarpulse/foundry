@@ -198,16 +198,50 @@ fn t61_end_to_end_reentry_bypass_crash_rebuild() {
     ));
 
     // "수락 → 작업 수행" — **재디에이션 작업 자체가 Foundry 주문**:
-    // RunSizing 작업은 preset_bound 결속으로 완결되고, 그 결속은
-    // 원장 CONSUMED 승인 검증을 통과한다(재귀 자기 적용 — 깊이 1).
-    ch.bind_preset_from_ledger("sz-1", "bmad-epic-build", "plan-epic").unwrap();
+    // RunSizing = 새 사이징 주문 sz-2 를 정문(dispatch)으로 실행.
+    orch.declare_plan(
+        "plan-rem-work",
+        vec![("sz-2".into(), vec![])],
+        vec![("sz-2".into(), "s-sizing".into())],
+    )
+    .unwrap();
+    rt.dispatch("sz-2", mkorder("sz-2", true)).unwrap();
+    autonomous_to_gate(&rt, "s-sizing", "sz-2", "t61-rw");
+    {
+        let mut ap2 = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
+        ap2.issue_grant("sizing-sz-2", "tok-human2", &serde_json::json!({
+            "order_id": "sz-2", "intent": "sizing", "artifact_digest": digest, "root_scope": "",
+        }))
+        .unwrap();
+    }
+    {
+        let e2 = rt.stream("s-sizing").unwrap();
+        let mut eng = e2.engine_if_unfenced().unwrap();
+        let mut hook = foundry_workflow::ApprovalLedgerAdapter(
+            foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
+        );
+        let grant = foundry_workflow::GrantRef { grant_id: "sizing-sz-2".into() };
+        let out = eng
+            .dispatch_live(
+                "sz-2",
+                "t61-rw",
+                &OrderEvent::Approved { intent: "sizing".into(), artifact_digest: digest.clone() },
+                1,
+                Some(&grant),
+                &mut hook,
+            )
+            .unwrap();
+        assert_eq!(out, Outcome::Applied, "remediation work order approved live");
+    }
+    // 재디에이션 작업 완결 — sz-2 승인(새 증거)으로 preset_bound 결속.
+    ch.bind_preset_from_ledger("sz-2", "bmad-epic-build", "plan-epic").unwrap();
 
     // 재입장 — **같은 원 요청(t-1)을 같은 정문(dispatch)으로 재시도**,
     // 전량 재평가(선언·바인딩·목적지) 통과.
     ch.reenter(
         "t-1",
         "ext:src/t61",
-        Some("sz-1"),
+        Some("sz-2"),
         Some(&digest),
         "plan-epic",
         "bmad-epic-build",
@@ -215,7 +249,7 @@ fn t61_end_to_end_reentry_bypass_crash_rebuild() {
     .unwrap();
     // A 고쳐도 B — 미선언 주문의 재입장은 여전히 거부(DeclarationMissing).
     assert!(matches!(
-        ch.reenter("t-undeclared", "ext:x", Some("sz-1"), Some(&digest), "plan-epic", "bmad-epic-build"),
+        ch.reenter("t-undeclared", "ext:x", Some("sz-2"), Some(&digest), "plan-epic", "bmad-epic-build"),
         Err(ChainerError::DeclarationMissing { .. })
     ));
 
@@ -274,10 +308,10 @@ fn t61_end_to_end_reentry_bypass_crash_rebuild() {
         assert!(rt.stream("s-epic").unwrap().order_shipped(t).unwrap(), "{t} shipped");
     }
 
-    // ── (7) 크래시 주입 — **중단 append 시뮬레이션**: 행 삽입 후 해시
-    // 확정 전 창에서 프로세스 사망(RAAI 트랜잭션 = 커밋 안 된 append 는
-    // 롤백돼야 한다). 트리거 수동 위반 대신, 같은 파일에 대해 즉시
-    // 재오픈해 미완 append 부재를 단정한다.
+    // ── (7) 크래시 주입 — append 트랜잭션 창(INSERT 후 커밋 전)의
+    // 프로세스 사망은 RAAI TxGuard(T57, astra r1 M5)가 롤백한다 — 이
+    // 종단에서는 창 **직후** 재오픈으로 커밋된 행만 생존함을 단정하고,
+    // 회복(재구축)이 상태를 완전 복원함을 증명한다.
     {
         // 창 내 재오픈 — 체인이 정합(마지막 행 = t-4 발행)이고 손상 없음.
         let reopened = OrchestrationLog::open(&d.join("orch.db")).unwrap();
@@ -317,7 +351,7 @@ fn t61_end_to_end_reentry_bypass_crash_rebuild() {
     ch2.reenter(
         "t-1",
         "ext:src/t61",
-        Some("sz-1"),
+        Some("sz-2"),
         Some(&digest),
         "plan-epic",
         "bmad-epic-build",
@@ -326,7 +360,7 @@ fn t61_end_to_end_reentry_bypass_crash_rebuild() {
     // 거부 행·preset_bound·재디에이션 연결이 재생에서 보존.
     let rows2 = orch2.read_all().unwrap();
     assert!(rows2.iter().any(|r| matches!(&r.kind, OrchestrationKind::Refusal { refusal_code, .. } if refusal_code == "UnsizedSpawn")));
-    assert!(rows2.iter().any(|r| matches!(&r.kind, OrchestrationKind::PresetBound { sizing_order, .. } if sizing_order == "sz-1")));
+    assert!(rows2.iter().any(|r| matches!(&r.kind, OrchestrationKind::PresetBound { sizing_order, .. } if sizing_order == "sz-2")));
     // read_all 자체가 체인 검증 포함 — 변조 없음이 곧 동등 증명.
     // 행 수 동일.
     assert_eq!(rows2.len(), rows.len(), "rebuild sees identical log");

@@ -501,10 +501,10 @@ impl OrchestrationLog {
         Ok((row, manifest))
     }
 
-    /// (T61 astra r1) 오케스트레이션 정지 래치 — 회복 코디네이터 소유.
-    /// 정지 중 preset_bound append 불가(결속도 정지 규율 공유 — 플랜 v9
-    /// H절 "preset_bound append도 그 정지 규율을 공유한다").
-    pub fn set_quiescent(&self, on: bool) {
+    /// (T61 astra r1+r2) 오케스트레이션 정지 래치 — **크레이트 내부
+    /// 전용**(회복 코디네이터=StreamRuntime 입장 차단과 결합). 정지 중
+    /// preset_bound append 불가.
+    pub(crate) fn set_quiescent(&self, on: bool) {
         self.quiescent.store(on, std::sync::atomic::Ordering::SeqCst);
     }
 
