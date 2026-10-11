@@ -321,10 +321,10 @@ fn t61_end_to_end_reentry_bypass_crash_rebuild() {
         assert!(rt.stream("s-epic").unwrap().order_shipped(t).unwrap(), "{t} shipped");
     }
 
-    // ── (7) 크래시 주입 — append 트랜잭션 창(INSERT 후 커밋 전)의
-    // 프로세스 사망은 RAAI TxGuard(T57, astra r1 M5)가 롤백한다 — 이
-    // 종단에서는 창 **직후** 재오픈으로 커밋된 행만 생존함을 단정하고,
-    // 회복(재구축)이 상태를 완전 복원함을 증명한다.
+    // ── (7) 크래시 — SIGKILL 창 내 사망은 SQLite 자체 크래시 회복이
+    // 롤백한다(프로세스 죽으면 Drop 은 실행되지 않는다 — 실제 kill -9
+    // 실증은 t61_kill9 참조). 이 종단은 창 직후 재오픈으로 커밋된 행만
+    // 생존함을 단정하고, 회복(재구축)이 상태를 완전 복원함을 증명한다.
     {
         // 창 내 재오픈 — 체인이 정합(마지막 행 = t-4 발행)이고 손상 없음.
         let reopened = OrchestrationLog::open(&d.join("orch.db")).unwrap();

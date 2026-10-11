@@ -507,6 +507,7 @@ dependencies = [
  "foundry-domain",
  "foundry-ledger",
  "foundry-workflow",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
