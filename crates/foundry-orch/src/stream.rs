@@ -118,10 +118,14 @@ impl Stream {
         Ok(())
     }
 
-    /// (astra r5) 펜스 검사 포함 실행 진입 — 유일한 엔진 접근 경로.
-    /// 펜스 시 거부: 회복 실패 스트림의 구 엔진이 dispatch_live 등을
-    /// 수행하는 경로를 원천 차단한다(fail-closed).
-    pub fn engine_if_unfenced(&self) -> Result<std::sync::MutexGuard<'_, WorkflowEngine>, String> {
+    /// (astra r5+r10) 펜스 검사 포함 실행 진입 — **크레이트 내부 전용**.
+    /// 가드의 &mut 역참조는 스트림 간 엔진 스왑(mem::swap)을 허용하므로,
+    /// 실행 주도권은 런타임/코디네이터(신뢰 경계 내)만 가진다. 외부
+    /// 공개면은 enroll/관찰(fence 상태·저널)뿐 — 실행 경로는 T61 종단
+    /// 배선에서 런타임 진입점으로 제공된다.
+    pub(crate) fn engine_if_unfenced(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, WorkflowEngine>, String> {
         if self.is_fenced() {
             return Err(format!(
                 "stream '{}' is fenced — execution refused until recovery succeeds",
