@@ -80,7 +80,9 @@ impl Stream {
         self.fenced.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    pub fn unfence(&self) {
+    /// (astra r6) 해제는 **회복 코디네이터 전용** — pub(crate). 외부가
+    /// 펜스를 임의 해제해 구 엔진을 되살리는 우회를 차단.
+    pub(crate) fn unfence(&self) {
         self.fenced.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
