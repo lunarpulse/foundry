@@ -309,6 +309,45 @@ impl StreamRuntime {
         }
     }
 
+    /// (M7.1 리뷰 B3) **실행 진입점** — 자율 단계(큐→다이 시작→다이
+    /// 성공→검수 통과)를 라이브로 진행해 게이트(승인 대기)에 둔다.
+    /// 테스트 전용 헬퍼를 대체하는 프로덕션 경로: 락 획득·저널 replay
+    // 문맥·게이트 도달 단정까지 소유.
+    pub fn advance_to_gate(
+        &self,
+        stream_id: &str,
+        order_id: &str,
+        exec: &str,
+    ) -> Result<foundry_domain::OrderState, String> {
+        let e = self.stream(stream_id).ok_or(format!("stream {stream_id} not registered"))?;
+        let mut eng = e.engine_if_unfenced()?;
+        eng.acquire(order_id, exec).map_err(|er| format!("acquire: {er:?}"))?;
+        for ev in [
+            foundry_domain::OrderEvent::Queued,
+            foundry_domain::OrderEvent::DieStarted,
+            foundry_domain::OrderEvent::DieSucceeded { attempt: 1 },
+            foundry_domain::OrderEvent::InspectionPassed,
+        ] {
+            let att = eng.order(order_id)
+                .ok_or(format!("order {order_id} unknown"))?
+                .attempt().max(1);
+            let rows = foundry_ledger::SqliteLedger::open(e.journal())
+                .map_err(|er| format!("journal: {er:?}"))?
+                .read_all().map_err(|er| format!("journal read: {er:?}"))?;
+            let ctx = crate::test_support::replay_ctx(order_id, &rows);
+            let ro: &'static mut foundry_ledger::SqliteLedger = Box::leak(Box::new(
+                foundry_ledger::SqliteLedger::open(e.journal())
+                    .map_err(|er| format!("journal: {er:?}"))?,
+            ));
+            eng.dispatch_replay_ctx(order_id, exec, &ev, att, &ctx, ro)
+                .map_err(|er| format!("advance event: {er:?}"))?;
+        }
+        let st = eng.order(order_id)
+            .ok_or(format!("order {order_id} unknown"))?
+            .state();
+        Ok(st)
+    }
+
     pub fn stream(&self, id: &str) -> Option<Arc<Stream>> {
         self.streams.lock().unwrap().iter().find(|s| s.stream_id == id).cloned()
     }

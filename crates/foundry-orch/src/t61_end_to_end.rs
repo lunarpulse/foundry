@@ -379,6 +379,50 @@ fn t61_end_to_end_reentry_bypass_crash_rebuild() {
     assert_eq!(rows2.len(), rows.len(), "rebuild sees identical log");
 }
 
+/// (M7.1 리뷰 B3) 실행 진입점 — advance_to_gate 가 프로덕션 경로로
+/// 주문을 게이트(승인 대기)에 둔다.
+#[test]
+fn t61_advance_to_gate_entry_point() {
+    let d = tmpdir("advgate");
+    let orch = OrchestrationLog::open(&d.join("orch.db")).unwrap();
+    orch.declare_plan(
+        "plan-g",
+        vec![("t-g1".into(), vec![])],
+        vec![("t-g1".into(), "s-g".into())],
+    )
+    .unwrap();
+    let mut ap = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
+    {
+        let digest = crate::chainer::sizing_digest("approved", "bmad-quickloop", "plan-g");
+        ap.issue_grant("sizing-sz-g", "tok-g", &serde_json::json!({
+            "order_id": "sz-g", "intent": "sizing", "artifact_digest": digest, "root_scope": "",
+        }))
+        .unwrap();
+        let sr = ap.reserve_grant("sizing-sz-g", &serde_json::json!({
+            "order_id": "sz-g", "intent": "sizing", "artifact_digest": digest, "root_scope": "",
+        }), "g", 1).unwrap();
+        ap.begin_apply("sizing-sz-g", "g", 1, sr.fence_token).unwrap();
+        ap.finalize_grant("sizing-sz-g", "g", 1, sr.fence_token).unwrap();
+        let ch = Chainer::new(&orch, &ap);
+        ch.bind_preset_from_ledger("sz-g", "bmad-quickloop", "plan-g").unwrap();
+    }
+    let rt = StreamRuntime::new(OrchestrationLog::open(&d.join("orch.db")).unwrap());
+    rt.add_stream(Stream::new_with_root("s-g", &d, "bmad-quickloop").unwrap()).unwrap();
+    rt.bind_approval_ledger(
+        foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
+    )
+    .unwrap();
+    rt.dispatch("t-g1", mkorder("t-g1", true)).unwrap();
+    // 프로덕션 진입점 — 게이트 도달.
+    let st = rt.advance_to_gate("s-g", "t-g1", "exec-g").unwrap();
+    assert_eq!(st, OrderState::FurnaceHold, "order at the approval gate");
+    // 저널에 진행 이벤트가 실렸다.
+    let e = rt.stream("s-g").unwrap();
+    let rows = foundry_ledger::SqliteLedger::open(e.journal()).unwrap().read_all().unwrap();
+    assert!(rows.iter().any(|r| r.event.contains("InspectionPassed")),
+        "gate-reaching events journaled");
+}
+
 /// (M7.1 리뷰 B1) 라이브 핸드오프 정문 — 그랜트가 라이브 경로로 소비되고
 /// 로그에 HandoffBound 행이 남는다(테스트 직접 소비 대체).
 #[test]
