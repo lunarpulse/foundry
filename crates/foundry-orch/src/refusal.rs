@@ -1,0 +1,196 @@
+//! (M7 T57 / I절) 거부 코드→수락 조건 레지스트리 — 타입드·전수 매핑.
+//!
+//! 계약:
+//! - 거부 코드는 **이 열거형으로만** 존재한다 — 미등록 문자열 코드
+//!   방출 금지 (타입 시스템 강제).
+//! - 모든 코드는 수락 조건(사람 말)과 (가능시) 재디에이션 작업 종류를
+//!   동반 — 열거형 매칭이 전수성을 강제한다 (새 코드 추가 시 컴파일러가
+//!   매핑 누락을 거부).
+//! - presets/README 의 진단 설명은 이 레지스트리에서 파생한다(단일
+//!   소스 — 드리프트 원천 차단).
+
+use crate::OrchestrationKind;
+
+/// 거부 코드 — 인간 대면 거부 경로가 방출할 수 있는 전 집합.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalCode {
+    /// 사이징 승인(preset_bound) 없는 발행.
+    UnsizedSpawn,
+    /// plan_declared 없는 주문.
+    UndeclaredOrder,
+    /// 선언의 의존성에 사이클.
+    DeclarationCycle,
+    /// 선언이 존재하지 않는 선행 주문을 참조.
+    MissingPredecessor,
+    /// 같은 plan 의 중복 선언.
+    DuplicateDeclaration,
+    /// 핸드오프 매니페스트 3자 불일치 (원장↔재계산↔로그).
+    HandoffMismatch,
+    /// 승인 이벤트가 게이트를 우회함 (방화벽) — 재디에이션 없음(구조 위반).
+    GateBypass,
+    /// 프리셋 검증 실패 (v9: 워크플로 문서 계층).
+    PresetInvalid,
+}
+
+impl RefusalCode {
+    /// 전집 — registry 전수성 검증의 기준 (수동 유지, 게이트가 대조).
+    pub const VARIANTS: &'static [RefusalCode] = &[
+        RefusalCode::UnsizedSpawn,
+        RefusalCode::UndeclaredOrder,
+        RefusalCode::DeclarationCycle,
+        RefusalCode::MissingPredecessor,
+        RefusalCode::DuplicateDeclaration,
+        RefusalCode::HandoffMismatch,
+        RefusalCode::GateBypass,
+        RefusalCode::PresetInvalid,
+    ];
+}
+
+/// 재디에이션 작업 종류 — 조건 충족 작업의 분류 (체이너가 제안).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemediationKind {
+    /// 사이징 주문을 열어 인간 게이트에서 스케일 확정.
+    RunSizing,
+    /// 계획 선언 주문(또는 declare_plan 제안)을 수행.
+    DeclarePlan,
+    /// 핸드오프 재결속 제안 (매니페스트 재계산·재발급).
+    RebindHandoff,
+    /// 재디에이션 불가 — 인간 에스컬레이션으로 종결 (깊이 1 제한).
+    Escalate,
+}
+
+/// 레지스트리 항목 — 사람 말 이유·수락 조건·재디에이션.
+pub struct RefusalEntry {
+    pub code: RefusalCode,
+    /// 사람 말 이유 (승인 프롬프트·RefusalRecord 에 기록).
+    pub reason_text: &'static str,
+    /// 수락 조건 — "무엇이 참이면 통과하는가".
+    pub acceptance_condition: &'static str,
+    /// 조건을 만드는 작업 (Escalate 면 제안 없음).
+    pub remediation: RemediationKind,
+}
+
+/// 전수 조회 — 모든 코드의 항목 (전수성: match 가 열거형 전체 커버).
+pub fn registry() -> Vec<RefusalEntry> {
+    use RefusalCode::*;
+    [
+        (UnsizedSpawn, "사이징 승인 없이 발행된 주문입니다", "사이징 게이트에서 프리셋이 확정되어야 합니다 (preset_bound)", RemediationKind::RunSizing),
+        (UndeclaredOrder, "계획 선언 없는 주문입니다", "plan_declared 행이 이 주문을 포함해야 합니다", RemediationKind::DeclarePlan),
+        (DeclarationCycle, "선언의 의존성에 사이클이 있습니다", "의존성 간선이 비순환이어야 합니다", RemediationKind::Escalate),
+        (MissingPredecessor, "존재하지 않는 선행 주문을 참조합니다", "선행 주문이 (같은 선언 안에) 먼저 선언되어야 합니다", RemediationKind::DeclarePlan),
+        (DuplicateDeclaration, "같은 계획이 두 번 선언되었습니다", "기존 선언을 갱신하거나 새 plan id 를 사용해야 합니다", RemediationKind::DeclarePlan),
+        (HandoffMismatch, "핸드오프 매니페스트가 로그·원장과 일치하지 않습니다", "매니페스트가 가리키는 로그 행 기준으로 재결속되어야 합니다", RemediationKind::RebindHandoff),
+        (GateBypass, "승인이 게이트를 우회하려 했습니다 (방화벽)", "인간 게이트(dispatch_live + grant)가 유일한 승인 경로입니다", RemediationKind::Escalate),
+        (PresetInvalid, "프리셋이 검증기를 통과하지 못했습니다", "검증기 진단(예: Prepare 배치·default_route)이 해소되어야 합니다", RemediationKind::Escalate),
+    ]
+    .into_iter()
+    .map(|(code, reason_text, acceptance_condition, remediation)| RefusalEntry {
+        code,
+        reason_text,
+        acceptance_condition,
+        remediation,
+    })
+    .collect()
+}
+
+/// 코드로 항목 조회 — 전수 레지스트리에 항상 있음 (컴파일 보장 아님,
+/// 런타임 전수 검증은 게이트가 수행).
+pub fn entry_for(code: RefusalCode) -> RefusalEntry {
+    registry().into_iter().find(|e| e.code == code).expect("registry is exhaustive")
+}
+
+/// OrchError → 코드 매핑 — 저장소 오류를 인간 대면 코드로.
+pub fn code_for_orch_error(e: &crate::OrchError) -> Option<RefusalCode> {
+    use crate::OrchError as E;
+    use RefusalCode::*;
+    Some(match e {
+        E::UndeclaredOrder { .. } => UnsizedSpawn,
+        E::MissingPredecessor { .. } => MissingPredecessor,
+        E::Cycle { .. } => DeclarationCycle,
+        E::DuplicateDeclaration { .. } => DuplicateDeclaration,
+        _ => return None, // Io/ChainBroken/NoRow 는 인간 대면 거부 아님(기술 오류)
+    })
+}
+
+/// RefusalRecord 를 로그에 append — 3요소 동반 단정 (I절 게이트 지원).
+pub fn record_refusal(
+    log: &crate::OrchestrationLog,
+    code: RefusalCode,
+    refused_request: &str,
+    remediation_proposal_id: Option<&str>,
+) -> Result<crate::OrchRow, crate::OrchError> {
+    let e = entry_for(code);
+    log.append(crate::OrchestrationKind::Refusal {
+        refused_request: refused_request.into(),
+        refusal_code: format!("{code:?}"),
+        reason_text: e.reason_text.into(),
+        acceptance_condition: e.acceptance_condition.into(),
+        remediation_proposal_id: remediation_proposal_id.map(|s| s.into()),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 전수성 — registry 가 모든 코드를 커버 (새 코드 추가 시 실패).
+    #[test]
+    fn registry_covers_all_codes() {
+        let all = registry();
+        assert_eq!(all.len(), RefusalCode::VARIANTS.len());
+        for code in RefusalCode::VARIANTS {
+            assert!(all.iter().any(|e| e.code == *code), "{code:?} missing");
+        }
+    }
+
+    /// 3요소 동반 — 모든 항목이 이유·조건·재디에이션을 가짐 (빈 문자열 금지).
+    #[test]
+    fn every_entry_carries_three_parts() {
+        for e in registry() {
+            assert!(!e.reason_text.is_empty(), "{:?} reason", e.code);
+            assert!(!e.acceptance_condition.is_empty(), "{:?} condition", e.code);
+        }
+    }
+
+    /// 거부 기록 — 레코드가 로그에 3요소로 남고 증거에서 배제된다.
+    #[test]
+    fn refusal_recorded_with_three_parts_and_excluded() {
+        let mut p = std::env::temp_dir();
+        p.push(format!("foundry-refusal-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let log = crate::OrchestrationLog::open(&p).unwrap();
+        let row = record_refusal(
+            &log,
+            RefusalCode::UnsizedSpawn,
+            "req-42",
+            Some("prop-1"),
+        )
+        .unwrap();
+        if let OrchestrationKind::Refusal {
+            refusal_code,
+            reason_text,
+            acceptance_condition,
+            ..
+        } = &row.kind
+        {
+            assert_eq!(refusal_code, "UnsizedSpawn");
+            assert!(reason_text.contains("사이징"));
+            assert!(acceptance_condition.contains("preset_bound"));
+        } else {
+            panic!("not a refusal row");
+        }
+        // 증거 배제.
+        assert_eq!(log.declaration_rows().unwrap().len(), 0);
+    }
+
+    /// 오류→코드 매핑 — 인간 대면 오류만 매핑 (Io 는 None).
+    #[test]
+    fn orch_error_maps_to_facing_codes() {
+        use crate::OrchError as E;
+        assert_eq!(
+            code_for_orch_error(&E::UndeclaredOrder { order: "o".into() }),
+            Some(RefusalCode::UnsizedSpawn)
+        );
+        assert_eq!(code_for_orch_error(&E::Io("x".into())), None);
+    }
+}

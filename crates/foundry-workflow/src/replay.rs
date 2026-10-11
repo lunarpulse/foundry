@@ -279,3 +279,42 @@ pub(crate) fn journal_append(
         .append(order_id, event, from, to, &handle.actor, at)
         .map_err(|e| format!("{e:?}"))
 }
+
+
+/// (M7 T57 C′) 핸드오프 로그 포트 — foundry-workflow 는 오케스트레이션
+/// 저장소를 이 포트로만 본다 (구현은 오케스트레이션 크레이트가 주입 —
+/// 순환 의존 부재, astra r3 데이터 경계 폐쇄).
+///
+/// 계약:
+/// - **fail-closed**: "fh1:" 매니페스트 digest 검증 중 행 조회 실패는
+///   Err 로만 표현된다 — "행 없으면 직접 산출물로 간주" 같은 폴백 없음.
+/// - 행은 (source, dest, artifact, seq) 전부를 반환 — 3자 일치(원장↔
+///   재계산↔행)의 행 측 재료.
+pub trait HandoffLogPort {
+    /// seq 위치의 핸드오프 행 조회 — 부재/불일치는 Err.
+    fn handoff_row(&self, seq: i64) -> Result<HandoffRow, HandoffLookupError>;
+    /// 로그 전체의 체인 무결성 (게이트·회복 경로용).
+    fn log_intact(&self) -> Result<bool, HandoffLookupError>;
+}
+
+/// 행 — 매니페스트 재계산의 재료 (kind=HandoffBound).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandoffRow {
+    pub seq: i64,
+    pub source_order: String,
+    pub dest_order: String,
+    pub artifact_digest: String,
+}
+
+/// 조회 실패 — 원인을 구분해 승인 거부 사유로 전파.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandoffLookupError {
+    /// 그 seq 에 행이 없다 (부재 — fail-closed).
+    NoRow { seq: i64 },
+    /// 행은 있으나 종류가 핸드오프가 아니다.
+    NotAHandoff { seq: i64 },
+    /// 로그 자체가 손상되었다 (체인 불일치).
+    ChainBroken { at_seq: i64 },
+    /// 저장소 접근 오류.
+    Io(String),
+}

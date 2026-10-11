@@ -499,6 +499,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "foundry-orch"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "foundry-domain",
+ "foundry-workflow",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "foundry-serve"
 version = "0.1.0"
 dependencies = [

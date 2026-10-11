@@ -1,0 +1,13 @@
+[package]
+name = "foundry-orch"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+foundry-domain = { path = "../foundry-domain" }
+foundry-workflow = { path = "../foundry-workflow" }
+rusqlite = { workspace = true }
+sha2 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }

@@ -4,6 +4,7 @@ members = [
     "crates/foundry-domain",
     "crates/foundry-blueprint",
     "crates/foundry-ledger",
+    "crates/foundry-orch",
     "crates/foundry-furnace",
     "crates/foundry-harness-cli",
     "crates/foundry-line",
@@ -27,6 +28,7 @@ serde_yaml = "0.9"
 serde_json = "1"
 thiserror = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"

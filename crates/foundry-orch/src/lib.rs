@@ -1,0 +1,732 @@
+//! T57 — 오케스트레이션 로그: 멀티-오더 오케스트레이션의 진실원천.
+//!
+//! (M7 플랜 v9 T57) 계약:
+//! - **해시체인 저장소**: 모든 행이 prev_hash 로 연결 — 변조 감지.
+//! - **행 타입**: plan_declared / order_spawned / handoff_bound /
+//!   preset_bound / refusal. refusal 은 체인에 포함되어 해시·검증되지만
+//!   **선언 증거에서 배제**된다(선언 순수성 — 거부가 발행 자격을
+//!   만들지 않는다).
+//! - **선언 검증**: 디스패치 전 내구 선언(어떤 주문도 plan_declared
+//!   없이 ready 될 수 없음)·사이클 거부·부재 선행 거부.
+//! - **스트림 identity**: 스트림 = 프리셋 root의 활성화 인스턴스
+//!   (안정 id). 같은 root의 재활성화는 별개 스트림.
+//! - **핸드오프 매니페스트**: 고정폭(8자리) len-prefix 정규 인코딩,
+//!   "fh1:" 가시 태그, 99,999,999 바이트 상한 — 구분자/길이스트림
+//!   모호성 원천 불가 (astra r4-r6 폐쇄).
+
+pub mod refusal;
+
+use serde::{Deserialize, Serialize};
+use sha2::Digest;
+use std::path::Path;
+
+/// 행 종류 — 타입드. 새 종류는 이 열거에 추가해야만 직렬화된다.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OrchestrationKind {
+    /// 에픽/프로젝트 선언 — 미래 주문 id·의존성 간선·스트림 배정.
+    PlanDeclared {
+        plan_id: String,
+        /// (주문 id → 선행 주문 id 목록) — 사이클 없어야.
+        edges: Vec<(String, Vec<String>)>,
+        /// 주문별 스트림 배정 (주문 id → 스트림 id).
+        streams: Vec<(String, String)>,
+    },
+    /// 체이너의 주문 발행 기록.
+    OrderSpawned { order_id: String, plan_id: String, stream: String },
+    /// 산출물 인계 (매니페스트 digest 는 이 행을 가리킨다).
+    HandoffBound {
+        source_order: String,
+        dest_order: String,
+        artifact_digest: String,
+    },
+    /// 사이즈 라우팅 — 인간 사이징 게이트 승인의 결속 (H절).
+    PresetBound {
+        sizing_order: String,
+        selected_root: String,
+        approved_digest: String,
+        spawn_plan: String,
+    },
+    /// 거부 기록 (I절 — 증거에서 배제, 감사 전용).
+    Refusal {
+        refused_request: String,
+        refusal_code: String,
+        reason_text: String,
+        acceptance_condition: String,
+        remediation_proposal_id: Option<String>,
+    },
+}
+
+/// 저장 행 — 체인 노드.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrchRow {
+    pub seq: i64,
+    pub kind: OrchestrationKind,
+    pub prev_hash: String,
+    pub hash: String,
+}
+
+const GENESIS: &str = "GENESIS";
+const DOMAIN_LABEL: &[u8] = b"foundry-orch-chain-v1\0";
+
+fn row_hash(prev: &str, kind_json: &str) -> String {
+    let mut h = sha2::Sha256::new();
+    h.update(DOMAIN_LABEL);
+    h.update(format!("{:016}:{}", prev.len(), "").as_bytes());
+    h.update(prev.as_bytes());
+    h.update(format!("{:016}:{}", kind_json.len(), "").as_bytes());
+    h.update(kind_json.as_bytes());
+    format!("{:x}", h.finalize())
+}
+
+/// 핸드오프 매니페스트 다이제스트 (C′ 계약).
+///
+/// 인코딩: "fh1:" 가시 태그 + hex(H(label ‖ f(source) ‖ f(dest) ‖
+/// f(artifact) ‖ f(seq_str))) where f(x) = format!("{:08}:", x.len()) ‖ x
+/// — **고정폭 8자리** len-prefix: 길이 필드 경계가 항상 유일
+/// (astra r5 "1"+"11111111111" 류 십진 스트림 충돌 원천 불가).
+pub const HANDOFF_TAG: &str = "fh1:";
+const HANDOFF_LABEL: &[u8] = b"foundry-handoff-v1\0";
+const FIELD_CAP: usize = 99_999_999;
+
+fn field(x: &str) -> Result<Vec<u8>, String> {
+    if x.len() > FIELD_CAP {
+        return Err(format!("field exceeds {FIELD_CAP} bytes"));
+    }
+    let mut out = format!("{:08}:", x.len()).into_bytes();
+    out.extend_from_slice(x.as_bytes());
+    Ok(out)
+}
+
+/// 매니페스트 digest 생성 — "fh1:<hex>" 형태.
+pub fn handoff_manifest_digest(
+    source: &str,
+    dest: &str,
+    artifact: &str,
+    log_seq: i64,
+) -> Result<String, String> {
+    let mut h = sha2::Sha256::new();
+    h.update(HANDOFF_LABEL);
+    for part in [source, dest, artifact, &log_seq.to_string()] {
+        h.update(field(part)?);
+    }
+    Ok(format!("{HANDOFF_TAG}{:x}", h.finalize()))
+}
+
+/// digest 가 핸드오프 매니페스트인지 (가시 태그 검사).
+pub fn is_handoff_digest(digest: &str) -> bool {
+    digest.starts_with(HANDOFF_TAG)
+}
+
+/// 로그 — sqlite 해시체인 저장소.
+pub struct OrchestrationLog {
+    conn: std::sync::Mutex<rusqlite::Connection>,
+}
+
+#[derive(Debug)]
+pub enum OrchError {
+    Io(String),
+    Cycle { node: String },
+    MissingPredecessor { order: String, missing: String },
+    UndeclaredOrder { order: String },
+    DuplicateDeclaration { plan_id: String },
+    ChainBroken { at_seq: i64 },
+    /// 해당 seq 의 행이 없다 (포트 fail-closed 매핑용).
+    NoRow { seq: i64 },
+    FieldTooLarge,
+}
+
+impl std::fmt::Display for OrchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "orchestration io: {e}"),
+            Self::Cycle { node } => write!(f, "declaration cycle through '{node}'"),
+            Self::MissingPredecessor { order, missing } => {
+                write!(f, "order '{order}' depends on undeclared '{missing}'")
+            }
+            Self::UndeclaredOrder { order } => {
+                write!(f, "order '{order}' has no plan declaration — unsized/undeclared spawn")
+            }
+            Self::DuplicateDeclaration { plan_id } => {
+                write!(f, "plan '{plan_id}' declared twice")
+            }
+            Self::ChainBroken { at_seq } => write!(f, "chain broken at seq {at_seq}"),
+            Self::NoRow { seq } => write!(f, "no row at seq {seq}"),
+            Self::FieldTooLarge => write!(f, "field exceeds cap"),
+        }
+    }
+}
+
+impl OrchestrationLog {
+    pub fn open(path: &Path) -> Result<Self, OrchError> {
+        let conn = rusqlite::Connection::open(path).map_err(|e| OrchError::Io(e.to_string()))?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS orch (
+                 seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                 payload TEXT NOT NULL,
+                 prev_hash TEXT NOT NULL,
+                 hash TEXT NOT NULL
+             );
+             CREATE TRIGGER IF NOT EXISTS orch_no_update BEFORE UPDATE ON orch
+                 BEGIN SELECT RAISE(ABORT, 'orchestration log is append-only'); END;
+             CREATE TRIGGER IF NOT EXISTS orch_no_delete BEFORE DELETE ON orch
+                 BEGIN SELECT RAISE(ABORT, 'orchestration log is append-only'); END;",
+        )
+        .map_err(|e| OrchError::Io(e.to_string()))?;
+        Ok(Self { conn: std::sync::Mutex::new(conn) })
+    }
+
+    /// 행 append — 체인 연장. 선언 검증은 declare_plan 에서.
+    pub fn append(&self, kind: OrchestrationKind) -> Result<OrchRow, OrchError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| OrchError::Io(e.to_string()))?;
+        let prev: String = conn
+            .query_row(
+                "SELECT hash FROM orch ORDER BY seq DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or_else(|_| GENESIS.to_string());
+        let payload = serde_json::to_string(&kind)
+            .map_err(|e| OrchError::Io(e.to_string()))?;
+        let hash = row_hash(&prev, &payload);
+        conn.execute(
+            "INSERT INTO orch (payload, prev_hash, hash) VALUES (?1, ?2, ?3)",
+            rusqlite::params![payload, prev, hash],
+        )
+        .map_err(|e| OrchError::Io(e.to_string()))?;
+        let seq = conn
+            .query_row("SELECT last_insert_rowid()", [], |r| r.get(0))
+            .map_err(|e| OrchError::Io(e.to_string()))?;
+        conn.execute_batch("COMMIT")
+            .map_err(|e| OrchError::Io(e.to_string()))?;
+        Ok(OrchRow { seq, kind, prev_hash: prev, hash })
+    }
+
+    /// 전 행 조회 (체인 무결성 검증 포함).
+    pub fn read_all(&self) -> Result<Vec<OrchRow>, OrchError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT seq, payload, prev_hash, hash FROM orch ORDER BY seq")
+            .map_err(|e| OrchError::Io(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |r| {
+                let seq: i64 = r.get(0)?;
+                let payload: String = r.get(1)?;
+                let prev_hash: String = r.get(2)?;
+                let hash: String = r.get(3)?;
+                Ok((seq, payload, prev_hash, hash))
+            })
+            .map_err(|e| OrchError::Io(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| OrchError::Io(e.to_string()))?;
+        let mut out = Vec::with_capacity(rows.len());
+        let mut expect_prev = GENESIS.to_string();
+        for (seq, payload, prev_hash, hash) in rows {
+            if prev_hash != expect_prev || row_hash(&prev_hash, &payload) != hash {
+                return Err(OrchError::ChainBroken { at_seq: seq });
+            }
+            let kind = serde_json::from_str(&payload)
+                .map_err(|e| OrchError::Io(format!("payload decode: {e}")))?;
+            expect_prev = hash.clone();
+            out.push(OrchRow { seq, kind, prev_hash, hash });
+        }
+        Ok(out)
+    }
+
+    /// 체인 검증만 (read_all 가 내부 수행 — 명시적 진입점).
+    pub fn verify_chain(&self) -> Result<bool, OrchError> {
+        self.read_all().map(|_| true)
+    }
+
+    /// 에픽 선언 — 디스패치 전 내구. 사이클·부재 선행·중복 선언 거부.
+    pub fn declare_plan(
+        &self,
+        plan_id: &str,
+        edges: Vec<(String, Vec<String>)>,
+        streams: Vec<(String, String)>,
+    ) -> Result<OrchRow, OrchError> {
+        // 중복 선언 거부.
+        let existing = self.read_all()?;
+        if existing.iter().any(|r| {
+            matches!(&r.kind, OrchestrationKind::PlanDeclared { plan_id: p, .. } if p == plan_id)
+        }) {
+            return Err(OrchError::DuplicateDeclaration { plan_id: plan_id.into() });
+        }
+        // 이 선언 안에서 (향후 다른 plan 의 기존 선언과 합쳐서) 선행 존재 검사:
+        // 선언된 주문 집합 = 기존 전체 + 이번 edges 키.
+        let mut declared: std::collections::BTreeSet<String> = existing
+            .iter()
+            .flat_map(|r| match &r.kind {
+                OrchestrationKind::PlanDeclared { edges, .. } => {
+                    edges.iter().map(|(o, _)| o.clone()).collect::<Vec<_>>()
+                }
+                _ => Vec::new(),
+            })
+            .collect();
+        for (o, _) in &edges {
+            declared.insert(o.clone());
+        }
+        // 부재 선행 거부.
+        for (order, preds) in &edges {
+            for p in preds {
+                if !declared.contains(p) {
+                    return Err(OrchError::MissingPredecessor {
+                        order: order.clone(),
+                        missing: p.clone(),
+                    });
+                }
+            }
+        }
+        // 사이클 거부 — 전체 간선 병합 그래프에서 DFS.
+        let mut all_edges: std::collections::BTreeMap<String, Vec<String>> =
+            existing.iter().fold(Default::default(), |mut acc, r| {
+                if let OrchestrationKind::PlanDeclared { edges, .. } = &r.kind {
+                    for (o, preds) in edges {
+                        acc.insert(o.clone(), preds.clone());
+                    }
+                }
+                acc
+            });
+        for (o, preds) in edges.clone() {
+            all_edges.insert(o, preds);
+        }
+        if let Some(cycle_node) = find_cycle(&all_edges) {
+            return Err(OrchError::Cycle { node: cycle_node });
+        }
+        // 스트림 배정 검사 — 각 주문의 스트림이 선언되어야.
+        for (order, _) in &edges {
+            if !streams.iter().any(|(o, _)| o == order) {
+                return Err(OrchError::Io(format!(
+                    "order '{order}' has no stream assignment"
+                )));
+            }
+        }
+        self.append(OrchestrationKind::PlanDeclared {
+            plan_id: plan_id.into(),
+            edges,
+            streams,
+        })
+    }
+
+    /// 발행 기록 — 선언되지 않은 주문의 발행은 거부 (unsized-spawn 계약).
+    pub fn spawn_order(
+        &self,
+        order_id: &str,
+        plan_id: &str,
+        stream: &str,
+    ) -> Result<OrchRow, OrchError> {
+        let existing = self.read_all()?;
+        let declared = existing.iter().any(|r| {
+            matches!(&r.kind, OrchestrationKind::PlanDeclared { plan_id: p, edges, .. }
+                if p == plan_id && edges.iter().any(|(o, _)| o == order_id))
+        });
+        if !declared {
+            return Err(OrchError::UndeclaredOrder { order: order_id.into() });
+        }
+        self.append(OrchestrationKind::OrderSpawned {
+            order_id: order_id.into(),
+            plan_id: plan_id.into(),
+            stream: stream.into(),
+        })
+    }
+
+    /// 핸드오프 결속 — digest 는 이 행의 seq 로 매니페스트 계산.
+    pub fn bind_handoff(
+        &self,
+        source_order: &str,
+        dest_order: &str,
+        artifact_digest: &str,
+    ) -> Result<(OrchRow, String), OrchError> {
+        let row = self.append(OrchestrationKind::HandoffBound {
+            source_order: source_order.into(),
+            dest_order: dest_order.into(),
+            artifact_digest: artifact_digest.into(),
+        })?;
+        let manifest = handoff_manifest_digest(
+            source_order,
+            dest_order,
+            artifact_digest,
+            row.seq,
+        )
+        .map_err(|_| OrchError::FieldTooLarge)?;
+        Ok((row, manifest))
+    }
+
+    /// 선언 증거 — refusal 행은 배제 (선언 순수성).
+    pub fn declaration_rows(&self) -> Result<Vec<OrchRow>, OrchError> {
+        Ok(self
+            .read_all()?
+            .into_iter()
+            .filter(|r| !matches!(r.kind, OrchestrationKind::Refusal { .. }))
+            .collect())
+    }
+
+    /// seq 로 행 조회 — HandoffLogPort 의 조회 기반 (fail-closed: 부재=Err).
+    pub fn row_at(&self, seq: i64) -> Result<OrchRow, OrchError> {
+        let rows = self.read_all()?;
+        rows.into_iter()
+            .find(|r| r.seq == seq)
+            .ok_or(OrchError::NoRow { seq })
+    }
+}
+
+/// DFS 사이클 검출 — 발견 시 사이클 노드 하나 반환.
+fn find_cycle(
+    edges: &std::collections::BTreeMap<String, Vec<String>>,
+) -> Option<String> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Mark {
+        White,
+        Grey,
+        Black,
+    }
+    let mut marks: std::collections::BTreeMap<String, Mark> =
+        edges.keys().map(|k| (k.clone(), Mark::White)).collect();
+    fn dfs(
+        node: &str,
+        edges: &std::collections::BTreeMap<String, Vec<String>>,
+        marks: &mut std::collections::BTreeMap<String, Mark>,
+    ) -> Option<String> {
+        marks.insert(node.into(), Mark::Grey);
+        for next in edges.get(node).into_iter().flatten() {
+            match marks.get(next).copied().unwrap_or(Mark::White) {
+                Mark::Grey => return Some(next.clone()),
+                Mark::White => {
+                    if let Some(c) = dfs(next, edges, marks) {
+                        return Some(c);
+                    }
+                }
+                Mark::Black => {}
+            }
+        }
+        marks.insert(node.into(), Mark::Black);
+        None
+    }
+    for node in edges.keys() {
+        if matches!(marks.get(node), Some(Mark::White) | None) {
+            marks.entry(node.clone()).or_insert(Mark::White);
+            if let Some(c) = dfs(node, edges, &mut marks) {
+                return Some(c);
+            }
+        }
+    }
+    None
+}
+
+/// T57 종단 재구축 — 행 집합에서 (선언·발행·인계·결속) 투영 재계산.
+/// read_all 결과와 독립 계산이 일치해야 (재구축 동등 게이트의 대상).
+pub struct Projection {
+    pub plans: Vec<(String, Vec<(String, Vec<String>)>)>,
+    pub spawned: Vec<(String, String, String)>,
+    pub handoffs: Vec<(String, String, String, i64)>,
+    pub preset_bounds: Vec<(String, String, String)>,
+}
+
+pub fn project(rows: &[OrchRow]) -> Projection {
+    let mut p = Projection { plans: Vec::new(), spawned: Vec::new(), handoffs: Vec::new(), preset_bounds: Vec::new() };
+    for r in rows {
+        match &r.kind {
+            OrchestrationKind::PlanDeclared { plan_id, edges, .. } => {
+                p.plans.push((plan_id.clone(), edges.clone()))
+            }
+            OrchestrationKind::OrderSpawned { order_id, plan_id, stream } => {
+                p.spawned.push((order_id.clone(), plan_id.clone(), stream.clone()))
+            }
+            OrchestrationKind::HandoffBound { source_order, dest_order, artifact_digest } => {
+                p.handoffs.push((source_order.clone(), dest_order.clone(), artifact_digest.clone(), r.seq))
+            }
+            OrchestrationKind::PresetBound { sizing_order, selected_root, approved_digest, .. } => {
+                p.preset_bounds.push((sizing_order.clone(), selected_root.clone(), approved_digest.clone()))
+            }
+            OrchestrationKind::Refusal { .. } => {
+                // 선언 순수성: 거부 행은 투영에 기여하지 않는다.
+            }
+        }
+    }
+    p
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("foundry-orch-{name}-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    #[test]
+    fn chain_appends_and_verifies() {
+        let log = OrchestrationLog::open(&tmp("chain")).unwrap();
+        log.declare_plan(
+            "p1",
+            vec![("o-a".into(), vec![])],
+            vec![("o-a".into(), "s-1".into())],
+        )
+        .unwrap();
+        log.spawn_order("o-a", "p1", "s-1").unwrap();
+        assert!(log.verify_chain().unwrap());
+        assert_eq!(log.read_all().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn cycle_rejected() {
+        let log = OrchestrationLog::open(&tmp("cycle")).unwrap();
+        let e = log
+            .declare_plan(
+                "p1",
+                vec![
+                    ("o-a".into(), vec!["o-b".into()]),
+                    ("o-b".into(), vec!["o-a".into()]),
+                ],
+                vec![
+                    ("o-a".into(), "s".into()),
+                    ("o-b".into(), "s".into()),
+                ],
+            )
+            .unwrap_err();
+        assert!(matches!(e, OrchError::Cycle { .. }), "{e:?}");
+    }
+
+    #[test]
+    fn missing_predecessor_rejected() {
+        let log = OrchestrationLog::open(&tmp("missing")).unwrap();
+        let e = log
+            .declare_plan(
+                "p1",
+                vec![("o-a".into(), vec!["o-ghost".into()])],
+                vec![("o-a".into(), "s".into())],
+            )
+            .unwrap_err();
+        assert!(matches!(e, OrchError::MissingPredecessor { .. }));
+    }
+
+    #[test]
+    fn undeclared_spawn_rejected() {
+        let log = OrchestrationLog::open(&tmp("undeclared")).unwrap();
+        let e = log.spawn_order("o-never", "p-none", "s").unwrap_err();
+        assert!(matches!(e, OrchError::UndeclaredOrder { .. }));
+    }
+
+    #[test]
+    fn refusal_rows_excluded_from_evidence() {
+        let log = OrchestrationLog::open(&tmp("refusal")).unwrap();
+        log.declare_plan(
+            "p1",
+            vec![("o-a".into(), vec![])],
+            vec![("o-a".into(), "s".into())],
+        )
+        .unwrap();
+        log.append(OrchestrationKind::Refusal {
+            refused_request: "req-1".into(),
+            refusal_code: "unsized_spawn".into(),
+            reason_text: "사이징 승인 없는 발행".into(),
+            acceptance_condition: "사이징 게이트에서 스케일 확정".into(),
+            remediation_proposal_id: Some("prop-1".into()),
+        })
+        .unwrap();
+        // 체인은 거부 행까지 포함해 검증.
+        assert!(log.verify_chain().unwrap());
+        assert_eq!(log.read_all().unwrap().len(), 2);
+        // 증거는 배제.
+        assert_eq!(log.declaration_rows().unwrap().len(), 1);
+        let p = project(&log.read_all().unwrap());
+        assert!(p.plans.len() == 1 && p.spawned.is_empty());
+    }
+
+    #[test]
+    fn tampering_detected() {
+        let path = tmp("tamper");
+        {
+            let log = OrchestrationLog::open(&path).unwrap();
+            log.declare_plan(
+                "p1",
+                vec![("o-a".into(), vec![])],
+                vec![("o-a".into(), "s".into())],
+            )
+            .unwrap();
+        }
+        // 직접 SQL 로 payload 변조 (트리거는 UPDATE 차단 — 테이블 재생성 우회).
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("DROP TRIGGER orch_no_update;").unwrap();
+        conn.execute(
+            "UPDATE orch SET payload = '{\"kind\":\"refusal\",\"refused_request\":\"x\",\"refusal_code\":\"y\",\"reason_text\":\"z\",\"acceptance_condition\":\"w\"}' WHERE seq = 1",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let log = OrchestrationLog::open(&path).unwrap();
+        assert!(matches!(
+            log.verify_chain(),
+            Err(OrchError::ChainBroken { .. })
+        ));
+    }
+
+    #[test]
+    fn rebuild_projection_equivalence() {
+        let path = tmp("rebuild");
+        let log = OrchestrationLog::open(&path).unwrap();
+        log.declare_plan(
+            "p1",
+            vec![
+                ("o-a".into(), vec![]),
+                ("o-b".into(), vec!["o-a".into()]),
+            ],
+            vec![
+                ("o-a".into(), "s-1".into()),
+                ("o-b".into(), "s-1".into()),
+            ],
+        )
+        .unwrap();
+        log.spawn_order("o-a", "p1", "s-1").unwrap();
+        let (row, manifest) = log.bind_handoff("o-a", "o-b", "dig-artifact").unwrap();
+        assert!(is_handoff_digest(&manifest));
+        // 매니페스트는 행 결속 — 재계산 일치 (3자 일치의 기반).
+        let again = handoff_manifest_digest("o-a", "o-b", "dig-artifact", row.seq).unwrap();
+        assert_eq!(manifest, again);
+        // 재구축 동등: 재오픈해서 투영이 동일.
+        let reopened = OrchestrationLog::open(&path).unwrap();
+        let p1 = project(&log.read_all().unwrap());
+        let p2 = project(&reopened.read_all().unwrap());
+        assert_eq!(p1.plans, p2.plans);
+        assert_eq!(p1.spawned, p2.spawned);
+        assert_eq!(p1.handoffs, p2.handoffs);
+    }
+
+    /// (astra r4-r6) 인코딩 모호성 회귀 — 구분자 포함 필드·충돌 쌍·초장.
+    #[test]
+    fn manifest_encoding_unambiguous() {
+        // 파이프/콜론 포함 필드도 유일 디코딩 (길이로만 경계 결정).
+        let a = handoff_manifest_digest("a|b", "c", "d", 1).unwrap();
+        let b = handoff_manifest_digest("a", "b|c", "d", 1).unwrap();
+        assert_ne!(a, b, "delimiter-bearing fields must not collide");
+        // r5 충돌 쌍: "1"+"11111111111" 십진 스트림 — 고정폭으로 불가.
+        let c = handoff_manifest_digest("1", "11111111111", "x", 1).unwrap();
+        let d = handoff_manifest_digest("11111111111", "1", "x", 1).unwrap();
+        assert_ne!(c, d, "fixed-width lengths must defeat decimal-stream collisions");
+        // 초장 필드 거부.
+        let big = "x".repeat(100_000_000);
+        assert!(handoff_manifest_digest(&big, "a", "b", 1).is_err());
+    }
+
+    /// row_at fail-closed — 부재 seq 는 Err.
+    #[test]
+    fn row_at_missing_fails_closed() {
+        let log = OrchestrationLog::open(&tmp("rowat")).unwrap();
+        log.declare_plan(
+            "p1",
+            vec![("o-a".into(), vec![])],
+            vec![("o-a".into(), "s".into())],
+        )
+        .unwrap();
+        assert!(log.row_at(99).is_err());
+        assert!(log.row_at(1).is_ok());
+    }
+
+    /// 스트림 identity — 같은 root 재활성화는 별개 스트림 id 로 선언 가능.
+    #[test]
+    fn same_root_distinct_streams_allowed() {
+        let log = OrchestrationLog::open(&tmp("streams")).unwrap();
+        log.declare_plan(
+            "p1",
+            vec![("o-a".into(), vec![])],
+            vec![("o-a".into(), "root-x#act-1".into())],
+        )
+        .unwrap();
+        log.declare_plan(
+            "p2",
+            vec![("o-b".into(), vec![])],
+            vec![("o-b".into(), "root-x#act-2".into())],
+        )
+        .unwrap();
+        let p = project(&log.read_all().unwrap());
+        assert_eq!(p.plans.len(), 2);
+    }
+}
+
+
+// ── HandoffLogPort 구현 (M7 T57 — foundry-workflow 포트의 orch 측 어댑터) ──
+
+/// foundry-workflow 가 오케스트레이션 로그를 보는 창 — 포트 계약 이행.
+pub struct HandoffLogAdapter<'a>(pub &'a OrchestrationLog);
+
+impl foundry_workflow::replay::HandoffLogPort for HandoffLogAdapter<'_> {
+    fn handoff_row(
+        &self,
+        seq: i64,
+    ) -> Result<foundry_workflow::replay::HandoffRow, foundry_workflow::replay::HandoffLookupError> {
+        use foundry_workflow::replay::{HandoffLookupError as E, HandoffRow as R};
+        let row = self.0.row_at(seq).map_err(|e| match e {
+            OrchError::ChainBroken { at_seq } => E::ChainBroken { at_seq },
+            OrchError::NoRow { seq } => E::NoRow { seq },
+            other => E::Io(other.to_string()),
+        })?;
+        match row.kind {
+            OrchestrationKind::HandoffBound { source_order, dest_order, artifact_digest } => {
+                Ok(R { seq: row.seq, source_order, dest_order, artifact_digest })
+            }
+            _ => Err(E::NotAHandoff { seq: row.seq }),
+        }
+    }
+
+    fn log_intact(&self) -> Result<bool, foundry_workflow::replay::HandoffLookupError> {
+        use foundry_workflow::replay::HandoffLookupError as E;
+        self.0.verify_chain().map_err(|e| match e {
+            OrchError::ChainBroken { at_seq } => E::ChainBroken { at_seq },
+            other => E::Io(other.to_string()),
+        })
+    }
+}
+
+#[cfg(test)]
+mod port_tests {
+    use super::*;
+    use foundry_workflow::replay::HandoffLogPort as _;
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("foundry-orch-port-{name}-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    /// 포트 조회 — 행 있으면 전 필드 반환.
+    #[test]
+    fn port_returns_handoff_row() {
+        let log = OrchestrationLog::open(&tmp("ok")).unwrap();
+        log.declare_plan(
+            "p1",
+            vec![("o-a".into(), vec![]), ("o-b".into(), vec!["o-a".into()])],
+            vec![("o-a".into(), "s".into()), ("o-b".into(), "s".into())],
+        )
+        .unwrap();
+        let (row, _manifest) = log.bind_handoff("o-a", "o-b", "dig-art").unwrap();
+        let adapter = HandoffLogAdapter(&log);
+        let got = adapter.handoff_row(row.seq).unwrap();
+        assert_eq!(got.source_order, "o-a");
+        assert_eq!(got.dest_order, "o-b");
+        assert_eq!(got.artifact_digest, "dig-art");
+        assert!(adapter.log_intact().unwrap());
+    }
+
+    /// 포트 fail-closed — 부재 seq 는 NoRow, 비핸드오프 행은 NotAHandoff.
+    #[test]
+    fn port_fails_closed() {
+        let log = OrchestrationLog::open(&tmp("fc")).unwrap();
+        let decl = log
+            .declare_plan(
+                "p1",
+                vec![("o-a".into(), vec![])],
+                vec![("o-a".into(), "s".into())],
+            )
+            .unwrap();
+        let adapter = HandoffLogAdapter(&log);
+        use foundry_workflow::replay::HandoffLookupError as E;
+        assert_eq!(adapter.handoff_row(99), Err(E::NoRow { seq: 99 }));
+        assert_eq!(adapter.handoff_row(decl.seq), Err(E::NotAHandoff { seq: decl.seq }));
+    }
+}
