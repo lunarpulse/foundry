@@ -107,8 +107,21 @@ impl Stream {
         Ok(())
     }
 
+    /// 엔진 접근 — 펜스 시 거부(astra r4: 펜스는 enroll 뿐 아니라 기존
+    /// 주문의 실행 경로(engine 접근)도 차단해 fail-closed 를 완성한다).
     pub fn engine(&self) -> std::sync::MutexGuard<'_, WorkflowEngine> {
         self.engine.lock().unwrap()
+    }
+
+    /// 펜스 검사 포함 실행 진입 — 기존 주문의 dispatch_live 등 실행 경로.
+    pub fn engine_if_unfenced(&self) -> Result<std::sync::MutexGuard<'_, WorkflowEngine>, String> {
+        if self.is_fenced() {
+            return Err(format!(
+                "stream '{}' is fenced — execution refused until recovery succeeds",
+                self.stream_id
+            ));
+        }
+        Ok(self.engine.lock().unwrap())
     }
 
     /// 저널 읽기 전용 스냅샷.
@@ -390,7 +403,7 @@ impl<'r> RecoveryCoordinator<'r> {
                 s.fence();
                 continue;
             };
-            match RecoveryRunner::run(&mut ap2, &jr, &mut fresh) {
+            match RecoveryRunner::run_after_scan(&jr, &mut fresh) {
                 Ok(rep) if rep.journal_verified => {
                     let mut guard = s.engine.lock().unwrap();
                     *guard = fresh;
@@ -660,6 +673,32 @@ mod tests {
         assert!(sx.iter().any(|r| r.to_state == "shipped"));
         assert!(sy.iter().any(|r| r.to_state == "shipped"));
         assert_ne!(rt.stream("sx").unwrap().journal_path, rt.stream("sy").unwrap().journal_path);
+    }
+
+    /// (astra r4) 펜스 — 실패 스트림의 실행 경로 차단·해제.
+    #[test]
+    fn fenced_stream_blocks_execution_until_recovery() {
+        let d = tmpdir("fence");
+        let orch = OrchestrationLog::open(&d.join("orch.db")).unwrap();
+        orch.declare_plan(
+            "p1",
+            vec![("o-f".into(), vec![])],
+            vec![("o-f".into(), "s-f".into())],
+        )
+        .unwrap();
+        let rt = StreamRuntime::new(orch);
+        let st = Stream::new("s-f", &d).unwrap();
+        rt.add_stream(st).unwrap();
+        let s = rt.stream("s-f").unwrap();
+        assert!(s.engine_if_unfenced().is_ok());
+        s.fence();
+        assert!(s.engine_if_unfenced().is_err(), "fenced stream refuses execution");
+        match s.engine_if_unfenced() {
+            Err(msg) => assert!(msg.contains("fenced")),
+            Ok(_) => panic!("must be fenced"),
+        }
+        s.unfence();
+        assert!(s.engine_if_unfenced().is_ok());
     }
 
     /// 스트림 id 유일 강제 (astra r1).

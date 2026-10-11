@@ -67,4 +67,26 @@ impl RecoveryRunner {
 
         Ok(RecoveryReport { released, consumed, journal_verified, rebuilt_orders })
     }
+
+    /// (M7 T58 astra r4) **스캔 없는** 재구축 — 회복 코디네이터가 전역
+    /// 스캔을 이미 1회 수행한 뒤 스트림별로 호출한다 (N+1 스캔 제거:
+    /// 원장 스캔은 전역 자산이라 1회면 족하다). 저널 verify + 엔진
+    /// rebuild 만 수행.
+    pub fn run_after_scan(
+        journal: &SqliteLedger,
+        engine: &mut WorkflowEngine,
+    ) -> Result<RecoveryReport, RecoveryError> {
+        let journal_verified = journal
+            .verify_chain()
+            .map_err(|e| RecoveryError::Ledger(format!("{e:?}")))?;
+        let rebuilt_orders = engine
+            .rebuild(journal)
+            .map_err(RecoveryError::Rebuild)?;
+        Ok(RecoveryReport {
+            released: Vec::new(),
+            consumed: Vec::new(),
+            journal_verified,
+            rebuilt_orders,
+        })
+    }
 }
