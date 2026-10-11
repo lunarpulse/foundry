@@ -379,6 +379,47 @@ fn t61_end_to_end_reentry_bypass_crash_rebuild() {
     assert_eq!(rows2.len(), rows.len(), "rebuild sees identical log");
 }
 
+/// (M7.1 리뷰 B2) 스트림 루트 결속 — 다른 루트로 결속된 사이징 승인을
+/// 이 스트림의 부트스트랩에 사용하면 거부.
+#[test]
+fn t61_stream_root_binding_mismatch_refused() {
+    let d = tmpdir("rootbind");
+    let orch = OrchestrationLog::open(&d.join("orch.db")).unwrap();
+    orch.declare_plan(
+        "plan-sizing",
+        vec![("sz-r".into(), vec![])],
+        vec![("sz-r".into(), "s-root".into())],
+    )
+    .unwrap();
+    let rt = StreamRuntime::new(OrchestrationLog::open(&d.join("orch.db")).unwrap());
+    rt.add_stream(Stream::new_with_root("s-root", &d, "bmad-quickloop").unwrap()).unwrap();
+    rt.bind_approval_ledger(
+        foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
+    )
+    .unwrap();
+    // 사이징 승인·결속 — 다른 루트(feature-prd)로.
+    let orch = rt.orch.clone();
+    let digest = crate::chainer::sizing_digest("approved", "bmad-feature-prd", "plan-sizing");
+    {
+        let mut ap = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
+        ap.issue_grant("sizing-sz-r", "tok-r", &serde_json::json!({
+            "order_id": "sz-r", "intent": "sizing", "artifact_digest": digest, "root_scope": "",
+        }))
+        .unwrap();
+        let sr = ap.reserve_grant("sizing-sz-r", &serde_json::json!({
+            "order_id": "sz-r", "intent": "sizing", "artifact_digest": digest, "root_scope": "",
+        }), "rb", 1).unwrap();
+        ap.begin_apply("sizing-sz-r", "rb", 1, sr.fence_token).unwrap();
+        ap.finalize_grant("sizing-sz-r", "rb", 1, sr.fence_token).unwrap();
+        let ch = Chainer::new(&orch, &ap);
+        ch.bind_preset_from_ledger("sz-r", "bmad-feature-prd", "plan-sizing").unwrap();
+    }
+    // 부트스트랩 dispatch — 스트림 루트(quickloop)와 결속 루트
+    // (feature-prd) 불일치 → 거부.
+    let refused = rt.dispatch("sz-r", mkorder("sz-r", true));
+    assert!(refused.is_err(), "bootstrap root mismatch refused");
+}
+
 /// 깊이 1 제한 — 재디에이션 작업 자신의 거부는 제안 불가(종단 맥락).
 #[test]
 fn t61_remediation_depth1_in_end_to_end_context() {

@@ -32,12 +32,23 @@ pub struct Stream {
     engine: Mutex<WorkflowEngine>,
     /// 이 스트림이 디스패치한 주문 (이중 디스패치 방지).
     dispatched: Mutex<BTreeSet<String>>,
+    /// (M7.1 리뷰 B2) 이 스트림이 호스팅하는 **프리셋 루트** — 불변.
+    /// 부트스트랩 주문은 자신의 preset_bound selected_root 가 이 값과
+    /// 일치해야 한다(임의 스트림 부트스트랩 차단).
+    preset_root: String,
     /// (astra r3) 펜스 — 회복 실패 스트림의 enroll 차단(fail-closed).
     fenced: std::sync::atomic::AtomicBool,
 }
 
 impl Stream {
     /// 신규 스트림 — journal_dir/{stream_id}.db 소유.
+    /// (M7.1 리뷰 B2) 루트 결속 생성자 — 이 스트림의 프리셋 루트를 고정.
+    pub fn new_with_root(stream_id: &str, journal_dir: &Path, preset_root: &str) -> Result<Self, String> {
+        let mut s = Self::new(stream_id, journal_dir)?;
+        s.preset_root = preset_root.to_string();
+        Ok(s)
+    }
+
     pub fn new(stream_id: &str, journal_dir: &Path) -> Result<Self, String> {
         // (astra r2 identity) id 검증 — 경로 세포 문자/별칭 차단.
         if stream_id.is_empty()
@@ -70,6 +81,8 @@ impl Stream {
             engine: Mutex::new(engine),
             dispatched: Mutex::new(BTreeSet::new()),
             fenced: std::sync::atomic::AtomicBool::new(false),
+        
+            preset_root: String::new(),
         })
     }
 
@@ -363,6 +376,7 @@ impl StreamRuntime {
                 ));
             }
             Some(ap) => {
+                let stream = self.stream(&s).ok_or(format!("stream {s} not registered"))?;
                 let ch = crate::chainer::Chainer::new(&self.orch, ap);
                 // 주문 소스 — 인테이크 부트스트랩 판별. 소스가 없으면
                 // 비부트스트랩(보수).
@@ -384,6 +398,36 @@ impl StreamRuntime {
                 );
                 // sizing_order 역산 — 이 plan 의 preset_bound 찾기.
                 let sizing = self.sizing_of_plan(&plan);
+                // (M7.1 리뷰 B2) **스트림 루트 결속** — 부트스트랩
+                // (Source::Intake) 주문은 이 스트림의 preset_root 와
+                // preset_bound selected_root 가 일치해야 한다. 임의
+                // 스트림에서의 부트스트랩 차단(자기비교 폐지).
+                let is_bootstrap = matches!(
+                    order.external.source,
+                    foundry_domain::order::Source::Intake
+                );
+                if is_bootstrap {
+                    let bound_root = sizing
+                        .as_deref()
+                        .and_then(|so| self.root_of_sizing(so));
+                    let expected = if stream.preset_root.is_empty() {
+                        bound_root.clone()
+                    } else {
+                        Some(stream.preset_root.clone())
+                    };
+                    if bound_root != expected {
+                        let _ = record_refusal(
+                            &self.orch,
+                            RefusalCode::UnsizedSpawn,
+                            order_id,
+                            None,
+                        );
+                        return Err(format!(
+                            "order '{order_id}' bootstrap root mismatch — stream expects {:?}, bound {:?}",
+                            expected, bound_root
+                        ));
+                    }
+                }
                 let r = match sizing {
                     Some(so) => ch.check_spawn_binding(
                         order_id,
