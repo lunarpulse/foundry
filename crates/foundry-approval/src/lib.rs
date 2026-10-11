@@ -138,6 +138,25 @@ impl ApprovalLedger {
         Ok(())
     }
 
+    /// (M7.1 리뷰 MAJOR-2) 잔여 예약 조회 — 회복 코디네이터의 drain
+    /// 교차 검증용(예약은 소비/해제 시 삭제).
+    pub fn pending_reservations(&self) -> Vec<(String, String, i64)> {
+        let mut stmt = match self
+            .conn
+            .prepare("SELECT grant_id, exec_id, dispatch_seq FROM reservations")
+        {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+        });
+        match rows {
+            Ok(it) => it.filter_map(|x| x.ok()).collect(),
+            Err(_) => vec![],
+        }
+    }
+
     /// (M7.1 리뷰 B1) 원장 경로 — 라이브 핸드오프 재오픈용.
     pub fn db_path(&self) -> Option<&Path> {
         self.path.as_deref()

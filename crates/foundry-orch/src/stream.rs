@@ -635,7 +635,23 @@ impl<'r> RecoveryCoordinator<'r> {
         loop {
             let done = drain_poll();
             if want.iter().all(|k| done.contains(k)) {
-                break;
+                // (M7.1 리뷰 MAJOR-2) **drain 증거 무신뢰** — 호출자 폴링
+                // 만으로 완료 판정하지 않는다: 원장에서 in-flight 예약이
+                // 실제 종결(존재하지 않거나 무효)됐는지 교차 검증.
+                let drained_in_ledger = (|| -> bool {
+                    let Ok(mut ap) =
+                        foundry_approval::ApprovalLedger::open(approval_db)
+                    else {
+                        return false;
+                    };
+                    let pending = foundry_approval::ApprovalLedger::pending_reservations(&ap);
+                    want.iter().all(|k| !pending.iter().any(|(g, _, _)| g == k))
+                })();
+                if drained_in_ledger {
+                    break;
+                }
+                // 원장이 아직 보류 중이면 폴링 주장과 불일치 — 계속 대기
+                // (타임아웃이 안전 중단 담당).
             }
             if std::time::Instant::now() >= deadline {
                 let missing: Vec<String> =

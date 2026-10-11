@@ -11,6 +11,7 @@
 //!    후 **전체 재구축** — 로그·원장·저널에서 상태 재생, 체인 검증.
 //! 5. **전체 재구축 동등**: 재구축 오케스트레이션 로그가 원본과 동일.
 
+use std::collections::BTreeSet;
 use crate::chainer::{Chainer, ChainerError, SizingVerdict};
 use crate::refusal::{RefusalCode, RemediationKind};
 use crate::stream::{Stream, StreamRuntime};
@@ -377,6 +378,35 @@ fn t61_end_to_end_reentry_bypass_crash_rebuild() {
     // read_all 자체가 체인 검증 포함 — 변조 없음이 곧 동등 증명.
     // 행 수 동일.
     assert_eq!(rows2.len(), rows.len(), "rebuild sees identical log");
+}
+
+/// (M7.1 리뷰 MAJOR-2) 거짓 drain 보고 — 원장에 예약이 남아 있는데
+/// 호출자가 완료 주장 → 회복은 타임아웃까지 기다린다(AbortedWithoutScan).
+#[test]
+fn t61_false_drain_claim_not_trusted() {
+    let d = tmpdir("falsedrain");
+    let ap_db = d.join("ap.db");
+    let mut ap = foundry_approval::ApprovalLedger::open(&ap_db).unwrap();
+    // 잔여 예약 — grant가 'issued' 상태로 예약 존재.
+    ap.issue_grant("sizing-x", "tok-x", &serde_json::json!({
+        "order_id": "o-x", "intent": "sizing", "artifact_digest": "dx", "root_scope": "",
+    }))
+    .unwrap();
+    ap.reserve_grant("sizing-x", &serde_json::json!({
+        "order_id": "o-x", "intent": "sizing", "artifact_digest": "dx", "root_scope": "",
+    }), "ex-x", 1).unwrap();
+    let orch = OrchestrationLog::open(&d.join("orch.db")).unwrap();
+    let rt = StreamRuntime::new(OrchestrationLog::open(&d.join("orch.db")).unwrap());
+    let coord = crate::stream::RecoveryCoordinator::new(&rt, 2);
+    // 거짓 보고 — 즉시 완료 주장.
+    let out = coord.recover(&["sizing-x".to_string()], || {
+        ["sizing-x".to_string()].into_iter().collect::<BTreeSet<_>>()
+    }, &ap_db);
+    assert!(
+        matches!(out, crate::stream::RecoveryOutcome::AbortedWithoutScan { .. }),
+        "false drain claim rejected by ledger cross-check: {out:?}"
+    );
+    let _ = orch;
 }
 
 /// (M7.1 리뷰 MAJOR-1) 내구 이중 디스패치 — 새 런타임(재구축)에서도
