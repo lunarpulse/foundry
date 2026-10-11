@@ -70,33 +70,57 @@ pub struct RefusalEntry {
     pub remediation: RemediationKind,
 }
 
-/// 전수 조회 — 모든 코드의 항목 (전수성: match 가 열거형 전체 커버).
+/// 전수 조회 — entry_for (전수 match) 에서 파생 (astra r1 M4: 단일 소스).
 pub fn registry() -> Vec<RefusalEntry> {
-    use RefusalCode::*;
-    [
-        (UnsizedSpawn, "사이징 승인 없이 발행된 주문입니다", "사이징 게이트에서 프리셋이 확정되어야 합니다 (preset_bound)", RemediationKind::RunSizing),
-        (UndeclaredOrder, "계획 선언 없는 주문입니다", "plan_declared 행이 이 주문을 포함해야 합니다", RemediationKind::DeclarePlan),
-        (DeclarationCycle, "선언의 의존성에 사이클이 있습니다", "의존성 간선이 비순환이어야 합니다", RemediationKind::Escalate),
-        (MissingPredecessor, "존재하지 않는 선행 주문을 참조합니다", "선행 주문이 (같은 선언 안에) 먼저 선언되어야 합니다", RemediationKind::DeclarePlan),
-        (DuplicateDeclaration, "같은 계획이 두 번 선언되었습니다", "기존 선언을 갱신하거나 새 plan id 를 사용해야 합니다", RemediationKind::DeclarePlan),
-        (HandoffMismatch, "핸드오프 매니페스트가 로그·원장과 일치하지 않습니다", "매니페스트가 가리키는 로그 행 기준으로 재결속되어야 합니다", RemediationKind::RebindHandoff),
-        (GateBypass, "승인이 게이트를 우회하려 했습니다 (방화벽)", "인간 게이트(dispatch_live + grant)가 유일한 승인 경로입니다", RemediationKind::Escalate),
-        (PresetInvalid, "프리셋이 검증기를 통과하지 못했습니다", "검증기 진단(예: Prepare 배치·default_route)이 해소되어야 합니다", RemediationKind::Escalate),
-    ]
-    .into_iter()
-    .map(|(code, reason_text, acceptance_condition, remediation)| RefusalEntry {
-        code,
-        reason_text,
-        acceptance_condition,
-        remediation,
-    })
-    .collect()
+    RefusalCode::VARIANTS.iter().map(|c| entry_for(*c)).collect()
 }
 
-/// 코드로 항목 조회 — 전수 레지스트리에 항상 있음 (컴파일 보장 아님,
-/// 런타임 전수 검증은 게이트가 수행).
+/// 코드로 항목 조회 — **전수 match** (astra r1 M4): 새 코드 추가 시
+/// 이 match 가 컴파일 오류로 매핑 누락을 강제한다 (러스트 전수성 검사).
 pub fn entry_for(code: RefusalCode) -> RefusalEntry {
-    registry().into_iter().find(|e| e.code == code).expect("registry is exhaustive")
+    let (reason_text, acceptance_condition, remediation) = match code {
+        RefusalCode::UnsizedSpawn => (
+            "사이징 승인 없이 발행된 주문입니다",
+            "사이징 게이트에서 프리셋이 확정되어야 합니다 (preset_bound)",
+            RemediationKind::RunSizing,
+        ),
+        RefusalCode::UndeclaredOrder => (
+            "계획 선언 없는 주문입니다",
+            "plan_declared 행이 이 주문을 포함해야 합니다",
+            RemediationKind::DeclarePlan,
+        ),
+        RefusalCode::DeclarationCycle => (
+            "선언의 의존성에 사이클이 있습니다",
+            "의존성 간선이 비순환이어야 합니다",
+            RemediationKind::Escalate,
+        ),
+        RefusalCode::MissingPredecessor => (
+            "존재하지 않는 선행 주문을 참조합니다",
+            "선행 주문이 (같은 선언 안에) 먼저 선언되어야 합니다",
+            RemediationKind::DeclarePlan,
+        ),
+        RefusalCode::DuplicateDeclaration => (
+            "같은 계획이 두 번 선언되었습니다",
+            "기존 선언을 갱신하거나 새 plan id 를 사용해야 합니다",
+            RemediationKind::DeclarePlan,
+        ),
+        RefusalCode::HandoffMismatch => (
+            "핸드오프 매니페스트가 로그·원장과 일치하지 않습니다",
+            "매니페스트가 가리키는 로그 행 기준으로 재결속되어야 합니다",
+            RemediationKind::RebindHandoff,
+        ),
+        RefusalCode::GateBypass => (
+            "승인이 게이트를 우회하려 했습니다 (방화벽)",
+            "인간 게이트(dispatch_live + grant)가 유일한 승인 경로입니다",
+            RemediationKind::Escalate,
+        ),
+        RefusalCode::PresetInvalid => (
+            "프리셋이 검증기를 통과하지 못했습니다",
+            "검증기 진단(예: Prepare 배치·default_route)이 해소되어야 합니다",
+            RemediationKind::Escalate,
+        ),
+    };
+    RefusalEntry { code, reason_text, acceptance_condition, remediation }
 }
 
 /// OrchError → 코드 매핑 — 저장소 오류를 인간 대면 코드로.
@@ -104,11 +128,14 @@ pub fn code_for_orch_error(e: &crate::OrchError) -> Option<RefusalCode> {
     use crate::OrchError as E;
     use RefusalCode::*;
     Some(match e {
-        E::UndeclaredOrder { .. } => UnsizedSpawn,
+        // (astra r1 M4 정정) 발행 시점의 UndeclaredOrder 는 unsized-spawn
+        // 계약 위반(사이징 결속 없는 발행)이 본질 — 동일 코드로 매핑.
+        // DuplicateOrder/StreamMismatch 도 발행 규율 위반의 변형.
+        E::UndeclaredOrder { .. } | E::DuplicateOrder { .. } | E::StreamMismatch { .. } => UnsizedSpawn,
         E::MissingPredecessor { .. } => MissingPredecessor,
         E::Cycle { .. } => DeclarationCycle,
         E::DuplicateDeclaration { .. } => DuplicateDeclaration,
-        _ => return None, // Io/ChainBroken/NoRow 는 인간 대면 거부 아님(기술 오류)
+        _ => return None, // Io/ChainBroken/NoRow/FieldTooLarge/RawAppend 는 기술 오류
     })
 }
 
@@ -127,6 +154,23 @@ pub fn record_refusal(
         acceptance_condition: e.acceptance_condition.into(),
         remediation_proposal_id: remediation_proposal_id.map(|s| s.into()),
     })
+}
+
+/// presets/README 진단 표 파생 (astra r1 M4 — 문서와 레지스트리 같은 소스).
+/// 마크다운 행들을 반환: | 코드 | 이유 | 수락 조건 | 재디에이션 |
+pub fn readme_diagnostic_rows() -> Vec<String> {
+    registry()
+        .into_iter()
+        .map(|e| {
+            format!(
+                "| `{}` | {} | {} | {:?} |",
+                format!("{:?}", e.code).replace("RefusalCode::", ""),
+                e.reason_text,
+                e.acceptance_condition,
+                e.remediation
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]

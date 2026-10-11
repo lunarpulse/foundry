@@ -69,9 +69,13 @@ pub struct OrchRow {
 const GENESIS: &str = "GENESIS";
 const DOMAIN_LABEL: &[u8] = b"foundry-orch-chain-v1\0";
 
-fn row_hash(prev: &str, kind_json: &str) -> String {
+fn row_hash(seq: i64, prev: &str, kind_json: &str) -> String {
     let mut h = sha2::Sha256::new();
     h.update(DOMAIN_LABEL);
+    // (astra r1 M3) seq 포함 — 재번호화·삭제 감지. 16자리 고정폭 hex.
+    let seq_hex: String = seq.to_le_bytes().iter().map(|b| format!("{:02x}", b)).collect();
+    h.update(format!("{:016}:{}", seq_hex.len(), "").as_bytes());
+    h.update(seq_hex.as_bytes());
     h.update(format!("{:016}:{}", prev.len(), "").as_bytes());
     h.update(prev.as_bytes());
     h.update(format!("{:016}:{}", kind_json.len(), "").as_bytes());
@@ -118,6 +122,34 @@ pub fn is_handoff_digest(digest: &str) -> bool {
     digest.starts_with(HANDOFF_TAG)
 }
 
+/// (astra r1 M5) 트랜잭션 가드 — Drop 시 활성 상태면 ROLLBACK.
+struct TxGuard<'c> {
+    conn: &'c rusqlite::Connection,
+    active: bool,
+}
+
+impl<'c> TxGuard<'c> {
+    fn begin(conn: &'c rusqlite::Connection) -> Result<Self, OrchError> {
+        conn.execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| OrchError::Io(e.to_string()))?;
+        Ok(Self { conn, active: true })
+    }
+
+    /// 커밋 — 성공 시 active 해제(Drop 중복 방지), 실패는 호출자 전파.
+    fn commit(mut self) -> Result<(), OrchError> {
+        self.active = false;
+        self.conn.execute_batch("COMMIT").map_err(|e| OrchError::Io(e.to_string()))
+    }
+}
+
+impl Drop for TxGuard<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.conn.execute_batch("ROLLBACK");
+        }
+    }
+}
+
 /// 로그 — sqlite 해시체인 저장소.
 pub struct OrchestrationLog {
     conn: std::sync::Mutex<rusqlite::Connection>,
@@ -130,6 +162,10 @@ pub enum OrchError {
     MissingPredecessor { order: String, missing: String },
     UndeclaredOrder { order: String },
     DuplicateDeclaration { plan_id: String },
+    /// (astra r1 M1) 이미 선언된 주문 id 의 재선언 — 전역 유일 위반.
+    DuplicateOrder { order: String, in_plan: String },
+    /// (astra r1 M2) 발행 스트림이 선언 배정과 불일치.
+    StreamMismatch { order: String, declared: String, claimed: String },
     ChainBroken { at_seq: i64 },
     /// 해당 seq 의 행이 없다 (포트 fail-closed 매핑용).
     NoRow { seq: i64 },
@@ -149,6 +185,12 @@ impl std::fmt::Display for OrchError {
             }
             Self::DuplicateDeclaration { plan_id } => {
                 write!(f, "plan '{plan_id}' declared twice")
+            }
+            Self::DuplicateOrder { order, in_plan } => {
+                write!(f, "order '{order}' already declared in plan '{in_plan}' — order ids are globally unique")
+            }
+            Self::StreamMismatch { order, declared, claimed } => {
+                write!(f, "order '{order}' declared on stream '{declared}' but spawned claiming '{claimed}'")
             }
             Self::ChainBroken { at_seq } => write!(f, "chain broken at seq {at_seq}"),
             Self::NoRow { seq } => write!(f, "no row at seq {seq}"),
@@ -176,11 +218,13 @@ impl OrchestrationLog {
         Ok(Self { conn: std::sync::Mutex::new(conn) })
     }
 
-    /// 행 append — 체인 연장. 선언 검증은 declare_plan 에서.
-    pub fn append(&self, kind: OrchestrationKind) -> Result<OrchRow, OrchError> {
+    /// 행 append — 체인 연장. **비공개** (astra r1 M2): 검증 통과
+    /// 진입점만 공개. RAAI 트랜잭션(astra r1 M5) — 오류/패닉 시 자동
+    /// 롤백. hash 는 seq 포함이므로 INSERT(빈 해시) → seq 확보 → UPDATE
+    /// 채움을 같은 트랜잭션에서 수행(원자).
+    fn append(&self, kind: OrchestrationKind) -> Result<OrchRow, OrchError> {
         let conn = self.conn.lock().unwrap();
-        conn.execute_batch("BEGIN IMMEDIATE")
-            .map_err(|e| OrchError::Io(e.to_string()))?;
+        let guard = TxGuard::begin(&conn)?;
         let prev: String = conn
             .query_row(
                 "SELECT hash FROM orch ORDER BY seq DESC LIMIT 1",
@@ -190,17 +234,28 @@ impl OrchestrationLog {
             .unwrap_or_else(|_| GENESIS.to_string());
         let payload = serde_json::to_string(&kind)
             .map_err(|e| OrchError::Io(e.to_string()))?;
-        let hash = row_hash(&prev, &payload);
+        conn.execute_batch("DROP TRIGGER orch_no_update;")
+            .map_err(|e| OrchError::Io(e.to_string()))?;
         conn.execute(
-            "INSERT INTO orch (payload, prev_hash, hash) VALUES (?1, ?2, ?3)",
-            rusqlite::params![payload, prev, hash],
+            "INSERT INTO orch (payload, prev_hash, hash) VALUES (?1, ?2, '')",
+            rusqlite::params![payload, prev],
         )
         .map_err(|e| OrchError::Io(e.to_string()))?;
-        let seq = conn
+        let seq: i64 = conn
             .query_row("SELECT last_insert_rowid()", [], |r| r.get(0))
             .map_err(|e| OrchError::Io(e.to_string()))?;
-        conn.execute_batch("COMMIT")
-            .map_err(|e| OrchError::Io(e.to_string()))?;
+        let hash = row_hash(seq, &prev, &payload);
+        conn.execute(
+            "UPDATE orch SET hash = ?1 WHERE seq = ?2",
+            rusqlite::params![hash, seq],
+        )
+        .map_err(|e| OrchError::Io(e.to_string()))?;
+        conn.execute_batch(
+            "CREATE TRIGGER orch_no_update BEFORE UPDATE ON orch
+                 BEGIN SELECT RAISE(ABORT, 'orchestration log is append-only'); END;",
+        )
+        .map_err(|e| OrchError::Io(e.to_string()))?;
+        guard.commit()?;
         Ok(OrchRow { seq, kind, prev_hash: prev, hash })
     }
 
@@ -224,7 +279,8 @@ impl OrchestrationLog {
         let mut out = Vec::with_capacity(rows.len());
         let mut expect_prev = GENESIS.to_string();
         for (seq, payload, prev_hash, hash) in rows {
-            if prev_hash != expect_prev || row_hash(&prev_hash, &payload) != hash {
+            let idx = out.len() as i64;
+            if seq != idx + 1 || prev_hash != expect_prev || row_hash(seq, &prev_hash, &payload) != hash {
                 return Err(OrchError::ChainBroken { at_seq: seq });
             }
             let kind = serde_json::from_str(&payload)
@@ -254,17 +310,39 @@ impl OrchestrationLog {
         }) {
             return Err(OrchError::DuplicateDeclaration { plan_id: plan_id.into() });
         }
-        // 이 선언 안에서 (향후 다른 plan 의 기존 선언과 합쳐서) 선행 존재 검사:
-        // 선언된 주문 집합 = 기존 전체 + 이번 edges 키.
-        let mut declared: std::collections::BTreeSet<String> = existing
+        // (astra r1 M1) 주문 id 전역 유일 — 기존 선언의 주문 재선언 거부.
+        // 교차 플랜 간선 덮어쓰기로 사이클이 숨는 일이 없다.
+        let prior_orders: std::collections::BTreeMap<String, String> = existing
             .iter()
             .flat_map(|r| match &r.kind {
-                OrchestrationKind::PlanDeclared { edges, .. } => {
-                    edges.iter().map(|(o, _)| o.clone()).collect::<Vec<_>>()
-                }
+                OrchestrationKind::PlanDeclared { plan_id, edges, .. } => edges
+                    .iter()
+                    .map(move |(o, _)| (o.clone(), plan_id.clone()))
+                    .collect::<Vec<_>>(),
                 _ => Vec::new(),
             })
             .collect();
+        for (order, _) in &edges {
+            if let Some(in_plan) = prior_orders.get(order) {
+                return Err(OrchError::DuplicateOrder {
+                    order: order.clone(),
+                    in_plan: in_plan.clone(),
+                });
+            }
+        }
+        // 이번 선언 안 중복 키도 거부.
+        let mut seen = std::collections::BTreeSet::new();
+        for (order, _) in &edges {
+            if !seen.insert(order.clone()) {
+                return Err(OrchError::DuplicateOrder {
+                    order: order.clone(),
+                    in_plan: plan_id.into(),
+                });
+            }
+        }
+        // 선행 존재 검사 — 전역 선언 집합(기존+이번).
+        let mut declared: std::collections::BTreeSet<String> =
+            prior_orders.keys().cloned().collect();
         for (o, _) in &edges {
             declared.insert(o.clone());
         }
@@ -318,12 +396,27 @@ impl OrchestrationLog {
         stream: &str,
     ) -> Result<OrchRow, OrchError> {
         let existing = self.read_all()?;
-        let declared = existing.iter().any(|r| {
-            matches!(&r.kind, OrchestrationKind::PlanDeclared { plan_id: p, edges, .. }
-                if p == plan_id && edges.iter().any(|(o, _)| o == order_id))
-        });
-        if !declared {
+        let mut found: Option<(String, String)> = None; // (plan, stream)
+        for r in &existing {
+            if let OrchestrationKind::PlanDeclared { plan_id: p, edges, streams } = &r.kind {
+                if edges.iter().any(|(o, _)| o == order_id) {
+                    if let Some((_, s)) = streams.iter().find(|(o, _)| o == order_id) {
+                        found = Some((p.clone(), s.clone()));
+                    }
+                }
+            }
+        }
+        let (declared_plan, declared_s) = found
+            .ok_or_else(|| OrchError::UndeclaredOrder { order: order_id.into() })?;
+        if declared_plan != plan_id {
             return Err(OrchError::UndeclaredOrder { order: order_id.into() });
+        }
+        if declared_s != stream {
+            return Err(OrchError::StreamMismatch {
+                order: order_id.into(),
+                declared: declared_s,
+                claimed: stream.into(),
+            });
         }
         self.append(OrchestrationKind::OrderSpawned {
             order_id: order_id.into(),
@@ -418,7 +511,8 @@ fn find_cycle(
 /// T57 종단 재구축 — 행 집합에서 (선언·발행·인계·결속) 투영 재계산.
 /// read_all 결과와 독립 계산이 일치해야 (재구축 동등 게이트의 대상).
 pub struct Projection {
-    pub plans: Vec<(String, Vec<(String, Vec<String>)>)>,
+    /// (astra r1 M3) 스트림 배정까지 전 필드 보존.
+    pub plans: Vec<(String, Vec<(String, Vec<String>)>, Vec<(String, String)>)>,
     pub spawned: Vec<(String, String, String)>,
     pub handoffs: Vec<(String, String, String, i64)>,
     pub preset_bounds: Vec<(String, String, String)>,
@@ -428,8 +522,8 @@ pub fn project(rows: &[OrchRow]) -> Projection {
     let mut p = Projection { plans: Vec::new(), spawned: Vec::new(), handoffs: Vec::new(), preset_bounds: Vec::new() };
     for r in rows {
         match &r.kind {
-            OrchestrationKind::PlanDeclared { plan_id, edges, .. } => {
-                p.plans.push((plan_id.clone(), edges.clone()))
+            OrchestrationKind::PlanDeclared { plan_id, edges, streams } => {
+                p.plans.push((plan_id.clone(), edges.clone(), streams.clone()))
             }
             OrchestrationKind::OrderSpawned { order_id, plan_id, stream } => {
                 p.spawned.push((order_id.clone(), plan_id.clone(), stream.clone()))
@@ -628,6 +722,113 @@ mod tests {
     }
 
     /// 스트림 identity — 같은 root 재활성화는 별개 스트림 id 로 선언 가능.
+    /// (astra r1 M1 회귀) 교차 플랜 덮어쓰기 사이클 — 주문 재선언 거부로 은닉 불가.
+    #[test]
+    fn cross_plan_overwrite_cycle_rejected() {
+        let log = OrchestrationLog::open(&tmp("cross")).unwrap();
+        log.declare_plan(
+            "A",
+            vec![("o-b".into(), vec!["o-c".into()]), ("o-c".into(), vec![])],
+            vec![("o-b".into(), "s".into()), ("o-c".into(), "s".into())],
+        )
+        .unwrap();
+        // o-c 재선언 시도 — DuplicateOrder 거부 (B={c→b} 가 A의 간선을 덮어써
+        // 사이클을 숨기는 공격 불가).
+        let e = log
+            .declare_plan(
+                "B",
+                vec![("o-c".into(), vec!["o-b".into()])],
+                vec![("o-c".into(), "s".into())],
+            )
+            .unwrap_err();
+        assert!(matches!(e, OrchError::DuplicateOrder { .. }), "{e:?}");
+        // 합법 교차 참조: 새 주문이 A의 주문을 선행으로.
+        log.declare_plan(
+            "B2",
+            vec![("o-d".into(), vec!["o-b".into(), "o-c".into()])],
+            vec![("o-d".into(), "s".into())],
+        )
+        .unwrap();
+    }
+
+    /// (astra r1 M2 회귀) 발행 스트림 불일치 거부 + 선언 플랜 불일치 거부.
+    #[test]
+    fn spawn_stream_and_plan_mismatch_rejected() {
+        let log = OrchestrationLog::open(&tmp("streammm")).unwrap();
+        log.declare_plan(
+            "p1",
+            vec![("o-a".into(), vec![])],
+            vec![("o-a".into(), "s-declared".into())],
+        )
+        .unwrap();
+        let e = log.spawn_order("o-a", "p1", "s-other").unwrap_err();
+        assert!(matches!(e, OrchError::StreamMismatch { .. }), "{e:?}");
+        let e2 = log.spawn_order("o-a", "p-wrong", "s-declared").unwrap_err();
+        assert!(matches!(e2, OrchError::UndeclaredOrder { .. }), "{e2:?}");
+        log.spawn_order("o-a", "p1", "s-declared").unwrap();
+    }
+
+    /// (astra r1 M3 회귀) seq 재번호화 — 행 삭제로 시퀀스가 당겨지면 감지.
+    #[test]
+    fn seq_renumbering_detected() {
+        let path = tmp("renumber");
+        {
+            let log = OrchestrationLog::open(&path).unwrap();
+            log.declare_plan("p1", vec![("o-a".into(), vec![])], vec![("o-a".into(), "s".into())]).unwrap();
+            log.declare_plan("p2", vec![("o-b".into(), vec![])], vec![("o-b".into(), "s".into())]).unwrap();
+        }
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("DROP TRIGGER orch_no_update; DROP TRIGGER orch_no_delete;").unwrap();
+        conn.execute("DELETE FROM orch WHERE seq = 1", []).unwrap();
+        drop(conn);
+        let log = OrchestrationLog::open(&path).unwrap();
+        assert!(matches!(log.read_all(), Err(OrchError::ChainBroken { .. })));
+    }
+
+    /// (astra r1 게이트7) 거부 행이 섞인 재오픈 동등 + 거부 행 변조 감지.
+    #[test]
+    fn mixed_refusal_reopen_and_tamper() {
+        let path = tmp("mixed");
+        {
+            let log = OrchestrationLog::open(&path).unwrap();
+            log.declare_plan("p1", vec![("o-a".into(), vec![])], vec![("o-a".into(), "s".into())]).unwrap();
+            crate::refusal::record_refusal(
+                &log,
+                crate::refusal::RefusalCode::HandoffMismatch,
+                "req-9",
+                None,
+            )
+            .unwrap();
+            log.spawn_order("o-a", "p1", "s").unwrap();
+        }
+        let reopened = OrchestrationLog::open(&path).unwrap();
+        let p1 = project(&reopened.read_all().unwrap());
+        assert_eq!(p1.plans.len(), 1);
+        assert_eq!(p1.spawned.len(), 1, "refusal row must not break projection");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("DROP TRIGGER orch_no_update;").unwrap();
+        conn.execute(
+            "UPDATE orch SET payload = replace(payload, '매니페스트', 'TAMPERED') WHERE seq = 2",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(matches!(reopened.verify_chain(), Err(OrchError::ChainBroken { .. })));
+    }
+
+    /// (astra r1 M5 회귀) 검증 실패 후에도 로그 정상 사용 가능 (RAAI).
+    #[test]
+    fn failed_validation_leaves_log_usable() {
+        let log = OrchestrationLog::open(&tmp("raai")).unwrap();
+        log.declare_plan("p1", vec![("o-a".into(), vec![])], vec![("o-a".into(), "s".into())]).unwrap();
+        let _ = log.declare_plan("p1", vec![("o-z".into(), vec![])], vec![("o-z".into(), "s".into())]);
+        let _ = log.spawn_order("o-ghost", "p1", "s");
+        let _ = log.spawn_order("o-a", "p1", "s-wrong");
+        log.spawn_order("o-a", "p1", "s").unwrap();
+        assert!(log.verify_chain().unwrap());
+        assert_eq!(log.read_all().unwrap().len(), 2);
+    }
+
     #[test]
     fn same_root_distinct_streams_allowed() {
         let log = OrchestrationLog::open(&tmp("streams")).unwrap();
