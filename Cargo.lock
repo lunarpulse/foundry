@@ -503,7 +503,9 @@ name = "foundry-orch"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "foundry-approval",
  "foundry-domain",
+ "foundry-ledger",
  "foundry-workflow",
  "rusqlite",
  "serde",

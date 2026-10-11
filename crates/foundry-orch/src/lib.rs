@@ -15,6 +15,7 @@
 //!   모호성 원천 불가 (astra r4-r6 폐쇄).
 
 pub mod refusal;
+pub mod stream;
 
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
@@ -1067,5 +1068,38 @@ mod port_tests {
         use foundry_workflow::replay::HandoffLookupError as E;
         assert_eq!(adapter.handoff_row(99), Err(E::NoRow { seq: 99 }));
         assert_eq!(adapter.handoff_row(decl.seq), Err(E::NotAHandoff { seq: decl.seq }));
+    }
+}
+
+
+/// (T58 테스트 지원) 저널 행에서 신뢰 커서 발급 — 게이트 common 의
+/// replay_ctx_for 등가. foundry-workflow 공개 API 만 사용.
+pub mod test_support {
+    /// 터미널 커밋먼트 산출 후 커서 발급.
+    pub fn replay_ctx(
+        order_id: &str,
+        rows: &[foundry_ledger::LedgerRow],
+    ) -> foundry_workflow::replay::ReplayContext {
+        use foundry_ledger::LedgerRow;
+        let max_seq = rows.iter().map(|r| r.seq).max().unwrap_or(0);
+        let chain_head = rows
+            .iter()
+            .find(|r| r.seq == max_seq)
+            .map(|r| r.hash.clone())
+            .unwrap_or_else(|| "GENESIS".into());
+        let count = rows.len() as i64;
+        let commit = foundry_workflow::replay::TerminalCommitment {
+            max_seq,
+            count,
+            chain_head,
+        };
+        let cursor = if rows.is_empty() {
+            // 부트스트랩: 행 없는 주문은 제네시스 커서.
+            foundry_workflow::replay::VerifiedReplayCursor::genesis(order_id)
+        } else {
+            foundry_workflow::replay::issue_replay_cursor(rows, &commit, order_id, max_seq)
+                .expect("cursor issuance")
+        };
+        foundry_workflow::replay::ReplayContext { cursor }
     }
 }

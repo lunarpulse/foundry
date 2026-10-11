@@ -4,8 +4,10 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-foundry-domain = { path = "../foundry-domain" }
+foundry-domain = { path = "../foundry-domain", features = ["proof-fixture"] }
 foundry-workflow = { path = "../foundry-workflow" }
+foundry-approval = { path = "../foundry-approval" }
+foundry-ledger = { path = "../foundry-ledger" }
 rusqlite = { workspace = true }
 sha2 = { workspace = true }
 serde = { workspace = true }
