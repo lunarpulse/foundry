@@ -40,8 +40,20 @@ pub trait StatusSink {
 }
 
 /// Notifications out (plan §3). M0: log. M1: Discord webhook.
-pub trait Notifier {
-    fn notify(&mut self, event: &str, order_id: &str) -> PortResult<()>;
+/// (Notifier v2.7) 구조화 알림 이벤트 — `#[non_exhaustive]`로 변종 추가가
+/// 비파괴(소비부 와일드카드 강제). 이벤트 축 OCP 회복의 핵심 장치.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotifyEvent {
+    FurnaceHold { order_id: String, digest: String },
+    Failed { order_id: String, reason: String },
+    Shipped { order_id: String, pr_url: String },
+}
+
+pub trait Notifier: Send {
+    fn notify(&mut self, event: NotifyEvent) -> PortResult<()>;
+    /// 관측 종결. 구현은 전송 자원을 안전하게 정리한다(기본 no-op).
+    fn drain(&mut self) {}
 }
 
 /// Who acts. M0: single local actor. M4: SSO/OIDC + non-human agent IDs.

@@ -210,6 +210,16 @@ fn human() -> ActorId {
     }
 }
 
+/// (Notifier v2.7 temporary) Extract the order_id from a NotifyEvent.
+fn notify_event_order_id(e: &foundry_domain::ports::NotifyEvent) -> &str {
+    match e {
+        foundry_domain::ports::NotifyEvent::FurnaceHold { order_id, .. }
+        | foundry_domain::ports::NotifyEvent::Failed { order_id, .. }
+        | foundry_domain::ports::NotifyEvent::Shipped { order_id, .. } => order_id,
+        _ => "",
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -641,12 +651,13 @@ async fn watch_cmd(once: bool, every: u64, repo: String, die: String, auto_appro
         use foundry_domain::ports::Notifier as _;
         // T13: Discord notifier — observation plane, never blocks the line.
         let mut notifier = foundry_watch::discord_notifier::DiscordNotifier::from_env();
-        let notify =
-            |n: &mut foundry_watch::discord_notifier::DiscordNotifier, event: &str, oid: &str| {
-                if let Err(e) = n.notify(event, oid) {
-                    eprintln!("notify: {oid} {event} failed (non-fatal): {e:?}");
-                }
-            };
+        let notify = |n: &mut foundry_watch::discord_notifier::DiscordNotifier,
+                      event: foundry_domain::ports::NotifyEvent| {
+            let oid = notify_event_order_id(&event).to_string();
+            if let Err(e) = n.notify(event) {
+                eprintln!("notify: {oid} failed (non-fatal): {e:?}");
+            }
+        };
         let intake = std::sync::Arc::new(tokio::sync::Mutex::new(intake));
         match foundry_watch::tick(&line, intake, &actor).await {
             Ok(n) => {
@@ -667,12 +678,20 @@ async fn watch_cmd(once: bool, every: u64, repo: String, die: String, auto_appro
                     let d: String = digest.chars().take(12).collect();
                     notify(
                         &mut notifier,
-                        &format!("furnace_hold attempt=1 digest={d}"),
-                        &oid,
+                        foundry_domain::ports::NotifyEvent::FurnaceHold {
+                            order_id: oid.clone(),
+                            digest: d.clone(),
+                        },
                     );
                 }
                 for oid in line.ids_in_state(foundry_domain::OrderState::Failed).await {
-                    notify(&mut notifier, "failed see ledger", &oid);
+                    notify(
+                        &mut notifier,
+                        foundry_domain::ports::NotifyEvent::Failed {
+                            order_id: oid.clone(),
+                            reason: "see ledger".into(),
+                        },
+                    );
                 }
                 // M0 gate autopilot: approve + publish every FurnaceHold order
                 // in-process. The Approved event (intent + digest) is journalled
@@ -700,7 +719,13 @@ async fn watch_cmd(once: bool, every: u64, repo: String, die: String, auto_appro
                                 Ok(st) => {
                                     println!("{oid} → {:?}", st.state);
                                     if st.state == foundry_domain::OrderState::Shipped {
-                                        notify(&mut notifier, "shipped", &oid);
+                                        notify(
+                                            &mut notifier,
+                                            foundry_domain::ports::NotifyEvent::Shipped {
+                                                order_id: oid.clone(),
+                                                pr_url: st.pr_url.clone().unwrap_or_default(),
+                                            },
+                                        );
                                     }
                                 }
                                 Err(e) => eprintln!("✗ publish {oid}: {e:?}"),
