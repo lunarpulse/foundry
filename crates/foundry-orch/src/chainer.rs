@@ -212,11 +212,14 @@ impl<'o, 'a> Chainer<'o, 'a> {
         artifact_digest: &str,
         issuer_token: &str,
     ) -> Result<ProposalView, ChainerError> {
-        // 재생 우선 — 기존 제안이면 멱등 반환. 파라미터 전부 비교
-        // (astra r2: source/dest 도 — 재시도가 다른 경로를 덮지 못하게).
+        // 재생 우선 — 기존 제안이면 멱등 반환. digest 불일치는 거부
+        // (astra r2: 재시도가 다른 경로를 덮지 못하게). issuer_token 은
+        // 제안 식별자가 아니라 confirm 의 그랜트 앵커가 검증한다 —
+        // 같은 핸드오프의 재발급 그랜트(다른 토큰)도 같은 제안을
+        // 재사용한다(M7.1 재리뷰 r2: 정문 재시도 경로).
         for p in self.replay_proposals()? {
             if p.proposal_id == proposal_id {
-                if p.issuer_token != issuer_token || p.artifact_digest != artifact_digest {
+                if p.artifact_digest != artifact_digest {
                     return Err(ChainerError::ThreeWayMismatch {
                         proposal_id: proposal_id.into(),
                     });
@@ -254,10 +257,29 @@ impl<'o, 'a> Chainer<'o, 'a> {
     /// ①로그 행 재계산 매니페스트 ②제시 매니페스트 ③**원장 그랜트
     /// 스코프의 artifact_digest**. 발급자 앵커: 그랜트 token_id.
     /// 재확정 멱등: 이미 CONSUMED 그랜트면 기존 성립으로 반환.
+    /// (M7.1 재리뷰 r2) 확정 **사전 검증** — 3자 일치+6필드 결속만
+    /// (그랜트 상태 무관). 정문이 소비 전 위조를 차단하는 게이트.
+    pub fn verify_handoff(
+        &self,
+        proposal_id: &str,
+        grant_id: &str,
+    ) -> Result<ProposalView, ChainerError> {
+        self.confirm_handoff_inner(proposal_id, grant_id, true)
+    }
+
     pub fn confirm_handoff(
         &self,
         proposal_id: &str,
         grant_id: &str,
+    ) -> Result<ProposalView, ChainerError> {
+        self.confirm_handoff_inner(proposal_id, grant_id, false)
+    }
+
+    fn confirm_handoff_inner(
+        &self,
+        proposal_id: &str,
+        grant_id: &str,
+        pre_verify_only: bool,
     ) -> Result<ProposalView, ChainerError> {
         let Some(p) = self
             .reply_proposal(proposal_id)?
@@ -269,10 +291,11 @@ impl<'o, 'a> Chainer<'o, 'a> {
             .ledger
             .get_grant(grant_id)
             .map_err(|e| ChainerError::Ledger(format!("{e:?}")))?;
-        // 위조 발급자 거부 — 그랜트 token_id ≠ 제안 issuer.
-        if grant.token_id != p.issuer_token {
-            return Err(ChainerError::IssuerMismatch { proposal_id: proposal_id.into() });
-        }
+        // (M7.1 재리뷰 r2) 발급자 앵커 — 제안 행의 최초 토큰 대신
+        // **매니페스트 결속**(아래 6필드 검증의 handoff_manifest)이
+        // 그랜트를 이 제안·이 행에 잠근다: 같은 핸드오프의 재발급
+        // 그랜트(다른 토큰)도 정당하며, 무관 그랜트는 매니페스트가
+        // 맞지 않아 거부된다.
         // (astra r2 BLOCKER) 스토프 **전체** 결속 — digest 뿐 아니라
         // source/dest 주문·intent·root_scope 가 그랜트 스코프와 일치해야
         // 한다(같은 digest 로 무관 경로 승인 차단).
@@ -332,9 +355,13 @@ impl<'o, 'a> Chainer<'o, 'a> {
         match grant.state {
             GrantState::Consumed => Ok(p),
             GrantState::Issued | GrantState::Pending | GrantState::Applying => {
-                Err(ChainerError::ThreeWayMismatch {
-                    proposal_id: proposal_id.into(),
-                })
+                if pre_verify_only {
+                    Ok(p)
+                } else {
+                    Err(ChainerError::ThreeWayMismatch {
+                        proposal_id: proposal_id.into(),
+                    })
+                }
             }
         }
     }
@@ -741,9 +768,11 @@ mod tests {
         });
         ledger.issue_grant("g-3", "tok-3", &scope3).unwrap();
         let ch3 = Chainer::new(&log, &ledger);
+        // (M7.1 재리뷰 r2) 발급자 앵커는 매니페스트 결속이 담당 — 무관
+        // 그랜트(g-2: handoff_manifest 부재)는 ThreeWayMismatch 로 거부.
         assert!(matches!(
             ch3.confirm_handoff("hp-2", "g-2"),
-            Err(ChainerError::IssuerMismatch { .. })
+            Err(ChainerError::ThreeWayMismatch { .. })
         ));
         assert!(matches!(
             ch3.confirm_handoff("hp-3", "g-3"),

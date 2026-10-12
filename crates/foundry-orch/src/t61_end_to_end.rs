@@ -387,6 +387,118 @@ fn t61_end_to_end_reentry_bypass_crash_rebuild() {
     assert!(rows2.iter().any(|r| matches!(&r.kind, OrchestrationKind::ReentryAdmitted { order, .. } if order == "t-1")));
 }
 
+/// (M7.1 리뷰 B2) 스트림 루트 결속 — 다른 루트로 결속된 사이징 승인을
+/// 이 스트림의 부트스트랩에 사용하면 거부.
+#[test]
+fn t61_stream_root_binding_mismatch_refused() {
+    let d = tmpdir("rootbind");
+    let orch = OrchestrationLog::open(&d.join("orch.db")).unwrap();
+    orch.declare_plan(
+        "plan-sizing",
+        vec![("sz-r".into(), vec![])],
+        vec![("sz-r".into(), "s-root".into())],
+    )
+    .unwrap();
+    let rt = StreamRuntime::new(OrchestrationLog::open(&d.join("orch.db")).unwrap());
+    rt.add_stream(Stream::new_with_root("s-root", &d, "bmad-quickloop").unwrap()).unwrap();
+    rt.bind_approval_ledger(
+        foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
+    )
+    .unwrap();
+    // 사이징 승인·결속 — 다른 루트(feature-prd)로.
+    let orch = rt.orch.clone();
+    let digest = crate::chainer::sizing_digest("approved", "bmad-feature-prd", "plan-sizing");
+    {
+        let mut ap = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
+        ap.issue_grant("sizing-sz-r", "tok-r", &serde_json::json!({
+            "order_id": "sz-r", "intent": "sizing", "artifact_digest": digest, "root_scope": "",
+        }))
+        .unwrap();
+        let sr = ap.reserve_grant("sizing-sz-r", &serde_json::json!({
+            "order_id": "sz-r", "intent": "sizing", "artifact_digest": digest, "root_scope": "",
+        }), "rb", 1).unwrap();
+        ap.begin_apply("sizing-sz-r", "rb", 1, sr.fence_token).unwrap();
+        ap.finalize_grant("sizing-sz-r", "rb", 1, sr.fence_token).unwrap();
+        let ch = Chainer::new(&orch, &ap);
+        ch.bind_preset_from_ledger("sz-r", "bmad-feature-prd", "plan-sizing").unwrap();
+    }
+    // 부트스트랩 dispatch — 스트림 루트(quickloop)와 결속 루트
+    // (feature-prd) 불일치 → 거부.
+    let refused = rt.dispatch("sz-r", mkorder("sz-r", true));
+    assert!(refused.is_err(), "bootstrap root mismatch refused");
+}
+
+/// 깊이 1 제한 — 재디에이션 작업 자신의 거부는 제안 불가(종단 맥락).
+#[test]
+fn t61_remediation_depth1_in_end_to_end_context() {
+    let d = tmpdir("depth");
+    let orch = OrchestrationLog::open(&d.join("orch.db")).unwrap();
+    let ap = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
+    // 원 요청 거부 + 재디에이션 제안(연결 행 append).
+    crate::refusal::record_refusal(&orch, RefusalCode::UnsizedSpawn, "req-1", None).unwrap();
+    let seq0 = orch.read_all().unwrap().iter().find(|r| matches!(&r.kind, OrchestrationKind::Refusal { .. })).unwrap().seq;
+    let ch0 = Chainer::new(&orch, &ap);
+    let (rem_pid, _) = ch0.propose_remediation(seq0).unwrap();
+    // **그 재디에이션 작업 주문 자신**의 거부 — 같은 pid 주문.
+    crate::refusal::record_refusal(&orch, RefusalCode::NotReady, &rem_pid, None).unwrap();
+    let ch = Chainer::new(&orch, &ap);
+    let rows = orch.read_all().unwrap();
+    let rem_seq = rows
+        .iter()
+        .find(|r| matches!(&r.kind, OrchestrationKind::Refusal { refused_request, .. } if refused_request == &rem_pid))
+        .unwrap()
+        .seq;
+    assert!(matches!(
+        ch.propose_remediation(rem_seq),
+        Err(ChainerError::RemediationDepth { .. })
+    ));
+    let _ = SizingVerdict::Approved;
+}
+
+/// (M7.1 리뷰 B3) 실행 진입점 — advance_to_gate 가 프로덕션 경로로
+/// 주문을 게이트(승인 대기)에 둔다.
+#[test]
+fn t61_advance_to_gate_entry_point() {
+    let d = tmpdir("advgate");
+    let orch = OrchestrationLog::open(&d.join("orch.db")).unwrap();
+    orch.declare_plan(
+        "plan-g",
+        vec![("t-g1".into(), vec![])],
+        vec![("t-g1".into(), "s-g".into())],
+    )
+    .unwrap();
+    let mut ap = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
+    {
+        let digest = crate::chainer::sizing_digest("approved", "bmad-quickloop", "plan-g");
+        ap.issue_grant("sizing-sz-g", "tok-g", &serde_json::json!({
+            "order_id": "sz-g", "intent": "sizing", "artifact_digest": digest, "root_scope": "",
+        }))
+        .unwrap();
+        let sr = ap.reserve_grant("sizing-sz-g", &serde_json::json!({
+            "order_id": "sz-g", "intent": "sizing", "artifact_digest": digest, "root_scope": "",
+        }), "g", 1).unwrap();
+        ap.begin_apply("sizing-sz-g", "g", 1, sr.fence_token).unwrap();
+        ap.finalize_grant("sizing-sz-g", "g", 1, sr.fence_token).unwrap();
+        let ch = Chainer::new(&orch, &ap);
+        ch.bind_preset_from_ledger("sz-g", "bmad-quickloop", "plan-g").unwrap();
+    }
+    let rt = StreamRuntime::new(OrchestrationLog::open(&d.join("orch.db")).unwrap());
+    rt.add_stream(Stream::new_with_root("s-g", &d, "bmad-quickloop").unwrap()).unwrap();
+    rt.bind_approval_ledger(
+        foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
+    )
+    .unwrap();
+    rt.dispatch("t-g1", mkorder("t-g1", true)).unwrap();
+    // 프로덕션 진입점 — 게이트 도달.
+    let st = rt.advance_to_gate("s-g", "t-g1", "exec-g").unwrap();
+    assert_eq!(st, OrderState::FurnaceHold, "order at the approval gate");
+    // 저널에 진행 이벤트가 실렸다.
+    let e = rt.stream("s-g").unwrap();
+    let rows = foundry_ledger::SqliteLedger::open(e.journal()).unwrap().read_all().unwrap();
+    assert!(rows.iter().any(|r| r.event.contains("InspectionPassed")),
+        "gate-reaching events journaled");
+}
+
 /// (M7.1 리뷰 MAJOR-4) 중복 디스패치 거부가 **영구 거부 레지스트리**에
 /// 기록된다(일시적 에러만 반환하는 게 아님).
 #[test]
@@ -510,70 +622,19 @@ fn t61_post_rebuild_redispatch_refused() {
     assert!(dup.is_err(), "post-rebuild redispatch refused via journal evidence");
 }
 
-/// (M7.1 리뷰 B3) 실행 진입점 — advance_to_gate 가 프로덕션 경로로
-/// 주문을 게이트(승인 대기)에 둔다.
-#[test]
-fn t61_advance_to_gate_entry_point() {
-    let d = tmpdir("advgate");
-    let orch = OrchestrationLog::open(&d.join("orch.db")).unwrap();
-    orch.declare_plan(
-        "plan-g",
-        vec![("t-g1".into(), vec![])],
-        vec![("t-g1".into(), "s-g".into())],
-    )
-    .unwrap();
-    let mut ap = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
-    {
-        let digest = crate::chainer::sizing_digest("approved", "bmad-quickloop", "plan-g");
-        ap.issue_grant("sizing-sz-g", "tok-g", &serde_json::json!({
-            "order_id": "sz-g", "intent": "sizing", "artifact_digest": digest, "root_scope": "",
-        }))
-        .unwrap();
-        let sr = ap.reserve_grant("sizing-sz-g", &serde_json::json!({
-            "order_id": "sz-g", "intent": "sizing", "artifact_digest": digest, "root_scope": "",
-        }), "g", 1).unwrap();
-        ap.begin_apply("sizing-sz-g", "g", 1, sr.fence_token).unwrap();
-        ap.finalize_grant("sizing-sz-g", "g", 1, sr.fence_token).unwrap();
-        let ch = Chainer::new(&orch, &ap);
-        ch.bind_preset_from_ledger("sz-g", "bmad-quickloop", "plan-g").unwrap();
-    }
-    let rt = StreamRuntime::new(OrchestrationLog::open(&d.join("orch.db")).unwrap());
-    rt.add_stream(Stream::new_with_root("s-g", &d, "bmad-quickloop").unwrap()).unwrap();
-    rt.bind_approval_ledger(
-        foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
-    )
-    .unwrap();
-    rt.dispatch("t-g1", mkorder("t-g1", true)).unwrap();
-    // 프로덕션 진입점 — 게이트 도달.
-    let st = rt.advance_to_gate("s-g", "t-g1", "exec-g").unwrap();
-    assert_eq!(st, OrderState::FurnaceHold, "order at the approval gate");
-    // 저널에 진행 이벤트가 실렸다.
-    let e = rt.stream("s-g").unwrap();
-    let rows = foundry_ledger::SqliteLedger::open(e.journal()).unwrap().read_all().unwrap();
-    assert!(rows.iter().any(|r| r.event.contains("InspectionPassed")),
-        "gate-reaching events journaled");
-}
-
-/// (M7.1 리뷰 B1) 라이브 핸드오프 정문 — 그랜트가 라이브 경로로 소비되고
-/// 로그에 HandoffBound 행이 남는다(테스트 직접 소비 대체).
+/// (M7.1 재리뷰 r2) 라이브 핸드오프 정문 — 2단계: prepare(제안 행+매니페
+/// 스트) → dispatch(사전 검증 → CONSUMED 소비 → 확정). 위조 매니페스
+/// 트는 소비 전 거부.
 #[test]
 fn t61_live_handoff_front_door() {
     let d = tmpdir("handoff");
     let orch = OrchestrationLog::open(&d.join("orch.db")).unwrap();
-    // 두 주문 선언 — t-h1(소스) → t-h2(목적지), 같은 스트림.
     orch.declare_plan(
         "plan-h",
-        vec![
-            ("t-h1".into(), vec![]),
-            ("t-h2".into(), vec![]),
-        ],
-        vec![
-            ("t-h1".into(), "s-h".into()),
-            ("t-h2".into(), "s-h".into()),
-        ],
+        vec![("t-h1".into(), vec![]), ("t-h2".into(), vec![])],
+        vec![("t-h1".into(), "s-h".into()), ("t-h2".into(), "s-h".into())],
     )
     .unwrap();
-    // preset_bound — 발행 권한(테스트 간소화: 사이징 승인 직접 결속).
     let mut ap = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
     {
         let digest = crate::chainer::sizing_digest("approved", "bmad-epic-build", "plan-h");
@@ -582,9 +643,7 @@ fn t61_live_handoff_front_door() {
         }))
         .unwrap();
         let sr = ap.reserve_grant("sizing-sz-h", &serde_json::json!({
-            "order_id": "sz-h", "intent": "sizing",
-            "artifact_digest": crate::chainer::sizing_digest("approved", "bmad-epic-build", "plan-h"),
-            "root_scope": "",
+            "order_id": "sz-h", "intent": "sizing", "artifact_digest": digest, "root_scope": "",
         }), "h", 1).unwrap();
         ap.begin_apply("sizing-sz-h", "h", 1, sr.fence_token).unwrap();
         ap.finalize_grant("sizing-sz-h", "h", 1, sr.fence_token).unwrap();
@@ -599,115 +658,30 @@ fn t61_live_handoff_front_door() {
     .unwrap();
     rt.dispatch("t-h1", mkorder("t-h1", false)).unwrap();
     rt.dispatch("t-h2", mkorder("t-h2", false)).unwrap();
-    // t-h1 을 게이트까지 진행(승인 대기 상태).
-    autonomous_to_gate(&rt, "s-h", "t-h1", "t61h");
-    // 게이트 후 실행 락 해제 — 핸드오프 정문이 자체 acquire.
-    {
-        let e = rt.stream("s-h").unwrap();
-        let mut eng = e.engine_if_unfenced().unwrap();
-        assert!(eng.release("t-h1", "t61h"), "gate exec lock released");
-    }
-    // (M7.1 B1) 정문은 bind_handoff 가 **멱등**(동일 튜플 재사용)이므로:
-    // ① 위조 매니페스트 그랜트는 라이브 소비 거부(스코프 결속).
-    // ② 정문 매니페스트 그랜트는 통과 — 로그에 행이 남고 그랜트 소비.
-    let orch = rt.orch.clone();
+    // ① 준비 — 제안 행 + 매니페스트.
+    let (manifest, _encoded) = rt.prepare_handoff("t-h1", "t-h2", "art-h").unwrap();
     let mut ap2 = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
+    // ② 위조 — 잘못된 매니페스트: 사전 검증에서 거부(미소비 유지).
     ap2.issue_grant("handoff-bad", "tok-bad", &serde_json::json!({
-        "order_id": "t-h1", "intent": "handoff",
-        "artifact_digest": "forged-manifest", "root_scope": "",
+        "order_id": "t-h1", "dest_order_id": "t-h2", "intent": "handoff",
+        "artifact_digest": "art-h", "handoff_manifest": "forged", "root_scope": "",
     }))
     .unwrap();
-    // 가시성 확인 — 별도 커넥션에서 두 그랜트가 보이는가.
-    {
-        let apv = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
-        assert!(apv.get_grant("handoff-bad").is_ok(), "handoff-bad visible");
-    }
     let refused = rt.dispatch_handoff("t-h1", "t-h2", "art-h", "handoff-bad");
-    assert!(refused.is_err(), "forged-manifest handoff grant refused live");
-    let (row, manifest) = orch.bind_handoff("t-h1", "t-h2", "art-h").unwrap();
-    ap2.issue_grant("handoff-ok", "tok-ok", &serde_json::json!({
-        "order_id": "t-h1", "intent": "handoff", "artifact_digest": manifest, "root_scope": "",
+    assert!(refused.is_err(), "forged-manifest handoff refused pre-consume");
+    // ③ 정품 — 매니페스트 결속 그랜트 소비(CONSUMED).
+    ap2.issue_grant("handoff-ok", "tok-ho", &serde_json::json!({
+        "order_id": "t-h1", "dest_order_id": "t-h2", "intent": "handoff",
+        "artifact_digest": "art-h", "handoff_manifest": manifest, "root_scope": "",
     }))
     .unwrap();
-    {
-        let apv = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
-        let g = apv.get_grant("handoff-ok").expect("handoff-ok visible before dispatch");
-        eprintln!("DBG scope stored: {}", g.scope_json);
-    }
     rt.dispatch_handoff("t-h1", "t-h2", "art-h", "handoff-ok")
         .unwrap_or_else(|e| panic!("live handoff front door: {e}"));
-    let rows = orch.read_all().unwrap();
-    assert!(rows.iter().any(|r| r.seq == row.seq
-        && matches!(&r.kind, OrchestrationKind::HandoffBound { .. })));
     let ap_check = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
     let g = ap_check.get_grant("handoff-ok").unwrap();
-    assert!(g.state == foundry_approval::GrantState::Consumed, "handoff grant consumed on the live path");
-}
-
-/// (M7.1 리뷰 B2) 스트림 루트 결속 — 다른 루트로 결속된 사이징 승인을
-/// 이 스트림의 부트스트랩에 사용하면 거부.
-#[test]
-fn t61_stream_root_binding_mismatch_refused() {
-    let d = tmpdir("rootbind");
-    let orch = OrchestrationLog::open(&d.join("orch.db")).unwrap();
-    orch.declare_plan(
-        "plan-sizing",
-        vec![("sz-r".into(), vec![])],
-        vec![("sz-r".into(), "s-root".into())],
-    )
-    .unwrap();
-    let rt = StreamRuntime::new(OrchestrationLog::open(&d.join("orch.db")).unwrap());
-    rt.add_stream(Stream::new_with_root("s-root", &d, "bmad-quickloop").unwrap()).unwrap();
-    rt.bind_approval_ledger(
-        foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
-    )
-    .unwrap();
-    // 사이징 승인·결속 — 다른 루트(feature-prd)로.
-    let orch = rt.orch.clone();
-    let digest = crate::chainer::sizing_digest("approved", "bmad-feature-prd", "plan-sizing");
-    {
-        let mut ap = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
-        ap.issue_grant("sizing-sz-r", "tok-r", &serde_json::json!({
-            "order_id": "sz-r", "intent": "sizing", "artifact_digest": digest, "root_scope": "",
-        }))
-        .unwrap();
-        let sr = ap.reserve_grant("sizing-sz-r", &serde_json::json!({
-            "order_id": "sz-r", "intent": "sizing", "artifact_digest": digest, "root_scope": "",
-        }), "rb", 1).unwrap();
-        ap.begin_apply("sizing-sz-r", "rb", 1, sr.fence_token).unwrap();
-        ap.finalize_grant("sizing-sz-r", "rb", 1, sr.fence_token).unwrap();
-        let ch = Chainer::new(&orch, &ap);
-        ch.bind_preset_from_ledger("sz-r", "bmad-feature-prd", "plan-sizing").unwrap();
-    }
-    // 부트스트랩 dispatch — 스트림 루트(quickloop)와 결속 루트
-    // (feature-prd) 불일치 → 거부.
-    let refused = rt.dispatch("sz-r", mkorder("sz-r", true));
-    assert!(refused.is_err(), "bootstrap root mismatch refused");
-}
-
-/// 깊이 1 제한 — 재디에이션 작업 자신의 거부는 제안 불가(종단 맥락).
-#[test]
-fn t61_remediation_depth1_in_end_to_end_context() {
-    let d = tmpdir("depth");
-    let orch = OrchestrationLog::open(&d.join("orch.db")).unwrap();
-    let ap = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
-    // 원 요청 거부 + 재디에이션 제안(연결 행 append).
-    crate::refusal::record_refusal(&orch, RefusalCode::UnsizedSpawn, "req-1", None).unwrap();
-    let seq0 = orch.read_all().unwrap().iter().find(|r| matches!(&r.kind, OrchestrationKind::Refusal { .. })).unwrap().seq;
-    let ch0 = Chainer::new(&orch, &ap);
-    let (rem_pid, _) = ch0.propose_remediation(seq0).unwrap();
-    // **그 재디에이션 작업 주문 자신**의 거부 — 같은 pid 주문.
-    crate::refusal::record_refusal(&orch, RefusalCode::NotReady, &rem_pid, None).unwrap();
-    let ch = Chainer::new(&orch, &ap);
-    let rows = orch.read_all().unwrap();
-    let rem_seq = rows
-        .iter()
-        .find(|r| matches!(&r.kind, OrchestrationKind::Refusal { refused_request, .. } if refused_request == &rem_pid))
-        .unwrap()
-        .seq;
-    assert!(matches!(
-        ch.propose_remediation(rem_seq),
-        Err(ChainerError::RemediationDepth { .. })
-    ));
-    let _ = SizingVerdict::Approved;
+    assert!(g.state == foundry_approval::GrantState::Consumed,
+        "handoff grant consumed via verify→consume→confirm");
+    let gbad = ap_check.get_grant("handoff-bad").unwrap();
+    assert!(gbad.state != foundry_approval::GrantState::Consumed,
+        "forged grant left unconsumed");
 }

@@ -277,10 +277,35 @@ impl StreamRuntime {
         Ok(())
     }
 
-    /// (M7.1 리뷰 B1) **라이브 핸드오프 정문** — 산출물 인계 승인을
-    /// 엔진의 라이브 경로(dispatch_live)로 소비한다. 그랜트 스코프는
-    /// scope_for 4필드 + handoff_manifest 결속(chainer.confirm_handoff
-    /// 검증). 테스트 직접 소비를 대체하는 유일한 경로.
+    /// (M7.1 재리뷰 r2) 핸드오프 준비 — 제안 행을 만들고 **매니페스트**를
+    /// 반환(그랜트 스코프 발급 재료). 소비는 dispatch_handoff.
+    pub fn prepare_handoff(
+        &self,
+        source_order: &str,
+        dest_order: &str,
+        artifact_digest: &str,
+    ) -> Result<(String, String), String> {
+        let ap_path = self
+            .approval_path
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or("approval ledger not bound (fail-closed)")?;
+        let ap = foundry_approval::ApprovalLedger::open(&ap_path)
+            .map_err(|e| format!("approval reopen: {e:?}"))?;
+        let ch = crate::chainer::Chainer::new(&self.orch, &ap);
+        let proposal_id = format!("ho-{source_order}-{dest_order}-{artifact_digest}");
+        let view = ch
+            .propose_handoff(&proposal_id, source_order, dest_order, artifact_digest, "intake")
+            .map_err(|e| format!("propose: {e:?}"))?;
+        // 반환: 매니페스트 + 그랜트 스코프 발급용 6필드 재료.
+        // artifact_digest 는 제안 인코딩(fp1) 문자열 — confirm 결속 기준.
+        let encoded = view.artifact_digest.clone();
+        Ok((view.manifest, encoded))
+    }
+
+    /// (M7.1 재리뷰 r2) 라이브 핸드오프 정문 — 체이너 6필드 스코프
+    /// 규약(propose 멱등 → confirm)으로 그랜트를 CONSUMED 소비.
     pub fn dispatch_handoff(
         &self,
         source_order: &str,
@@ -288,56 +313,44 @@ impl StreamRuntime {
         artifact_digest: &str,
         grant_id: &str,
     ) -> Result<(), String> {
-        // ① 체이너로 핸드오프 제안+결속(bind_handoff) — 매니페스트 획득.
-        let orch = &self.orch;
-        let (row, manifest) = orch
-            .bind_handoff(source_order, dest_order, artifact_digest)
-            .map_err(|e| format!("bind_handoff: {e:?}"))?;
-        // ② 그랜트 라이브 소비 — 원장 어댑터로 dispatch_live.
-        //    핸드오프 승인 이벤트 = Approved(intent="handoff")를
-        //    source_order 엔진에 적용(스코프 4필드 + manifest 는
-        //    그랜트 스코프의 6필드 규약과 confirm_handoff 가 정합).
-        let Some((_, sid)) = self.assignment_of(source_order)? else {
-            return Err(format!("order {source_order} has no assignment"));
+        let ap_path = self
+            .approval_path
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or("approval ledger not bound (fail-closed)")?;
+        let mut ap = foundry_approval::ApprovalLedger::open(&ap_path)
+            .map_err(|e| format!("approval reopen: {e:?}"))?;
+        let proposal_id = format!("ho-{source_order}-{dest_order}-{artifact_digest}");
+        let scope_val: serde_json::Value = {
+            let g = ap
+                .get_grant(grant_id)
+                .map_err(|e| format!("grant lookup: {e:?}"))?;
+            serde_json::from_str(&g.scope_json).map_err(|e| format!("scope parse: {e}"))?
         };
-        let stream = self.stream(&sid).ok_or(format!("stream {sid} not registered"))?;
-        let mut eng = stream.engine_if_unfenced()?;
-        let ap = foundry_approval::ApprovalLedger::open(
-            self.approval_path.lock().unwrap().clone()
-                .ok_or("approval ledger not bound (fail-closed)")?,
-        )
-        .map_err(|e| format!("approval reopen: {e:?}"))?;
-        let mut hook = foundry_workflow::ApprovalLedgerAdapter(ap);
-        let grant = foundry_workflow::GrantRef { grant_id: grant_id.into() };
-        // (M7.1 B1) exec_id 는 호출마다 고유 — 첫 실패의 실행 래치가
-        // 후속 재시도를 오염시키지 않는다. 실행 락 획득이 dispatch 전제.
-        let exec = format!("handoff-{}-{}-{}", source_order, grant_id, manifest.chars().rev().take(8).collect::<String>());
-        eng.acquire(source_order, &exec).map_err(|e| format!("acquire: {e:?}"))?;
-        let out = eng
-            .dispatch_live(
-                source_order,
-                &exec,
-                &foundry_domain::OrderEvent::Approved {
-                    intent: "handoff".into(),
-                    artifact_digest: manifest.clone(),
-                },
-                1,
-                Some(&grant),
-                &mut hook,
-            );
-        // (M7.1 B1) 실패 경로 락 해제 — 승인 거부는 상태 불변이므로
-        // 실행 락도 반환한다(성공은 소유권이 그랜트로 이전).
-        if out.is_err() {
-            let _ = eng.release(source_order, &exec);
+        // ① 제안(멱등) + 사전 검증 — 위조 매니페스트/무관 그랜트는
+        // 소비 전 거부(그랜트 상태 무관 게이트).
+        {
+            let ch = crate::chainer::Chainer::new(&self.orch, &ap);
+            ch.propose_handoff(&proposal_id, source_order, dest_order, artifact_digest, "intake")
+                .map_err(|e| format!("propose: {e:?}"))?;
+            ch.verify_handoff(&proposal_id, grant_id)
+                .map_err(|e| format!("verify: {e:?}"))?;
         }
-        let out = out.map_err(|e| format!("handoff live dispatch: {e:?}"))?;
-        let _ = row;
-        match out {
-            foundry_workflow::Outcome::Applied => Ok(()),
-            other => Err(format!(
-                "handoff {source_order}->{dest_order} not applied: {other:?}"
-            )),
-        }
+        // ② 소비 — 예약→적용 개시→확정(CONSUMED). fence 는 원장 TxGuard.
+        let exec = format!("handoff-{source_order}-{dest_order}");
+        let sr = ap
+            .reserve_grant(grant_id, &scope_val, &exec, 1)
+            .map_err(|e| format!("reserve: {e:?}"))?;
+        ap.begin_apply(grant_id, &exec, 1, sr.fence_token)
+            .map_err(|e| format!("begin_apply: {e:?}"))?;
+        ap.finalize_grant(grant_id, &exec, 1, sr.fence_token)
+            .map_err(|e| format!("finalize: {e:?}"))?;
+        // ③ 확정 — CONSUMED 원장 앵커로 6필드 재검증.
+        let ch = crate::chainer::Chainer::new(&self.orch, &ap);
+        ch.confirm_handoff(&proposal_id, grant_id)
+            .map_err(|e| format!("confirm: {e:?}"))?;
+        Ok(())
     }
 
     /// (M7.1 리뷰 B3) **실행 진입점** — 자율 단계(큐→다이 시작→다이
