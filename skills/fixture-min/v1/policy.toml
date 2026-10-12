@@ -1,0 +1,20 @@
+entry = "scan"
+
+[[nodes]]
+id = "scan"
+kind = "dispatch"
+stages = []
+on_done = "done"
+
+[[nodes]]
+id = "done"
+kind = "route"
+[[nodes.branches]]
+when = "true"
+do = "emit(InspectionPassed, summary)"
+goto = "end_hold"
+
+[[nodes]]
+id = "end_hold"
+kind = "hold"
+resume_targets = []
