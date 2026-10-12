@@ -81,6 +81,7 @@ base = "origin"
 pre_stage = "replan-stage"
 bump = "replans"
 on_done = "lenses"
+on_redrive_error = "hold"
 hold_target = "human"
 
 # r11-2: intent_gap 전용 hold — 해결 후 계획 재실행으로만 resume

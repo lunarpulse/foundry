@@ -1,6 +1,6 @@
 # Golden trace — bmad-review-full v1.1.0 (부록 A.3)
 
-대상: skills/bmad-review-full/v1 (pack=22c90f9affd40b8dce351a65519449ba7d66373ca75587f7fcea5f6b5035681b)
+대상: skills/bmad-review-full/v1 (pack=e0499416acc05a4b04fa9db4a07f8ac157b23820953f341e164d556a06015a1c)
 도메인: 전 경로 Inspecting 유지, attempt=1 불변(§2.4a).
 
 원본 step-04 계약(50–110행): 루프백은 intent_gap·bad_plan 트리거,
