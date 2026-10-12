@@ -104,8 +104,9 @@ on_done = "lenses"   # 루프 폐쇄: lenses→route→fixdie→lenses…
 
 [[nodes]]
 id = "replan"        # ③' redrive의 특수형: replanner 지시문 실행 후
-kind = "redrive"     #    emit_failed로 도메인 백엣지(새 Die 시도)
+kind = "redrive"     #    새 generation 재구현 — emit 없음(r5 정정)
 target = "die-workdir"
+payload = "replan"   # (r7-1 스키마 필수)
 pre_stage = "replan-stage"   # 팩 정의 스테이지(KEEP 추출·계획 수정)
 bump = "replans"
 on_done = "lenses"   # 재구현 결과는 다시 검증으로 — 루프 폐쇄(r5
@@ -113,11 +114,12 @@ on_done = "lenses"   # 재구현 결과는 다시 검증으로 — 루프 폐쇄
                      # 유지 — 도메인 emit/시도 소모 없음)
 
 [[nodes]]
-id = "emit_failed_node"   # ④ emit: 재주문 정책 경로 — 팩이 route에서
-kind = "emit"             #    명시 선택 시만. BMad 재계획은 미경유(§2.4a)
-event = "InspectionFailed"   #    재주문 산출물 정책: 기본 폐기(청정
-payload_from = "cumulative_findings"  # workdir). 새 run은 counters만
-on_done = "HALT"     # 승계, 산출물은 재검증 의무(§3.3a)
+id = "emit_failed_node"   # ④ emit: 재주문 정책 경로 — HALT 암시(r7-1:
+kind = "emit"             #    on_done 불가). 팩이 route에서 명시 선택
+event = "InspectionFailed"   #    시만. BMad 재계획은 미경유(§2.4a).
+payload_from = "cumulative_findings"  # 재주문 산출물: 기본 폐기(청정
+                      # workdir). 새 run은 counters만 승계, 산출물은
+                      # 재검증 의무(§3.3a).
 
 [[nodes]]
 id = "pass"          # ④' emit(InspectionPassed)
