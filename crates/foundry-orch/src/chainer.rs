@@ -658,6 +658,14 @@ impl<'o, 'a> Chainer<'o, 'a> {
                 _ => false,
             });
             if !is_declared {
+                // (r2 MAJOR-3) 미선언 재입장 거부도 영구 기록 — 검증만 하고
+                // 흔적 없는 경로 폐지(아래 ReentryRefused 와 동일 규약).
+                let _ = crate::refusal::record_refusal(
+                    self.log,
+                    crate::refusal::RefusalCode::UndeclaredOrder,
+                    order_id,
+                    None,
+                );
                 return Err(ChainerError::DeclarationMissing { order: order_id.into() });
             }
         }
