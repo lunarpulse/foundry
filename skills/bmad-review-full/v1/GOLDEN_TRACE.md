@@ -1,6 +1,6 @@
 # Golden trace — bmad-review-full v1.2.0 (부록 A.3)
 
-대상: skills/bmad-review-full/v1 (pack=997ead1e116fb94f9751b0d7fab56d581007355288cd34cb266f6294bed0af16)
+대상: skills/bmad-review-full/v1 (pack=e925fd014d367c4c7f3d83fe92d03cd4bc4d3b7cbc1ecdf0d4e77320acab1db8)
 도메인: 전 경로 Inspecting 유지, attempt=1 불변(§2.4a).
 
 **검증은 실행형**(r12-1): tools/verify_golden_trace.py가 **팩 policy.toml을
@@ -8,8 +8,9 @@
 원본 step-04 계약과 대조한다. 수기 분기 미러링이 아니다.
 
 원본 계약: 루프백은 intent_gap·bad_plan 트리거(하위 moot), **루프백 전**
-review_loop_iteration 증가, 5 초과 HALT — 팩: loopbacks 단일 카운터,
-replan·replan_full 모두 bump=loopbacks(가드가 검사하는 같은 카운터).
+review_loop_iteration 증가, 증가 후 5 초과면 HALT — 팩: loopbacks 단일
+카운터, 증가는 route branch do(bad_plan·intent_gap·상한 branch 전부 —
+redrive 노드 bump 아님), 인간 hold 진입 시점 카운터=6(6번째 루프백).
 
 | # | verdicts / 카운터 | 원본 분기 | 팩 실행 | ✓ |
 |---|---|---|---|---|

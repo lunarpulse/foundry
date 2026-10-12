@@ -1,7 +1,7 @@
 # Foundry Universal Skill Spec — 범용 실행 모델 (Universal Review Engine)
 
-- **버전**: v0.15 (2026-10-12) — r13 REWORK(MAJOR 6+MINOR 2) 반영 +
-  독립 이중 검증 도입. 재검증 대기.
+- **버전**: v0.16 (2026-10-12) — r14 REWORK(MAJOR 6+MINOR 2) 반영.
+  규범-팩 정합·fixture 완결. 재검증 대기.
 - **의도(소유자)**: Foundry는 어떤 방법론도 돌릴 수 있는 유니버설
   플랫폼. BMad는 스킬 데이터의 첫 고객. **Rust 도메인에 방법론
   코드가 박히는 순간이 실패.** 엔진 고정·확장 선언(procedural macro
@@ -71,9 +71,10 @@ goto  = "human"
 [[nodes.branches]]   # (r11-1b) 공통 loopback 상한 — 원본 "loopback 전
 when  = '(any_in(verdicts, ["intent_gap", "bad_plan"])) && !count_lt(loopbacks, 5)'
 goto  = "human"      # increment 후 5 초과 HALT — replan resume 불가
-[[nodes.branches]]   # intent_gap: 인간 해결 후 계획 재실행
+[[nodes.branches]]   # intent_gap: bump+revert가 hold 전(원본 순서)
 when  = 'any_in(verdicts, ["intent_gap"])'
-goto  = "human_gap"  # 전용 hold — resume("replan")만 허용
+do    = 'bump(loopbacks); revert(origin)'
+goto  = "human_gap"  # 전용 hold — resume("replan_full")만 허용
 [[nodes.branches]]   # bad_plan: 롤백+재계획(상한 5)
 when  = 'any_in(verdicts, ["bad_plan"]) && count_lt(loopbacks, 5)'
 goto  = "replan"
@@ -146,9 +147,9 @@ event = "InspectionPassed"
 payload_from = "summary"   # (r7-1 스키마 필수)
 
 [[nodes]]
-id = "human_gap"     # ⑤' intent_gap 전용 hold — 계획 재실행으로만 resume
+id = "human_gap"     # ⑤' intent_gap 전용 hold — resume은 replan_full만
 kind = "hold"
-resume_targets = ["replan"]
+resume_targets = ["replan_full"]
 
 [[nodes]]
 id = "human"         # ⑤ hold
@@ -172,7 +173,7 @@ resume_targets = ["fixdie"]
 | fix 루프(무제한이던 것) | fix_rounds 상한(팩 값) | 동등+상한 |
 | bad_plan → **롤백+자동 재계획 5회** | route 카테고리 분기(any_in) → replan(pre_stage KEEP·**base="origin"** 롤백) → redrive(generation++) — 도메인 시도 불변 | **동등**(§2.4a·r9-7) |
 | intent_gap: 인간 해결 후 재계획 | route 카테고리 분기 → human hold → `resume("replan")` 진입 | 동등(예제 trace) |
-| defer(기록 후 진행) | `side_records = ["deferred"]` + 출력 스키마 `condition = "no_loopback"` — 루프백 시 기록 억제(원본 moot 규칙, r12-5). 정규화된 deferred 레코드(schema-defer.toml)는 outbox intent로 저널 기록(emit과 독립) | 동등 |
+| defer(기록 후 진행) | `side_records = ["deferred"]` + 출력 스키마 `when = '<DSL 조건식>'`(r14-5 규범) — 평가 스냅샷(verdicts·카운터)을 기록에 결속, **평가·기록은 run 종결 emit 커밋 시 단일 트랜잭션에서 1회**(멱등키 = run_id#record_name), hold/resume·재시도에서 재평가 없이 이미 기록되었으면 skip. 정규화된 레코드(schema-defer.toml)는 outbox intent로 저널 | 동등 |
 | carried(재런 저널 대조) | verify 지시문에 저널 대조 입력 포함 | 근사 |
 | quick/thorough/auto | selection(fixed/by-diff) | 변형 |
 
@@ -216,6 +217,16 @@ int      := u64 10진수
 
 action   := 'emit' '(' event_id ',' payload_ref ')'
           | 'bump' '(' id ')'        ; hold는 액션이 아닌 노드(r9-3)
+          | 'revert' '(' base ')'    ; base = "origin"|"latest" — 산출물을
+                                    ; 해당 base로 되돌림(내구 승격 이전
+                                    ; 상태). 증거 무효화: revert 시 현재
+                                    ; artifact 결속 증거 전부 superseded
+                                    ; (§2.4a와 동일 규칙). revert 후
+                                    ; emit은 거부(검증 대상 부재 — 로드
+                                    ; 검증: revert를 포함한 경로는
+                                    ; 재실행 경로로만 종결). 실패·복구:
+                                    ; revert는 결과 커밋의 일부(원자) —
+                                    ; 크래시 시 미적용 상태로 재시작.
 event_id := 'InspectionPassed' | 'InspectionFailed'   ; 로드 검증
 payload_ref := id             ; 노드/스테이지 출력 참조(로드 검증)
 do_seq   := action ( ';' action )*     ; emit은 전 시퀀스에 최대 1회
@@ -232,18 +243,19 @@ do_seq   := action ( ';' action )*     ; emit은 전 시퀀스에 최대 1회
   |---|---|---|---|
   | dispatch | stages(최소 1 — r10-6), on_done, hold_target, on_verify_invalid(hold\|fail-run), on_no_valid(hold\|fail-run) | side_records, role | — |
   | route | branches(마지막 원소 when="true") | — | on_done |
-  | redrive | target, payload, on_done, hold_target, on_redrive_error(hold\|fail-run), **bump — 루프백 redrive는 필수**(가드가 검사하는 카운터를 증가시켜야 함, r12-1) | pre_stage, base("latest"\|"origin", 기본 latest) | — |
+  | redrive | target, payload, on_done, hold_target, on_redrive_error(hold\|fail-run) | pre_stage, base("latest"\|"origin", 기본 latest), bump(비루프백 fix 루프용 — 노드 필드) | — |
   | emit | event, payload_from | — | on_done(HALT 암시) |
   | hold | resume_targets | notify_only | on_done |
   branch(r9-3 종단 규칙): **do가 종단 액션(emit 포함)이면 goto 금지**
   (emit 후 HALT). **do가 비종단(bump만)이면 goto 필수**. {when, goto}
   단독 항상 허용. do는 emit/bump 시퀀스(emit≤1) — hold_for_human
-  액션은 폐지(hold는 노드 진입으로만 발생). **bump-가드 일치(r12-1)**:
-  루프를 닫는 redrive의 bump는 루프 진입을 검사하는 count_lt가 참조하는
-  같은 카운터여야 한다(로드 검증: 사이클 경로 카운터-가드-증가 일치
-  정적 검사) — 다른 카운터를 증가시키면 상한이 발화하지 않는다(v0.13
-  실증 반례: loopbacks 가드 + replans bump → 7회 진입). 골든 trace는
-  실제 팩 TOML을 파싱·실행하는 검증기로만 유효(수기 분기 미러링 금지).
+  액션은 폐지(hold는 노드 진입으로만 발생). **bump-가드 일치(r12-1,
+  r14-2 경로 단위)**: 닫힌 사이클 경로 전체에서 그 사이클의 진입을
+  검사하는 count_lt가 참조하는 카운터는 경로상 정확히 한 곳(노드 bump
+  또는 route branch do의 bump)에서 증가해야 한다 — 로드 검증이 사이클별
+  정적 검사(누락=상한 미발화, 2곳=이중 증가, 가드 불일치, 전부 거부).
+  v0.13 실증 반례: loopbacks 가드 + replans bump → 7회 진입. 골든
+  trace는 실제 팩 TOML을 파싱·실행하는 검증기로만 유효(수기 미러링 금지).
   오류 정책
   (on_verify_invalid, on_no_valid, on_redrive_error)은 dispatch/redrive
   노드의 필드. **hold 이송 통일(r9-3)**: 모든 엔진 주도 hold(오류
@@ -454,6 +466,12 @@ policy = "discard-finding" # 개별 finding 거부(부분 거부)
 - 인간 선택: `commit_pass` / `commit_fail` / `resume(node_id)` /
   `abort`. 결속 재검사(run·attempt·artifact)와 커밋이 **동일 원자
   경계**(§3.2.4). API 멱등(중복 응답 폐기 — action_id).
+- **인간 resume과 카운터 상한(r14-4)**: 인간 resume은 자동 카운터
+  상한의 **명시적 예외**다 — 상한은 자동 루프의 무한 실행 방지가
+  목적이고, 인간 개입은 그 자체가 상한의 대체 종결 기구다. 단 ①resume
+  도 실행 횟수 예산(§2.4b 비환급)은 소모(예산은 인간도 우회 불가)
+  ②resume 반복에도 별도 상한을 두려면 팩이 인간 전용 카운터를 bump하는
+  hold-resume 경로를 그래프에 선언(데이터 소유).
 - `resume(node_id)`: 인간 응답(해결문·수정 intent)은 **불변 artifact
   (human_resolution)로 저장되어 resume에 결속** — 재개된 redrive의
   pre_stage가 입력으로 소비(r12-3). **팩이 hold 노드에 선언한 허용 목적지 목록**
@@ -584,6 +602,14 @@ baseline = A.1 팩 전체(모든 필드 정합·TOML·DSL 문법 유효·digest
 
 **수용성 규칙(단일)**: LF 개행 + 파일 끝 LF 필수 — CRLF·CR·끝 LF
 부재는 로드 거부. 9종 전부 거부 + A.1 수용이 회귀 조건.
+**규칙→fixture 대응(r14-6)**: 구현 시 로드 검증 규칙 전수에 대해
+거부 fixture를 확장 — 추가 예정: 카운터-가드 불일치(누락·이중·불일치
+3종), 다중 emit, emit 뒤 후속 액션, verify 스테이지 2개, 동일 세션
+병렬 stage, 오류 정책 미선언, revert 후 emit 경로. 구현 검증기는
+A.1 수용 + 전 거부 fixture의 **기대 오류 코드 정확 대조**를 셀프테스트로
+포함(양 독립 검증기의 A.2 실행 검증 포함). 정규화 템플릿 "구현 중
+확정" 항목(A.3 markdown 그룹 규칙)은 첫 구현 마일스톤 승인 범위에서
+**제외** — 별도 승인.
 
 ### A.4 stage 규범 스키마 (승인 전 고정 — r8-2)
 dispatch.stages[] 각 항목: {id(필수), lenses[파일명](필수≥1),
