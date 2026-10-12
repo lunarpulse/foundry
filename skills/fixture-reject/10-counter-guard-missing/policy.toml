@@ -1,0 +1,59 @@
+entry = "scan"
+
+[counters]
+loopbacks = 0
+fix_rounds = 0
+
+[[nodes]]
+id = "scan"
+kind = "dispatch"
+stages = [{ id = "lens-a", lenses = ["lens-a.md"], role = "lens" }]
+on_done = "rt"
+hold_target = "end_hold"
+on_verify_invalid = "hold"
+on_no_valid = "hold"
+
+[[nodes]]
+id = "rt"
+kind = "route"
+[[nodes.branches]]
+when = 'count_lt(loopbacks, 5)'
+goto = "fix"
+
+[[nodes.branches]]
+when = "true"
+goto = "end_hold"
+
+
+[[nodes]]
+id = "fix"
+kind = "redrive"
+target = "die-workdir"
+payload = "findings"
+on_done = "scan"
+hold_target = "end_hold"
+on_redrive_error = "hold"
+
+[[nodes]]
+id = "end_hold"
+kind = "hold"
+resume_targets = []
+
+[[output.on_error]]
+state = "ok"
+policy = "accept-stage"
+
+[[output.on_error]]
+state = "dispatch_error"
+policy = "discard-stage"
+
+[[output.on_error]]
+state = "parse_error"
+policy = "discard-finding"
+
+[[output.on_error]]
+state = "timeout"
+policy = "hold"
+
+[hold]
+timeout_s = 0

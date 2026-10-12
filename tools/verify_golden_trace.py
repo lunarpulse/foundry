@@ -19,7 +19,9 @@ entry="missing") still passed. This one:
   entry=missing, edge session removed, triage schema removed).
 """
 import copy
+import os
 import re
+import struct
 import sys
 import tomllib
 from itertools import combinations
@@ -239,9 +241,34 @@ def negative_controls(doc, active_cats):
     d_real, res_real = walk(doc, ["bad_plan"], active_cats)
     assert d_real.count("replan") == 5, d_real
     assert d_real[-1] == "hold:human", d_real
-    # counter hit 5 exactly at the 6th decision
+    # counter hit 6 at the 6th loopback (cap branch bumps too)
     st_real = res_real[0] if isinstance(res_real, tuple) else res_real
     assert st_real["counters"]["loopbacks"] == 6, st_real
+    # 1b. (r15-2) replan_full.on_done -> pass: intent_gap RESUME outcome
+    # must NOT emit pass — checked against the actual resume walk
+    bad = copy.deepcopy(doc)
+    for n in bad["nodes"]:
+        if n["id"] == "replan_full":
+            n["on_done"] = "pass"
+    d, res = walk(bad, ["intent_gap"], active_cats, max_steps=30)
+    _, outs = res
+    wrong_pass = any("emit:InspectionPassed" in o[0] for o in (outs or []))
+    assert wrong_pass, "mutated replan_full.on_done=pass must be detectable"
+    # and the REAL pack's intent_gap resume never emits pass
+    d, res = walk(doc, ["intent_gap"], active_cats, max_steps=30)
+    _, outs = res
+    assert not any("emit:InspectionPassed" in o[0] for o in (outs or [])), \
+        f"real pack must not pass on intent_gap: {outs}"
+    # 1c. (r15-2) human_gap.resume_targets += ["pass"] must be detectable:
+    # the mutated resume reaches emit:pass while the real one doesn't
+    bad = copy.deepcopy(doc)
+    for n in bad["nodes"]:
+        if n["id"] == "human_gap":
+            n["resume_targets"] = n["resume_targets"] + ["pass"]
+    d, res = walk(bad, ["intent_gap"], active_cats, max_steps=30)
+    _, outs = res
+    assert any(o[0] and o[0][0] == "emit:InspectionPassed" for o in outs), \
+        "mutated resume_targets+=pass must produce a detectable wrong pass"
     # 2. entry -> missing node must raise
     bad2 = copy.deepcopy(doc)
     bad2["entry"] = "missing"
@@ -259,17 +286,11 @@ def negative_controls(doc, active_cats):
             for st in n.get("stages", []):
                 if st.get("role") == "verify":
                     st.pop("output_schema", None)
-    orig_open = open
     try:
-        import builtins
-        builtins.open = orig_open  # schema loader must find nothing
-        try:
-            active_categories(bad3)
-            raise AssertionError("schema removal must break ACTIVE lookup")
-        except AssertionError as e:
-            assert "output_schema" in str(e)
-    finally:
-        builtins.open = orig_open
+        active_categories(bad3)
+        raise AssertionError("schema removal must break ACTIVE lookup")
+    except AssertionError as e:
+        assert "output_schema" in str(e)
 
 
 def main():
@@ -370,8 +391,47 @@ def main():
     assert tgt == "human", f"patch at cap must go human, got {tgt}"
 
     negative_controls(doc, ac)
+    sweep_rejection_fixtures()
     print("ALL PASS — real-graph walk == original step-04 contract")
+
+
+def sweep_rejection_fixtures():
+    """(r15-1) A.2 sweep: every fixture dir must carry expected_error.txt;
+    structural rejects are checked where decidable statically."""
+    import glob
+    base = "skills/fixture-reject"
+    dirs = sorted(os.path.basename(d) for d in glob.glob(f"{base}/*"))
+    assert len(dirs) >= 18, f"expected >=18 fixtures, found {len(dirs)}"
+    for name in dirs:
+        exp = open(f"{base}/{name}/expected_error.txt").read().strip()
+        assert exp.startswith("E_"), f"{name}: bad error code {exp}"
+    # byte-format checks decidable here:
+    b8 = open(f"{base}/08-crlf-manifest/manifest.toml", "rb").read()
+    assert b"\r\n" in b8, "08 must carry real CRLF"
+    b9 = open(f"{base}/09-no-trailing-lf/manifest.toml", "rb").read()
+    assert not b9.endswith(b"\n"), "09 must lack trailing LF"
+    # 08 digest is computed over its ORIGINAL CRLF bytes (r15-5)
+    files = {"lens-a.md": open(f"{base}/08-crlf-manifest/lens-a.md").read(),
+             "policy.toml": open(f"{base}/08-crlf-manifest/policy.toml").read()}
+    man = b8.decode()
+    line = [l for l in man.splitlines(True) if l.startswith("digest =")][0]
+    files["manifest.toml"] = man.replace(line, "")
+    import hashlib
+    h = hashlib.sha256()
+    for pn in sorted(files):
+        cb = files[pn].encode()
+        h.update(struct.pack("<Q", len(pn.encode())))
+        h.update(pn.encode())
+        h.update(struct.pack("<Q", len(cb)))
+        h.update(cb)
+    import re as _re
+    declared = _re.search(r'"([0-9a-f]{64})"', line).group(1)
+    assert declared == h.hexdigest(), \
+        f"08 digest must match its CRLF-original bytes: {declared[:12]} vs {h.hexdigest()[:12]}"
+    print(f"fixture sweep: {len(dirs)} fixtures, error codes valid,"
+          " 08 CRLF-bytes digest ok, 09 no-trailing-LF ok")
 
 
 if __name__ == "__main__":
     sys.exit(main())
+

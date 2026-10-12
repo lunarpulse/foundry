@@ -1,7 +1,7 @@
 # Foundry Universal Skill Spec — 범용 실행 모델 (Universal Review Engine)
 
-- **버전**: v0.16 (2026-10-12) — r14 REWORK(MAJOR 6+MINOR 2) 반영.
-  규범-팩 정합·fixture 완결. 재검증 대기.
+- **버전**: v0.17 (2026-10-12) — r15 REWORK(MAJOR 3+MINOR 2) 반영.
+  거부 fixture 18종 실파일·검증기 스윕·resume 네거티브. 재검증 대기.
 - **의도(소유자)**: Foundry는 어떤 방법론도 돌릴 수 있는 유니버설
   플랫폼. BMad는 스킬 데이터의 첫 고객. **Rust 도메인에 방법론
   코드가 박히는 순간이 실패.** 엔진 고정·확장 선언(procedural macro
@@ -126,7 +126,7 @@ target = "die-workdir"
 payload = "replan"   # (r7-1 스키마 필수)
 base = "origin"      # r9-7: bad_plan = 롤백 후 재계획(원본 step-04)
 pre_stage = "replan-stage"   # 팩 [[pack_stages]]에 등록(r11-4)   # 팩 정의 스테이지(KEEP 추출·계획 수정)
-bump = "loopbacks"   # 공통 loopback 카운터(원본 review_loop_iteration)
+bump = "fix_rounds"   # 비루프백 fix 루프(루프백 bump는 branch do)
 on_done = "lenses"   # 재구현 결과는 다시 검증으로 — 루프 폐쇄(r5
                      # 정정: replans 0..5 전부 attempt=1, Inspecting
                      # 유지 — 도메인 emit/시도 소모 없음)
@@ -172,7 +172,7 @@ resume_targets = ["fixdie"]
 | patch=같은 구현자 재호출 | redrive: 물리 실행 격리(gen-N workdir) + **논리 구현자 세션 계승**(fix-context 전달·base=최신 수용) | 동등(물리/논리 분리 — r7-7) |
 | fix 루프(무제한이던 것) | fix_rounds 상한(팩 값) | 동등+상한 |
 | bad_plan → **롤백+자동 재계획 5회** | route 카테고리 분기(any_in) → replan(pre_stage KEEP·**base="origin"** 롤백) → redrive(generation++) — 도메인 시도 불변 | **동등**(§2.4a·r9-7) |
-| intent_gap: 인간 해결 후 재계획 | route 카테고리 분기 → human hold → `resume("replan")` 진입 | 동등(예제 trace) |
+| intent_gap: 인간 해결 후 재계획 | route 카테고리 분기 → human hold → `resume("replan_full")` 진입 | 동등(예제 trace) |
 | defer(기록 후 진행) | `side_records = ["deferred"]` + 출력 스키마 `when = '<DSL 조건식>'`(r14-5 규범) — 평가 스냅샷(verdicts·카운터)을 기록에 결속, **평가·기록은 run 종결 emit 커밋 시 단일 트랜잭션에서 1회**(멱등키 = run_id#record_name), hold/resume·재시도에서 재평가 없이 이미 기록되었으면 skip. 정규화된 레코드(schema-defer.toml)는 outbox intent로 저널 | 동등 |
 | carried(재런 저널 대조) | verify 지시문에 저널 대조 입력 포함 | 근사 |
 | quick/thorough/auto | selection(fixed/by-diff) | 변형 |
@@ -183,7 +183,7 @@ resume_targets = ["fixdie"]
   (fix_rounds 0→3, 전부 도메인 attempt 불변) — 원본 "같은 구현자 최소 수정"
 - bad_plan → replan(pre_stage KEEP, **base=origin 롤백**) → lenses
   (replans 0→5, attempt 불변) — 원본 "롤백 후 재계획"
-- intent_gap → human(hold) → resume("replan") — 원본 "인간 해결"
+- intent_gap → human(hold) → resume("replan_full") — 원본 "인간 해결"
 - defer → pass + side_records=deferred 저널 — 원본 "기록 후 진행"
 - replans=5 도달 시 bad_plan branch 미매치 → has_findings → human
   (HALT 인간 승격 — 원본 상한 5→HALT와 동등)
@@ -248,7 +248,8 @@ do_seq   := action ( ';' action )*     ; emit은 전 시퀀스에 최대 1회
   | hold | resume_targets | notify_only | on_done |
   branch(r9-3 종단 규칙): **do가 종단 액션(emit 포함)이면 goto 금지**
   (emit 후 HALT). **do가 비종단(bump만)이면 goto 필수**. {when, goto}
-  단독 항상 허용. do는 emit/bump 시퀀스(emit≤1) — hold_for_human
+  단독 항상 허용. do는 emit/bump/**revert** 시퀀스(emit≤1, revert는
+비종단 — emit 이전에만) — hold_for_human
   액션은 폐지(hold는 노드 진입으로만 발생). **bump-가드 일치(r12-1,
   r14-2 경로 단위)**: 닫힌 사이클 경로 전체에서 그 사이클의 진입을
   검사하는 count_lt가 참조하는 카운터는 경로상 정확히 한 곳(노드 bump
@@ -574,7 +575,9 @@ GOLDEN_TRACE.md(혼합 범주·상한 경계 10케이스 — 부록 A.3 승인 �
 보지 않고 작성, 자체 DSL 인터프리터)가 같은 팩을 검증한다. 독립
 검증기가 주 검증기가 놓친 결함(상한 branch의 bump 누락 — 인간 hold
 진입 시 loopbacks=6이어야)을 실제로 발견·수정했다. 두 검증기 모두
-PASS여야 회귀 조건.
+PASS여야 회귀 조건. 주 검증기는 r15-2 보강으로 resume 네거티브
+(replan_full.on_done=pass·resume_targets+=pass 변이 검출)와 A.2
+18종 스윕도 포함한다.
 
 **digest(독립 계산, python hashlib §3.1 canonical)** — fixture-min:
 pack=8528b29eb4564756d29adfa58698dcfc74cd7a1fbd6c365632ec6d7c2e9160c6,
@@ -597,19 +600,27 @@ baseline = A.1 팩 전체(모든 필드 정합·TOML·DSL 문법 유효·digest
 | 05-no-true-fallback | 마지막 branch false | E_NO_TRUE_FALLBACK |
 | 06-do-only-nonterminal | do=bump, goto 없음 | E_NONTERMINAL_DO_NO_GOTO |
 | 07-quoted-digest-key | manifest `"digest" =` | E_DIGEST_KEY_QUOTED |
-| 08-crlf-manifest | CRLF 개행(digest 정상) | E_LF_REQUIRED |
-| 09-no-trailing-lf | 끝 LF 부재(digest 정상) | E_LF_REQUIRED |
+| 08-crlf-manifest | CRLF 개행(digest는 **CRLF 원본 바이트**로 계산됨) | E_LF_REQUIRED |
+| 09-no-trailing-lf | 끝 LF 부재(digest는 그 바이트로 계산됨) | E_LF_REQUIRED |
+| 10-counter-guard-missing | 사이클의 가드 카운터 증가 없음 | E_COUNTER_GUARD_MISSING |
+| 11-counter-guard-double | 노드 bump + branch bump 이중 증가 | E_COUNTER_GUARD_DOUBLE |
+| 12-counter-guard-mismatch | 가드=loopbacks, bump=fix_rounds | E_COUNTER_GUARD_MISMATCH |
+| 13-multi-emit | do에 emit 2회 | E_MULTI_EMIT |
+| 14-post-emit-action | emit 뒤 후속 액션 | E_POST_EMIT_ACTION |
+| 15-verify-duplicate | verify 스테이지 2개 | E_VERIFY_DUPLICATE |
+| 16-session-parallel | 동일 세션 병렬 stage | E_SESSION_PARALLEL |
+| 17-missing-error-policy | 오류 정책 미선언 | E_MISSING_ERROR_POLICY |
+| 18-revert-then-emit | revert 후 재검증 없이 emit | E_REVERT_THEN_EMIT |
 
 **수용성 규칙(단일)**: LF 개행 + 파일 끝 LF 필수 — CRLF·CR·끝 LF
 부재는 로드 거부. 9종 전부 거부 + A.1 수용이 회귀 조건.
-**규칙→fixture 대응(r14-6)**: 구현 시 로드 검증 규칙 전수에 대해
-거부 fixture를 확장 — 추가 예정: 카운터-가드 불일치(누락·이중·불일치
-3종), 다중 emit, emit 뒤 후속 액션, verify 스테이지 2개, 동일 세션
-병렬 stage, 오류 정책 미선언, revert 후 emit 경로. 구현 검증기는
-A.1 수용 + 전 거부 fixture의 **기대 오류 코드 정확 대조**를 셀프테스트로
-포함(양 독립 검증기의 A.2 실행 검증 포함). 정규화 템플릿 "구현 중
-확정" 항목(A.3 markdown 그룹 규칙)은 첫 구현 마일스톤 승인 범위에서
-**제외** — 별도 승인.
+**규칙→fixture 대응(r15-1 완결)**: 위 18종이 전부 **실제 파일**로
+존재(skills/fixture-reject/)하며 각 디렉터리에 expected_error.txt(기대
+오류 코드)가 동봉된다. 주 검증기의 스윝(sweep_rejection_fixtures)이
+①18종 전부의 오류 코드 형식 ②08의 실측 CRLF 바이트+그 바이트로
+계산된 digest ③09의 끝 LF 부재를 실행 검증한다. 구현 로더의 셀프테스트는
+A.1 수용 + 18종의 기대 오류 코드 정확 대조가 회귀 조건. 정규화
+템플릿 "구현 중 확정" 항목(A.3)은 첫 구현 마일스톤 승인 범위 밖.
 
 ### A.4 stage 규범 스키마 (승인 전 고정 — r8-2)
 dispatch.stages[] 각 항목: {id(필수), lenses[파일명](필수≥1),
