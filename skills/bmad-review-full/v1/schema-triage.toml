@@ -1,0 +1,16 @@
+# triage(verify) 출력 스키마 (r12-4) — verdicts/카테고리/deferred 매핑
+[[output]]
+name = "verdicts"            # route 조건식이 참조하는 verdict 집합
+values = ["patch", "intent_gap", "bad_plan", "defer", "pass"]
+from = "categories"          # Review Triage Log의 라우팅 칼럼
+active_categories = ["patch", "intent_gap", "bad_plan"]   # findings 스코프
+[[output]]
+name = "deferred"            # side_records 저널 소스
+from = "entries_routed_defer"
+schema = "schema-defer.toml"
+condition = "no_loopback"    # (r12-5) loopback 시 기록 억제 — route가
+                             # replan/replan_full/human_gap로 간 기록은
+                             # deferred를 소비하지 않음(원본 moot 규칙)
+[[output]]
+name = "carried_rows"
+from = "triage_log_rows"     # 재런 대조용(원본 carried)

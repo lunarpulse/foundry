@@ -1,27 +1,34 @@
-# Golden trace — bmad-review-full v1.1.0 (부록 A.3)
+# Golden trace — bmad-review-full v1.2.0 (부록 A.3)
 
-대상: skills/bmad-review-full/v1 (pack=e0499416acc05a4b04fa9db4a07f8ac157b23820953f341e164d556a06015a1c)
+대상: skills/bmad-review-full/v1 (pack=997ead1e116fb94f9751b0d7fab56d581007355288cd34cb266f6294bed0af16)
 도메인: 전 경로 Inspecting 유지, attempt=1 불변(§2.4a).
 
-원본 step-04 계약(50–110행): 루프백은 intent_gap·bad_plan 트리거,
-하위 항목 moot. **루프백 전에** review_loop_iteration 증가, 5 초과 시
-HALT 인간 — intent_gap 루프백에도 동일(원본 "Before each loopback").
-팩: loopbacks 카운터가 공통 상한.
+**검증은 실행형**(r12-1): tools/verify_golden_trace.py가 **팩 policy.toml을
+실제로 파싱**해 조건식을 평가·goto/hold/resume 전이·bump 적용 후
+원본 step-04 계약과 대조한다. 수기 분기 미러링이 아니다.
+
+원본 계약: 루프백은 intent_gap·bad_plan 트리거(하위 moot), **루프백 전**
+review_loop_iteration 증가, 5 초과 HALT — 팩: loopbacks 단일 카운터,
+replan·replan_full 모두 bump=loopbacks(가드가 검사하는 같은 카운터).
 
 | # | verdicts / 카운터 | 원본 분기 | 팩 실행 | ✓ |
 |---|---|---|---|---|
 | 1 | {patch}, fix_rounds<3 | 같은 구현자 최소 수정 | fixdie(base=latest)→lenses | ✓ |
-| 2 | {bad_plan}, loopbacks<5 | KEEP+롤백+재계획 | replan(pre_stage, base=origin, loopbacks++)→lenses | ✓ |
-| 3 | {intent_gap}, loopbacks<5 | 인간 해결→계획 재실행 | human_gap→resume("replan")→pre_stage→replan | ✓ |
-| 4 | {defer}만 | 기록 후 진행 | pass + side_records=deferred(schema-defer.toml) | ✓ |
-| 5 | {intent_gap,bad_plan}, lb<5 | intent_gap 우선 인간 | human_gap(bad_plan moot) | ✓ |
-| 6 | {bad_plan,patch}, lb=5 | 상한 HALT 인간 | 공통 상한 branch→human(누수 없음) | ✓ |
-| 7 | {intent_gap}, lb=5 | 상한 HALT(loopback 전 검사) | 공통 상한 branch→human(human_gap 아님) | ✓ |
-| 8 | {patch}, fix_rounds=3 | patch 상한→인간 | patch branch 실패→has_findings→human(fix만 resume) | ✓ |
+| 2 | {bad_plan}, lb<5 | KEEP+롤백+비동절 부분 수정 | replan(pre_stage, base=origin, lb++)→lenses | ✓ |
+| 3 | {intent_gap}, lb<5 | **되돌림→인간 해결→step-02 전체 재생성** | human_gap→resume("replan_full")→replan_full(base=origin, pre_stage=replan-full-stage, lb++) | ✓ |
+| 4 | {defer}만 | 기록 후 진행 | pass + deferred 저널(schema-defer) | ✓ |
+| 5 | {intent_gap,bad_plan}, lb<5 | intent_gap 우선 인간 | human_gap | ✓ |
+| 6 | {bad_plan,patch}, lb=5 | 상한 HALT | 공통 상한 branch→human, **deferred 기록 억제**(condition=no_loopback, r12-5) | ✓ |
+| 7 | {intent_gap}, lb=5 | 상한 HALT | 공통 상한 branch→human(replan_full resume 불가) | ✓ |
+| 8 | {patch}, fix_rounds=3 | patch 상한→인간 | human(fix만 resume) | ✓ |
 | 9 | 카테고리 없음+findings 없음 | 통과 | pass(적격성 V=ok) | ✓ |
-| 10 | 예산 소진 | — | 최우선→human(실행 resume 거부) | ✓ |
+| 10 | 예산 소진 | — | 최우선→human | ✓ |
 
-16 부분집합 × fix_rounds∈{2,3} × loopbacks∈{4,5} 전수 대조(64조합):
-원본 기대와 전부 일치 — tools/verify_golden_trace.py가 전수 생성·
-검증(구현 셀프테스트 편입). v0.12의 2건 누수({bad_plan,patch} 상한)와
-초안의 intent_gap 상한 누락은 공통 상한 branch로 폐쇄.
+**반복 전이(r12-1 핵심)**:
+- bad_plan 반복(신규 run): replan×5 → 6번째 진입 **human**(lb=5에서
+  cap branch 발화) — v0.13의 replans/loopbacks 분리 결함 실증·폐쇄.
+- intent_gap 반복: human_gap→replan_full 쌍 ×5 → 6번째 진입 human.
+
+렌즈 구성(r12-2): edge→claims 동일 session(trace) = 원본 "같은 리뷰어가
+추적 뒤 claims 확인". verif은 독립 렌즈(원본 verification-gap의 독립
+탐색 계약). triage가 전부 after로 수집.

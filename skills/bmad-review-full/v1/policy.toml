@@ -3,17 +3,19 @@ interface_version = 1
 
 [counters]
 fix_rounds = 0
-replans = 0
 loopbacks = 0
 
 [[nodes]]
 id = "lenses"
 kind = "dispatch"
+# (r12-2) 원본 렌즈 구성 이식: edge 리뷰어가 자신의 추적 "뒤" claims를
+# 확인 = edge와 claims가 동일 session(trace). verif은 독립 렌즈(병렬).
+# triage는 전부 after로 수집. claims 개봉은 after=edge 완료 시점.
 stages = [
-  { id = "edge", lenses = ["lens-edge.md"], role = "lens" },
-  { id = "verif", lenses = ["lens-verif.md"], role = "lens", after = "edge", session = "trace" },
-  { id = "claims", lenses = ["lens-claims.md"], role = "lens", after = "verif", session = "trace" },
-  { id = "triage", lenses = ["lens-triage.md"], role = "verify", after = "claims", session = "trace" },
+  { id = "edge", lenses = ["lens-edge.md"], role = "lens", output_schema = "schema-findings.toml" },
+  { id = "verif", lenses = ["lens-verif.md"], role = "lens", output_schema = "schema-findings.toml" },
+  { id = "claims", lenses = ["lens-claims.md"], role = "lens", after = "edge", session = "trace", output_schema = "schema-findings.toml" },
+  { id = "triage", lenses = ["lens-triage.md"], role = "verify", after = ["edge", "verif", "claims"], output_schema = "schema-triage.toml" },
 ]
 side_records = ["deferred"]
 on_done = "route1"
@@ -25,6 +27,11 @@ on_no_valid = "hold"
 [[pack_stages]]
 id = "replan-stage"
 lenses = ["lens-replan.md"]
+role = "replan"
+
+[[pack_stages]]
+id = "replan-full-stage"
+lenses = ["lens-replan-full.md"]
 role = "replan"
 
 [[nodes]]
@@ -73,22 +80,37 @@ hold_target = "human"
 on_redrive_error = "hold"
 
 [[nodes]]
-id = "replan"
+id = "replan"        # bad_plan: 비동결 부분 수정(원본 step-03 재유도)
 kind = "redrive"
 target = "die-workdir"
 payload = "plan"
 base = "origin"
 pre_stage = "replan-stage"
-bump = "replans"
+bump = "loopbacks"
 on_done = "lenses"
 on_redrive_error = "hold"
 hold_target = "human"
 
-# r11-2: intent_gap 전용 hold — 해결 후 계획 재실행으로만 resume
+# (r12-3) intent_gap 전용 hold — 인간이 frozen intent 해결. 인간 응답은
+# 불변 artifact(human_resolution)로 저장되어 resume에 결속(§3.3).
 [[nodes]]
 id = "human_gap"
 kind = "hold"
-resume_targets = ["replan"]
+resume_targets = ["replan_full"]
+
+# (r12-3) intent_gap 경로: 코드 되돌림(base=origin) 후 계획 전체 재생성
+# (원본 step-02부터) — bad_plan의 비동결 부분 수정(replan)과 다른 계약.
+[[nodes]]
+id = "replan_full"
+kind = "redrive"
+target = "die-workdir"
+payload = "plan_full"
+base = "origin"
+pre_stage = "replan-full-stage"
+bump = "loopbacks"
+on_done = "lenses"
+hold_target = "human"
+on_redrive_error = "hold"
 
 [[nodes]]
 id = "pass"

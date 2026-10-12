@@ -1,7 +1,7 @@
 # Foundry Universal Skill Spec — 범용 실행 모델 (Universal Review Engine)
 
-- **버전**: v0.13 (2026-10-12) — r11 REWORK(MAJOR 7) 반영. 64조합
-  대조·barrier 19,680조합·digest r11 확인. 재검증 대기.
+- **버전**: v0.14 (2026-10-12) — r12 REWORK(MAJOR 6+MINOR) 반영.
+  실행형 검증 도입(팩 TOML 실실행). 재검증 대기.
 - **의도(소유자)**: Foundry는 어떤 방법론도 돌릴 수 있는 유니버설
   플랫폼. BMad는 스킬 데이터의 첫 고객. **Rust 도메인에 방법론
   코드가 박히는 순간이 실패.** 엔진 고정·확장 선언(procedural macro
@@ -172,7 +172,7 @@ resume_targets = ["fixdie"]
 | fix 루프(무제한이던 것) | fix_rounds 상한(팩 값) | 동등+상한 |
 | bad_plan → **롤백+자동 재계획 5회** | route 카테고리 분기(any_in) → replan(pre_stage KEEP·**base="origin"** 롤백) → redrive(generation++) — 도메인 시도 불변 | **동등**(§2.4a·r9-7) |
 | intent_gap: 인간 해결 후 재계획 | route 카테고리 분기 → human hold → `resume("replan")` 진입 | 동등(예제 trace) |
-| defer(기록 후 진행) | dispatch 노드의 `side_records = ["deferred"]` — 스테이지 출력에서 팩 정의 필드(`schema-defer.toml`)를 정규화해 outbox intent에 저널 기록(emit과 독립, 액션 문법 확장 아님) | 동등 |
+| defer(기록 후 진행) | `side_records = ["deferred"]` + 출력 스키마 `condition = "no_loopback"` — 루프백 시 기록 억제(원본 moot 규칙, r12-5). 정규화된 deferred 레코드(schema-defer.toml)는 outbox intent로 저널 기록(emit과 독립) | 동등 |
 | carried(재런 저널 대조) | verify 지시문에 저널 대조 입력 포함 | 근사 |
 | quick/thorough/auto | selection(fixed/by-diff) | 변형 |
 
@@ -230,9 +230,9 @@ do_seq   := action ( ';' action )*     ; emit은 전 시퀀스에 최대 1회
   복종:
   | kind | 필수 | 선택 | 금지 |
   |---|---|---|---|
-  | dispatch | stages(최소 1 — T=0 배타성 붕괴 금지, r10-6), on_done, hold_target | side_records, role | — |
+  | dispatch | stages(최소 1 — r10-6), on_done, hold_target, on_verify_invalid(hold\|fail-run), on_no_valid(hold\|fail-run) | side_records, role | — |
   | route | branches(마지막 원소 when="true") | — | on_done |
-  | redrive | target, payload, on_done, hold_target | bump, pre_stage, base("latest"\|"origin", 기본 latest), on_redrive_error("hold"\|"fail-run") | — |
+  | redrive | target, payload, on_done, hold_target, on_redrive_error(hold\|fail-run), **bump — 루프백 redrive는 필수**(가드가 검사하는 카운터를 증가시켜야 함, r12-1) | pre_stage, base("latest"\|"origin", 기본 latest) | — |
   | emit | event, payload_from | — | on_done(HALT 암시) |
   | hold | resume_targets | notify_only | on_done |
   branch(r9-3 종단 규칙): **do가 종단 액션(emit 포함)이면 goto 금지**
@@ -448,7 +448,9 @@ policy = "discard-finding" # 개별 finding 거부(부분 거부)
 - 인간 선택: `commit_pass` / `commit_fail` / `resume(node_id)` /
   `abort`. 결속 재검사(run·attempt·artifact)와 커밋이 **동일 원자
   경계**(§3.2.4). API 멱등(중복 응답 폐기 — action_id).
-- `resume(node_id)`: **팩이 hold 노드에 선언한 허용 목적지 목록**
+- `resume(node_id)`: 인간 응답(해결문·수정 intent)은 **불변 artifact
+  (human_resolution)로 저장되어 resume에 결속** — 재개된 redrive의
+  pre_stage가 입력으로 소비(r12-3). **팩이 hold 노드에 선언한 허용 목적지 목록**
   (`resume_targets`)으로 제한. hold 진입 시 **불변 hold_instance_id
   발급**(재진입 시마다 신규 발급 — r7-4) + 선행 activation/evidence
   id 집합 + 현재 artifact digest를 hold 레코드에 저장. **네 인간
@@ -538,8 +540,8 @@ kind="review-pack" — advisory-pack은 emit 노드 포함 자체가 로드 거�
 **FULL 팩(r10-3)**: `skills/bmad-review-full/v1/` — BMad FULL
 라우팅 수용 팩 실파일(counters·entry·stages 4[verify=triage]·
 side_records=deferred·pack_stages(replan-stage)·schema-defer.toml·
-GOLDEN_TRACE.md+tools/verify_golden_trace.py(64조합 전수),
-pack=7a0630fa372d0c270b3f321b049109f536c3ad670208b3f17e6bd1b0239d9028).
+GOLDEN_TRACE.md+tools/verify_golden_trace.py(실행형: 팩 TOML 실파싱·60조합+반복 전이),
+pack=997ead1e116fb94f9751b0d7fab56d581007355288cd34cb266f6294bed0af16).
 §2.1 예제는 이 팩 policy.toml의 간략화, 기대 trace는
 GOLDEN_TRACE.md(혼합 범주·상한 경계 10케이스 — 부록 A.3 승인 전 확정).
 
@@ -574,7 +576,9 @@ baseline = A.1 팩 전체(모든 필드 정합·TOML·DSL 문법 유효·digest
 dispatch.stages[] 각 항목: {id(필수), lenses[파일명](필수≥1),
 session?(id), after?[stage id], inputs_unsealed?[입력명],
 role?("lens"|"verify"|"replan" — 팩 전체 verify≤1),
-output_schema?(파일명)} — 오류 정책은 스테이지가 아닌 §2.5 팩 전체
+output_schema?(파일명, 권장 — verdicts/findings/side_records 매핑을
+  팩 데이터로 고정, r12-4: values/from/active_categories/condition)} —
+  오류 정책은 스테이지가 아닌 §2.5 팩 전체
 [[output.on_error]](필수·순서=우선순위)가 소유(r9-4). 표준 payload_ref:
 "summary"(dispatch 산출 요약), "findings"(정규화 출력),
 "cumulative_findings"(run 누적). markdown 그룹 규칙 템플릿·전체

@@ -1,0 +1,9 @@
+# findings 출력 스키마 (r12-4) — 렌즈 출력 정규화 계약
+# 각 렌즈는 마크다운 그룹 섹션으로 출력; 정규화 규칙:
+[[output]]
+name = "findings"            # run 스코프 findings 집합으로 병합
+groups_from = "## "          # 그룹 태그 = 마크다운 h2 제목
+active = true                # findings 스코프 = active set(route 참조)
+[[output]]
+name = "summary"
+from = "first_paragraph"     # dispatch 기본 산출물 요약
