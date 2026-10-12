@@ -70,6 +70,7 @@ when  = 'budget_exhausted() || timeout()'
 goto  = "human"
 [[nodes.branches]]   # (r11-1b) 공통 loopback 상한 — 원본 "loopback 전
 when  = '(any_in(verdicts, ["intent_gap", "bad_plan"])) && !count_lt(loopbacks, 5)'
+do    = 'bump(loopbacks)'   # 상한 진입도 루프백 — hold 시점 6
 goto  = "human"      # increment 후 5 초과 HALT — replan resume 불가
 [[nodes.branches]]   # intent_gap: bump+revert가 hold 전(원본 순서)
 when  = 'any_in(verdicts, ["intent_gap"])'
@@ -116,9 +117,11 @@ kind = "redrive"     #    재디스패치 — 새 generation workdir(물리 격�
 #    superseded 처리(§2.4a)
 target = "die-workdir"
 payload = "findings"
+base = "latest"
 bump = "fix_rounds"
 on_done = "lenses"   # 루프 폐쇄: lenses→route→fixdie→lenses…
 hold_target = "human"
+on_redrive_error = "hold"
 
 [[nodes]]
 id = "replan"        # bad_plan: 비동결 부분 수정(KEEP 추출 후 재유도)
@@ -650,3 +653,8 @@ output_schema?(파일명, 권장 — verdicts/findings/side_records 매핑을
 "summary"(dispatch 산출 요약), "findings"(정규화 출력),
 "cumulative_findings"(run 누적). markdown 그룹 규칙 템플릿·전체
 예는 구현 중 확정(A.5) — 스키마 자체는 이대로 동결.
+
+### A.5 이연 항목 (첫 구현 마일스톤 승인 범위 밖)
+- markdown 그룹 정규화 규칙 템플릿(§2.5 missing_field 필수 집합·
+  ext_over 단위·그룹 형식) — 첫 구현에서 fixture 실측 후 별도 승인.
+- notify_async(spawn_blocking) 통합 — 데모 단계에서 연기 선언 승계.

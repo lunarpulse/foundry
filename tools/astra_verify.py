@@ -253,7 +253,31 @@ def main():
 
     check('manifest closure + canonical digest', lambda: canonical(args.pack))
     policy = tomllib.loads((args.pack / 'policy.toml').read_text())
-    schema = tomllib.loads((args.pack / 'schema-triage.toml').read_text())
+    # (r17-4) follow the ACTUAL verify stage's output_schema reference
+    # instead of hardcoding schema-triage.toml
+    def _verify_schema_path(pol):
+        for n in pol['nodes']:
+            if n.get('kind') == 'dispatch':
+                for st in n.get('stages', []):
+                    if st.get('role') == 'verify':
+                        return st['output_schema']
+        raise AssertionError('no verify stage with output_schema')
+    schema_name = _verify_schema_path(policy)
+    schema = tomllib.loads((args.pack / schema_name).read_text())
+    # negative control: swapping the reference must break this lookup
+    swapped = tomllib.loads((args.pack / 'policy.toml').read_text())
+    for n in swapped['nodes']:
+        if n.get('kind') == 'dispatch':
+            for st in n.get('stages', []):
+                if st.get('role') == 'verify':
+                    st['output_schema'] = 'schema-findings.toml'
+    try:
+        sname2 = _verify_schema_path(swapped)
+        s2 = tomllib.loads((args.pack / sname2).read_text())
+        next(o['active_categories'] for o in s2['output'] if o['name'] == 'verdicts')
+        raise AssertionError('schema swap mutant NOT detected')
+    except StopIteration:
+        pass  # expected: findings schema has no verdicts output
     active = next(o['active_categories'] for o in schema['output'] if o['name'] == 'verdicts')
     check('graph structure', lambda: graph(policy))
 
