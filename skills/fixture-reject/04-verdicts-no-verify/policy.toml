@@ -6,12 +6,14 @@ kind = "dispatch"
 stages = [{ id = "lens-a", lenses = ["lens-a.md"], role = "lens" }]
 on_done = "done"
 hold_target = "end_hold"
+on_verify_invalid = "hold"
+on_no_valid = "hold"
 
 [[nodes]]
 id = "done"
 kind = "route"
 [[nodes.branches]]
-when = 'any_in(verdicts, {"ok"})'
+when = 'any_in(verdicts, ["ok"])'
 goto = "end_hold"
 [[nodes.branches]]
 when = "true"

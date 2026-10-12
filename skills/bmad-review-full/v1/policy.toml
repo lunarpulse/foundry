@@ -4,46 +4,59 @@ interface_version = 1
 [counters]
 fix_rounds = 0
 replans = 0
+loopbacks = 0
 
 [[nodes]]
 id = "lenses"
 kind = "dispatch"
 stages = [
   { id = "edge", lenses = ["lens-edge.md"], role = "lens" },
-  { id = "verif", lenses = ["lens-verif.md"], role = "lens", after = "edge" },
+  { id = "verif", lenses = ["lens-verif.md"], role = "lens", after = "edge", session = "trace" },
   { id = "claims", lenses = ["lens-claims.md"], role = "lens", after = "verif", session = "trace" },
-  { id = "triage", lenses = ["lens-triage.md"], role = "verify", after = "claims" },
+  { id = "triage", lenses = ["lens-triage.md"], role = "verify", after = "claims", session = "trace" },
 ]
 side_records = ["deferred"]
 on_done = "route1"
 hold_target = "human"
+on_verify_invalid = "hold"
+on_no_valid = "hold"
+
+# r11-2: pre_stage는 팩 stages에 등록된다(참조 폐쇄)
+[[pack_stages]]
+id = "replan-stage"
+lenses = ["lens-replan.md"]
+role = "replan"
 
 [[nodes]]
 id = "route1"
 kind = "route"
-# r10-1: 원본 cascading 순서 — intent_gap > bad_plan > patch > defer.
-# 각 범주 상한 초과 시 하위 범주로 누수 없이 human.
+# (r11-1) 원본 cascading: intent_gap/bad_plan 존재 시 loopback — 하위
+# 항목은 moot. 상한은 공통 loopbacks 카운터(원본 review_loop_iteration).
+# 조건식은 규범 문법 [..] 집합(r11-3).
 [[nodes.branches]]
 when = 'budget_exhausted() || timeout()'
 goto = "human"
+[[nodes.branches]]   # (r11-1b) 공통 loopback 상한 — 원본 "loopback 전
+when = '(any_in(verdicts, ["intent_gap", "bad_plan"])) && !count_lt(loopbacks, 5)'   # increment, 5 초과 HALT
+goto = "human"          # 상한 인간 — replan resume 불가
 [[nodes.branches]]
-when = 'any_in(verdicts, {"intent_gap"})'
-goto = "human"
+when = 'any_in(verdicts, ["intent_gap"])'
+goto = "human_gap"
 [[nodes.branches]]
-when = 'any_in(verdicts, {"bad_plan"}) && count_lt(replans, 5)'
+when = 'any_in(verdicts, ["bad_plan"]) && count_lt(loopbacks, 5)'
 goto = "replan"
 [[nodes.branches]]
-when = 'any_in(verdicts, {"patch"}) && count_lt(fix_rounds, 3)'
+when = 'any_in(verdicts, ["bad_plan"])'
+goto = "human"          # 상한 도달 — loopback 불가(r11-1: patch로 누수 금지)
+[[nodes.branches]]
+when = 'any_in(verdicts, ["patch"]) && count_lt(fix_rounds, 3)'
 goto = "fixdie"
 [[nodes.branches]]
-when = 'any_in(verdicts, {"defer"}) && !has_findings(any)'
-goto = "pass"
-[[nodes.branches]]
 when = 'has_findings(any)'
-goto = "human"
+goto = "human"          # patch 상한 등 잔여 — 인간
 [[nodes.branches]]
 when = '!has_findings(any)'
-goto = "pass"
+goto = "pass"           # defer-only: 기록은 side_records(출력 정규화)
 [[nodes.branches]]
 when = 'true'
 goto = "human"
@@ -57,17 +70,24 @@ base = "latest"
 bump = "fix_rounds"
 on_done = "lenses"
 hold_target = "human"
+on_redrive_error = "hold"
 
 [[nodes]]
 id = "replan"
 kind = "redrive"
 target = "die-workdir"
-payload = "replan"
+payload = "plan"
 base = "origin"
 pre_stage = "replan-stage"
 bump = "replans"
 on_done = "lenses"
 hold_target = "human"
+
+# r11-2: intent_gap 전용 hold — 해결 후 계획 재실행으로만 resume
+[[nodes]]
+id = "human_gap"
+kind = "hold"
+resume_targets = ["replan"]
 
 [[nodes]]
 id = "pass"
@@ -76,16 +96,9 @@ event = "InspectionPassed"
 payload_from = "summary"
 
 [[nodes]]
-id = "emit_failed_node"
-kind = "emit"
-event = "InspectionFailed"
-payload_from = "cumulative_findings"
-
-[[nodes]]
 id = "human"
 kind = "hold"
-# r10-2: 상한 도달 human은 replan resume 금지 — resume_targets는
-# fixdie만. (resume은 팩 데이터; 엔진은 목록만 집행)
+# r11-1/2: 상한·잔여 인간 — fix만 resume 가능(replan 재계획은 human_gap 전용)
 resume_targets = ["fixdie"]
 
 [[output.on_error]]

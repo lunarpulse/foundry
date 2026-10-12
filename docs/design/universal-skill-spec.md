@@ -1,7 +1,7 @@
 # Foundry Universal Skill Spec — 범용 실행 모델 (Universal Review Engine)
 
-- **버전**: v0.12 (2026-10-12) — r10 REWORK(MAJOR 7+MINOR 1) 반영.
-  digest·진리표(T≥1 7,107조합)·원본 step-04 hash r10 확인. 재검증 대기.
+- **버전**: v0.13 (2026-10-12) — r11 REWORK(MAJOR 7) 반영. 64조합
+  대조·barrier 19,680조합·digest r11 확인. 재검증 대기.
 - **의도(소유자)**: Foundry는 어떤 방법론도 돌릴 수 있는 유니버설
   플랫폼. BMad는 스킬 데이터의 첫 고객. **Rust 도메인에 방법론
   코드가 박히는 순간이 실패.** 엔진 고정·확장 선언(procedural macro
@@ -68,17 +68,20 @@ kind = "route"
 [[nodes.branches]]
 when  = 'budget_exhausted() || timeout()'
 goto  = "human"
-[[nodes.branches]]   # intent_gap: 공통 loopback 카운터 경유 후 인간 해결
-when  = 'any_in(verdicts, {"intent_gap"})'   # (원본 — 재계획 전 인간)
-goto  = "human"      # 인간 해결 후 resume은 §3.3 목록 데이터
+[[nodes.branches]]   # (r11-1b) 공통 loopback 상한 — 원본 "loopback 전
+when  = '(any_in(verdicts, ["intent_gap", "bad_plan"])) && !count_lt(loopbacks, 5)'
+goto  = "human"      # increment 후 5 초과 HALT — replan resume 불가
+[[nodes.branches]]   # intent_gap: 인간 해결 후 계획 재실행
+when  = 'any_in(verdicts, ["intent_gap"])'
+goto  = "human_gap"  # 전용 hold — resume("replan")만 허용
 [[nodes.branches]]   # bad_plan: 롤백+재계획(상한 5)
-when  = 'any_in(verdicts, {"bad_plan"}) && count_lt(replans, 5)'
+when  = 'any_in(verdicts, ["bad_plan"]) && count_lt(loopbacks, 5)'
 goto  = "replan"
 [[nodes.branches]]   # patch: 같은 구현자 최소 수정(상한 3)
-when  = 'any_in(verdicts, {"patch"}) && count_lt(fix_rounds, 3)'
+when  = 'any_in(verdicts, ["patch"]) && count_lt(fix_rounds, 3)'
 goto  = "fixdie"
 [[nodes.branches]]   # defer: 기록 후 진행 — findings 없을 때만 pass
-when  = 'any_in(verdicts, {"defer"}) && !has_findings(any)'
+when  = 'any_in(verdicts, ["defer"]) && !has_findings(any)'
 goto  = "pass"       # side_records=deferred 저널(§2.2 표)
 [[nodes.branches]]
 when  = 'has_findings(any)'
@@ -121,8 +124,8 @@ kind = "redrive"     #    새 generation 재구현 — emit 없음(r5 정정)
 target = "die-workdir"
 payload = "replan"   # (r7-1 스키마 필수)
 base = "origin"      # r9-7: bad_plan = 롤백 후 재계획(원본 step-04)
-pre_stage = "replan-stage"   # 팩 정의 스테이지(KEEP 추출·계획 수정)
-bump = "replans"
+pre_stage = "replan-stage"   # 팩 [[pack_stages]]에 등록(r11-4)   # 팩 정의 스테이지(KEEP 추출·계획 수정)
+bump = "loopbacks"   # 공통 loopback 카운터(원본 review_loop_iteration)
 on_done = "lenses"   # 재구현 결과는 다시 검증으로 — 루프 폐쇄(r5
                      # 정정: replans 0..5 전부 attempt=1, Inspecting
                      # 유지 — 도메인 emit/시도 소모 없음)
@@ -143,12 +146,15 @@ event = "InspectionPassed"
 payload_from = "summary"   # (r7-1 스키마 필수)
 
 [[nodes]]
+id = "human_gap"     # ⑤' intent_gap 전용 hold — 계획 재실행으로만 resume
+kind = "hold"
+resume_targets = ["replan"]
+
+[[nodes]]
 id = "human"         # ⑤ hold
 kind = "hold"
-# (r8-3) route1 재개 제거 — 유한성 DAG 통과: human→(replan→lenses는
-# 차감 경로)만. route1 재개는 route1이 차감 노드 경유 없이 재평가되는
-# 사이클이라 로더가 본 예제를 거부했음.
-resume_targets = ["replan"]   # (r7-1 스키마 필수)
+# (r11) 상한·잔여 인간 — fix만 resume(replan은 human_gap 전용).
+resume_targets = ["fixdie"]
 ```
 
 **노드 5종 = 엔진 전부**: `dispatch` / `route` / `redrive` / `emit` /
@@ -531,21 +537,24 @@ kind="review-pack" — advisory-pack은 emit 노드 포함 자체가 로드 거�
 
 **FULL 팩(r10-3)**: `skills/bmad-review-full/v1/` — BMad FULL
 라우팅 수용 팩 실파일(counters·entry·stages 4[verify=triage]·
-side_records=deferred·replan pre_stage+lens-replan.md,
-pack=31a75c15a8ef68d309a1f4d765d3c05e8db7c09899001fa5272d4e78229080e5).
+side_records=deferred·pack_stages(replan-stage)·schema-defer.toml·
+GOLDEN_TRACE.md+tools/verify_golden_trace.py(64조합 전수),
+pack=7a0630fa372d0c270b3f321b049109f536c3ad670208b3f17e6bd1b0239d9028).
 §2.1 예제는 이 팩 policy.toml의 간략화, 기대 trace는
 GOLDEN_TRACE.md(혼합 범주·상한 경계 10케이스 — 부록 A.3 승인 전 확정).
 
 **digest(독립 계산, python hashlib §3.1 canonical)** — fixture-min:
-pack=0a0f70b75d8025080352e29c6dfb82cbd1916c3a14735828c7d1633cf924bfd3,
-leaf(quick-inspect,fixture-min,1.0.0,advisory)=b12266c3043f7dce60825bd39c59d94a4210ad47cef357361682ac19db6e8c0d —
+pack=8528b29eb4564756d29adfa58698dcfc74cd7a1fbd6c365632ec6d7c2e9160c6,
+leaf(quick-inspect,fixture-min,1.0.0,advisory)=2be18a52eeea833d605f42e1d037d4430f0977b3815b9620619f6b5b185962dd —
 구현은 재현 의무(파일→canonical→digest 대조).
 
 ### A.2 거부 fixture — 9종 실제 파일 (r10-5: baseline 정합 + 기대 오류 코드)
 
-baseline = A.1 팩 전체(모든 필드 정합·TOML 유효·digest 정상).
-각 디렉터리는 **규칙 1개만 위반** + `expected_error.txt`(기대 오류
-코드). 로더 회귀: 각 fixture가 **정확히 그 코드로** 거부해야 함:
+baseline = A.1 팩 전체(모든 필드 정합·TOML·DSL 문법 유효·digest
+재계산 일치). 각 디렉터리는 **규칙 1개만 위반** +
+`expected_error.txt`(기대 오류 코드) — 01~06의 manifest digest는
+변형 후 재계산되어 정상(위반은 policy 그래프뿔), 07~09는 manifest
+형식만 위반. 로더 회귀: 각 fixture가 **정확히 그 코드로** 거부:
 | 디렉터리 | 위반 | 기대 코드 |
 |---|---|---|
 | 01-route-cycle | ra↔rb 상호참조 | E_DAG_CYCLE |

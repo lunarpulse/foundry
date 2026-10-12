@@ -6,6 +6,8 @@ kind = "dispatch"
 stages = [{ id = "lens-a", lenses = ["lens-a.md"], role = "lens" }]
 on_done = "done"
 hold_target = "end_hold"
+on_verify_invalid = "hold"
+on_no_valid = "hold"
 
 [[nodes]]
 id = "done"
@@ -18,6 +20,10 @@ do = "emit(InspectionPassed, summary)"
 id = "end_hold"
 kind = "hold"
 resume_targets = []
+
+[[output.on_error]]
+state = "ok"
+policy = "accept-stage"
 
 [[output.on_error]]
 state = "dispatch_error"

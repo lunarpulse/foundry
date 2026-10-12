@@ -1,0 +1,6 @@
+# deferred record schema (side-record, r11-4)
+# normalized from triage output entries routed "defer":
+[[record]]
+source_run = "run_id"      # engine-bound
+summary = "one sentence"
+evidence = "why real; for maybe-false, what would settle it"

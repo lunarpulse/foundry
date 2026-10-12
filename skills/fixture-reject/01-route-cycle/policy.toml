@@ -6,6 +6,8 @@ kind = "dispatch"
 stages = [{ id = "lens-a", lenses = ["lens-a.md"], role = "lens" }]
 on_done = "ra"
 hold_target = "end_hold"
+on_verify_invalid = "hold"
+on_no_valid = "hold"
 
 [[nodes]]
 id = "ra"

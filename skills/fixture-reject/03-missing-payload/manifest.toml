@@ -3,4 +3,4 @@ interface_version = 1
 kind = "review-pack"
 version = "1.0.0"
 files = ["lens-a.md", "policy.toml"]
-digest = "9ba6ed5c3684498783138360e8b7222af2571f4ab54672e0ab9f0e6024129a2f"
+digest = "2e3cafa44d6d82d67716e62e6459463e8881a5e46c6a601508993ca7d30f40fc"
