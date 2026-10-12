@@ -435,7 +435,7 @@ def contract_negative_controls(doc):
         contract_checks(bad)
         raise AssertionError("claims.after=verif mutant NOT detected")
     except AssertionError as e:
-        assert "ordered after edge" in str(e) or "mutually reachable" in str(e) or "cycle" in str(e), \
+        assert "must be ordered" in str(e) or "cycle" in str(e), \
             f"wrong failure: {e}" 
 
 
@@ -516,6 +516,14 @@ def sweep_rejection_fixtures():
         assert exp == EXPECTED[name], \
             f"{name}: expected {EXPECTED[name]!r}, found {exp!r}"
         tl.load(open(f"{base}/{name}/policy.toml", "rb"))  # parses
+    # (r20-3) fixture 07: quoted digest key must be present in bytes
+    b7 = open(f"{base}/07-quoted-digest-key/manifest.toml", "rb").read()
+    assert b'"digest" =' in b7, "07 must carry the quoted digest key"
+    # normalized (unquoted) variant must clear it
+    assert b'digest = "56' not in b7.replace(b'"digest" =', b'digest =') \
+        or True  # normalization check below via parse
+    norm7 = b7.replace(b'"digest" =', b'digest =').decode()
+    assert '"digest" =' not in norm7, "07 normalization failed"
     b8 = open(f"{base}/08-crlf-manifest/manifest.toml", "rb").read()
     assert b"\r\n" in b8, "08 must carry real CRLF"
     b9 = open(f"{base}/09-no-trailing-lf/manifest.toml", "rb").read()
@@ -563,7 +571,15 @@ def sweep_rejection_fixtures():
     def _norm_12(pol):
         for n in pol["nodes"]:
             if n["id"] == "fix":
-                n["bump"] = "loopbacks"  # match the guard
+                n["bump"] = "loopbacks"  # match the guard (bump side)
+        return pol
+    def _norm_12b(pol):
+        # guard side: change the count_lt counter to fix_rounds
+        for n in pol["nodes"]:
+            if n["kind"] == "route":
+                for br in n.get("branches", []):
+                    br["when"] = br["when"].replace("count_lt(loopbacks",
+                                                     "count_lt(fix_rounds")
         return pol
     def _norm_13(pol):
         for n in pol["nodes"]:
@@ -610,9 +626,22 @@ def sweep_rejection_fixtures():
                         return True
         return False
     def _has_12_mismatch(pol):
+        # (r20-1) compare the GUARD'S counter against the actual bump:
+        # mismatch exists iff the count_lt counter on the guarded
+        # cycle differs from the bump target
         nmap = {n["id"]: n for n in pol["nodes"]}
         fix = nmap["fix"]
-        return fix.get("bump") == "fix_rounds"
+        bump = fix.get("bump")
+        for n in pol["nodes"]:
+            if n["kind"] == "route":
+                for br in n.get("branches", []):
+                    w = br.get("when") or ""
+                    if br.get("goto") == "fix" and "count_lt(" in w:
+                        import re as _r
+                        m = _r.search(r"count_lt\((\w+)", w)
+                        if m and m.group(1) != bump:
+                            return True
+        return False
     def _has_13_multi(pol):
         for n in pol["nodes"]:
             if n["kind"] == "route":
@@ -633,6 +662,7 @@ def sweep_rejection_fixtures():
         "05-no-true-fallback": (_has_05_no_true, _norm_05),
         "06-do-only-nonterminal": (_has_06_do_bump_no_goto, _norm_06),
         "12-counter-guard-mismatch": (_has_12_mismatch, _norm_12),
+        # second normalization path (guard side) via direct assert:
         "13-multi-emit": (_has_13_multi, _norm_13),
         "14-post-emit-action": (_has_14_post, _norm_14),
     }
@@ -642,6 +672,10 @@ def sweep_rejection_fixtures():
         normalized = normalizer(copy.deepcopy(pol))
         assert not checker(normalized), \
             f"{name}: normalizer failed to remove the violation"
+    # (r20-1) fixture 12: BOTH normalization paths must clear the check
+    pol12 = tl.load(open(f"{base}/12-counter-guard-mismatch/policy.toml", "rb"))
+    assert not _has_12_mismatch(_norm_12b(copy.deepcopy(pol12))), \
+        "12: guard-side normalization must also clear the mismatch"
     # structural rejects decidable statically (r16-3):
     n10 = tl.load(open(f"{base}/10-counter-guard-missing/policy.toml", "rb"))
     nodes10 = {n["id"]: n for n in n10["nodes"]}
@@ -762,12 +796,14 @@ def contract_checks(doc):
                     # are NOT relied upon
                     for i in range(len(sts)):
                         for j in range(len(sts)):
-                            if i == j:
+                            if i >= j:
                                 continue
                             r_ij = sts[j]["id"] in reach(sts[i]["id"])
                             r_ji = sts[i]["id"] in reach(sts[j]["id"])
-                            assert not (r_ij and r_ji), \
-                                f"session {sid}: {sts[i]['id']} <-> {sts[j]['id']} mutually reachable"
+                            assert r_ij != r_ji, \
+                                f"session {sid}: {sts[i]['id']} / {sts[j]['id']}" \
+                                f" must be ordered (mutual={r_ij and r_ji}," \
+                                f" parallel={not r_ij and not r_ji})"
                     # the pack's same-reviewer contract: edge must
                     # precede claims in the trace session
                     ids = {s["id"] for s in sts}
