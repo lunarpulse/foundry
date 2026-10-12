@@ -285,6 +285,18 @@ impl StreamRuntime {
         dest_order: &str,
         artifact_digest: &str,
     ) -> Result<(String, String), String> {
+        // (r2 MAJOR-1) 회복 정지 중 입장 차단 — dispatch 와 동일 게이트.
+        if self.is_admission_blocked() {
+            let _ = record_refusal(
+                &self.orch,
+                RefusalCode::QuiescenceBlocked,
+                source_order,
+                None,
+            );
+            return Err(format!(
+                "admission blocked — handoff prepare for '{source_order}' refused during recovery quiescence"
+            ));
+        }
         let ap_path = self
             .approval_path
             .lock()
@@ -313,6 +325,18 @@ impl StreamRuntime {
         artifact_digest: &str,
         grant_id: &str,
     ) -> Result<(), String> {
+        // (r2 MAJOR-1) 회복 정지 중 입장 차단 — dispatch 와 동일 게이트.
+        if self.is_admission_blocked() {
+            let _ = record_refusal(
+                &self.orch,
+                RefusalCode::QuiescenceBlocked,
+                source_order,
+                None,
+            );
+            return Err(format!(
+                "admission blocked — handoff dispatch for '{source_order}' refused during recovery quiescence"
+            ));
+        }
         let ap_path = self
             .approval_path
             .lock()
@@ -363,6 +387,18 @@ impl StreamRuntime {
         order_id: &str,
         exec: &str,
     ) -> Result<foundry_domain::OrderState, String> {
+        // (r2 MAJOR-1) 회복 정지 중 입장 차단 — dispatch 와 동일 게이트.
+        if self.is_admission_blocked() {
+            let _ = record_refusal(
+                &self.orch,
+                RefusalCode::QuiescenceBlocked,
+                order_id,
+                None,
+            );
+            return Err(format!(
+                "admission blocked — advance for '{order_id}' refused during recovery quiescence"
+            ));
+        }
         let e = self.stream(stream_id).ok_or(format!("stream {stream_id} not registered"))?;
         let mut eng = e.engine_if_unfenced()?;
         eng.acquire(order_id, exec).map_err(|er| format!("acquire: {er:?}"))?;
@@ -669,15 +705,13 @@ impl<'r> RecoveryCoordinator<'r> {
                 // (M7.1 리뷰 MAJOR-2) **drain 증거 무신뢰** — 호출자 폴링
                 // 만으로 완료 판정하지 않는다: 원장에서 in-flight 예약이
                 // 실제 종결(존재하지 않거나 무효)됐는지 교차 검증.
-                let drained_in_ledger = (|| -> bool {
-                    let Ok(mut ap) =
-                        foundry_approval::ApprovalLedger::open(approval_db)
-                    else {
-                        return false;
-                    };
-                    let pending = foundry_approval::ApprovalLedger::pending_reservations(&ap);
-                    want.iter().all(|k| !pending.iter().any(|(g, _, _)| g == k))
-                })();
+                let drained_in_ledger = (|| -> Option<bool> {
+                    let ap = foundry_approval::ApprovalLedger::open(approval_db).ok()?;
+                    // (r2 MAJOR-2) 읽기 실패는 drain 아님(fail-closed).
+                    let pending = ap.pending_reservations().ok()?;
+                    Some(want.iter().all(|k| !pending.iter().any(|(g, _, _)| g == k)))
+                })()
+                .unwrap_or(false);
                 if drained_in_ledger {
                     break;
                 }

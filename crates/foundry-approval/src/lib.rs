@@ -139,22 +139,30 @@ impl ApprovalLedger {
     }
 
     /// (M7.1 리뷰 MAJOR-2) 잔여 예약 조회 — 회복 코디네이터의 drain
-    /// 교차 검증용(예약은 소비/해제 시 삭제).
-    pub fn pending_reservations(&self) -> Vec<(String, String, i64)> {
-        let mut stmt = match self
+    /// 교차 검증용(예약은 소비/해제 시 삭제). (r2 MAJOR-2) 읽기 실패는
+    /// fail-closed: 빈 벡터가 아니라 Err — 호출자가 drain됐다고
+    /// 오판하지 못하게.
+    pub fn pending_reservations(
+        &self,
+    ) -> Result<Vec<(String, String, i64)>, String> {
+        let mut stmt = self
             .conn
             .prepare("SELECT grant_id, exec_id, dispatch_seq FROM reservations")
-        {
-            Ok(s) => s,
-            Err(_) => return vec![],
-        };
-        let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
-        });
-        match rows {
-            Ok(it) => it.filter_map(|x| x.ok()).collect(),
-            Err(_) => vec![],
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| e.to_string())?);
         }
+        Ok(out)
     }
 
     /// (M7.1 리뷰 B1) 원장 경로 — 라이브 핸드오프 재오픈용.
