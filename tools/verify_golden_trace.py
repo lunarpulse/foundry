@@ -396,21 +396,22 @@ def main():
 
 
 def sweep_rejection_fixtures():
-    """(r15-1) A.2 sweep: every fixture dir must carry expected_error.txt;
-    structural rejects are checked where decidable statically."""
+    """(r15-1, r16-3) A.2 sweep: exact expected codes + structural
+    checks decidable without a loader implementation."""
     import glob
+    import tomllib as tl
     base = "skills/fixture-reject"
     dirs = sorted(os.path.basename(d) for d in glob.glob(f"{base}/*"))
-    assert len(dirs) >= 18, f"expected >=18 fixtures, found {len(dirs)}"
+    assert len(dirs) == 18, f"expected 18 fixtures, found {len(dirs)}"
     for name in dirs:
         exp = open(f"{base}/{name}/expected_error.txt").read().strip()
-        assert exp.startswith("E_"), f"{name}: bad error code {exp}"
-    # byte-format checks decidable here:
+        assert exp.startswith("E_") and "\n" not in exp, \
+            f"{name}: bad error code {exp!r}"
+        tl.load(open(f"{base}/{name}/policy.toml", "rb"))  # parses
     b8 = open(f"{base}/08-crlf-manifest/manifest.toml", "rb").read()
     assert b"\r\n" in b8, "08 must carry real CRLF"
     b9 = open(f"{base}/09-no-trailing-lf/manifest.toml", "rb").read()
     assert not b9.endswith(b"\n"), "09 must lack trailing LF"
-    # 08 digest is computed over its ORIGINAL CRLF bytes (r15-5)
     files = {"lens-a.md": open(f"{base}/08-crlf-manifest/lens-a.md").read(),
              "policy.toml": open(f"{base}/08-crlf-manifest/policy.toml").read()}
     man = b8.decode()
@@ -427,11 +428,75 @@ def sweep_rejection_fixtures():
     import re as _re
     declared = _re.search(r'"([0-9a-f]{64})"', line).group(1)
     assert declared == h.hexdigest(), \
-        f"08 digest must match its CRLF-original bytes: {declared[:12]} vs {h.hexdigest()[:12]}"
-    print(f"fixture sweep: {len(dirs)} fixtures, error codes valid,"
-          " 08 CRLF-bytes digest ok, 09 no-trailing-LF ok")
+        f"08 digest must match CRLF-original bytes: {declared[:12]} vs {h.hexdigest()[:12]}"
+    # structural rejects decidable statically (r16-3):
+    n10 = tl.load(open(f"{base}/10-counter-guard-missing/policy.toml", "rb"))
+    nodes10 = {n["id"]: n for n in n10["nodes"]}
+    fix10 = nodes10["fix"]
+    branches10 = nodes10["rt"]["branches"]
+    has_bump = bool(fix10.get("bump")) or any(
+        "bump(" in (br.get("do") or "") for br in branches10
+        if br.get("goto") == "fix")
+    assert not has_bump, "10 must have NO bump on the guarded cycle"
+    n11 = tl.load(open(f"{base}/11-counter-guard-double/policy.toml", "rb"))
+    nodes11 = {n["id"]: n for n in n11["nodes"]}
+    bumps11 = (1 if nodes11["fix"].get("bump") else 0) + sum(
+        1 for br in nodes11["rt"]["branches"]
+        if br.get("goto") == "fix" and "bump(" in (br.get("do") or ""))
+    assert bumps11 == 2, f"11 must double-bump, got {bumps11}"
+    n15 = tl.load(open(f"{base}/15-verify-duplicate/policy.toml", "rb"))
+    ver = sum(1 for n in n15["nodes"] if n["kind"] == "dispatch"
+              for st in n.get("stages", []) if st.get("role") == "verify")
+    assert ver == 2, f"15 must have 2 verify stages, got {ver}"
+    n16 = tl.load(open(f"{base}/16-session-parallel/policy.toml", "rb"))
+    for n in n16["nodes"]:
+        if n["kind"] == "dispatch":
+            sess = {}
+            for st in n.get("stages", []):
+                if st.get("session"):
+                    sess.setdefault(st["session"], []).append(st)
+            for sid, sts in sess.items():
+                unordered = [x for x in sts if not x.get("after")]
+                assert len(sts) > 1 and len(unordered) > 1, \
+                    "16 must have same-session stages without ordering"
+    n17 = tl.load(open(f"{base}/17-missing-error-policy/policy.toml", "rb"))
+    for n in n17["nodes"]:
+        if n["kind"] == "dispatch":
+            assert "on_verify_invalid" not in n, "17 must lack the policy"
+    print(f"fixture sweep: 18 fixtures, exact codes, 08 CRLF digest,"
+          " structural rejects 10/11/15/16/17 verified")
+
+
+def contract_checks(doc):
+    """(r16-2) pack-contract regressions: pre_stage wiring and
+    same-session ordering — the two mutants r15 slipped through."""
+    stages_by_pack = {s["id"]: s for s in doc.get("pack_stages", [])}
+    for n in doc["nodes"]:
+        if n["kind"] == "redrive" and n.get("pre_stage"):
+            ps = n["pre_stage"]
+            assert ps in stages_by_pack, \
+                f"{n['id']}.pre_stage={ps} not registered in pack_stages"
+            for lf in stages_by_pack[ps].get("lenses", []):
+                assert os.path.exists(f"{PACK}/{lf}"), \
+                    f"pre_stage {ps} lens {lf} missing"
+            if n["id"] == "replan_full":
+                assert "lens-replan-full.md" in stages_by_pack[ps]["lenses"], \
+                    "replan_full must run the full-plan regenerator"
+            if n["id"] == "replan":
+                assert "lens-replan.md" in stages_by_pack[ps]["lenses"], \
+                    "replan must run the partial amender"
+    for n in doc["nodes"]:
+        if n["kind"] == "dispatch":
+            sess = {}
+            for st in n.get("stages", []):
+                if st.get("session"):
+                    sess.setdefault(st["session"], []).append(st)
+            for sid, sts in sess.items():
+                if len(sts) > 1:
+                    ordered = [x for x in sts if x.get("after")]
+                    assert len(ordered) == len(sts) - 1, \
+                        f"same-session {sid} stages must be after-ordered"
 
 
 if __name__ == "__main__":
     sys.exit(main())
-

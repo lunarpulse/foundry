@@ -1,7 +1,7 @@
 # Foundry Universal Skill Spec — 범용 실행 모델 (Universal Review Engine)
 
-- **버전**: v0.17 (2026-10-12) — r15 REWORK(MAJOR 3+MINOR 2) 반영.
-  거부 fixture 18종 실파일·검증기 스윕·resume 네거티브. 재검증 대기.
+- **버전**: v0.18 (2026-10-12) — r16 REWORK(MAJOR 3+MINOR 2) 반영.
+  예제=canonical 팩 추출·검증기 계약 검사 강화. 재검증 대기.
 - **의도(소유자)**: Foundry는 어떤 방법론도 돌릴 수 있는 유니버설
   플랫폼. BMad는 스킬 데이터의 첫 고객. **Rust 도메인에 방법론
   코드가 박히는 순간이 실패.** 엔진 고정·확장 선언(procedural macro
@@ -62,9 +62,9 @@ hold_target = "human"   # r9-3: 엔진 주도 hold 이송 필수 필드
 [[nodes]]
 id = "route1"        # ② route: 조건식 → 다음 노드 선택
 kind = "route"
-# (r10-1/2) 문서 예제는 FULL 팩(skills/bmad-review-full/v1/policy.toml)
-# 의 route1과 논리 동일 — 원본 cascading 순서 intent_gap > bad_plan >
-# patch > defer, 상한 초과는 하위 누수 없이 human:
+# (r16-1) 아래 그래프 발췌는 skills/bmad-review-full/v1/policy.toml의
+# **축약이 아니라 동일 노드 집합의 추출** — 검증기가 문서 예제를 파싱해
+# canonical 팩 노드와 동일성(diff) 검사한다(아래 "예제-팩 동일성").
 [[nodes.branches]]
 when  = 'budget_exhausted() || timeout()'
 goto  = "human"
@@ -75,21 +75,22 @@ goto  = "human"      # increment 후 5 초과 HALT — replan resume 불가
 when  = 'any_in(verdicts, ["intent_gap"])'
 do    = 'bump(loopbacks); revert(origin)'
 goto  = "human_gap"  # 전용 hold — resume("replan_full")만 허용
-[[nodes.branches]]   # bad_plan: 롤백+재계획(상한 5)
+[[nodes.branches]]   # bad_plan: bump가 redrive 전(원본 "루프백 전")
 when  = 'any_in(verdicts, ["bad_plan"]) && count_lt(loopbacks, 5)'
+do    = 'bump(loopbacks)'
 goto  = "replan"
+[[nodes.branches]]   # 잔여 bad_plan=상한 — patch로 누수 금지
+when  = 'any_in(verdicts, ["bad_plan"])'
+goto  = "human"
 [[nodes.branches]]   # patch: 같은 구현자 최소 수정(상한 3)
 when  = 'any_in(verdicts, ["patch"]) && count_lt(fix_rounds, 3)'
 goto  = "fixdie"
-[[nodes.branches]]   # defer: 기록 후 진행 — findings 없을 때만 pass
-when  = 'any_in(verdicts, ["defer"]) && !has_findings(any)'
-goto  = "pass"       # side_records=deferred 저널(§2.2 표)
 [[nodes.branches]]
 when  = 'has_findings(any)'
 goto  = "human"
-[[nodes.branches]]
+[[nodes.branches]]   # defer-only: 기록 후 진행
 when  = '!has_findings(any)'
-goto  = "pass"
+goto  = "pass"       # side_records=deferred 저널(§2.2 표)
 
 # 마지막 branch는 반드시 true 폴백(§2.3 로드 검증 요건 — r6-5):
 [[nodes.branches]]
@@ -120,17 +121,26 @@ on_done = "lenses"   # 루프 폐쇄: lenses→route→fixdie→lenses…
 hold_target = "human"
 
 [[nodes]]
-id = "replan"        # ③' redrive의 특수형: replanner 지시문 실행 후
-kind = "redrive"     #    새 generation 재구현 — emit 없음(r5 정정)
+id = "replan"        # bad_plan: 비동결 부분 수정(KEEP 추출 후 재유도)
+kind = "redrive"
 target = "die-workdir"
-payload = "replan"   # (r7-1 스키마 필수)
-base = "origin"      # r9-7: bad_plan = 롤백 후 재계획(원본 step-04)
-pre_stage = "replan-stage"   # 팩 [[pack_stages]]에 등록(r11-4)   # 팩 정의 스테이지(KEEP 추출·계획 수정)
-bump = "fix_rounds"   # 비루프백 fix 루프(루프백 bump는 branch do)
-on_done = "lenses"   # 재구현 결과는 다시 검증으로 — 루프 폐쇄(r5
-                     # 정정: replans 0..5 전부 attempt=1, Inspecting
-                     # 유지 — 도메인 emit/시도 소모 없음)
+payload = "plan"
+base = "origin"
+pre_stage = "replan-stage"
+on_done = "lenses"
 hold_target = "human"
+on_redrive_error = "hold"
+
+[[nodes]]
+id = "replan_full"   # intent_gap 해결 후: 계획 전체 재생성(step-02부터)
+kind = "redrive"
+target = "die-workdir"
+payload = "plan_full"
+base = "origin"
+pre_stage = "replan-full-stage"
+on_done = "lenses"
+hold_target = "human"
+on_redrive_error = "hold"
 
 [[nodes]]
 id = "emit_failed_node"   # ④ emit: 재주문 정책 경로 — HALT 암시(r7-1:
@@ -246,8 +256,10 @@ do_seq   := action ( ';' action )*     ; emit은 전 시퀀스에 최대 1회
   | redrive | target, payload, on_done, hold_target, on_redrive_error(hold\|fail-run) | pre_stage, base("latest"\|"origin", 기본 latest), bump(비루프백 fix 루프용 — 노드 필드) | — |
   | emit | event, payload_from | — | on_done(HALT 암시) |
   | hold | resume_targets | notify_only | on_done |
-  branch(r9-3 종단 규칙): **do가 종단 액션(emit 포함)이면 goto 금지**
-  (emit 후 HALT). **do가 비종단(bump만)이면 goto 필수**. {when, goto}
+  branch(r9-3 종단 규칙, r16-4): **do에 emit이 있으면 goto 금지**(emit
+  후 HALT). **emit 없는 bump/revert 시퀀스면 goto 필수**. revert 직후
+  emit은 재검증 없이 금지(revert→…→dispatch 재실행→검증→emit 경로만
+  허용 — fixture 18). {when, goto}
   단독 항상 허용. do는 emit/bump/**revert** 시퀀스(emit≤1, revert는
 비종단 — emit 이전에만) — hold_for_human
   액션은 폐지(hold는 노드 진입으로만 발생). **bump-가드 일치(r12-1,
@@ -568,7 +580,7 @@ side_records=deferred·pack_stages(replan-stage)·schema-defer.toml·
 GOLDEN_TRACE.md+tools/verify_golden_trace.py(실행형: 팩 TOML 실파싱·60조합+반복 전이),
 pack=e925fd014d367c4c7f3d83fe92d03cd4bc4d3b7cbc1ecdf0d4e77320acab1db8).
 §2.1 예제는 이 팩 policy.toml의 간략화, 기대 trace는
-GOLDEN_TRACE.md(혼합 범주·상한 경계 10케이스 — 부록 A.3 승인 전 확정).
+GOLDEN_TRACE.md(혼합 범주·상한 경계 10케이스 — §A.3).
 
 **이중 독립 검증(r14)**: `tools/verify_golden_trace.py`(주 검증기 —
 실제 그래프 순회)와 `tools/astra_verify.py`(독립 검증기 — 주 검증기를
@@ -584,7 +596,7 @@ pack=8528b29eb4564756d29adfa58698dcfc74cd7a1fbd6c365632ec6d7c2e9160c6,
 leaf(quick-inspect,fixture-min,1.0.0,advisory)=2be18a52eeea833d605f42e1d037d4430f0977b3815b9620619f6b5b185962dd —
 구현은 재현 의무(파일→canonical→digest 대조).
 
-### A.2 거부 fixture — 9종 실제 파일 (r10-5: baseline 정합 + 기대 오류 코드)
+### A.2 거부 fixture — 18종 실제 파일 (baseline 정합 + 기대 오류 코드)
 
 baseline = A.1 팩 전체(모든 필드 정합·TOML·DSL 문법 유효·digest
 재계산 일치). 각 디렉터리는 **규칙 1개만 위반** +
@@ -613,14 +625,19 @@ baseline = A.1 팩 전체(모든 필드 정합·TOML·DSL 문법 유효·digest
 | 18-revert-then-emit | revert 후 재검증 없이 emit | E_REVERT_THEN_EMIT |
 
 **수용성 규칙(단일)**: LF 개행 + 파일 끝 LF 필수 — CRLF·CR·끝 LF
-부재는 로드 거부. 9종 전부 거부 + A.1 수용이 회귀 조건.
+부재는 로드 거부. 18종 전부 거부 + A.1 수용이 회귀 조건.
 **규칙→fixture 대응(r15-1 완결)**: 위 18종이 전부 **실제 파일**로
 존재(skills/fixture-reject/)하며 각 디렉터리에 expected_error.txt(기대
 오류 코드)가 동봉된다. 주 검증기의 스윝(sweep_rejection_fixtures)이
 ①18종 전부의 오류 코드 형식 ②08의 실측 CRLF 바이트+그 바이트로
 계산된 digest ③09의 끝 LF 부재를 실행 검증한다. 구현 로더의 셀프테스트는
 A.1 수용 + 18종의 기대 오류 코드 정확 대조가 회귀 조건. 정규화
-템플릿 "구현 중 확정" 항목(A.3)은 첫 구현 마일스톤 승인 범위 밖.
+템플릿 "구현 중 확정" 항목(A.5)은 첫 구현 마일스톤 승인 범위 밖.
+
+### A.3 골든 트레이스 — bmad-review-full v1.2.0
+실파일: skills/bmad-review-full/v1/GOLDEN_TRACE.md(pack=e925fd01…).
+혼합 범주·상한 경계 10케이스 + 반복 전이 + 시점(bump→revert→hold).
+실행형: tools/verify_golden_trace.py + tools/astra_verify.py(독립).
 
 ### A.4 stage 규범 스키마 (승인 전 고정 — r8-2)
 dispatch.stages[] 각 항목: {id(필수), lenses[파일명](필수≥1),
@@ -632,4 +649,4 @@ output_schema?(파일명, 권장 — verdicts/findings/side_records 매핑을
 [[output.on_error]](필수·순서=우선순위)가 소유(r9-4). 표준 payload_ref:
 "summary"(dispatch 산출 요약), "findings"(정규화 출력),
 "cumulative_findings"(run 누적). markdown 그룹 규칙 템플릿·전체
-예는 구현 중 확정(A.3 명맥) — 스키마 자체는 이대로 동결.
+예는 구현 중 확정(A.5) — 스키마 자체는 이대로 동결.
