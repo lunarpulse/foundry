@@ -91,6 +91,9 @@ enum Cmd {
         /// (gate measurement only — approval is still journalled immutably).
         #[arg(long, default_value = "")]
         auto_approve: String,
+        /// notify channel: discord | console | all
+        #[arg(long, default_value = "discord")]
+        notify_mode: String,
     },
     /// Show order state + journal tail.
     Show {
@@ -263,7 +266,8 @@ async fn main() {
             repo,
             die,
             auto_approve,
-        } => watch_cmd(once, every, repo, die, auto_approve).await,
+            notify_mode,
+        } => watch_cmd(once, every, repo, die, auto_approve, notify_mode).await,
         Cmd::Show { order, db } => show(order, &expand(&db)).await,
         Cmd::Status { db } => status_cmd(&expand(&db)),
         Cmd::Doctor { db } => doctor_cmd(&expand(&db)),
@@ -553,7 +557,14 @@ async fn show(order_id: String, db: &str) -> i32 {
     }
 }
 
-async fn watch_cmd(once: bool, every: u64, repo: String, die: String, auto_approve: String) -> i32 {
+async fn watch_cmd(
+    once: bool,
+    every: u64,
+    repo: String,
+    die: String,
+    auto_approve: String,
+    notify_mode: String,
+) -> i32 {
     let (owner, name) = repo
         .split_once('/')
         .unwrap_or((repo.as_str(), "contextmesh-rs"));
@@ -650,8 +661,15 @@ async fn watch_cmd(once: bool, every: u64, repo: String, die: String, auto_appro
         };
         use foundry_domain::ports::Notifier as _;
         // T13: Discord notifier — observation plane, never blocks the line.
-        let mut notifier = foundry_watch::discord_notifier::DiscordNotifier::from_env();
-        let notify = |n: &mut foundry_watch::discord_notifier::DiscordNotifier,
+        let mut notifier: Box<dyn foundry_domain::ports::Notifier> = match notify_mode.as_str() {
+            "console" => Box::new(foundry_watch::discord_notifier::ConsoleNotifier),
+            "all" => Box::new(foundry_watch::discord_notifier::FanOutNotifier(vec![
+                Box::new(foundry_watch::discord_notifier::DiscordNotifier::from_env()),
+                Box::new(foundry_watch::discord_notifier::ConsoleNotifier),
+            ])),
+            _ => Box::new(foundry_watch::discord_notifier::DiscordNotifier::from_env()),
+        };
+        let notify = |n: &mut Box<dyn foundry_domain::ports::Notifier>,
                       event: foundry_domain::ports::NotifyEvent| {
             let oid = notify_event_order_id(&event).to_string();
             if let Err(e) = n.notify(event) {

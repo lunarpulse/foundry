@@ -492,3 +492,101 @@ mod tests {
         assert_eq!(n.client_state_tag(), "fresh");
     }
 }
+
+// ─── 콘솔 관측 + 팬아웃(설계 §3.4) ────────────────────────────
+
+/// 콘솔 관측 notifier — 데모용 println!. 무전송자원.
+pub struct ConsoleNotifier;
+
+impl Notifier for ConsoleNotifier {
+    fn notify(&mut self, event: NotifyEvent) -> PortResult<()> {
+        let r = DiscordRenderer.render(&event);
+        println!("[notify:{}] {}", severity_tag(r.severity), r.title);
+        if !r.body.is_empty() {
+            println!("            {}", r.body.replace('\n', "\n            "));
+        }
+        Ok(())
+    }
+}
+
+fn severity_tag(s: Severity) -> &'static str {
+    match s {
+        Severity::Info => "info",
+        Severity::Attention => "ATTN",
+        Severity::Critical => "CRIT",
+    }
+}
+
+/// 팬아웃 — 동일 이벤트를 복수 관측자에게. 개별 실패는 로그만(관측 플레인).
+pub struct FanOutNotifier(pub Vec<Box<dyn Notifier>>);
+
+impl Notifier for FanOutNotifier {
+    fn notify(&mut self, event: NotifyEvent) -> PortResult<()> {
+        let mut first_err = None;
+        for n in &mut self.0 {
+            if let Err(e) = n.notify(event.clone()) {
+                eprintln!("fanout branch failed (non-fatal): {e:?}");
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    fn drain(&mut self) {
+        for n in &mut self.0 {
+            n.drain();
+        }
+    }
+}
+
+#[cfg(test)]
+mod fanout_tests {
+    use super::*;
+
+    struct RecordingNotifier {
+        pub events: std::sync::mpsc::Sender<String>,
+    }
+
+    impl Notifier for RecordingNotifier {
+        fn notify(&mut self, event: NotifyEvent) -> PortResult<()> {
+            self.events.send(format!("{event:?}")).ok();
+            Ok(())
+        }
+    }
+
+    struct FailingNotifier;
+    impl Notifier for FailingNotifier {
+        fn notify(&mut self, _event: NotifyEvent) -> PortResult<()> {
+            Err(PortError::Retryable("always fails".into()))
+        }
+    }
+
+    #[test]
+    fn fanout_delivers_to_all_and_isolates_failure() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut fan = FanOutNotifier(vec![
+            Box::new(FailingNotifier),
+            Box::new(RecordingNotifier { events: tx }),
+        ]);
+        // 실패 브랜치가 있어도 Ok 브랜치로 전달 — 하지만 첫 에러 전파
+        let res = fan.notify(NotifyEvent::Shipped {
+            order_id: "o-1".into(),
+            pr_url: "u".into(),
+        });
+        assert!(res.is_err()); // 관측 플레인: 호출부는 로그만 하므로 무해
+        assert!(rx.recv().unwrap().contains("Shipped"));
+    }
+
+    #[test]
+    fn console_notifier_renders_without_resources() {
+        let mut c = ConsoleNotifier;
+        c.notify(NotifyEvent::FurnaceHold { order_id: "o".into(), digest: "d".into() })
+            .unwrap();
+        c.drain(); // no-op
+    }
+}
