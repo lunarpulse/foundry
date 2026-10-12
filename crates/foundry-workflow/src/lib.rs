@@ -53,7 +53,7 @@ pub mod replay;
 pub mod recovery;
 
 use foundry_domain::order::{Order, OrderEvent, OrderState};
-use foundry_domain::ports::Ledger;
+use foundry_domain::ports::{DieOutput, Ledger};
 use foundry_domain::workflow_encoding::{edge_event_of, EdgeTarget, EmbeddedWorkflow};
 use std::collections::HashMap;
 
@@ -821,6 +821,20 @@ impl WorkflowEngine {
     /// 엔진 경유와 직접 경유로 각각 실행해 동일한 결과가 나오는지.
     pub fn order(&self, order_id: &str) -> Option<&Order> {
         self.orders.get(order_id)
+    }
+
+    /// (M8 데모 어댑터) 실 Die 결과 반영 — order_mut 미제공 정책의
+    /// 공식 예외: DieOutput는 라인 executor가 유일한 기존 선례(line.rs
+    /// 216-247)이며 여기도 동일 결속(artifact_digest = result_commit,
+    /// M0 규약)만 수행한다. 다른 필드 접근은 금지(호출부 국소 계약).
+    pub fn bind_die_output(&mut self, order_id: &str, die: &DieOutput) -> Result<(), EngineError> {
+        let Some(o) = self.orders.get_mut(order_id) else {
+            return Err(EngineError::EncodingDrift {
+                detail: format!("order {order_id} not enrolled"),
+            });
+        };
+        o.artifact_digest = Some(die.result_commit.clone());
+        Ok(())
     }
 
     fn observe(

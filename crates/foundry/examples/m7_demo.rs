@@ -45,6 +45,34 @@ fn advance_to_gate(rt: &StreamRuntime, sid: &str, oid: &str, exec: &str) {
     println!("   → 게이트 도달: {st:?} (인간 승인 대기)");
 }
 
+/// (M8 데모 어댑터 시연) 실 Die 세그먼트 — start로 Working 진입 후
+/// 실제 Harness를 실행하고 finish로 게이트에 도달한다.
+/// FakeHarness는 인과 검증용: 세그먼트 사이에 실제 바이너리
+/// (rustain → foundary-demo PR)가 있었음을 DieOutput가 증명한다.
+fn advance_to_gate_real_die(
+    rt: &StreamRuntime,
+    sid: &str,
+    oid: &str,
+    exec: &str,
+    harness: &foundry_harness_cli::fake::FakeHarness,
+    workroot: &std::path::Path,
+) {
+    let st = rt.start_die_segment(sid, oid, exec).unwrap();
+    println!("   Die 세그먼트 시작: {st:?} — 실 Harness 실행 창");
+    let order = rt.stream(sid).unwrap().order_snapshot(oid).unwrap();
+    let die = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            use foundry_domain::ports::Harness as _;
+            harness.run(&order, 1, workroot).await.unwrap()
+        });
+    println!("   Die 완료: result_commit = {}…", &die.result_commit[..8.min(die.result_commit.len())]);
+    let st = rt.finish_die_segment(sid, oid, exec, &die).unwrap();
+    println!("   → 게이트 도달: {st:?} (실 Die 산출물 결속)");
+}
+
 /// 게이트에서 라이브 승인(원장 그랜트 CONSUMED) 후 발행 확정 → Shipped.
 fn approve_and_ship(
     rt: &StreamRuntime,
@@ -111,7 +139,13 @@ fn main() {
     banner(3, "사이징 주문: 자율 구간 → 인간 승인(라이브 그랜트)");
     rt.dispatch("sz-1", mkorder("sz-1", true)).unwrap();
     println!("sz-1 입장 (Intake 부트스트랩 — 타입으로 판별)");
-    advance_to_gate(&rt, "s-sizing", "sz-1", "demo-sz");
+    // M8 어댑터: 시뮬레이션 대신 실 Die 세그먼트(start → Harness → finish).
+    // FakeHarness는 인과 검증용이며 프로덕션에서는 CliHarness(rustain)가
+    // foundary-demo에 커밋을 만들어 DieOutput.result_commit을 생산한다.
+    let harness = foundry_harness_cli::fake::FakeHarness::default();
+    let workroot = d.join("die-work");
+    std::fs::create_dir_all(&workroot).unwrap();
+    advance_to_gate_real_die(&rt, "s-sizing", "sz-1", "demo-sz", &harness, &workroot);
     let digest = foundry_orch::chainer::sizing_digest("approved", "bmad-epic-build", "plan-epic");
     approve_and_ship(&rt, "s-sizing", "sz-1", "demo-sz", "sizing-sz-1", "sizing", &digest, &ap_db);
     {

@@ -212,6 +212,16 @@ impl Stream {
             .iter()
             .any(|r| r.order_id == order_id && r.to_state == OrderState::Shipped.to_string()))
     }
+
+    /// (M8 데모 어댑터) 주문 스냅샷 읽기 — Die 실행 재료(external ref 등).
+    pub fn order_snapshot(&self, order_id: &str) -> Result<foundry_domain::Order, String> {
+        self.engine
+            .lock()
+            .unwrap()
+            .order(order_id)
+            .cloned()
+            .ok_or_else(|| format!("order {order_id} not enrolled"))
+    }
 }
 
 /// 런타임 — 스트림 레지스트리 + 오케스트레이션 로그 + 입장 게이트.
@@ -517,6 +527,112 @@ impl StreamRuntime {
 
     pub fn stream(&self, id: &str) -> Option<Arc<Stream>> {
         self.streams.lock().unwrap().iter().find(|s| s.stream_id == id).cloned()
+    }
+
+    /// (M8 데모 어댑터) 실 Die 세그먼트 시작 — Queued→DieStarted까지만
+    /// 진행하고 Working 상태에서 반환한다. 호출부가 이 사이에 실제
+    /// Harness(예: rustain 경유 foundary-demo PR)를 실행한 뒤
+    /// finish_die_segment를 호출한다. 크래시 윈도우(DieStarted 이후
+    /// DieSucceeded 이전)는 T61 재입장/재구축 경로가 이미 소유한다.
+    pub fn start_die_segment(
+        &self,
+        stream_id: &str,
+        order_id: &str,
+        exec: &str,
+    ) -> Result<foundry_domain::OrderState, String> {
+        if self.is_admission_blocked() {
+            let _ = record_refusal(
+                &self.orch,
+                RefusalCode::QuiescenceBlocked,
+                order_id,
+                None,
+            );
+            return Err(format!(
+                "admission blocked — die segment for '{order_id}' refused during recovery quiescence"
+            ));
+        }
+        let e = self.stream(stream_id).ok_or(format!("stream {stream_id} not registered"))?;
+        let mut eng = e.engine_if_unfenced()?;
+        eng.acquire(order_id, exec).map_err(|er| format!("acquire: {er:?}"))?;
+        for ev in [
+            foundry_domain::OrderEvent::Queued,
+            foundry_domain::OrderEvent::DieStarted,
+        ] {
+            let att = eng
+                .order(order_id)
+                .ok_or(format!("order {order_id} unknown"))?
+                .attempt()
+                .max(1);
+            let rows = foundry_ledger::SqliteLedger::open(e.journal())
+                .map_err(|er| format!("journal: {er:?}"))?
+                .read_all()
+                .map_err(|er| format!("journal read: {er:?}"))?;
+            let ctx = crate::test_support::replay_ctx(order_id, &rows);
+            let ro: &'static mut foundry_ledger::SqliteLedger = Box::leak(Box::new(
+                foundry_ledger::SqliteLedger::open(e.journal())
+                    .map_err(|er| format!("journal: {er:?}"))?,
+            ));
+            eng.dispatch_replay_ctx(order_id, exec, &ev, att, &ctx, ro)
+                .map_err(|er| format!("die segment start: {er:?}"))?;
+        }
+        let st = eng
+            .order(order_id)
+            .ok_or(format!("order {order_id} unknown"))?
+            .state();
+        Ok(st)
+    }
+
+    /// (M8 데모 어댑터) 실 Die 세그먼트 종결 — DieOutput를 엔진에 결속
+    /// (artifact_digest = result_commit, M0 규약 — line executor와 동일
+    /// 결속)하고 DieSucceeded→InspectionPassed를 재생해 게이트에 둔다.
+    /// Die 실패는 호출부가 DieFailed를 dispatch하는 별도 경로(라인
+    /// executor 백오프 정책 소유)를 쓴다 — 이 정문은 성공 경로만.
+    pub fn finish_die_segment(
+        &self,
+        stream_id: &str,
+        order_id: &str,
+        exec: &str,
+        die: &foundry_domain::ports::DieOutput,
+    ) -> Result<foundry_domain::OrderState, String> {
+        let e = self.stream(stream_id).ok_or(format!("stream {stream_id} not registered"))?;
+        let mut eng = e.engine_if_unfenced()?;
+        let att = eng
+            .order(order_id)
+            .ok_or(format!("order {order_id} unknown"))?
+            .attempt()
+            .max(1);
+        // (no-op taxonomy, T19) result==base 또는 빈 result는 진짜 성공이
+        // 아니다 — 거부해 호출부가 DieFailed 경로를 선택하게 한다.
+        if die.result_commit.is_empty() || die.result_commit == die.base_commit {
+            return Err(format!(
+                "die produced no change (result {:?} == base {:?}) — no-op taxonomy refuses",
+                die.result_commit,
+                die.base_commit
+            ));
+        }
+        let rows = foundry_ledger::SqliteLedger::open(e.journal())
+            .map_err(|er| format!("journal: {er:?}"))?
+            .read_all()
+            .map_err(|er| format!("journal read: {er:?}"))?;
+        let ctx = crate::test_support::replay_ctx(order_id, &rows);
+        let ro: &'static mut foundry_ledger::SqliteLedger = Box::leak(Box::new(
+            foundry_ledger::SqliteLedger::open(e.journal())
+                .map_err(|er| format!("journal: {er:?}"))?,
+        ));
+        eng.bind_die_output(order_id, die)
+            .map_err(|er| format!("bind die output: {er:?}"))?;
+        for ev in [
+            foundry_domain::OrderEvent::DieSucceeded { attempt: att },
+            foundry_domain::OrderEvent::InspectionPassed,
+        ] {
+            eng.dispatch_replay_ctx(order_id, exec, &ev, att, &ctx, ro)
+                .map_err(|er| format!("die segment finish: {er:?}"))?;
+        }
+        let st = eng
+            .order(order_id)
+            .ok_or(format!("order {order_id} unknown"))?
+            .state();
+        Ok(st)
     }
 
     /// 입장 차단 (코디네이터 전용). (T61 astra r2) 오케스트레이션 정지
