@@ -547,9 +547,16 @@ kind="review-pack" — advisory-pack은 emit 노드 포함 자체가 로드 거�
 라우팅 수용 팩 실파일(counters·entry·stages 4[verify=triage]·
 side_records=deferred·pack_stages(replan-stage)·schema-defer.toml·
 GOLDEN_TRACE.md+tools/verify_golden_trace.py(실행형: 팩 TOML 실파싱·60조합+반복 전이),
-pack=997ead1e116fb94f9751b0d7fab56d581007355288cd34cb266f6294bed0af16).
+pack=e925fd014d367c4c7f3d83fe92d03cd4bc4d3b7cbc1ecdf0d4e77320acab1db8).
 §2.1 예제는 이 팩 policy.toml의 간략화, 기대 trace는
 GOLDEN_TRACE.md(혼합 범주·상한 경계 10케이스 — 부록 A.3 승인 전 확정).
+
+**이중 독립 검증(r14)**: `tools/verify_golden_trace.py`(주 검증기 —
+실제 그래프 순회)와 `tools/astra_verify.py`(독립 검증기 — 주 검증기를
+보지 않고 작성, 자체 DSL 인터프리터)가 같은 팩을 검증한다. 독립
+검증기가 주 검증기가 놓친 결함(상한 branch의 bump 누락 — 인간 hold
+진입 시 loopbacks=6이어야)을 실제로 발견·수정했다. 두 검증기 모두
+PASS여야 회귀 조건.
 
 **digest(독립 계산, python hashlib §3.1 canonical)** — fixture-min:
 pack=8528b29eb4564756d29adfa58698dcfc74cd7a1fbd6c365632ec6d7c2e9160c6,
