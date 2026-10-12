@@ -685,3 +685,56 @@ fn t61_live_handoff_front_door() {
     assert!(gbad.state != foundry_approval::GrantState::Consumed,
         "forged grant left unconsumed");
 }
+
+
+/// (r3 MAJOR-1) 소비 후 재시도 멱등 — CONSUMED 그랜트로 정문 재호출이
+/// AlreadyConsumed 에러 없이 성공(confirm 재수행).
+#[test]
+fn t61_handoff_retry_after_consumption_idempotent() {
+    let d = tmpdir("horetry");
+    let orch = OrchestrationLog::open(&d.join("orch.db")).unwrap();
+    orch.declare_plan(
+        "plan-hr",
+        vec![("t-r1".into(), vec![]), ("t-r2".into(), vec![])],
+        vec![("t-r1".into(), "s-hr".into()), ("t-r2".into(), "s-hr".into())],
+    )
+    .unwrap();
+    let mut ap = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
+    {
+        let digest = crate::chainer::sizing_digest("approved", "bmad-epic-build", "plan-hr");
+        ap.issue_grant("sizing-sz-hr", "tok-hr", &serde_json::json!({
+            "order_id": "sz-hr", "intent": "sizing", "artifact_digest": digest, "root_scope": "",
+        }))
+        .unwrap();
+        let sr = ap.reserve_grant("sizing-sz-hr", &serde_json::json!({
+            "order_id": "sz-hr", "intent": "sizing", "artifact_digest": digest, "root_scope": "",
+        }), "hr", 1).unwrap();
+        ap.begin_apply("sizing-sz-hr", "hr", 1, sr.fence_token).unwrap();
+        ap.finalize_grant("sizing-sz-hr", "hr", 1, sr.fence_token).unwrap();
+        let ch = Chainer::new(&orch, &ap);
+        ch.bind_preset_from_ledger("sz-hr", "bmad-epic-build", "plan-hr").unwrap();
+    }
+    let rt = StreamRuntime::new(OrchestrationLog::open(&d.join("orch.db")).unwrap());
+    rt.add_stream(Stream::new_with_root("s-hr", &d, "bmad-epic-build").unwrap()).unwrap();
+    rt.bind_approval_ledger(
+        foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
+    )
+    .unwrap();
+    rt.dispatch("t-r1", mkorder("t-r1", false)).unwrap();
+    rt.dispatch("t-r2", mkorder("t-r2", false)).unwrap();
+    let (manifest, _enc) = rt.prepare_handoff("t-r1", "t-r2", "art-hr").unwrap();
+    let mut ap2 = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
+    ap2.issue_grant("ho-hr", "tok-ho2", &serde_json::json!({
+        "order_id": "t-r1", "dest_order_id": "t-r2", "intent": "handoff",
+        "artifact_digest": "art-hr", "handoff_manifest": manifest, "root_scope": "",
+    }))
+    .unwrap();
+    // 1차 소비.
+    rt.dispatch_handoff("t-r1", "t-r2", "art-hr", "ho-hr").unwrap();
+    // 재시도 — CONSUMED 면 멱등 성공이어야 한다(AlreadyConsumed 아님).
+    rt.dispatch_handoff("t-r1", "t-r2", "art-hr", "ho-hr")
+        .unwrap_or_else(|e| panic!("retry after consumption must be idempotent: {e}"));
+    let ap_check = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
+    assert!(ap_check.get_grant("ho-hr").unwrap().state
+        == foundry_approval::GrantState::Consumed);
+}

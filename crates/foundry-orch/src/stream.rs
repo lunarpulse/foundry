@@ -362,14 +362,24 @@ impl StreamRuntime {
                 .map_err(|e| format!("verify: {e:?}"))?;
         }
         // ② 소비 — 예약→적용 개시→확정(CONSUMED). fence 는 원장 TxGuard.
-        let exec = format!("handoff-{source_order}-{dest_order}");
-        let sr = ap
-            .reserve_grant(grant_id, &scope_val, &exec, 1)
-            .map_err(|e| format!("reserve: {e:?}"))?;
-        ap.begin_apply(grant_id, &exec, 1, sr.fence_token)
-            .map_err(|e| format!("begin_apply: {e:?}"))?;
-        ap.finalize_grant(grant_id, &exec, 1, sr.fence_token)
-            .map_err(|e| format!("finalize: {e:?}"))?;
+        // (r3 MAJOR-1) 이미 CONSUMED 면 소비를 건너뛰고 확정만 재수행
+        // (멱등 재시도: 정상 소비 후 재호출, finalize↔confirm 사이
+        // 크래시 후 재호출 모두 정문으로 회복).
+        let already_consumed = ap
+            .get_grant(grant_id)
+            .map_err(|e| format!("grant lookup: {e:?}"))?
+            .state
+            == foundry_approval::GrantState::Consumed;
+        if !already_consumed {
+            let exec = format!("handoff-{source_order}-{dest_order}");
+            let sr = ap
+                .reserve_grant(grant_id, &scope_val, &exec, 1)
+                .map_err(|e| format!("reserve: {e:?}"))?;
+            ap.begin_apply(grant_id, &exec, 1, sr.fence_token)
+                .map_err(|e| format!("begin_apply: {e:?}"))?;
+            ap.finalize_grant(grant_id, &exec, 1, sr.fence_token)
+                .map_err(|e| format!("finalize: {e:?}"))?;
+        }
         // ③ 확정 — CONSUMED 원장 앵커로 6필드 재검증.
         let ch = crate::chainer::Chainer::new(&self.orch, &ap);
         ch.confirm_handoff(&proposal_id, grant_id)
