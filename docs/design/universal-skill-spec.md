@@ -238,7 +238,13 @@ do_seq   := action ( ';' action )*     ; emit은 전 시퀀스에 최대 1회
   branch(r9-3 종단 규칙): **do가 종단 액션(emit 포함)이면 goto 금지**
   (emit 후 HALT). **do가 비종단(bump만)이면 goto 필수**. {when, goto}
   단독 항상 허용. do는 emit/bump 시퀀스(emit≤1) — hold_for_human
-  액션은 폐지(hold는 노드 진입으로만 발생). 오류 정책
+  액션은 폐지(hold는 노드 진입으로만 발생). **bump-가드 일치(r12-1)**:
+  루프를 닫는 redrive의 bump는 루프 진입을 검사하는 count_lt가 참조하는
+  같은 카운터여야 한다(로드 검증: 사이클 경로 카운터-가드-증가 일치
+  정적 검사) — 다른 카운터를 증가시키면 상한이 발화하지 않는다(v0.13
+  실증 반례: loopbacks 가드 + replans bump → 7회 진입). 골든 trace는
+  실제 팩 TOML을 파싱·실행하는 검증기로만 유효(수기 분기 미러링 금지).
+  오류 정책
   (on_verify_invalid, on_no_valid, on_redrive_error)은 dispatch/redrive
   노드의 필드. **hold 이송 통일(r9-3)**: 모든 엔진 주도 hold(오류
   정책 hold·예산 소진 진입 차단·카운터 overflow·pass 적격성 거부)는
