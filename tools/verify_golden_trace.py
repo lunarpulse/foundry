@@ -511,12 +511,36 @@ def sweep_rejection_fixtures():
         "17-missing-error-policy": "E_MISSING_ERROR_POLICY",
         "18-revert-then-emit": "E_REVERT_THEN_EMIT",
     }
+    import hashlib as _hl
     for name in dirs:
         exp = open(f"{base}/{name}/expected_error.txt").read().strip()
         assert exp == EXPECTED[name], \
             f"{name}: expected {EXPECTED[name]!r}, found {exp!r}"
         tl.load(open(f"{base}/{name}/policy.toml", "rb"))  # parses
-    # (r21-1/2) generic closed-cycle + guard/bump analysis
+        # (r22-MINOR) manifest digest over ORIGINAL bytes — except the
+        # intended byte-format violations 08/09 and key-format 07
+        if name not in ("07-quoted-digest-key", "08-crlf-manifest",
+                        "09-no-trailing-lf"):
+            raw = open(f"{base}/{name}/manifest.toml", "rb").read()
+            man = raw.decode()
+            dl = [l for l in man.splitlines(True) if l.startswith("digest =")]
+            assert dl, f"{name}: no digest line"
+            files_ = {"lens-a.md": open(f"{base}/{name}/lens-a.md").read(),
+                      "policy.toml": open(f"{base}/{name}/policy.toml").read(),
+                      "manifest.toml": man.replace(dl[0], "")}
+            h_ = _hl.sha256()
+            for pn in sorted(files_):
+                cb = files_[pn].encode()
+                h_.update(struct.pack("<Q", len(pn.encode())))
+                h_.update(pn.encode())
+                h_.update(struct.pack("<Q", len(cb)))
+                h_.update(cb)
+            decl = re.search(r'"([0-9a-f]{64})"', dl[0]).group(1)
+            assert decl == h_.hexdigest(), \
+                f"{name}: manifest digest mismatch (single-violation premise)"
+    # (r22-1/2) generic closed-cycle analysis — first-match branch
+    # semantics, self-loops, ALL simple cycles (bounded), §2.4b
+    # deduct-node rule for resume edges
     def _succ(pol):
         out = {}
         for n in pol["nodes"]:
@@ -532,67 +556,105 @@ def sweep_rejection_fixtures():
                 out[nid] = []
         return out
 
-    def _find_cycle(pol):
+    def _all_cycles(pol, bound=32):
+        """All simple cycles incl. self-loops (bounded count)."""
         succ = _succ(pol)
+        cycles = []
+        for start in sorted(succ):
+            # DFS for simple cycles from start
+            stack = [(start, [start])]
+            while stack and len(cycles) < bound:
+                cur, path = stack.pop()
+                for nxt in succ.get(cur, []):
+                    if nxt is None:
+                        continue
+                    if nxt == start:
+                        cycles.append(path + [start])
+                    elif nxt not in path and nxt in succ:
+                        stack.append((nxt, path + [nxt]))
+        return cycles
+
+    def _cycle_counter_analysis(pol):
+        """Per-TRAVERSAL bump counting with first-match branch
+        exclusivity: within one route node only ONE branch fires, so
+        multiple bumped branches on the same node toward the cycle
+        count as ONE bump per traversal. Returns list of per-cycle
+        (guard, bump_count_per_traversal)."""
+        nmap = {n["id"]: n for n in pol["nodes"]}
+        results = []
+        for cyc in _all_cycles(pol):
+            if len(cyc) < 2:
+                continue
+            cycset = set(cyc[:-1])
+            guard = None
+            bump_per_trav = 0
+            for nid in cycset:
+                n = nmap[nid]
+                if n["kind"] == "route":
+                    # cycle-continuing branches = goto back into cycle
+                    cont = [br for br in n.get("branches", [])
+                            if br.get("goto") in cycset]
+                    for br in cont:
+                        w = br.get("when") or ""
+                        m2 = re.search(r"count_lt[(]([A-Za-z_]\w*)", w)
+                        if m2:
+                            guard = m2.group(1)
+                    # first-match: at most one fired branch per visit
+                    if any("bump(" in (br.get("do") or "") for br in cont):
+                        bump_per_trav += 1
+                elif n["kind"] == "redrive":
+                    if n.get("bump"):
+                        bump_per_trav += 1
+            results.append((guard, bump_per_trav))
+        return results
+
+    def _has_02_resume_cycle(pol):
+        # (r22-2) §2.4b: remove dispatch/redrive (deduct) nodes; a
+        # resume edge participating in a cycle in the REMAINING graph
+        # is the violation. Legal loops through deduct nodes pass.
+        deduct = {n["id"] for n in pol["nodes"]
+                  if n["kind"] in ("dispatch", "redrive")}
+        succ = {}
+        for n in pol["nodes"]:
+            nid = n["id"]
+            if nid in deduct:
+                continue
+            if n["kind"] == "route":
+                succ[nid] = [br.get("goto") for br in n.get("branches", [])
+                             if br.get("goto") and br["goto"] not in deduct]
+            elif n["kind"] == "hold":
+                succ[nid] = [t for t in n.get("resume_targets", [])
+                             if t not in deduct]
+            else:
+                succ[nid] = []
+        hold_ids = {n["id"] for n in pol["nodes"] if n["kind"] == "hold"}
         for start in succ:
             stack, seen = [(start, [start])], {start}
             while stack:
                 cur, path = stack.pop()
                 for nxt in succ.get(cur, []):
-                    if nxt is None:
-                        continue
-                    if nxt == start and len(path) > 1:
-                        return path
+                    if nxt == start and len(path) >= 1:
+                        # cycle contains a hold resume edge?
+                        if any(x in hold_ids for x in path):
+                            return True
                     if nxt not in seen and nxt in succ:
                         seen.add(nxt)
                         stack.append((nxt, path + [nxt]))
-        return None
-
-    def _cycle_counter_analysis(pol):
-        """(counter guarding entry, counter actually bumped) on the
-        closed cycle, or (None, bump) when no guarded cycle exists."""
-        cyc = _find_cycle(pol)
-        if not cyc:
-            return (None, None)
-        guard = None
-        nmap = {n["id"]: n for n in pol["nodes"]}
-        for nid in cyc:
-            n = nmap[nid]
-            if n["kind"] == "route":
-                for br in n.get("branches", []):
-                    w = br.get("when") or ""
-                    if br.get("goto") in cyc and "count_lt(" in w:
-                        m2 = re.search(r"count_lt[(](\w+)", w)
-                        if m2:
-                            guard = m2.group(1)
-        bump_sites = []  # (site description, counter) — occurrence count
-        for nid in cyc:
-            n = nmap[nid]
-            if n.get("bump"):
-                bump_sites.append((f"node:{nid}", n["bump"]))
-            if n["kind"] == "route":
-                for br in n.get("branches", []):
-                    d = br.get("do") or ""
-                    for m3 in re.finditer(r"bump[(](\w+)[)]", d):
-                        bump_sites.append((f"branch:{nid}", m3.group(1)))
-        return (guard, bump_sites)
-
-    def _has_02_resume_cycle(pol):
-        # hold resume edge participates in a cycle
-        cyc = _find_cycle(pol)
-        if not cyc:
-            return False
-        nmap = {n["id"]: n for n in pol["nodes"]}
-        for nid in cyc:
-            n = nmap[nid]
-            if n["kind"] == "hold" and set(n.get("resume_targets", [])) & set(cyc):
-                return True
         return False
 
     def _norm_02(pol):
         for n in pol["nodes"]:
             if n["kind"] == "hold":
                 n["resume_targets"] = []
+        return pol
+
+    def _norm_02_legal(pol):
+        # (r22-2) LEGAL finite loop: resume back into the dispatch —
+        # cycle passes through a deduct node, must NOT be a violation
+        for n in pol["nodes"]:
+            if n["kind"] == "hold":
+                n["resume_targets"] = ["scan"] if any(
+                    x["id"] == "scan" for x in pol["nodes"]) else []
         return pol
 
     def _has_03_missing_payload(pol):
@@ -608,6 +670,8 @@ def sweep_rejection_fixtures():
         return pol
 
     def _has_04_verdicts_no_verify(pol):
+        # (r22-3) semantic: verdicts as a VARIABLE reference (bare
+        # identifier outside quotes), not a string literal
         has_verify = any(n.get("kind") == "dispatch"
                          and any(st.get("role") == "verify"
                                  for st in n.get("stages", []))
@@ -617,7 +681,10 @@ def sweep_rejection_fixtures():
         for n in pol["nodes"]:
             if n["kind"] == "route":
                 for br in n.get("branches", []):
-                    if "verdicts" in (br.get("when") or ""):
+                    w = br.get("when") or ""
+                    # strip all quoted string literals first
+                    stripped = re.sub(r'"[^"]*"', '""', w)
+                    if re.search(r"(?<![\w.])verdicts(?![\w])", stripped):
                         return True
         return False
 
@@ -625,11 +692,13 @@ def sweep_rejection_fixtures():
         for n in pol["nodes"]:
             if n["kind"] == "route":
                 for br in n.get("branches", []):
-                    if "verdicts" in (br.get("when") or ""):
+                    w = br.get("when") or ""
+                    stripped = re.sub(r'"[^"]*"', '""', w)
+                    if re.search(r"(?<![\w.])verdicts(?![\w])", stripped):
                         br["when"] = "false"
         return pol
 
-    # 02/03/04 structural pair checks (r21-1)
+    # 02/03/04 structural pair checks (r21-1, r22-2/3)
     for name, (chk, nrm) in {
         "02-resume-cycle": (_has_02_resume_cycle, _norm_02),
         "03-missing-payload": (_has_03_missing_payload, _norm_03),
@@ -639,44 +708,76 @@ def sweep_rejection_fixtures():
         assert chk(pol), f"{name}: violation structure NOT present"
         assert not chk(nrm(copy.deepcopy(pol))), \
             f"{name}: normalization failed to clear the violation"
+    # legal resume loop regression (r22-2): resume into dispatch is OK
+    pol02 = tl.load(open(f"{base}/02-resume-cycle/policy.toml", "rb"))
+    assert not _has_02_resume_cycle(_norm_02_legal(copy.deepcopy(pol02))), \
+        "02: legal deduct-node resume loop must NOT be a violation"
+    # 04 semantic regression: verdicts as a string literal is NOT a ref
+    pol04 = tl.load(open(f"{base}/04-verdicts-no-verify/policy.toml", "rb"))
+    str_lit = copy.deepcopy(pol04)
+    for n in str_lit["nodes"]:
+        if n["kind"] == "route":
+            for br in n.get("branches", []):
+                if "verdicts" in (br.get("when") or ""):
+                    br["when"] = 'any_in(findings.group, ["verdicts"])'
+    assert not _has_04_verdicts_no_verify(str_lit), \
+        "04: string-literal 'verdicts' must not count as a variable ref"
 
-    # 10/11/12 (r21-2): analyze the ACTUAL closed cycle — guard must
-    # exist and the bump set must relate correctly; cycle REMOVAL
-    # (on_done rewire) must also clear each violation checker
-    for fname, checker in [
-        ("10-counter-guard-missing", None),
-        ("11-counter-guard-double", None),
-        ("12-counter-guard-mismatch", None),
-    ]:
+    # 10/11/12 (r22-1): per-traversal analysis on ALL cycles
+    for fname in ("10-counter-guard-missing", "11-counter-guard-double",
+                  "12-counter-guard-mismatch"):
         pol = tl.load(open(f"{base}/{fname}/policy.toml", "rb"))
-        guard, sites = _cycle_counter_analysis(pol)
-        counters = [c for _, c in sites]
+        results = _cycle_counter_analysis(pol)
+        assert results, f"{fname}: no cycle found"
         if fname.endswith("missing"):
-            assert guard is not None and not sites, \
-                f"{fname}: expected guarded cycle with NO bump, got {guard}/{sites}"
+            assert any(g is not None and b == 0 for g, b in results) and \
+                all(b == 0 for g, b in results), \
+                f"{fname}: expected guarded cycle with 0 bumps/traversal: {results}"
         elif fname.endswith("double"):
-            assert len(sites) == 2, \
-                f"{fname}: expected 2 bump sites on cycle, got {sites}"
+            assert all(b >= 2 for g, b in results) and \
+                any(b >= 2 for g, b in results), \
+                f"{fname}: expected >=2 bumps/traversal: {results}"
         else:
-            assert guard is not None and guard not in counters, \
-                f"{fname}: expected guard/bump mismatch, got {guard}/{sites}"
-        # cycle-removal mutation must clear ALL analysis expectations
+            assert any(g is not None and g == "loopbacks" and b >= 1
+                       for g, b in results) and \
+                all(g != "fix_rounds" or b == 0 for g, b in results), \
+                f"{fname}: expected guard(loopbacks) bumped with fix_rounds: {results}"
+        # branch-exclusivity regression (r22-1): splitting the node bump
+        # into two same-target branches must NOT read as double
+        if fname.endswith("double"):
+            excl = copy.deepcopy(pol)
+            for n in excl["nodes"]:
+                if n.get("id") == "fix":
+                    n.pop("bump", None)
+            for n in excl["nodes"]:
+                if n.get("kind") == "route":
+                    fired = False
+                    for br in n.get("branches", []):
+                        if br.get("goto") == "fix" and not fired:
+                            br["do"] = "bump(loopbacks)"
+                            fired = True
+            res2 = _cycle_counter_analysis(excl)
+            assert all(b == 1 for g, b in res2), \
+                f"{fname}: exclusive split branches must count 1/traversal: {res2}"
+        # cycle-removal mutation clears the analysis
         mut = copy.deepcopy(pol)
         for n in mut["nodes"]:
             if n.get("id") == "fix" and n.get("on_done") == "scan":
                 n["on_done"] = "end_hold"
-        g2, s2 = _cycle_counter_analysis(mut)
-        assert g2 is None and not s2, \
-            f"{fname}: cycle-removal must clear the analysis ({g2}/{s2})"
+        assert not _cycle_counter_analysis(mut), \
+            f"{fname}: cycle-removal must clear the analysis"
 
-    # (r20-3) fixture 07: quoted digest key must be present in bytes
+    # (r22-3) fixture 07: quoted digest key as a real TOML KEY TOKEN —
+    # a line starting with "digest" (comments stripped), not a mention
     b7 = open(f"{base}/07-quoted-digest-key/manifest.toml", "rb").read()
-    assert b'"digest" =' in b7, "07 must carry the quoted digest key"
-    # normalized (unquoted) variant must clear it
-    assert b'digest = "56' not in b7.replace(b'"digest" =', b'digest =') \
-        or True  # normalization check below via parse
-    norm7 = b7.replace(b'"digest" =', b'digest =').decode()
-    assert '"digest" =' not in norm7, "07 normalization failed"
+    key_lines = [ln for ln in b7.decode().splitlines()
+                 if ln.lstrip().startswith('"digest"')]
+    assert key_lines, "07 must carry the quoted digest key as a real key"
+    # normalization must leave zero quoted-key lines
+    norm7 = b7.decode().replace('"digest" =', 'digest =')
+    assert not [ln for ln in norm7.splitlines()
+                if ln.lstrip().startswith('"digest"')], \
+        "07 normalization failed"
     b8 = open(f"{base}/08-crlf-manifest/manifest.toml", "rb").read()
     assert b"\r\n" in b8, "08 must carry real CRLF"
     b9 = open(f"{base}/09-no-trailing-lf/manifest.toml", "rb").read()
