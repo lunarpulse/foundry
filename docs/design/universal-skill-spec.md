@@ -365,6 +365,9 @@ policy = "discard-finding" # 개별 finding 거부(부분 거부)
    retry_seq. 커서 전진과 다음 activation_seq 할당은 동일 트랜잭션.
    크래시 규칙: (a) intent·완료 없음 → retry_seq+1 재실행(같은
    activation). (b) 결과 커밋에 카운터·커서·후속 intent 포함.
+   **(b-pre, r8-6) 산출물 내구 승격이 결과 커밋의 선행조건**: 내구
+   저장→영수증 확보→결과/커서 커밋 순서. 커밋 전 크래시 orphan 승격물은
+   GC(저널 무참조). 저장 영수증 없는 emit은 거부.
    (c) hold CAS 소비+resume intent 동일 트랜잭션. (d) emit 원자
    경계(r6-2): **이벤트 반영+증거+UNIQUE(action_id) 영수증을 stream
    ledger 단일 트랜잭션**에 기록(InspectionFailed 포함). 복구는 원래
@@ -478,7 +481,7 @@ policy = "discard-finding" # 개별 finding 거부(부분 거부)
 **digest 절차**: 실측은 스펙 확정 직후 독립 스크립트(python hashlib,
 §3.1 canonical)로 계산해 이곳에 hex로 기입하고 리뷰 검증 — 구현은
 그 값을 재현. (아래 "DIGEST:" 행 — 계산 후 기입)
-DIGEST: pack=<계산 대기> leaf=<계산 대기>
+DIGEST: pack=31d09ee9aa964ce13e2a685438bfd34857c2f08ba9c8a2006480f9c29dc69cbd leaf(quick-inspect,fixture-min,1.0.0,advisory)=9728fc35aead252abcfa37c6380ca680ce5748bcd005905f68d6365facb9454a — python hashlib §3.1 canonical 독립 계산(2026-10-12), 구현은 재현 의무. fixture 실파일: skills/fixture-min/v1/ (리포 동봉)
 ### A.2 거부 fixture (규칙별 1) — 각 실제 파일
 route 순환(a→b→a), resume 순환(hold→predecessor), replan payload
 누락, verify 없는 activation의 verdicts 참조, 마지막 branch true
