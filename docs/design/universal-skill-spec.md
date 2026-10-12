@@ -68,13 +68,18 @@ when  = 'has_findings(any) && count_lt(fix_rounds, 3)'
 goto  = "fixdie"     # ★ 팩 내부 fix 루프 — 도메인 attempt 불사용
 [[nodes.branches]]
 when  = 'has_findings(any) && count_lt(replans, 5)'
-goto  = "replan"     # ★ 자동 재계획 — 도메인 백엣지 경유
+goto  = "replan"     # ★ 자동 재계획 — generation 경유(§2.4a)
 [[nodes.branches]]
 when  = 'has_findings(any)'
 goto  = "human"
 [[nodes.branches]]
 when  = '!has_findings(any)'
 goto  = "pass"
+
+# 마지막 branch는 반드시 true 폴백(§2.3 로드 검증 요건 — r6-5):
+[[nodes.branches]]
+when  = 'true'
+goto  = "human"
 
 [[nodes]]
 id = "fixdie"        # ③ redrive: 같은 Die workdir에 findings를 실어 재디스패치
@@ -268,9 +273,11 @@ policy = "discard-stage"   # discard-stage | hold | fail-run
 state = "parse_error"
 policy = "discard-finding" # 개별 finding 거부(부분 거부)
 ```
-- barrier 집계 상태 5분류: `all-ok-empty`(정상 빈)·`all-ok-nonempty`·
-  `valid-partial`(일부 폐기+유효 존재)·`no-valid-stage`(유효 0 —
-  **on_error 정책 우선, 통과 아님**)·`all-error`. `missing_field`의
+- barrier 집계 상태는 **§2.3 진리표로 단일화(r6-6)**: all-ok /
+  valid-partial / no-valid-stage / all-error / verify-invalid —
+  배타적. no-valid-stage·all-error·verify-invalid은 route 평가
+  진입 **전** 오류 정책(on_no_valid 등)으로 강제 이송(통과 불가).
+  verify 스테이지 "정확히 1개"는 팩 전체 범위. `missing_field`
   필수 집합·`ext_over` 단위(bytes)·markdown 그룹 규칙 형식은
   정규화 스키마 표준 템플릿(§부록 A, 구현 시점 확정)에 명시.
 
@@ -323,8 +330,12 @@ policy = "discard-finding" # 개별 finding 거부(부분 거부)
    retry_seq. 커서 전진과 다음 activation_seq 할당은 동일 트랜잭션.
    크래시 규칙: (a) intent·완료 없음 → retry_seq+1 재실행(같은
    activation). (b) 결과 커밋에 카운터·커서·후속 intent 포함.
-   (c) hold CAS 소비+resume intent 동일 트랜잭션. (d) emit 재소비는
-   action_id 영수증 반환.
+   (c) hold CAS 소비+resume intent 동일 트랜잭션. (d) emit 원자
+   경계(r6-2): **이벤트 반영+증거+UNIQUE(action_id) 영수증을 stream
+   ledger 단일 트랜잭션**에 기록(InspectionFailed 포함). 복구는 원래
+   action_id로 영수증 회수, 커서 완료는 그 영수증 근거 멱등 확정.
+   늦은 emit 재실행은 UNIQUE 위반으로 차단(order.rs 284가 attempt
+   미검사 사실의 대비책).
 5. **디스패치 fencing(r3-MAJOR-6, r4-MAJOR-7)**: (a) 응답 차단 —
    stage별 dispatch generation + 활성 실행 토큰 내구 기록, 응답
    수용 시 generation·토큰·run·attempt·artifact를 **단일 수용
