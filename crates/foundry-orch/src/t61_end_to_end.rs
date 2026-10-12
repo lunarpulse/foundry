@@ -113,8 +113,8 @@ fn t61_end_to_end_reentry_bypass_crash_rebuild() {
     .unwrap();
     let rt = StreamRuntime::new(orch);
     let orch = rt.orch.clone();
-    rt.add_stream(Stream::new("s-sizing", &d).unwrap()).unwrap();
-    rt.add_stream(Stream::new("s-epic", &d).unwrap()).unwrap();
+    rt.add_stream(Stream::new_with_root("s-sizing", &d, "bmad-epic-build").unwrap()).unwrap();
+    rt.add_stream(Stream::new_with_root("s-epic", &d, "bmad-epic-build").unwrap()).unwrap();
     rt.bind_approval_ledger(
         foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
     )

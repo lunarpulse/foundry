@@ -598,12 +598,25 @@ impl StreamRuntime {
                     let bound_root = sizing
                         .as_deref()
                         .and_then(|so| self.root_of_sizing(so));
-                    let expected = if stream.preset_root.is_empty() {
-                        bound_root.clone()
-                    } else {
-                        Some(stream.preset_root.clone())
-                    };
-                    if bound_root != expected {
+                    // (r2 B2) 빈 preset_root 스트림은 부트스트랩 거부 —
+                    // 자기비교 폴백 폐지(fail-closed).
+                    if stream.preset_root.is_empty() {
+                        let _ = record_refusal(
+                            &self.orch,
+                            RefusalCode::UnsizedSpawn,
+                            order_id,
+                            None,
+                        );
+                        return Err(format!(
+                            "order '{order_id}' bootstrap refused — stream '{}' has no bound preset root (use new_with_root)",
+                            stream.id()
+                        ));
+                    }
+                    let expected = Some(stream.preset_root.clone());
+                    // (r2 B2 part3) 미결속(None) 부트스트랩은 루트 결속
+                    // 스트림이면 허용 — 사이징 이전 입장(결속 생성 전).
+                    // 결속이 존재하면 일치해야 한다.
+                    if bound_root.is_some() && bound_root != expected {
                         let _ = record_refusal(
                             &self.orch,
                             RefusalCode::UnsizedSpawn,
@@ -924,7 +937,7 @@ mod tests {
         )
         .unwrap();
         let rt = StreamRuntime::new(orch);
-        rt.add_stream(Stream::new("s-1", &d).unwrap()).unwrap();
+        rt.add_stream(Stream::new_with_root("s-1", &d, "bmad-quickloop").unwrap()).unwrap();
         rt.bind_approval_ledger(
             foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
         )
@@ -974,7 +987,7 @@ mod tests {
         )
         .unwrap();
         let rt = StreamRuntime::new(orch);
-        rt.add_stream(Stream::new("s-c", &d).unwrap()).unwrap();
+        rt.add_stream(Stream::new_with_root("s-c", &d, "bmad-quickloop").unwrap()).unwrap();
         rt.bind_approval_ledger(
             foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
         )
@@ -1007,7 +1020,7 @@ mod tests {
         )
         .unwrap();
         let rt2 = StreamRuntime::new(orch2);
-        rt2.add_stream(Stream::new("s-t", &d).unwrap()).unwrap();
+        rt2.add_stream(Stream::new_with_root("s-t", &d, "bmad-quickloop").unwrap()).unwrap();
 
         let c2 = RecoveryCoordinator::new(&rt2, 0); // 즉시 타임아웃
         // (2) 차단 시작을 관측한 뒤 dispatch 시도 — recover 는 폴링 사이
@@ -1054,8 +1067,8 @@ mod tests {
         )
         .unwrap();
         let rt = StreamRuntime::new(orch);
-        rt.add_stream(Stream::new("sx", &d).unwrap()).unwrap();
-        rt.add_stream(Stream::new("sy", &d).unwrap()).unwrap();
+        rt.add_stream(Stream::new_with_root("sx", &d, "bmad-quickloop").unwrap()).unwrap();
+        rt.add_stream(Stream::new_with_root("sy", &d, "bmad-quickloop").unwrap()).unwrap();
         rt.bind_approval_ledger(
             foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
         )

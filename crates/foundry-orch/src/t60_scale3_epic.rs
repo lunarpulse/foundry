@@ -151,8 +151,8 @@ mod t60_scale3_epic {
         .unwrap();
         let rt = StreamRuntime::new(orch);
         let orch = rt.orch.clone();
-        rt.add_stream(Stream::new("s-sizing", &d).unwrap()).unwrap();
-        rt.add_stream(Stream::new("s-epic", &d).unwrap()).unwrap();
+        rt.add_stream(Stream::new_with_root("s-sizing", &d, "bmad-epic-build").unwrap()).unwrap();
+        rt.add_stream(Stream::new_with_root("s-epic", &d, "bmad-epic-build").unwrap()).unwrap();
         rt.bind_approval_ledger(
             foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
         )
@@ -297,7 +297,7 @@ mod t60_scale3_epic {
             )
             .unwrap();
             let rt = StreamRuntime::new(orch);
-            rt.add_stream(Stream::new(&format!("s-sel{scale}"), &d).unwrap()).unwrap();
+            rt.add_stream(Stream::new_with_root(&format!("s-sel{scale}"), &d, root).unwrap()).unwrap();
             rt.bind_approval_ledger(
                 foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
             )
@@ -416,7 +416,7 @@ mod t60_scale3_epic {
         )
         .unwrap();
         let rt = StreamRuntime::new(orch);
-        rt.add_stream(Stream::new("s-f", &d).unwrap()).unwrap();
+        rt.add_stream(Stream::new_with_root("s-f", &d, "bmad-epic-build").unwrap()).unwrap();
         rt.bind_approval_ledger(
             foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
         )
