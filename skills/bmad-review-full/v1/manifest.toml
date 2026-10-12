@@ -3,4 +3,4 @@ interface_version = 1
 kind = "review-pack"
 version = "1.2.0"
 files = ["lens-edge.md", "lens-verif.md", "lens-claims.md", "lens-triage.md", "lens-replan.md", "lens-replan-full.md", "schema-defer.toml", "schema-findings.toml", "schema-triage.toml", "policy.toml"]
-digest = "6cdfac4917b95629f17b3bcc24be8e3befdf3262b8c9abaa36ecf876287887b9"
+digest = "e925fd014d367c4c7f3d83fe92d03cd4bc4d3b7cbc1ecdf0d4e77320acab1db8"

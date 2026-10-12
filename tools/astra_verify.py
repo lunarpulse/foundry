@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+"""Independent, stdlib-only declarative pack verifier; never executes lens prompts.
+Oracle: bmad-build step-04 cascading contract. No engine/test code is imported.
+Models successful dispatch/redrive; holds stop execution before human resume.
+The 60 cases are 15 NONEMPTY category subsets x two fix x two loop counts.
+"""
+import argparse
+import copy
+import hashlib
+import itertools
+from pathlib import Path, PurePosixPath
+import re
+import struct
+import sys
+import tomllib
+
+
+class Expr:
+    """Recursive descent parser; consumes all tokens (no eval or short-circuit parsing)."""
+    token = re.compile(r'\s*(\&\&|\|\||[!(),\[\]]|"(?:[^"\\]|\\.)*"|[a-z_][a-z0-9_]*|[0-9]+)')
+
+    def __init__(self, text, state):
+        self.tokens = []
+        pos = 0
+        while pos < len(text.rstrip()):
+            m = self.token.match(text, pos)
+            if not m:
+                raise ValueError(f"bad expression at {text[pos:]!r}")
+            self.tokens.append(m[1])
+            pos = m.end()
+        self.i, self.state = 0, state
+
+    def take(self, expected=None):
+        if self.i == len(self.tokens):
+            raise ValueError('unexpected end of expression')
+        t = self.tokens[self.i]
+        self.i += 1
+        if expected is not None and t != expected:
+            raise ValueError(f'expected {expected}, got {t}')
+        return t
+
+    def peek(self, token):
+        return self.i < len(self.tokens) and self.tokens[self.i] == token
+
+    def run(self):
+        result = self.disjunction()
+        if self.i != len(self.tokens):
+            raise ValueError('trailing expression tokens')
+        return result
+
+    def disjunction(self):
+        value = self.conjunction()
+        while self.peek('||'):
+            self.take()
+            rhs = self.conjunction()
+            value = value or rhs
+        return value
+
+    def conjunction(self):
+        value = self.unary()
+        while self.peek('&&'):
+            self.take()
+            rhs = self.unary()
+            value = value and rhs
+        return value
+
+    def unary(self):
+        if self.peek('!'):
+            self.take()
+            return not self.unary()
+        if self.peek('('):
+            self.take()
+            value = self.disjunction()
+            self.take(')')
+            return value
+        name = self.take()
+        if name in ('true', 'false'):
+            return name == 'true'
+        self.take('(')
+        if name == 'any_in':
+            self.take('verdicts')
+            self.take(',')
+            self.take('[')
+            values = []
+            if not self.peek(']'):
+                while True:
+                    literal = self.take()
+                    if not literal.startswith('"'):
+                        raise ValueError('expected string literal')
+                    values.append(tomllib.loads('v = ' + literal)['v'])
+                    if not self.peek(','):
+                        break
+                    self.take(',')
+            self.take(']')
+            value = bool(set(values) & self.state['verdicts'])
+        elif name == 'count_lt':
+            counter = self.take()
+            self.take(',')
+            bound = self.take()
+            if not bound.isdecimal() or int(bound) >= 2**64:
+                raise ValueError('invalid u64')
+            value = self.state['counters'][counter] < int(bound)
+        elif name == 'has_findings':
+            group = self.take()
+            active = self.state['verdicts'] & self.state['active']
+            value = bool(active if group == 'any' else active & {group})
+        elif name in ('budget_exhausted', 'timeout'):
+            value = self.state[name]
+        else:
+            raise ValueError('unsupported function: ' + name)
+        self.take(')')
+        return value
+
+
+def state(categories=(), fix=0, loops=0, active=None):
+    return dict(verdicts=set(categories), counters=dict(fix_rounds=fix, loopbacks=loops),
+                active=set(active if active is not None else ('intent_gap', 'bad_plan', 'patch')),
+                budget_exhausted=False, timeout=False, reverted=False, events=[])
+
+
+def actions(text, s):
+    for action in filter(None, map(str.strip, text.split(';'))):
+        m = re.fullmatch(r'(bump|revert)\(\s*([a-z_][a-z0-9_]*)\s*\)', action)
+        if not m:
+            raise ValueError('unsupported action: ' + action)
+        op, arg = m.groups()
+        if op == 'bump':
+            s['counters'][arg] += 1
+        elif arg == 'origin':
+            s['reverted'] = True
+        else:
+            raise ValueError('unsupported revert base')
+        s['events'].append(f'{op}({arg})')
+
+
+def decision(policy, s, start=None):
+    """Walk actual graph to first hold/emit/redrive; actions occur before entry."""
+    nodes = {n['id']: n for n in policy['nodes']}
+    cursor = start or policy['entry']
+    for _ in range(100):
+        n = nodes[cursor]
+        kind = n['kind']
+        s['events'].append(f'enter:{cursor}')
+        if kind in ('hold', 'emit', 'redrive'):
+            return n
+        if kind == 'dispatch':
+            cursor = n['on_done']  # supplied normalized successful triage output
+        elif kind == 'route':
+            for branch in n['branches']:
+                if Expr(branch['when'], s).run():
+                    actions(branch.get('do', ''), s)
+                    cursor = branch['goto']
+                    break
+            else:
+                raise ValueError('no route branch matched')
+        else:
+            raise ValueError('unknown node kind')
+    raise ValueError('nonterminating first decision')
+
+
+def oracle(categories, fix, loops):
+    # Written from original contract, independent of policy branch expressions.
+    if set(categories) & {'intent_gap', 'bad_plan'}:
+        loops += 1
+        target = 'human' if loops > 5 else ('human_gap' if 'intent_gap' in categories else 'replan')
+        return target, loops
+    return ('fixdie' if fix < 3 else 'human') if 'patch' in categories else 'pass', loops
+
+
+def canonical(root):
+    raw = (root / 'manifest.toml').read_bytes()
+    manifest = tomllib.loads(raw.decode())
+    files = manifest['files']
+    assert len(files) == len(set(files)), 'duplicate files'
+    assert 'manifest.toml' not in files, 'manifest listed twice'
+    refs = set(files)
+    for name in files:
+        p = PurePosixPath(name)
+        assert not p.is_absolute() and '..' not in p.parts and str(p) == name, f'unsafe path {name}'
+        assert (root / name).resolve().is_relative_to(root.resolve()), f'escaping path {name}'
+        assert (root / name).is_file(), f'missing file {name}'
+    digest = hashlib.sha256()
+    for name in sorted(refs | {'manifest.toml'}, key=lambda p: p.encode('utf-8')):
+        data = (root / name).read_bytes()
+        assert b'\r' not in data and data.endswith(b'\n'), f'noncanonical newlines: {name}'
+        if name == 'manifest.toml':
+            lines = data.splitlines(keepends=True)
+            indices = [i for i, line in enumerate(lines) if re.match(rb'^\s*digest =', line)]
+            assert len(indices) == 1, 'expected exactly one digest line'
+            assert not any(line.lstrip().startswith(b'[') for line in lines[:indices[0]]), 'digest not top-level'
+            data = b''.join(line for i, line in enumerate(lines) if i != indices[0])
+        path = name.encode('utf-8')
+        digest.update(struct.pack('<Q', len(path)) + path + struct.pack('<Q', len(data)) + data)
+    # All declarative file references must belong to the manifest closure.
+    def walk(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key == 'lenses':
+                    assert set(child) <= refs, f'unlisted lens {child}'
+                if key in ('output_schema', 'schema'):
+                    assert child in refs, f'unlisted schema {child}'
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+    for name in files:
+        if name.endswith('.toml'):
+            walk(tomllib.loads((root / name).read_text()))
+    actual = digest.hexdigest()
+    assert actual == manifest['digest'], f'digest declared={manifest["digest"]} calculated={actual}'
+    return f'version={manifest["version"]}, files={len(files)}+manifest, sha256={actual}'
+
+
+def graph(policy):
+    nodes = {n['id']: n for n in policy['nodes']}
+    assert len(nodes) == len(policy['nodes']), 'duplicate node IDs'
+    assert policy['entry'] in nodes, 'missing entry'
+    stages = {s['id'] for s in policy.get('pack_stages', [])}
+    for n in nodes.values():
+        kind = n['kind']
+        assert kind in ('dispatch', 'route', 'redrive', 'emit', 'hold'), 'unknown node kind'
+        refs = [n[k] for k in ('on_done', 'hold_target') if k in n]
+        if kind == 'route':
+            assert n['branches'][-1]['when'].strip() == 'true', 'missing last true fallback'
+            for b in n['branches']:
+                Expr(b['when'], state()).run()
+                actions(b.get('do', ''), state())
+                refs.append(b['goto'])
+        if kind == 'hold':
+            refs.extend(n['resume_targets'])
+            assert 'on_done' not in n, 'hold has on_done'
+        if kind == 'emit':
+            assert not any(k in n for k in ('on_done', 'goto', 'hold_target', 'resume_targets', 'branches')), 'emit not terminal'
+        if 'pre_stage' in n:
+            assert n['pre_stage'] in stages, 'unknown pre_stage'
+        assert all(r in nodes for r in refs), f'dangling node reference from {n["id"]}'
+    return f'{len(nodes)} nodes, entry/references/fallback/resume/emit valid'
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('pack', nargs='?', type=Path, default=Path('skills/bmad-review-full/v1'))
+    args = parser.parse_args()
+    failures = []
+
+    def check(label, fn):
+        try:
+            detail = fn()
+            print(f'PASS {label}' + (f': {detail}' if detail else ''))
+        except (AssertionError, ValueError, KeyError, OSError, TypeError) as e:
+            failures.append(label)
+            print(f'FAIL {label}: {e}')
+
+    check('manifest closure + canonical digest', lambda: canonical(args.pack))
+    policy = tomllib.loads((args.pack / 'policy.toml').read_text())
+    schema = tomllib.loads((args.pack / 'schema-triage.toml').read_text())
+    active = next(o['active_categories'] for o in schema['output'] if o['name'] == 'verdicts')
+    check('graph structure', lambda: graph(policy))
+
+    def expression_tests():
+        s = state(['patch'], fix=2, loops=5)
+        cases = [('false || true && false', False), ('!false && (true || false)', True),
+                 ('any_in(verdicts, ["bad_plan", "patch"])', True),
+                 ('count_lt(fix_rounds, 3) && !count_lt(loopbacks, 5)', True),
+                 ('has_findings(any)', True), ('budget_exhausted() || timeout()', False)]
+        for expr, expected in cases:
+            assert Expr(expr, s).run() == expected, expr
+        for flag in ('timeout', 'budget_exhausted'):
+            s[flag] = True
+            assert Expr(flag + '()', s).run()
+            s[flag] = False
+        for invalid in ('true garbage', 'true ||', 'evil()', 'count_lt(fix_rounds, -1)'):
+            try:
+                Expr(invalid, s).run()
+            except ValueError:
+                continue
+            raise AssertionError('accepted invalid expression ' + invalid)
+        return 'precedence, parentheses, functions, flags, malformed input'
+    check('independent expression interpreter', expression_tests)
+    categories = ('intent_gap', 'bad_plan', 'patch', 'defer')
+    subsets = [c for size in range(1, 5) for c in itertools.combinations(categories, size)]
+    route_matches = state_matches = total = 0
+    for cats, fix, loops in itertools.product(subsets, (2, 3), (4, 5)):
+        total += 1
+        s = state(cats, fix, loops, active)
+        node = decision(policy, s)
+        expected_node, expected_count = oracle(cats, fix, loops)
+        route_matches += node['id'] == expected_node
+        state_matches += node['id'] == expected_node and s['counters']['loopbacks'] == expected_count
+        def verify_case():
+            assert (node['id'], s['counters']['loopbacks']) == (expected_node, expected_count), (
+                f'actual={node["id"]}/loopbacks={s["counters"]["loopbacks"]}, '
+                f'expected={expected_node}/loopbacks={expected_count}')
+        check(f'case {total:02d} {"+".join(cats)} fix={fix} loops={loops}', verify_case)
+    print(f'MATRIX destinations={route_matches}/{total}; destination+counter={state_matches}/{total}')
+
+    def repeated():
+        s = state(['bad_plan'], active=active)
+        trace = []
+        for visit in range(1, 8):
+            node = decision(policy, s)
+            trace.append(f'{visit}:{node["id"]}(loops={s["counters"]["loopbacks"]})')
+            if node['kind'] == 'hold':
+                print('TRACE bad_plan ' + ' -> '.join(trace))
+                assert visit == 6 and node['id'] == 'human', 'wrong halt visit/destination'
+                assert s['counters']['loopbacks'] == 6, 'sixth entry must persist increment to 6 before HALT; actual=5'
+                return
+            assert node['kind'] == 'redrive', 'unexpected terminal'
+            if 'bump' in node:
+                actions(f'bump({node["bump"]})', s)
+        raise AssertionError('no halt')
+    check('repeated bad_plan sixth-entry state', repeated)
+
+    def gap_timing(p=policy):
+        s = state(['intent_gap', 'bad_plan', 'patch', 'defer'], loops=4, active=active)
+        n = decision(p, s)
+        assert n['kind'] == 'hold' and n['id'] == 'human_gap', 'wrong gap hold'
+        assert s['counters']['loopbacks'] == 5 and s['reverted'], 'hold entered before bump/revert'
+        e = s['events']
+        assert e.index('bump(loopbacks)') < e.index('revert(origin)') < e.index('enter:human_gap'), e
+        return ' -> '.join(e)
+    check('intent_gap pre-hold timing', gap_timing)
+
+    def declarations():
+        ns = {n['id']: n for n in policy['nodes']}
+        assert ns['human_gap']['resume_targets'] == ['replan_full']
+        for name, payload in [('replan', 'plan'), ('replan_full', 'plan_full')]:
+            assert ns[name]['base'] == 'origin' and ns[name]['payload'] == payload
+            assert ns[name]['on_done'] == policy['entry'] and 'pre_stage' in ns[name]
+        assert ns['fixdie']['target'] == 'die-workdir' and ns['fixdie']['base'] == 'latest'
+        assert ns['fixdie']['payload'] == 'findings' and ns['fixdie']['bump'] == 'fix_rounds'
+        assert 'deferred' in ns[policy['entry']]['side_records']
+        deferred = next(o for o in schema['output'] if o['name'] == 'deferred')
+        for cats in subsets:
+            expected = not bool(set(cats) & {'intent_gap', 'bad_plan'})
+            assert Expr(deferred['when'], state(cats)).run() == expected, 'defer moot mismatch'
+        return 'gap resume/full plan, bad_plan origin, patch continuation declarations, defer guard'
+    check('continuation + defer declarations', declarations)
+    check('empty set supplementary', lambda: assert_empty(policy, active))
+    for flag in ('budget_exhausted', 'timeout'):
+        def emergency():
+            s = state(['intent_gap'], active=active)
+            s[flag] = True
+            assert decision(policy, s)['id'] == 'human'
+        check('emergency ' + flag, emergency)
+
+    # In-memory mutations isolate semantic detectors from digest mismatch.
+    def negative_timing():
+        mutant = copy.deepcopy(policy)
+        route = next(n for n in mutant['nodes'] if n['id'] == 'route1')
+        b = next(b for b in route['branches'] if b.get('goto') == 'human_gap')
+        del b['do']
+        try:
+            gap_timing(mutant)
+        except AssertionError as e:
+            return 'mutant rejected: ' + str(e)
+        raise AssertionError('bad pack accepted')
+    check('negative control remove gap pre-hold actions', negative_timing)
+
+    def negative_graph():
+        mutant = copy.deepcopy(policy)
+        next(n for n in mutant['nodes'] if n['kind'] == 'hold')['resume_targets'] = ['missing']
+        try:
+            graph(mutant)
+        except AssertionError as e:
+            return 'mutant rejected: ' + str(e)
+        raise AssertionError('bad graph accepted')
+    check('negative control dangling resume', negative_graph)
+    print('SCOPE: declarative model; no live engine/subagent execution. Prompt compliance and actual session reuse are not proven.')
+    print(f'RESULT: {"FAIL" if failures else "PASS"}; {len(failures)} failed checks')
+    return bool(failures)
+
+
+def assert_empty(policy, active):
+    assert decision(policy, state(active=active))['id'] == 'pass'
+
+
+if __name__ == '__main__':
+    sys.exit(main())

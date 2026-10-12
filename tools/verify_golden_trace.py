@@ -306,7 +306,9 @@ def main():
     assert d.count("replan") == 5
     assert d[-1] == "hold:human"
     st_bad = res[0] if isinstance(res, tuple) else res
-    assert st_bad["counters"]["loopbacks"] == 5, st_bad
+    # r14-1: the cap branch ALSO bumps (original increments, then checks
+    # >5) — human hold is entered with loopbacks=6 on the 6th loopback
+    assert st_bad["counters"]["loopbacks"] == 6, st_bad
 
     # --- iterated intent_gap: bump+revert BEFORE hold (original order),
     #     5 resume pairs then capped human ---

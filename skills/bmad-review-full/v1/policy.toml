@@ -43,8 +43,9 @@ kind = "route"
 [[nodes.branches]]
 when = 'budget_exhausted() || timeout()'
 goto = "human"
-[[nodes.branches]]   # (r11-1b) 공통 loopback 상한 — 원본 "loopback 전
-when = '(any_in(verdicts, ["intent_gap", "bad_plan"])) && !count_lt(loopbacks, 5)'   # increment, 5 초과 HALT
+[[nodes.branches]]   # (r11-1b, r14-1) 공통 loopback 상한 — 원본: increment
+when = '(any_in(verdicts, ["intent_gap", "bad_plan"])) && !count_lt(loopbacks, 5)'   # "후" 5 초과 검사
+do = 'bump(loopbacks)'  # 상한 진입도 loopback이므로 증가 — hold 시점 6
 goto = "human"          # 상한 인간 — replan resume 불가
 [[nodes.branches]]   # (r13-6) bump+revert가 hold "전" — 원본 순서:
 when = 'any_in(verdicts, ["intent_gap"])'
