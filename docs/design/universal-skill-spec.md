@@ -1,7 +1,7 @@
 # Foundry Universal Skill Spec — 범용 실행 모델 (Universal Review Engine)
 
-- **버전**: v0.18 (2026-10-12) — r16 REWORK(MAJOR 3+MINOR 2) 반영.
-  예제=canonical 팩 추출·검증기 계약 검사 강화. 재검증 대기.
+- **버전**: v0.20 (2026-10-12) — r18 REWORK(MAJOR 4+MINOR 2) 반영.
+  노드 집합 동일성·의존 그래프 순서 검사. 재검증 대기.
 - **의도(소유자)**: Foundry는 어떤 방법론도 돌릴 수 있는 유니버설
   플랫폼. BMad는 스킬 데이터의 첫 고객. **Rust 도메인에 방법론
   코드가 박히는 순간이 실패.** 엔진 고정·확장 선언(procedural macro
@@ -56,8 +56,11 @@ id = "lenses"        # ① dispatch: 스테이지 그래프 실행(렌즈/검증
 kind = "dispatch"
 # stages = [ ... ]   # 팩의 §3.3 스테이지 정의 (부록 A 전체 예 — 여기선
 #                  생략; verify 스테이지가 triage 카테고리 verdicts 출력)
+side_records = ["deferred"]
 on_done = "route1"
 hold_target = "human"   # r9-3: 엔진 주도 hold 이송 필수 필드
+on_verify_invalid = "hold"
+on_no_valid = "hold"
 
 [[nodes]]
 id = "route1"        # ② route: 조건식 → 다음 노드 선택
@@ -529,7 +532,7 @@ policy = "discard-finding" # 개별 finding 거부(부분 거부)
 
 `skills/fixture-min/v1/` **실파일이 canonical 입력의 유일한 원본** —
 아래 전사는 가독용이며 계산에 쓰지 않는다(문서-파일 불일치 원천 차단).
-- `manifest.toml`(LF, 끝 LF):
+- `policy.toml`(LF, 끝 LF):
 ```toml
 entry = "scan"
 
@@ -539,6 +542,8 @@ kind = "dispatch"
 stages = [{ id = "lens-a", lenses = ["lens-a.md"], role = "lens" }]
 on_done = "done"
 hold_target = "end_hold"
+on_verify_invalid = "hold"
+on_no_valid = "hold"
 
 [[nodes]]
 id = "done"

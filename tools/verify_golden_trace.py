@@ -419,29 +419,28 @@ def contract_negative_controls(doc):
         contract_checks(bad)
         raise AssertionError("pre_stage removal mutant NOT detected")
     except AssertionError as e:
-        pass  # contract_checks itself must raise for missing registration
-    # claims.after -> "verif" (wrong ordering dependency) -> detected by
-    # real dependency-graph check below; simulate the ordering violation
+        assert "must declare pre_stage" in str(e), \
+            f"wrong failure: {e}"
+    # claims.after -> "verif": claims(trace) must remain ordered after
+    # edge(trace) — the reachability check must reject this rewire
     bad = copy.deepcopy(doc)
     for n in bad["nodes"]:
         if n["kind"] == "dispatch":
             for st in n.get("stages", []):
                 if st["id"] == "claims":
                     st["after"] = "verif"
-    # same-session ordering is validated via the after-graph in
-    # contract_checks; claims(trace) after verif breaks session order
-    sess_order_ok = True
     try:
         contract_checks(bad)
-    except AssertionError:
-        sess_order_ok = False
-    # the swap may still satisfy count-based ordering; the real
-    # dependency check lives in contract_checks' session graph
+        raise AssertionError("claims.after=verif mutant NOT detected")
+    except AssertionError as e:
+        assert "not ordered after" in str(e) or "cycle" in str(e), \
+            f"wrong failure: {e}" 
 
 
 def example_pack_identity():
-    """(r17-1) the §2.1 doc example must be node-for-node identical to
-    the canonical pack policy (minus intentionally-elided stages)."""
+    """(r17-1, r18-1) the §2.1 doc example must be node-set-identical
+    to the canonical pack: same node IDs, and every canonical field
+    compared in full. Only `stages` may be elided in the example."""
     import tomllib as tl
     doc_txt = open("docs/design/universal-skill-spec.md").read()
     blocks = re.findall(r"```toml\n(.*?)```", doc_txt, re.S)
@@ -455,25 +454,28 @@ def example_pack_identity():
     pack = load()
     ex_nodes = {n["id"]: n for n in ex["nodes"]}
     pk_nodes = {n["id"]: n for n in pack["nodes"]}
-    # every node present in BOTH must match on all canonical fields
-    CANON_FIELDS = {"kind", "target", "payload", "base", "pre_stage",
-                    "on_done", "hold_target", "on_redrive_error",
-                    "resume_targets", "event", "payload_from"}
+    # (r18-1) NODE SET equality — example-only nodes forbidden EXCEPT
+    # the documented demonstration node
+    ALLOWED_EXAMPLE_ONLY = {"emit_failed_node"}  # §2.1 demo of §2.4a
+    ex_only = set(ex_nodes) - set(pk_nodes)
+    pk_only = set(pk_nodes) - set(ex_nodes)
+    assert ex_only <= ALLOWED_EXAMPLE_ONLY, \
+        f"example has non-pack nodes: {ex_only - ALLOWED_EXAMPLE_ONLY}"
+    assert not pk_only, f"example is missing pack nodes: {pk_only}"
+    # full-field comparison on every shared node
     for nid, pkn in pk_nodes.items():
-        if nid in ex_nodes:
-            for f in CANON_FIELDS:
-                if f in pkn or f in ex_nodes[nid]:
-                    assert ex_nodes[nid].get(f) == pkn.get(f), \
-                        f"example node {nid}.{f}: {ex_nodes[nid].get(f)!r}" \
-                        f" != pack {pkn.get(f)!r}"
-    # route1 branches must be IDENTICAL in order (when/do/goto)
-    ex_r1 = [n for n in ex["nodes"] if n["id"] == "route1"][0]["branches"]
-    pk_r1 = [n for n in pack["nodes"] if n["id"] == "route1"][0]["branches"]
+        exn = ex_nodes[nid]
+        pkf = {k: v for k, v in pkn.items() if k not in ("stages", "branches", "id")}
+        exf = {k: v for k, v in exn.items() if k not in ("stages", "branches", "id")}
+        assert exf == pkf, \
+            f"node {nid}: example fields {exf} != pack fields {pkf}"
+    # route1 branches identical in order (when/do/goto)
+    ex_r1 = ex_nodes["route1"]["branches"]
+    pk_r1 = pk_nodes["route1"]["branches"]
     assert len(ex_r1) == len(pk_r1), \
         f"route1 branch count {len(ex_r1)} != {len(pk_r1)}"
     for i, (a, b) in enumerate(zip(ex_r1, pk_r1)):
-        assert a.get("when") == b.get("when"), \
-            f"route1[{i}].when differs"
+        assert a.get("when") == b.get("when"), f"route1[{i}].when differs"
         assert a.get("do") == b.get("do"), \
             f"route1[{i}].do differs: {a.get('do')!r} vs {b.get('do')!r}"
         assert a.get("goto") == b.get("goto"), f"route1[{i}].goto differs"
@@ -589,30 +591,71 @@ def contract_checks(doc):
     same-session ordering — the two mutants r15 slipped through."""
     stages_by_pack = {s["id"]: s for s in doc.get("pack_stages", [])}
     for n in doc["nodes"]:
-        if n["kind"] == "redrive" and n.get("pre_stage"):
-            ps = n["pre_stage"]
-            assert ps in stages_by_pack, \
-                f"{n['id']}.pre_stage={ps} not registered in pack_stages"
-            for lf in stages_by_pack[ps].get("lenses", []):
-                assert os.path.exists(f"{PACK}/{lf}"), \
-                    f"pre_stage {ps} lens {lf} missing"
-            if n["id"] == "replan_full":
-                assert "lens-replan-full.md" in stages_by_pack[ps]["lenses"], \
-                    "replan_full must run the full-plan regenerator"
-            if n["id"] == "replan":
-                assert "lens-replan.md" in stages_by_pack[ps]["lenses"], \
-                    "replan must run the partial amender"
+        if n["kind"] == "redrive":
+            if n["id"] in ("replan", "replan_full"):
+                assert n.get("pre_stage"), \
+                    f"{n['id']} must declare pre_stage (r18-2)"
+            if n.get("pre_stage"):
+                ps = n["pre_stage"]
+                assert ps in stages_by_pack, \
+                    f"{n['id']}.pre_stage={ps} not registered in pack_stages"
+                for lf in stages_by_pack[ps].get("lenses", []):
+                    assert os.path.exists(f"{PACK}/{lf}"), \
+                        f"pre_stage {ps} lens {lf} missing"
+                if n["id"] == "replan_full":
+                    assert "lens-replan-full.md" in stages_by_pack[ps]["lenses"], \
+                        "replan_full must run the full-plan regenerator"
+                if n["id"] == "replan":
+                    assert "lens-replan.md" in stages_by_pack[ps]["lenses"], \
+                        "replan must run the partial amender"
     for n in doc["nodes"]:
         if n["kind"] == "dispatch":
+            # (r18-3) full stage dependency graph over this dispatch:
+            # acyclicity + same-session ordered reachability
+            import collections
+            adj = collections.defaultdict(list)
+            indeg = {s["id"]: 0 for s in n["stages"]}
+            for s in n["stages"]:
+                aft = s.get("after")
+                if aft is None:
+                    aft = []
+                elif isinstance(aft, str):
+                    aft = [aft]
+                for a in aft:
+                    assert a in indeg, \
+                        f"{s['id']}.after={a} dangling"
+                    adj[a].append(s["id"])
+                    indeg[s["id"]] += 1
+            q = collections.deque(k for k, v in indeg.items() if v == 0)
+            seen = 0
+            while q:
+                x = q.popleft(); seen += 1
+                for y in adj[x]:
+                    indeg[y] -= 1
+                    if indeg[y] == 0: q.append(y)
+            assert seen == len(indeg), "stage dependency graph has a cycle"
+
+            def reach(fr):
+                out, stack = set(), [fr]
+                while stack:
+                    x = stack.pop()
+                    for y in adj.get(x, []):
+                        if y not in out:
+                            out.add(y); stack.append(y)
+                return out
+
             sess = {}
             for st in n.get("stages", []):
                 if st.get("session"):
                     sess.setdefault(st["session"], []).append(st)
             for sid, sts in sess.items():
                 if len(sts) > 1:
-                    ordered = [x for x in sts if x.get("after")]
+                    ordered = [x for x in sts if x.get("after") is not None]
                     assert len(ordered) == len(sts) - 1, \
                         f"same-session {sid} stages must be after-ordered"
+                    for a, b in zip(sts, sts[1:]):
+                        assert b["id"] in reach(a["id"]), \
+                            f"session {sid}: {b['id']} not ordered after {a['id']}"
 
 
 if __name__ == "__main__":
