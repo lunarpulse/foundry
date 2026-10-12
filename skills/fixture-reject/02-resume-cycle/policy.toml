@@ -8,16 +8,20 @@ on_done = "done"
 hold_target = "end_hold"
 
 [[nodes]]
-[[nodes]]
 id = "done"
 kind = "route"
 [[nodes.branches]]
 when = "true"
 goto = "end_hold"
+
 [[nodes]]
 id = "end_hold"
 kind = "hold"
 resume_targets = ["done"]
+
+[[output.on_error]]
+state = "ok"
+policy = "accept-stage"
 
 [[output.on_error]]
 state = "dispatch_error"

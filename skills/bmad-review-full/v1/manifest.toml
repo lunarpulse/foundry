@@ -1,0 +1,6 @@
+id = "bmad-review-full"
+interface_version = 1
+kind = "review-pack"
+version = "1.0.0"
+files = ["lens-edge.md", "lens-verif.md", "lens-claims.md", "lens-triage.md", "lens-replan.md", "policy.toml"]
+digest = "31a75c15a8ef68d309a1f4d765d3c05e8db7c09899001fa5272d4e78229080e5"

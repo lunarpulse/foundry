@@ -1,0 +1,108 @@
+entry = "lenses"
+interface_version = 1
+
+[counters]
+fix_rounds = 0
+replans = 0
+
+[[nodes]]
+id = "lenses"
+kind = "dispatch"
+stages = [
+  { id = "edge", lenses = ["lens-edge.md"], role = "lens" },
+  { id = "verif", lenses = ["lens-verif.md"], role = "lens", after = "edge" },
+  { id = "claims", lenses = ["lens-claims.md"], role = "lens", after = "verif", session = "trace" },
+  { id = "triage", lenses = ["lens-triage.md"], role = "verify", after = "claims" },
+]
+side_records = ["deferred"]
+on_done = "route1"
+hold_target = "human"
+
+[[nodes]]
+id = "route1"
+kind = "route"
+# r10-1: 원본 cascading 순서 — intent_gap > bad_plan > patch > defer.
+# 각 범주 상한 초과 시 하위 범주로 누수 없이 human.
+[[nodes.branches]]
+when = 'budget_exhausted() || timeout()'
+goto = "human"
+[[nodes.branches]]
+when = 'any_in(verdicts, {"intent_gap"})'
+goto = "human"
+[[nodes.branches]]
+when = 'any_in(verdicts, {"bad_plan"}) && count_lt(replans, 5)'
+goto = "replan"
+[[nodes.branches]]
+when = 'any_in(verdicts, {"patch"}) && count_lt(fix_rounds, 3)'
+goto = "fixdie"
+[[nodes.branches]]
+when = 'any_in(verdicts, {"defer"}) && !has_findings(any)'
+goto = "pass"
+[[nodes.branches]]
+when = 'has_findings(any)'
+goto = "human"
+[[nodes.branches]]
+when = '!has_findings(any)'
+goto = "pass"
+[[nodes.branches]]
+when = 'true'
+goto = "human"
+
+[[nodes]]
+id = "fixdie"
+kind = "redrive"
+target = "die-workdir"
+payload = "findings"
+base = "latest"
+bump = "fix_rounds"
+on_done = "lenses"
+hold_target = "human"
+
+[[nodes]]
+id = "replan"
+kind = "redrive"
+target = "die-workdir"
+payload = "replan"
+base = "origin"
+pre_stage = "replan-stage"
+bump = "replans"
+on_done = "lenses"
+hold_target = "human"
+
+[[nodes]]
+id = "pass"
+kind = "emit"
+event = "InspectionPassed"
+payload_from = "summary"
+
+[[nodes]]
+id = "emit_failed_node"
+kind = "emit"
+event = "InspectionFailed"
+payload_from = "cumulative_findings"
+
+[[nodes]]
+id = "human"
+kind = "hold"
+# r10-2: 상한 도달 human은 replan resume 금지 — resume_targets는
+# fixdie만. (resume은 팩 데이터; 엔진은 목록만 집행)
+resume_targets = ["fixdie"]
+
+[[output.on_error]]
+state = "ok"
+policy = "accept-stage"
+
+[[output.on_error]]
+state = "dispatch_error"
+policy = "discard-stage"
+
+[[output.on_error]]
+state = "parse_error"
+policy = "discard-finding"
+
+[[output.on_error]]
+state = "timeout"
+policy = "hold"
+
+[hold]
+timeout_s = 0

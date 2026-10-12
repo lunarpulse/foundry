@@ -1,5 +1,8 @@
 entry = "scan"
 
+[counters]
+fix_rounds = 0
+
 [[nodes]]
 id = "scan"
 kind = "dispatch"
@@ -8,16 +11,20 @@ on_done = "done"
 hold_target = "end_hold"
 
 [[nodes]]
-[[nodes]]
 id = "done"
 kind = "route"
 [[nodes.branches]]
 when = "true"
 do = "bump(fix_rounds)"
+
 [[nodes]]
 id = "end_hold"
 kind = "hold"
 resume_targets = []
+
+[[output.on_error]]
+state = "ok"
+policy = "accept-stage"
 
 [[output.on_error]]
 state = "dispatch_error"

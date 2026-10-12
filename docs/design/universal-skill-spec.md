@@ -1,7 +1,7 @@
 # Foundry Universal Skill Spec — 범용 실행 모델 (Universal Review Engine)
 
-- **버전**: v0.11 (2026-10-12) — r9 REWORK(MAJOR 7+MINOR 1) 반영.
-  digest 재현·DAG·승격 순서는 r9 확인 완료. 재검증 대기.
+- **버전**: v0.12 (2026-10-12) — r10 REWORK(MAJOR 7+MINOR 1) 반영.
+  digest·진리표(T≥1 7,107조합)·원본 step-04 hash r10 확인. 재검증 대기.
 - **의도(소유자)**: Foundry는 어떤 방법론도 돌릴 수 있는 유니버설
   플랫폼. BMad는 스킬 데이터의 첫 고객. **Rust 도메인에 방법론
   코드가 박히는 순간이 실패.** 엔진 고정·확장 선언(procedural macro
@@ -62,21 +62,24 @@ hold_target = "human"   # r9-3: 엔진 주도 hold 이송 필수 필드
 [[nodes]]
 id = "route1"        # ② route: 조건식 → 다음 노드 선택
 kind = "route"
-[[nodes.branches]]   # 순서=우선순위, 첫 매치 후 중단 (r9-7: 카테고리
-when  = 'budget_exhausted() || timeout()'   # 판정 전부 팩 데이터)
+# (r10-1/2) 문서 예제는 FULL 팩(skills/bmad-review-full/v1/policy.toml)
+# 의 route1과 논리 동일 — 원본 cascading 순서 intent_gap > bad_plan >
+# patch > defer, 상한 초과는 하위 누수 없이 human:
+[[nodes.branches]]
+when  = 'budget_exhausted() || timeout()'
 goto  = "human"
-[[nodes.branches]]   # defer: 기록 후 진행(원본 step-04 4분기)
-when  = 'any_in(verdicts, {"defer"})'
-goto  = "pass"       # side_records=deferred 저널(§2.2 표)
-[[nodes.branches]]   # intent_gap: 인간 해결(원본)
-when  = 'any_in(verdicts, {"intent_gap"})'
-goto  = "human"
-[[nodes.branches]]   # bad_plan: KEEP 추출·롤백·재계획(원본)
+[[nodes.branches]]   # intent_gap: 공통 loopback 카운터 경유 후 인간 해결
+when  = 'any_in(verdicts, {"intent_gap"})'   # (원본 — 재계획 전 인간)
+goto  = "human"      # 인간 해결 후 resume은 §3.3 목록 데이터
+[[nodes.branches]]   # bad_plan: 롤백+재계획(상한 5)
 when  = 'any_in(verdicts, {"bad_plan"}) && count_lt(replans, 5)'
-goto  = "replan"     # ★ 자동 재계획 — generation 경유(§2.4a)
-[[nodes.branches]]   # patch: 같은 구현자 최소 수정(원본)
+goto  = "replan"
+[[nodes.branches]]   # patch: 같은 구현자 최소 수정(상한 3)
 when  = 'any_in(verdicts, {"patch"}) && count_lt(fix_rounds, 3)'
-goto  = "fixdie"     # ★ 팩 내부 fix 루프 — 도메인 attempt 불사용
+goto  = "fixdie"
+[[nodes.branches]]   # defer: 기록 후 진행 — findings 없을 때만 pass
+when  = 'any_in(verdicts, {"defer"}) && !has_findings(any)'
+goto  = "pass"       # side_records=deferred 저널(§2.2 표)
 [[nodes.branches]]
 when  = 'has_findings(any)'
 goto  = "human"
@@ -204,8 +207,6 @@ literal  := string-literal(TOML 1.0 문자열)
 id       := [a-z_][a-z0-9_]*     ; 팩 [counters]에 선언된 것만(로드 검증)
 group_id := id | 'any'           ; 'any' 예약(팩 그룹 태그명 충돌 거부)
 int      := u64 10진수
-set      := '{' str (',' str)* '}'   ; 카테고리 집합 리터럴(r9-7)
-str      := '"' [a-z0-9_-]+ '"'
 
 action   := 'emit' '(' event_id ',' payload_ref ')'
           | 'bump' '(' id ')'        ; hold는 액션이 아닌 노드(r9-3)
@@ -223,7 +224,7 @@ do_seq   := action ( ';' action )*     ; emit은 전 시퀀스에 최대 1회
   복종:
   | kind | 필수 | 선택 | 금지 |
   |---|---|---|---|
-  | dispatch | stages, on_done, hold_target | side_records, role | — |
+  | dispatch | stages(최소 1 — T=0 배타성 붕괴 금지, r10-6), on_done, hold_target | side_records, role | — |
   | route | branches(마지막 원소 when="true") | — | on_done |
   | redrive | target, payload, on_done, hold_target | bump, pre_stage, base("latest"\|"origin", 기본 latest), on_redrive_error("hold"\|"fail-run") | — |
   | emit | event, payload_from | — | on_done(HALT 암시) |
@@ -240,7 +241,12 @@ do_seq   := action ( ';' action )*     ; emit은 전 시퀀스에 최대 1회
   resume 간선·DAG 검증 가능.
   entry = 그래프 최상위 `entry`(dispatch 노드 id만). stage 전체
   스키마(stages[]의 id/lenses/session/after/inputs_unsealed/role/
-  output_schema)는 A.4에 규범 정의(승인 전 고정 — 아래). 예제 정합(반영): replan+payload="replan", pass+
+  output_schema)는 A.4에 규범 정의(승인 전 고정 — 아래).
+  **hold 목적지 실행 컨텍스트(r10-7)**: hold_target은 activation
+  커서에 **dispatch/redrive 진입 시 승계 저장**(내구 컨텍스트 —
+  route/emit은 hold_target 없음, 진입 시점의 활성 값 사용). 간선
+  dispatch/redrive→hold_target도 DAG 검증에 포함. route의 bump
+  overflow hold는 같은 컨텍스트로 이송. 예제 정합(반영): replan+payload="replan", pass+
   payload_from="summary", human+resume_targets=["replan","…"],
   emit_failed_node의 on_done="HALT" 제거(HALT 암시).
   부록 A에 **수용 fixture(전체 팩)+거부 fixture(검증 규칙별 1개)**
@@ -328,8 +334,9 @@ review-run 소유의 범용 실행 회차(generation)로 정의한다.**
 
 ### 2.5 정규화 (r3-MAJOR-7)
 - 4분류(ok/parse_error/dispatch_error/timeout)별 정책표 — 팩이
-  **키·허용값·기본값 전부 선언**(엔진 기본값 없음, 미선언 시 로드
-  거부):
+  **4 상태 전부 선언**(ok의 정상 수용 정책 accept-stage 포함,
+  r10-4; 엔진 기본값 없음, 미선언 시 로드 거부). 오류 정책은 팩
+  전체 [[output.on_error]]가 유일 소유(노드 필드 아님):
 ```toml
 [[output.on_error]]        # 순서=우선순위
 state = "dispatch_error"   # ok | parse_error | dispatch_error | timeout
@@ -476,16 +483,6 @@ policy = "discard-finding" # 개별 finding 거부(부분 거부)
 아래 전사는 가독용이며 계산에 쓰지 않는다(문서-파일 불일치 원천 차단).
 - `manifest.toml`(LF, 끝 LF):
 ```toml
-id = "fixture-min"
-interface_version = 1
-kind = "review-pack"
-version = "1.0.0"
-files = ["lens-a.md", "policy.toml"]
-digest = "8dacc42e8c337eac7bb4131b9ed976956be6ce8097ff634f5345d5dee53323ab"
-```
-- `lens-a.md`(LF, 끝 LF): `ok`
-- `policy.toml`(LF, 끝 LF):
-```toml
 entry = "scan"
 
 [[nodes]]
@@ -508,6 +505,10 @@ kind = "hold"
 resume_targets = []
 
 [[output.on_error]]
+state = "ok"
+policy = "accept-stage"
+
+[[output.on_error]]
 state = "dispatch_error"
 policy = "discard-stage"
 
@@ -522,34 +523,25 @@ policy = "hold"
 [hold]
 timeout_s = 0
 ```
-**기대 trace**: T=1, E=0, 유효=1, V=absent → all-ok(absent) →
-route(true) → do=emit(InspectionPassed) → **적격성 게이트가 V=ok
-증거 부재로 거부** → hold_target(end_hold) 진입. 즉 이 fixture는
-"verify 없는 자동 pass 거부→hold" 경로의 수용 시험이다(성공 emit
-fixture가 아님). kind="review-pack" — advisory-pack은 emit 노드
-포함 자체가 로드 거부(§3.1 저널 차단과 정합, r9-2).
-**digest(독립 계산, python hashlib §3.1 canonical)**:
-pack=8dacc42e8c337eac7bb4131b9ed976956be6ce8097ff634f5345d5dee53323ab, leaf(quick-inspect,fixture-min,1.0.0,advisory)=bbb87fcfaff9db1db2871217fecedb7ba27e1a1372288f02f51ba307f16ee25a —
-구현은 재현 의무(검증 절차: 파일→canonical→digest 대조).
+### A.2 거부 fixture — 9종 실제 파일 (r10-5: baseline 정합 + 기대 오류 코드)
 
-### A.2 거부 fixture — 9종 실제 파일 (r9-6: skills/fixture-reject/)
-
-baseline = A.1 팩, 각 디렉터리는 **규칙 1개만 위반**:
-| 디렉터리 | 위반 규칙 | 기대 거부 |
+baseline = A.1 팩 전체(모든 필드 정합·TOML 유효·digest 정상).
+각 디렉터리는 **규칙 1개만 위반** + `expected_error.txt`(기대 오류
+코드). 로더 회귀: 각 fixture가 **정확히 그 코드로** 거부해야 함:
+| 디렉터리 | 위반 | 기대 코드 |
 |---|---|---|
-| 01-route-cycle | ra↔rb true 상호참조(차감 노드 없는 사이클) | DAG 검사(§2.4b) |
-| 02-resume-cycle | done→end_hold→(resume)→done 비차감 사이클 | resume 간선 DAG |
-| 03-missing-payload | redrive에 payload 없음 | 노드 스키마(r7-1) |
-| 04-verdicts-no-verify | verify 없는 팩의 any_in(verdicts,…) | provenance(§2.3) |
-| 05-no-true-fallback | 마지막 branch가 true 아님 | 폴백 규칙 |
-| 06-do-only-nonterminal | do="bump(…)"에 goto 없음 | r9-3 종단 규칙 |
-| 07-quoted-digest-key | manifest `"digest" = …` quoted 키 | §3.1 제거 규칙 |
-| 08-crlf-manifest | manifest CRLF 개행 | LF 필수(r8-5/r9-8) |
-| 09-no-trailing-lf | manifest 끝 LF 부재 | LF 필수(r8-5/r9-8) |
+| 01-route-cycle | ra↔rb 상호참조 | E_DAG_CYCLE |
+| 02-resume-cycle | resume 간선 사이클(done) | E_DAG_RESUME_CYCLE |
+| 03-missing-payload | redrive payload 누락 | E_SCHEMA_MISSING_FIELD |
+| 04-verdicts-no-verify | verify 없는 verdicts 참조 | E_PROVENANCE |
+| 05-no-true-fallback | 마지막 branch false | E_NO_TRUE_FALLBACK |
+| 06-do-only-nonterminal | do=bump, goto 없음 | E_NONTERMINAL_DO_NO_GOTO |
+| 07-quoted-digest-key | manifest `"digest" =` | E_DIGEST_KEY_QUOTED |
+| 08-crlf-manifest | CRLF 개행(digest 정상) | E_LF_REQUIRED |
+| 09-no-trailing-lf | 끝 LF 부재(digest 정상) | E_LF_REQUIRED |
 
-**수용성 규칙 통일(r8-5, r9-8)**: canonical 입력은 **LF 개행 + 파일
-끝 LF 필수**만 수용 — CRLF·CR·끝 LF 부재는 로드 거부(§3.1 본문과
-동일 규칙 — 단일 진실원). 로더 회귀: 9종 전부 거부 + A.1 수용.
+**수용성 규칙(단일)**: LF 개행 + 파일 끝 LF 필수 — CRLF·CR·끝 LF
+부재는 로드 거부. 9종 전부 거부 + A.1 수용이 회귀 조건.
 
 ### A.4 stage 규범 스키마 (승인 전 고정 — r8-2)
 dispatch.stages[] 각 항목: {id(필수), lenses[파일명](필수≥1),

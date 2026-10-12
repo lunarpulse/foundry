@@ -20,6 +20,10 @@ kind = "hold"
 resume_targets = []
 
 [[output.on_error]]
+state = "ok"
+policy = "accept-stage"
+
+[[output.on_error]]
 state = "dispatch_error"
 policy = "discard-stage"
 
