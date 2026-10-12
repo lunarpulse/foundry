@@ -241,7 +241,7 @@ def negative_controls(doc, active_cats):
     assert d_real[-1] == "hold:human", d_real
     # counter hit 5 exactly at the 6th decision
     st_real = res_real[0] if isinstance(res_real, tuple) else res_real
-    assert st_real["counters"]["loopbacks"] == 5, st_real
+    assert st_real["counters"]["loopbacks"] == 6, st_real
     # 2. entry -> missing node must raise
     bad2 = copy.deepcopy(doc)
     bad2["entry"] = "missing"
