@@ -525,12 +525,12 @@ def sweep_rejection_fixtures():
             man = raw.decode()
             dl = [l for l in man.splitlines(True) if l.startswith("digest =")]
             assert dl, f"{name}: no digest line"
-            files_ = {"lens-a.md": open(f"{base}/{name}/lens-a.md").read(),
-                      "policy.toml": open(f"{base}/{name}/policy.toml").read(),
-                      "manifest.toml": man.replace(dl[0], "")}
+            files_ = {"lens-a.md": open(f"{base}/{name}/lens-a.md", "rb").read(),
+                      "policy.toml": open(f"{base}/{name}/policy.toml", "rb").read(),
+                      "manifest.toml": man.replace(dl[0], "").encode()}
             h_ = _hl.sha256()
             for pn in sorted(files_):
-                cb = files_[pn].encode()
+                cb = files_[pn]  # bytes (r23-4: original bytes)
                 h_.update(struct.pack("<Q", len(pn.encode())))
                 h_.update(pn.encode())
                 h_.update(struct.pack("<Q", len(cb)))
@@ -556,56 +556,81 @@ def sweep_rejection_fixtures():
                 out[nid] = []
         return out
 
-    def _all_cycles(pol, bound=32):
-        """All simple cycles incl. self-loops (bounded count)."""
+    def _all_cycles(pol, bound=256):
+        """All simple cycles incl. self-loops, rotation-Deduped.
+        Exceeding the bound FAILS (never silently under-check)."""
         succ = _succ(pol)
+        seen_canon = set()
         cycles = []
         for start in sorted(succ):
-            # DFS for simple cycles from start
             stack = [(start, [start])]
-            while stack and len(cycles) < bound:
+            while stack:
                 cur, path = stack.pop()
                 for nxt in succ.get(cur, []):
                     if nxt is None:
                         continue
                     if nxt == start:
-                        cycles.append(path + [start])
+                        cyc = path  # node sequence, no repeat
+                        # canonical rotation: smallest id first
+                        mi = cyc.index(min(cyc))
+                        canon = tuple(cyc[mi:] + cyc[:mi])
+                        if canon not in seen_canon:
+                            if len(seen_canon) >= bound:
+                                raise AssertionError(
+                                    f"cycle enumeration exceeded bound {bound}")
+                            seen_canon.add(canon)
+                            cycles.append(list(canon))
                     elif nxt not in path and nxt in succ:
                         stack.append((nxt, path + [nxt]))
         return cycles
 
+    def _bumps_in(do):
+        """Counter occurrence counts in an action sequence."""
+        out = {}
+        for m in re.finditer(r"bump[(]([A-Za-z_]\w*)[)]", do or ""):
+            out[m.group(1)] = out.get(m.group(1), 0) + 1
+        return out
+
+    def _merge(dst, src):
+        for k, v in src.items():
+            dst[k] = dst.get(k, 0) + v
+
     def _cycle_counter_analysis(pol):
-        """Per-TRAVERSAL bump counting with first-match branch
-        exclusivity: within one route node only ONE branch fires, so
-        multiple bumped branches on the same node toward the cycle
-        count as ONE bump per traversal. Returns list of per-cycle
-        (guard, bump_count_per_traversal)."""
+        """Per-TRAVERSAL bump counts. For each cycle, enumerate the
+        product of cycle-continuing branch choices at each route node
+        (each choice is a possible traversal under first-match), plus
+        deterministic node bumps. Returns list of
+        (guard, [per-traversal {counter: count}, ...])."""
+        import itertools
         nmap = {n["id"]: n for n in pol["nodes"]}
         results = []
         for cyc in _all_cycles(pol):
-            if len(cyc) < 2:
-                continue
-            cycset = set(cyc[:-1])
+            cycset = set(cyc)
             guard = None
-            bump_per_trav = 0
-            for nid in cycset:
+            route_options = []  # list of lists of (branch)
+            node_bumps = {}
+            for nid in cyc:
                 n = nmap[nid]
                 if n["kind"] == "route":
-                    # cycle-continuing branches = goto back into cycle
                     cont = [br for br in n.get("branches", [])
                             if br.get("goto") in cycset]
+                    opts = []
                     for br in cont:
                         w = br.get("when") or ""
                         m2 = re.search(r"count_lt[(]([A-Za-z_]\w*)", w)
                         if m2:
                             guard = m2.group(1)
-                    # first-match: at most one fired branch per visit
-                    if any("bump(" in (br.get("do") or "") for br in cont):
-                        bump_per_trav += 1
-                elif n["kind"] == "redrive":
-                    if n.get("bump"):
-                        bump_per_trav += 1
-            results.append((guard, bump_per_trav))
+                        opts.append(br)
+                    route_options.append(opts)
+                elif n["kind"] == "redrive" and n.get("bump"):
+                    _merge(node_bumps, {n["bump"]: 1})
+            traversals = []
+            for combo in itertools.product(*route_options) if route_options else [()]:
+                tot = dict(node_bumps)
+                for br in combo:
+                    _merge(tot, _bumps_in(br.get("do")))
+                traversals.append(tot)
+            results.append((guard, traversals))
         return results
 
     def _has_02_resume_cycle(pol):
@@ -670,8 +695,9 @@ def sweep_rejection_fixtures():
         return pol
 
     def _has_04_verdicts_no_verify(pol):
-        # (r22-3) semantic: verdicts as a VARIABLE reference (bare
-        # identifier outside quotes), not a string literal
+        # (r23-3) provenance: verdicts OR findings referenced as a
+        # VARIABLE (bare identifier) without a verify stage producing
+        # them — string literals don't count
         has_verify = any(n.get("kind") == "dispatch"
                          and any(st.get("role") == "verify"
                                  for st in n.get("stages", []))
@@ -682,19 +708,22 @@ def sweep_rejection_fixtures():
             if n["kind"] == "route":
                 for br in n.get("branches", []):
                     w = br.get("when") or ""
-                    # strip all quoted string literals first
                     stripped = re.sub(r'"[^"]*"', '""', w)
-                    if re.search(r"(?<![\w.])verdicts(?![\w])", stripped):
-                        return True
+                    for var in ("verdicts", "findings"):
+                        if re.search(rf"(?<![\w.]){var}(?![\w])", stripped):
+                            return True
         return False
 
     def _norm_04(pol):
+        # remove ALL provenance references from branch conditions
         for n in pol["nodes"]:
             if n["kind"] == "route":
                 for br in n.get("branches", []):
                     w = br.get("when") or ""
                     stripped = re.sub(r'"[^"]*"', '""', w)
-                    if re.search(r"(?<![\w.])verdicts(?![\w])", stripped):
+                    hit = any(re.search(rf"(?<![\w.]){v}(?![\w])", stripped)
+                              for v in ("verdicts", "findings"))
+                    if hit:
                         br["when"] = "false"
         return pol
 
@@ -712,7 +741,8 @@ def sweep_rejection_fixtures():
     pol02 = tl.load(open(f"{base}/02-resume-cycle/policy.toml", "rb"))
     assert not _has_02_resume_cycle(_norm_02_legal(copy.deepcopy(pol02))), \
         "02: legal deduct-node resume loop must NOT be a violation"
-    # 04 semantic regression: verdicts as a string literal is NOT a ref
+    # 04 semantic regressions (r23-3): string-literal verdicts alone is
+    # NOT a verdicts ref — but findings IS a provenance ref either way
     pol04 = tl.load(open(f"{base}/04-verdicts-no-verify/policy.toml", "rb"))
     str_lit = copy.deepcopy(pol04)
     for n in str_lit["nodes"]:
@@ -720,8 +750,16 @@ def sweep_rejection_fixtures():
             for br in n.get("branches", []):
                 if "verdicts" in (br.get("when") or ""):
                     br["when"] = 'any_in(findings.group, ["verdicts"])'
-    assert not _has_04_verdicts_no_verify(str_lit), \
-        "04: string-literal 'verdicts' must not count as a variable ref"
+    assert _has_04_verdicts_no_verify(str_lit), \
+        "04: findings reference (even with string-literal verdicts)" \
+        " must be a provenance violation"
+    no_ref = copy.deepcopy(pol04)
+    for n in no_ref["nodes"]:
+        if n["kind"] == "route":
+            for br in n.get("branches", []):
+                br["when"] = "false"
+    assert not _has_04_verdicts_no_verify(no_ref), \
+        "04: fully removed refs must clear the violation"
 
     # 10/11/12 (r22-1): per-traversal analysis on ALL cycles
     for fname in ("10-counter-guard-missing", "11-counter-guard-double",
@@ -729,36 +767,62 @@ def sweep_rejection_fixtures():
         pol = tl.load(open(f"{base}/{fname}/policy.toml", "rb"))
         results = _cycle_counter_analysis(pol)
         assert results, f"{fname}: no cycle found"
+        # guarded cycles only (cap analysis targets guarded cycles)
+        guarded = [(g, t) for g, travs in results if g is not None
+                   for t in travs]
+        assert guarded, f"{fname}: no guarded cycle found: {results}"
         if fname.endswith("missing"):
-            assert any(g is not None and b == 0 for g, b in results) and \
-                all(b == 0 for g, b in results), \
-                f"{fname}: expected guarded cycle with 0 bumps/traversal: {results}"
+            # every traversal bumps the guard 0 times
+            assert all(t.get(g, 0) == 0 for g, t in guarded), \
+                f"{fname}: expected 0 guard-bumps/traversal: {guarded}"
         elif fname.endswith("double"):
-            assert all(b >= 2 for g, b in results) and \
-                any(b >= 2 for g, b in results), \
-                f"{fname}: expected >=2 bumps/traversal: {results}"
+            # every traversal bumps the guard >= 2 times
+            assert all(t.get(g, 0) >= 2 for g, t in guarded), \
+                f"{fname}: expected >=2 guard-bumps/traversal: {guarded}"
         else:
-            assert any(g is not None and g == "loopbacks" and b >= 1
-                       for g, b in results) and \
-                all(g != "fix_rounds" or b == 0 for g, b in results), \
-                f"{fname}: expected guard(loopbacks) bumped with fix_rounds: {results}"
+            # guard(loopbacks) never bumped by any traversal while a
+            # different counter IS bumped (mismatch)
+            assert all(t.get("loopbacks", 0) == 0 and any(t.values())
+                       for g, t in guarded if g == "loopbacks"), \
+                f"{fname}: expected loopbacks never bumped: {guarded}"
         # branch-exclusivity regression (r22-1): splitting the node bump
         # into two same-target branches must NOT read as double
         if fname.endswith("double"):
+            # (r23-2) exclusive split: node bump removed, TWO same-
+            # target branches each carrying a bump — each traversal
+            # takes exactly ONE, so guard-bumps must be 1 (not 2)
             excl = copy.deepcopy(pol)
             for n in excl["nodes"]:
                 if n.get("id") == "fix":
                     n.pop("bump", None)
             for n in excl["nodes"]:
                 if n.get("kind") == "route":
-                    fired = False
                     for br in n.get("branches", []):
-                        if br.get("goto") == "fix" and not fired:
-                            br["do"] = "bump(loopbacks)"
-                            fired = True
+                        br.pop("do", None)
+                    # rebuild: cap branch (no bump) + guarded branch (bump)
+                    n["branches"] = [
+                        {"when": "timeout()", "goto": "end_hold"},
+                        {"when": "count_lt(loopbacks, 5)",
+                         "do": "bump(loopbacks)", "goto": "fix"},
+                        {"when": "true", "goto": "end_hold"},
+                    ]
             res2 = _cycle_counter_analysis(excl)
-            assert all(b == 1 for g, b in res2), \
-                f"{fname}: exclusive split branches must count 1/traversal: {res2}"
+            g2 = [(g, t) for g, travs in res2 if g is not None for t in travs]
+            assert g2 and all(t.get(g, 0) == 1 for g, t in g2), \
+                f"{fname}: exclusive split must be 1/traversal: {g2}"
+            # double action in ONE branch = 2 (r23-2)
+            dbl = copy.deepcopy(pol)
+            for n in dbl["nodes"]:
+                if n.get("id") == "fix":
+                    n.pop("bump", None)
+                if n.get("kind") == "route":
+                    for br in n.get("branches", []):
+                        if br.get("goto") == "fix":
+                            br["do"] = "bump(loopbacks); bump(loopbacks)"
+            res3 = _cycle_counter_analysis(dbl)
+            g3 = [(g, t) for g, travs in res3 if g is not None for t in travs]
+            assert g3 and all(t.get(g, 0) == 2 for g, t in g3), \
+                f"{fname}: single-branch double bump must be 2/traversal: {g3}"
         # cycle-removal mutation clears the analysis
         mut = copy.deepcopy(pol)
         for n in mut["nodes"]:
