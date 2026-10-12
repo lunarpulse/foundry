@@ -237,6 +237,14 @@ pub struct StreamRuntime {
     admission_blocked: std::sync::atomic::AtomicBool,
 }
 
+/// (publish-bridge v1.6 D2) 발행 전 재료 — precheck이 가드 해제 후 반환.
+#[derive(Debug, Clone)]
+pub struct PublishMaterial {
+    pub digest: String,
+    pub attempt: u32,
+    pub op_id: String,
+}
+
 impl StreamRuntime {
     pub fn new(orch: OrchestrationLog) -> Self {
         Self {
@@ -246,6 +254,81 @@ impl StreamRuntime {
             streams: Mutex::new(Vec::new()),
             admission_blocked: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// 발행 전 주문 상태와 발행 재료를 확인한다. 엔진 가드는 반환 전에 해제한다.
+    pub fn publish_precheck(
+        &self,
+        stream_id: &str,
+        order_id: &str,
+    ) -> Result<PublishMaterial, String> {
+        let stream = self.stream(stream_id).ok_or(format!("stream {stream_id} not registered"))?;
+        let material = {
+            let engine = stream.engine_if_unfenced()?;
+            let order = engine.order(order_id).ok_or(format!("order {order_id} not enrolled"))?;
+            if order.state() != OrderState::Publishing {
+                return Err(format!("order {order_id} must be Publishing, was {}", order.state()));
+            }
+            let digest = order.artifact_digest.clone().unwrap_or_default();
+            if digest.is_empty() {
+                return Err(format!("order {order_id} has empty artifact digest"));
+            }
+            let attempt = order.attempt().max(1);
+            PublishMaterial { digest, attempt, op_id: format!("{order_id}:{attempt}") }
+        };
+        Ok(material)
+    }
+
+    /// 발행 결과를 저널에 확정한다. 이미 확정된 주문은 같은 URL만 멱등 승인한다.
+    pub fn confirm_published(
+        &self,
+        stream_id: &str,
+        order_id: &str,
+        exec: &str,
+        pr_url: &str,
+    ) -> Result<OrderState, String> {
+        if pr_url.is_empty() || !pr_url.starts_with("https://") {
+            return Err("invalid pr_url".into());
+        }
+        let stream = self.stream(stream_id).ok_or(format!("stream {stream_id} not registered"))?;
+        let mut engine = stream.engine_if_unfenced()?;
+        let state = engine.order(order_id).ok_or(format!("order {order_id} not enrolled"))?.state();
+        let rows = stream.journal_rows()?;
+        let has_url = |rows: &[foundry_ledger::LedgerRow]| rows.iter().any(|row| {
+            if row.order_id != order_id || row.to_state != OrderState::Shipped.to_string() {
+                return false;
+            }
+            row.event_json.as_deref().and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                .is_some_and(|v| v.get("type").and_then(|t| t.as_str()) == Some("publish_confirmed")
+                    && v.get("pr_url").and_then(|u| u.as_str()) == Some(pr_url))
+        });
+        if state == OrderState::Shipped {
+            return if has_url(&rows) { Ok(OrderState::Shipped) }
+                else { Err("pr_url mismatch on shipped order".into()) };
+        }
+        if state != OrderState::Publishing {
+            return Err(format!("order {order_id} must be Publishing or Shipped, was {state}"));
+        }
+        engine.acquire(order_id, exec).map_err(|e| format!("publish lock: {e:?}"))?;
+        let ctx = crate::test_support::replay_ctx(order_id, &rows);
+        let ledger: &'static mut foundry_ledger::SqliteLedger = Box::leak(Box::new(
+            foundry_ledger::SqliteLedger::open(stream.journal()).map_err(|e| format!("journal: {e:?}"))?,
+        ));
+        let outcome = engine.dispatch_replay_ctx(
+            order_id, exec, &OrderEvent::PublishConfirmed { pr_url: pr_url.into() }, 1, &ctx, ledger,
+        ).map_err(|e| format!("publish: {e:?}"))?;
+        if outcome != Outcome::Applied {
+            return Err(format!("{outcome:?}"));
+        }
+        let state = engine.order(order_id).ok_or(format!("order {order_id} not enrolled"))?.state();
+        if state != OrderState::Shipped {
+            return Err(format!("order {order_id} confirmation left state {state}"));
+        }
+        let rows = stream.journal_rows()?;
+        if !has_url(&rows) {
+            return Err("published journal pr_url mismatch".into());
+        }
+        Ok(OrderState::Shipped)
     }
 
     /// (astra r9 P1) 승인 원장 결속 — 프로세스 수명 원장을 leak 해
@@ -1051,6 +1134,63 @@ mod tests {
         let mut o = Order::new(id.into(), ExternalRef::intake(id, &format!("dedup:{id}")), chrono::Utc::now());
         o.force_state_for_test(OrderState::Received, 1);
         o
+    }
+
+    mod publish {
+    use super::*;
+
+    fn publish_fixture(name: &str, state: OrderState) -> (PathBuf, StreamRuntime) {
+        let d = tmpdir(name);
+        let orch = OrchestrationLog::open(&d.join("orch.db")).unwrap();
+        let rt = StreamRuntime::new(orch);
+        rt.add_stream(Stream::new("publish", &d).unwrap()).unwrap();
+        let mut order = mkorder("pub-order");
+        order.force_state_for_test(state, 2);
+        if state == OrderState::Publishing { order.artifact_digest = Some("digest-1".into()); }
+        rt.stream("publish").unwrap().enroll(order).unwrap();
+        (d, rt)
+    }
+
+    #[test]
+    fn precheck_refuses_non_publishing() {
+        let (_d, rt) = publish_fixture("precheck-state", OrderState::FurnaceHold);
+        assert!(rt.publish_precheck("publish", "pub-order").unwrap_err().contains("Publishing"));
+    }
+
+    #[test]
+    fn confirm_first_transition_ships() {
+        let (_d, rt) = publish_fixture("confirm-first", OrderState::Publishing);
+        let url = "https://github.com/x/pr/1";
+        assert_eq!(rt.confirm_published("publish", "pub-order", "exec-a", url).unwrap(), OrderState::Shipped);
+        assert!(rt.stream("publish").unwrap().journal_rows().unwrap().iter().any(|r|
+            r.order_id == "pub-order" && r.to_state == "shipped" &&
+            r.event_json.as_deref().is_some_and(|j| j.contains(url))));
+    }
+
+    #[test]
+    fn confirm_idempotent_on_shipped_matching_url() {
+        let (_d, rt) = publish_fixture("confirm-idempotent", OrderState::Publishing);
+        let url = "https://github.com/x/pr/1";
+        rt.confirm_published("publish", "pub-order", "exec-a", url).unwrap();
+        let before = rt.stream("publish").unwrap().journal_rows().unwrap().len();
+        assert_eq!(rt.confirm_published("publish", "pub-order", "exec-b", url).unwrap(), OrderState::Shipped);
+        assert_eq!(rt.stream("publish").unwrap().journal_rows().unwrap().len(), before);
+    }
+
+    #[test]
+    fn confirm_rejects_url_mismatch_on_shipped() {
+        let (_d, rt) = publish_fixture("confirm-mismatch", OrderState::Publishing);
+        rt.confirm_published("publish", "pub-order", "exec-a", "https://github.com/x/pr/1").unwrap();
+        assert!(rt.confirm_published("publish", "pub-order", "exec-b", "https://github.com/x/pr/2").is_err());
+    }
+
+    #[test]
+    fn confirm_rejects_empty_or_invalid_url() {
+        let (_d, rt) = publish_fixture("confirm-invalid-url", OrderState::Publishing);
+        for url in ["", "github.com/x"] {
+            assert_eq!(rt.confirm_published("publish", "pub-order", "exec-a", url).unwrap_err(), "invalid pr_url");
+        }
+    }
     }
 
     /// 주문을 자율 구간+직접 승인으로 Shipped 까지.
