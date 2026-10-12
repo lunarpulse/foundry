@@ -8,11 +8,11 @@ loopbacks = 0
 [[nodes]]
 id = "lenses"
 kind = "dispatch"
-# (r12-2) 원본 렌즈 구성 이식: edge 리뷰어가 자신의 추적 "뒤" claims를
-# 확인 = edge와 claims가 동일 session(trace). verif은 독립 렌즈(병렬).
-# triage는 전부 after로 수집. claims 개봉은 after=edge 완료 시점.
+# (r12-2/r13-2) 원본 렌즈 구성: edge와 claims가 동일 session(trace) =
+# 같은 리뷰어가 자신의 추적 "뒤" claims 확인(세션 결속, 순서 아님).
+# verif은 독립 렌즈(병렬). triage는 after로 전부 수집.
 stages = [
-  { id = "edge", lenses = ["lens-edge.md"], role = "lens", output_schema = "schema-findings.toml" },
+  { id = "edge", lenses = ["lens-edge.md"], role = "lens", session = "trace", output_schema = "schema-findings.toml" },
   { id = "verif", lenses = ["lens-verif.md"], role = "lens", output_schema = "schema-findings.toml" },
   { id = "claims", lenses = ["lens-claims.md"], role = "lens", after = "edge", session = "trace", output_schema = "schema-findings.toml" },
   { id = "triage", lenses = ["lens-triage.md"], role = "verify", after = ["edge", "verif", "claims"], output_schema = "schema-triage.toml" },
@@ -46,11 +46,13 @@ goto = "human"
 [[nodes.branches]]   # (r11-1b) 공통 loopback 상한 — 원본 "loopback 전
 when = '(any_in(verdicts, ["intent_gap", "bad_plan"])) && !count_lt(loopbacks, 5)'   # increment, 5 초과 HALT
 goto = "human"          # 상한 인간 — replan resume 불가
-[[nodes.branches]]
+[[nodes.branches]]   # (r13-6) bump+revert가 hold "전" — 원본 순서:
 when = 'any_in(verdicts, ["intent_gap"])'
+do = 'bump(loopbacks); revert(origin)'   # increment → 되돌림 → 인간
 goto = "human_gap"
-[[nodes.branches]]
+[[nodes.branches]]   # (r13-6) bump가 redrive "전" — 원본 순서
 when = 'any_in(verdicts, ["bad_plan"]) && count_lt(loopbacks, 5)'
+do = 'bump(loopbacks)'
 goto = "replan"
 [[nodes.branches]]
 when = 'any_in(verdicts, ["bad_plan"])'
@@ -86,7 +88,6 @@ target = "die-workdir"
 payload = "plan"
 base = "origin"
 pre_stage = "replan-stage"
-bump = "loopbacks"
 on_done = "lenses"
 on_redrive_error = "hold"
 hold_target = "human"
@@ -107,7 +108,6 @@ target = "die-workdir"
 payload = "plan_full"
 base = "origin"
 pre_stage = "replan-full-stage"
-bump = "loopbacks"
 on_done = "lenses"
 hold_target = "human"
 on_redrive_error = "hold"

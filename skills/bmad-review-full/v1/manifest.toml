@@ -1,6 +1,6 @@
 id = "bmad-review-full"
 interface_version = 1
 kind = "review-pack"
-version = "1.1.0"
+version = "1.2.0"
 files = ["lens-edge.md", "lens-verif.md", "lens-claims.md", "lens-triage.md", "lens-replan.md", "lens-replan-full.md", "schema-defer.toml", "schema-findings.toml", "schema-triage.toml", "policy.toml"]
-digest = "997ead1e116fb94f9751b0d7fab56d581007355288cd34cb266f6294bed0af16"
+digest = "6cdfac4917b95629f17b3bcc24be8e3befdf3262b8c9abaa36ecf876287887b9"
