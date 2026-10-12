@@ -1,0 +1,6 @@
+id = "fixture-min"
+interface_version = 1
+kind = "review-pack"
+version = "1.0.0"
+files = ["lens-a.md", "policy.toml"]
+digest = "b2b03f4001dad7c6257aac7ffffd3fc2497fc64a1bb555de160c0ca8405ff19f"

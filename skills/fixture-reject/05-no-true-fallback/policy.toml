@@ -1,0 +1,38 @@
+entry = "scan"
+
+[[nodes]]
+id = "scan"
+kind = "dispatch"
+stages = [{ id = "lens-a", lenses = ["lens-a.md"], role = "lens" }]
+on_done = "done"
+hold_target = "end_hold"
+
+[[nodes]]
+[[nodes]]
+id = "done"
+kind = "route"
+[[nodes.branches]]
+when = "false"
+goto = "end_hold"
+[[nodes.branches]]
+when = '!has_findings(any)'
+goto = "end_hold"
+[[nodes]]
+id = "end_hold"
+kind = "hold"
+resume_targets = []
+
+[[output.on_error]]
+state = "dispatch_error"
+policy = "discard-stage"
+
+[[output.on_error]]
+state = "parse_error"
+policy = "discard-finding"
+
+[[output.on_error]]
+state = "timeout"
+policy = "hold"
+
+[hold]
+timeout_s = 0

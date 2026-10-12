@@ -1,6 +1,6 @@
 id = "fixture-min"
 interface_version = 1
-kind = "advisory-pack"
+kind = "review-pack"
 version = "1.0.0"
 files = ["lens-a.md", "policy.toml"]
-digest = "PENDING"
+digest = "8dacc42e8c337eac7bb4131b9ed976956be6ce8097ff634f5345d5dee53323ab"
