@@ -596,41 +596,46 @@ def sweep_rejection_fixtures():
             dst[k] = dst.get(k, 0) + v
 
     def _cycle_counter_analysis(pol):
-        """Per-TRAVERSAL bump counts. For each cycle, enumerate the
-        product of cycle-continuing branch choices at each route node
-        (each choice is a possible traversal under first-match), plus
-        deterministic node bumps. Returns list of
-        (guard, [per-traversal {counter: count}, ...])."""
+        """(r24-1) Per-TRAVERSAL analysis. A traversal of the cycle
+        follows EXACT edges: at each route node only branches whose
+        goto is the cycle's NEXT node (not merely any cycle member)
+        are choices; guard is recorded PER traversal (choice), not
+        collapsed. Node bumps collected only from nodes ON the exact
+        path. Returns list of ({counter:guard-counts per traversal},
+        [per-traversal {counter: bump counts}, ...])."""
         import itertools
         nmap = {n["id"]: n for n in pol["nodes"]}
         results = []
         for cyc in _all_cycles(pol):
-            cycset = set(cyc)
-            guard = None
-            route_options = []  # list of lists of (branch)
+            L = len(cyc)
+            route_options = []   # per position: list of (branch)
             node_bumps = {}
-            for nid in cyc:
+            for i, nid in enumerate(cyc):
+                nxt = cyc[(i + 1) % L]
                 n = nmap[nid]
                 if n["kind"] == "route":
                     cont = [br for br in n.get("branches", [])
-                            if br.get("goto") in cycset]
-                    opts = []
-                    for br in cont:
-                        w = br.get("when") or ""
-                        m2 = re.search(r"count_lt[(]([A-Za-z_]\w*)", w)
-                        if m2:
-                            guard = m2.group(1)
-                        opts.append(br)
-                    route_options.append(opts)
-                elif n["kind"] == "redrive" and n.get("bump"):
-                    _merge(node_bumps, {n["bump"]: 1})
+                            if br.get("goto") == nxt]
+                    route_options.append(cont)
+                else:
+                    route_options.append(None)
+                    if n["kind"] == "redrive" and n.get("bump"):
+                        _merge(node_bumps, {n["bump"]: 1})
             traversals = []
-            for combo in itertools.product(*route_options) if route_options else [()]:
+            for combo in itertools.product(*[
+                    opts if opts else [None] for opts in route_options]):
                 tot = dict(node_bumps)
+                guard = None
                 for br in combo:
+                    if br is None:
+                        continue
+                    w = br.get("when") or ""
+                    m2 = re.search(r"count_lt[(]([A-Za-z_]\w*)", w)
+                    if m2:
+                        guard = m2.group(1)
                     _merge(tot, _bumps_in(br.get("do")))
-                traversals.append(tot)
-            results.append((guard, traversals))
+                traversals.append((guard, tot))
+            results.append(traversals)
         return results
 
     def _has_02_resume_cycle(pol):
@@ -695,9 +700,8 @@ def sweep_rejection_fixtures():
         return pol
 
     def _has_04_verdicts_no_verify(pol):
-        # (r23-3) provenance: verdicts OR findings referenced as a
-        # VARIABLE (bare identifier) without a verify stage producing
-        # them — string literals don't count
+        # (r24-2) provenance: verdicts / findings / has_findings —
+        # raw lens output used without a verify stage producing it
         has_verify = any(n.get("kind") == "dispatch"
                          and any(st.get("role") == "verify"
                                  for st in n.get("stages", []))
@@ -709,8 +713,10 @@ def sweep_rejection_fixtures():
                 for br in n.get("branches", []):
                     w = br.get("when") or ""
                     stripped = re.sub(r'"[^"]*"', '""', w)
-                    for var in ("verdicts", "findings"):
-                        if re.search(rf"(?<![\w.]){var}(?![\w])", stripped):
+                    for pat in (r"(?<![\w.])verdicts(?![\w])",
+                                r"(?<![\w.])findings(?![\w])",
+                                r"(?<![\w.])has_findings(?![\w])"):
+                        if re.search(pat, stripped):
                             return True
         return False
 
@@ -721,9 +727,10 @@ def sweep_rejection_fixtures():
                 for br in n.get("branches", []):
                     w = br.get("when") or ""
                     stripped = re.sub(r'"[^"]*"', '""', w)
-                    hit = any(re.search(rf"(?<![\w.]){v}(?![\w])", stripped)
-                              for v in ("verdicts", "findings"))
-                    if hit:
+                    pats = (r"(?<![\w.])verdicts(?![\w])",
+                            r"(?<![\w.])findings(?![\w])",
+                            r"(?<![\w.])has_findings(?![\w])")
+                    if any(re.search(p, stripped) for p in pats):
                         br["when"] = "false"
         return pol
 
@@ -753,6 +760,14 @@ def sweep_rejection_fixtures():
     assert _has_04_verdicts_no_verify(str_lit), \
         "04: findings reference (even with string-literal verdicts)" \
         " must be a provenance violation"
+    # (r24-2) has_findings alone is also a provenance ref
+    hf = copy.deepcopy(pol04)
+    for n in hf["nodes"]:
+        if n["kind"] == "route":
+            for br in n.get("branches", []):
+                br["when"] = "has_findings(any)"
+    assert _has_04_verdicts_no_verify(hf), \
+        "04: has_findings(any) without verify must be a violation"
     no_ref = copy.deepcopy(pol04)
     for n in no_ref["nodes"]:
         if n["kind"] == "route":
@@ -767,21 +782,16 @@ def sweep_rejection_fixtures():
         pol = tl.load(open(f"{base}/{fname}/policy.toml", "rb"))
         results = _cycle_counter_analysis(pol)
         assert results, f"{fname}: no cycle found"
-        # guarded cycles only (cap analysis targets guarded cycles)
-        guarded = [(g, t) for g, travs in results if g is not None
-                   for t in travs]
+        guarded = [(g, t) for travs in results for g, t in travs
+                   if g is not None]
         assert guarded, f"{fname}: no guarded cycle found: {results}"
         if fname.endswith("missing"):
-            # every traversal bumps the guard 0 times
             assert all(t.get(g, 0) == 0 for g, t in guarded), \
                 f"{fname}: expected 0 guard-bumps/traversal: {guarded}"
         elif fname.endswith("double"):
-            # every traversal bumps the guard >= 2 times
             assert all(t.get(g, 0) >= 2 for g, t in guarded), \
                 f"{fname}: expected >=2 guard-bumps/traversal: {guarded}"
         else:
-            # guard(loopbacks) never bumped by any traversal while a
-            # different counter IS bumped (mismatch)
             assert all(t.get("loopbacks", 0) == 0 and any(t.values())
                        for g, t in guarded if g == "loopbacks"), \
                 f"{fname}: expected loopbacks never bumped: {guarded}"
@@ -799,15 +809,21 @@ def sweep_rejection_fixtures():
                 if n.get("kind") == "route":
                     for br in n.get("branches", []):
                         br.pop("do", None)
-                    # rebuild: cap branch (no bump) + guarded branch (bump)
+                    # rebuild: TWO same-destination branches, only ONE
+                    # carrying a bump — each traversal fires exactly
+                    # one (first-match), so guard-bumps must be 1
                     n["branches"] = [
-                        {"when": "timeout()", "goto": "end_hold"},
+                        {"when": "timeout() && count_lt(loopbacks, 5)",
+                         "do": "bump(loopbacks)", "goto": "fix"},
                         {"when": "count_lt(loopbacks, 5)",
                          "do": "bump(loopbacks)", "goto": "fix"},
                         {"when": "true", "goto": "end_hold"},
                     ]
+                    # verify the mutant actually has 2 fix-dest branches
+                    fx = [b for b in n["branches"] if b.get("goto") == "fix"]
+                    assert len(fx) == 2, f"regression needs 2 fix branches, got {len(fx)}"
             res2 = _cycle_counter_analysis(excl)
-            g2 = [(g, t) for g, travs in res2 if g is not None for t in travs]
+            g2 = [(g, t) for travs in res2 for g, t in travs if g is not None]
             assert g2 and all(t.get(g, 0) == 1 for g, t in g2), \
                 f"{fname}: exclusive split must be 1/traversal: {g2}"
             # double action in ONE branch = 2 (r23-2)
@@ -820,7 +836,7 @@ def sweep_rejection_fixtures():
                         if br.get("goto") == "fix":
                             br["do"] = "bump(loopbacks); bump(loopbacks)"
             res3 = _cycle_counter_analysis(dbl)
-            g3 = [(g, t) for g, travs in res3 if g is not None for t in travs]
+            g3 = [(g, t) for travs in res3 for g, t in travs if g is not None]
             assert g3 and all(t.get(g, 0) == 2 for g, t in g3), \
                 f"{fname}: single-branch double bump must be 2/traversal: {g3}"
         # cycle-removal mutation clears the analysis
@@ -846,15 +862,15 @@ def sweep_rejection_fixtures():
     assert b"\r\n" in b8, "08 must carry real CRLF"
     b9 = open(f"{base}/09-no-trailing-lf/manifest.toml", "rb").read()
     assert not b9.endswith(b"\n"), "09 must lack trailing LF"
-    files = {"lens-a.md": open(f"{base}/08-crlf-manifest/lens-a.md").read(),
-             "policy.toml": open(f"{base}/08-crlf-manifest/policy.toml").read()}
+    files = {"lens-a.md": open(f"{base}/08-crlf-manifest/lens-a.md", "rb").read(),
+             "policy.toml": open(f"{base}/08-crlf-manifest/policy.toml", "rb").read()}
     man = b8.decode()
     line = [l for l in man.splitlines(True) if l.startswith("digest =")][0]
-    files["manifest.toml"] = man.replace(line, "")
+    files["manifest.toml"] = man.replace(line, "").encode()
     import hashlib
     h = hashlib.sha256()
     for pn in sorted(files):
-        cb = files[pn].encode()
+        cb = files[pn]  # bytes (r24-MINOR-2)
         h.update(struct.pack("<Q", len(pn.encode())))
         h.update(pn.encode())
         h.update(struct.pack("<Q", len(cb)))
