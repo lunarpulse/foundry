@@ -277,6 +277,83 @@ impl StreamRuntime {
         Ok(())
     }
 
+    /// (M7 데모) 게이트에서 라이브 승인 — 원장 그랜트(CONSUMED 소비)로
+    /// Approved 를 적용한다. advance_to_gate 이후의 프로덕션 경로.
+    pub fn approve_at_gate(
+        &self,
+        stream_id: &str,
+        order_id: &str,
+        exec: &str,
+        grant_id: &str,
+        intent: &str,
+        artifact_digest: &str,
+    ) -> Result<foundry_workflow::Outcome, String> {
+        let e = self.stream(stream_id).ok_or(format!("stream {stream_id} not registered"))?;
+        let mut eng = e.engine_if_unfenced()?;
+        let ap_path = self
+            .approval_path
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or("approval ledger not bound (fail-closed)")?;
+        let mut ap = foundry_approval::ApprovalLedger::open(&ap_path)
+            .map_err(|er| format!("approval reopen: {er:?}"))?;
+        ap.issue_grant(
+            grant_id,
+            &format!("tok-{grant_id}"),
+            &serde_json::json!({
+                "order_id": order_id, "intent": intent,
+                "artifact_digest": artifact_digest, "root_scope": "",
+            }),
+        )
+        .map_err(|er| format!("issue grant: {er:?}"))?;
+        let mut hook = foundry_workflow::ApprovalLedgerAdapter(ap);
+        let grant = foundry_workflow::GrantRef { grant_id: grant_id.into() };
+        eng.dispatch_live(
+            order_id,
+            exec,
+            &foundry_domain::OrderEvent::Approved {
+                intent: intent.into(),
+                artifact_digest: artifact_digest.into(),
+            },
+            1,
+            Some(&grant),
+            &mut hook,
+        )
+        .map_err(|er| format!("dispatch_live: {er:?}"))
+    }
+
+    /// (M7 데모) 출하 확정 — PublishConfirmed 를 재생 컨텍스트로 적용.
+    pub fn confirm_publish(
+        &self,
+        stream_id: &str,
+        order_id: &str,
+        exec: &str,
+        pr_url: &str,
+    ) -> Result<(), String> {
+        let e = self.stream(stream_id).ok_or(format!("stream {stream_id} not registered"))?;
+        let mut eng = e.engine_if_unfenced()?;
+        let rows = foundry_ledger::SqliteLedger::open(e.journal())
+            .map_err(|er| format!("journal: {er:?}"))?
+            .read_all()
+            .map_err(|er| format!("journal read: {er:?}"))?;
+        let ctx = crate::test_support::replay_ctx(order_id, &rows);
+        let ro: &'static mut foundry_ledger::SqliteLedger = Box::leak(Box::new(
+            foundry_ledger::SqliteLedger::open(e.journal())
+                .map_err(|er| format!("journal: {er:?}"))?,
+        ));
+        eng.dispatch_replay_ctx(
+            order_id,
+            exec,
+            &foundry_domain::OrderEvent::PublishConfirmed { pr_url: pr_url.into() },
+            1,
+            &ctx,
+            ro,
+        )
+        .map_err(|er| format!("publish: {er:?}"))?;
+        Ok(())
+    }
+
     /// (M7.1 재리뷰 r2) 핸드오프 준비 — 제안 행을 만들고 **매니페스트**를
     /// 반환(그랜트 스코프 발급 재료). 소비는 dispatch_handoff.
     pub fn prepare_handoff(

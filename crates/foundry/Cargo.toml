@@ -13,6 +13,9 @@ futures = "0.3"
 sha2 = "0.10"
 hex = "0.4"
 foundry-domain = { path = "../foundry-domain" }
+foundry-orch = { path = "../foundry-orch" }
+foundry-approval = { path = "../foundry-approval" }
+foundry-workflow = { path = "../foundry-workflow" }
 foundry-line = { path = "../foundry-line" }
 foundry-blueprint = { path = "../foundry-blueprint" }
 foundry-ledger = { path = "../foundry-ledger" }

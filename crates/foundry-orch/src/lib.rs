@@ -1164,6 +1164,8 @@ mod port_tests {
 
 /// (T58 테스트 지원) 저널 행에서 신뢰 커서 발급 — 게이트 common 의
 /// replay_ctx_for 등가. foundry-workflow 공개 API 만 사용.
+/// (M7 데모) 프로덕션 바이너리/예제에서 쓰는 재생 컨텍스트 조립 —
+/// test_support(cfg(test)) 와 동일 논리의 공개 버전.
 pub mod test_support {
     /// 터미널 커밋먼트 산출 후 **주문별 마지막 행 위치**로 커서 발급
     /// (다주문 저널: 전역 max_seq 가 요청 주문의 행이 아닐 수 있다 —
