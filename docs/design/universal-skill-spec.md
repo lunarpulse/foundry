@@ -1,7 +1,7 @@
 # Foundry Universal Skill Spec — 범용 실행 모델 (Universal Review Engine)
 
-- **버전**: v0.8 (2026-10-12) — r6 REWORK(MAJOR 8) 반영. r6가 재계획/
-  MAX_ATTEMPTS 충돌 해소 확인. 재검증 대기.
+- **버전**: v0.9 (2026-10-12) — r7 REWORK(MAJOR 6+MINOR) 반영.
+  generation 모델·인과·크래시 창 해소 r7 확인. 재검증 대기.
 - **의도(소유자)**: Foundry는 어떤 방법론도 돌릴 수 있는 유니버설
   플랫폼. BMad는 스킬 데이터의 첫 고객. **Rust 도메인에 방법론
   코드가 박히는 순간이 실패.** 엔진 고정·확장 선언(procedural macro
@@ -123,10 +123,12 @@ on_done = "HALT"     # 승계, 산출물은 재검증 의무(§3.3a)
 id = "pass"          # ④' emit(InspectionPassed)
 kind = "emit"
 event = "InspectionPassed"
+payload_from = "summary"   # (r7-1 스키마 필수)
 
 [[nodes]]
 id = "human"         # ⑤ hold
 kind = "hold"
+resume_targets = ["replan", "route1"]   # (r7-1 스키마 필수)
 ```
 
 **노드 5종 = 엔진 전부**: `dispatch` / `route` / `redrive` / `emit` /
@@ -140,7 +142,7 @@ kind = "hold"
 | 렌즈 독립 병렬+after | dispatch stages | 동등 |
 | claims=같은 리뷰어 후속 | session 재사용+seal | 동등 |
 | 트리아지 실측 검증 | verify 스테이지(팩 지시문) | 동등 |
-| patch=같은 구현자 재호출 | redrive(die-workdir) — **동일 workdir 재디스패치로 세션·작업물 지속** | 동등(r3 §4 '변형' → v0.5 승격) |
+| patch=같은 구현자 재호출 | redrive: 물리 실행 격리(gen-N workdir) + **논리 구현자 세션 계승**(fix-context 전달·base=최신 수용) | 동등(물리/논리 분리 — r7-7) |
 | fix 루프(무제한이던 것) | fix_rounds 상한(팩 값) | 동등+상한 |
 | intent_gap/bad_plan → **자동 재계획 5회** | replan 노드: pre_stage(KEEP 추출·계획 수정) → redrive(generation++) — 도메인 시도 불변 | **동등**(§2.4a) |
 | intent_gap: 인간 해결 후 재계획 | hold 후 인간 API의 `resume`이 replan 노드로 진입 | 동등 |
@@ -186,13 +188,22 @@ do_seq   := action ( ';' action )*     ; emit은 전 시퀀스에 최대 1회
   route는 무매치 불가 — 마지막 branch `true` 폴백 필수(로드 검증).
   `fail-run` = 실행 중단+저널 review_aborted+Inspecting 유지+알림
   (도메인 이벤트 없음 — 재주문은 운영/인간 정책).
-- 노드 필드 제약(§2.3a): dispatch{stages,side_records?,on_done},
-  route{branches(마지막 true)}, redrive{target,payload,bump?,
-  pre_stage?,on_done}, emit{event,payload_from}(on_done 금지 —
-  HALT 암시), hold{resume_targets,notify_only?}(on_done 금지).
-  entry는 dispatch 노드만. HALT는 예약어(on_done 값 불가).
+- **노드 규범 스키마(r7-1)** — 유일 규범, 예제·부록 fixture는 이것에
+  복종:
+  | kind | 필수 | 선택 | 금지 |
+  |---|---|---|---|
+  | dispatch | stages, on_done | side_records, role | — |
+  | route | branches(마지막 원소 when="true") | — | on_done |
+  | redrive | target, payload, on_done | bump, pre_stage, base("latest"\|"origin", 기본 latest), on_redrive_error("hold"\|"fail-run", 기본 hold) | — |
+  | emit | event, payload_from | — | on_done(HALT 암시) |
+  | hold | resume_targets | notify_only | on_done |
+  branch: {when, goto} 또는 {when, do} — goto와 do 상호배제, do는
+  emit/hold/bump 시퀀스(emit≤1). entry = 그래프 최상위 `entry`(dispatch
+  노드 id만). 예제 정합(반영): replan+payload="replan", pass+
+  payload_from="summary", human+resume_targets=["replan","…"],
+  emit_failed_node의 on_done="HALT" 제거(HALT 암시).
   부록 A에 **수용 fixture(전체 팩)+거부 fixture(검증 규칙별 1개)**
-  필수 — 구현 승인 전 제출.
+  필수 — 구현 승인 전 제출(아래 부록에 실제 수록).
 - 우선순위 `!` > `&&` > `||`, 괄호 허용. `any`는 has_findings의
   **예약 와일드카드**(로드 검증에서 일반 태그명과 충돌 거부).
 - **provenance(r3-MAJOR-4, r4-MAJOR-8)**: 조건식 바인딩은 엔진이
@@ -200,12 +211,20 @@ do_seq   := action ( ';' action )*     ; emit은 전 시퀀스에 최대 1회
   스테이지의 출력만 verdicts/findings.group 스코프가 됨(로드 검증:
   verify 스테이지 정확히 1개, 미선언 시 조건식에서 verdicts/
   findings 참조 거부). 원시 렌즈 출력은 has_findings에서도 불가.
-  **barrier 진리표(r5-9)** — (stage_total, stage_ok, verify_ok):
-  all-error / no-valid-stage / valid-partial(일부 유효+verify 유효)
-  / all-ok / **verify-invalid**(유효 stage 있어도 verify 오류·폐기)
-  — 배타적 5분류. pass 진입 가능은 all-ok·valid-partial뿐, 엔진이
-  상태별 branch 진입 집합 강제(조건식이 아니라 상태 머신 판정).
-  verify-invalid는 on_verify_invalid 정책(hold|fail-run)만.
+  **barrier 필요충분조건(r7-5)** — 집계 단위 = **dispatch activation
+  하나**(다중 dispatch는 각자 barrier). 술어: T=스테이지 수,
+  E=오류(dispatch/timeout) 수, R=정상·정규화 거부 수, V=verify
+  스테이지의 최종 상태(ok|error|absent).
+  - all-error ⟺ E=T (V 포함 전부 오류)
+  - no-valid-stage ⟺ E<T ∧ 유효 출력 0 (R>0 정규화 거부 포함)
+  - verify-invalid ⟺ 유효 출력 ≥1 ∧ V=error
+  - valid-partial ⟺ 0<유효<T ∧ V=ok
+  - all-ok ⟺ 유효=T ∧ V=ok
+  배타적(조건 불충족 시 정의되지 않음 없음). **verify 없는 dispatch
+  허용** — 단 그 activation의 조건식은 verdicts/findings 참조
+  불가(로드 검증이 정적 차단) — provenance 모순 제거. pass 진입은
+  all-ok·valid-partial만, 엔진이 상태별 branch 진입 집합 강제.
+  verify-invalid는 on_verify_invalid(hold|fail-run)만.
 - `do` 시퀀스 문법: `action ( ';' action )*` — 다중 emit은 로드
   검증 거부(도메인 단일 전이 원칙).
 
@@ -213,7 +232,7 @@ do_seq   := action ( ';' action )*     ; emit은 전 시퀀스에 최대 1회
 
 | 루프 | 매커니즘 | 도메인 attempt |
 |---|---|---|
-| **fix 루프**(팩 내부) | redrive가 **같은 Inspecting 상태에서** 같은 Die workdir 재디스패치 — Die 재시작 없음, 이벤트 없음 | **불변** |
+| **fix 루프**(팩 내부) | redrive: Inspecting 유지 + **새 gen workdir에서 Die 프로세스 재실행**(물리 재실행, 논리 세션 계승 — §2.4a), 이벤트 없음 | **불변** |
 | **재계획**(BMad 5회) | pre_stage(KEEP·계획 수정) 후 redrive(새 **generation** 실행 — §2.4a) | **불변** (도메인 시도 아님) |
 
 - 두 루프의 구분은 **팩의 그래프 설계가 소유** — 엔진은 redrive가
@@ -257,9 +276,11 @@ review-run 소유의 범용 실행 회차(generation)로 정의한다.**
   무관하게 **우회 불가** — "상한 경로 포함"이 아니라 진입 차단.
 - 카운터: u64, run 생성 시 0, bump만 증가, 감소 없음, overflow 시
   엔진 hold(래핑 방지). run 간 승계는 §3.3a(주문 단위 누계).
-- 그래프 로드 검증: 모든 사이클 경로에 {예산 차감 노드} 포함 —
-  redrive/dispatch 외 노드만의 사이클은 존재 불가(route는
-  이동만, emit/hold는 종단·HALT)이므로 구조적으로 자동 충족.
+- 그래프 로드 검증(r7-2): **차감 노드(dispatch/redrive)를 제거한
+  전이 그래프가 비순환(DAG)인지** 정적 검사 — route↔route 상호
+  참조·hold→resume→hold 사이클(resume_targets 그래프 포함) 전부
+  거부. "구조적 자동 충족" 주장 철회(반례: route A↔B). 거부
+  fixture 2종(route 순환, resume 순환) 부록 고정.
 
 ### 2.5 정규화 (r3-MAJOR-7)
 - 4분류(ok/parse_error/dispatch_error/timeout)별 정책표 — 팩이
@@ -335,7 +356,12 @@ policy = "discard-finding" # 개별 finding 거부(부분 거부)
    ledger 단일 트랜잭션**에 기록(InspectionFailed 포함). 복구는 원래
    action_id로 영수증 회수, 커서 완료는 그 영수증 근거 멱등 확정.
    늦은 emit 재실행은 UNIQUE 위반으로 차단(order.rs 284가 attempt
-   미검사 사실의 대비책).
+   미검사 사실의 대비책). **영수증 없는 구 run emit(r7-3)**: ledger
+   트랜잭션 안에서 expected order version·attempt·**활성 run/epoch**
+   ·generation·artifact·유효 증거를 전부 대조 — 구 run 무효화는
+   활성 epoch 전진으로 직렬화, 구 run의 emit은 epoch 불일치로
+   거부(UNIQUE만으로는 구 run 최초 지연 emit을 못 막는 r7 반례
+   폐쇄). 기존 영수증은 재적용 없이 반환.
 5. **디스패치 fencing(r3-MAJOR-6, r4-MAJOR-7)**: (a) 응답 차단 —
    stage별 dispatch generation + 활성 실행 토큰 내구 기록, 응답
    수용 시 generation·토큰·run·attempt·artifact를 **단일 수용
@@ -361,13 +387,14 @@ policy = "discard-finding" # 개별 finding 거부(부분 거부)
   `abort`. 결속 재검사(run·attempt·artifact)와 커밋이 **동일 원자
   경계**(§3.2.4). API 멱등(중복 응답 폐기 — action_id).
 - `resume(node_id)`: **팩이 hold 노드에 선언한 허용 목적지 목록**
-  (`resume_targets`)으로 제한. hold 진입 시 **선행 activation/evidence
-  id 집합 + 현재 artifact digest를 hold 레코드에 저장** — resume·
-  commit_pass·commit_fail·abort 전부 동일 hold 소비 규칙(CAS)으로
-  사전조건을 그 집합과 대조(구 활성화 증거 배제 — r6-7). 자동
-  Passed는 **현재 검증 회차의 verify 증거만** 인정. 인간
-  commit_pass 대체는 명시적 override: 신원+사유+원장 증거.
-  경합 시 하나만 승리(늦은 응답 폐기).
+  (`resume_targets`)으로 제한. hold 진입 시 **불변 hold_instance_id
+  발급**(재진입 시마다 신규 발급 — r7-4) + 선행 activation/evidence
+  id 집합 + 현재 artifact digest를 hold 레코드에 저장. **네 인간
+  API(resume/commit_pass/commit_fail/abort) 전부 hold_instance_id를
+  필수 입력** — CAS는 그 ID·미소비 상태·증거 스냅샷에 대해 수행
+  (H1 화면의 늦은 요청이 H2를 소비하는 구현 배제). 자동 Passed는
+  현재 검증 회차의 verify 증거만 인정. commit_pass 대체는 명시적
+  override: 신원+사유+원장 증거. 경합 시 하나만 승리.
 
 ### 3.3a 카운터·세션 승계 (구 §3.6)
 - 주문 단위 누계(fix_rounds·replans 등): run 저널에서 주문 최신 run
@@ -392,6 +419,27 @@ policy = "discard-finding" # 개별 finding 거부(부분 거부)
 5. `skills/plain-cr-review/v1` — 인수: **라우팅·루프·어휘 전부
    다른데 엔진 diff 0**
 
-## 부록 A (구현 시점 확정 예정)
-정규화 스키마 표준 템플릿(markdown 그룹 규칙 형식·필수 필드 집합)·
-golden digest 목록·dispatch 스테이지 TOML 전체 예.
+## 부록 A — 규범 fixture (r7-6 실수록)
+
+### A.1 최소 팩 (수용) — 실제 바이트·digest
+파일: `skills/fixture-min/v1/` (아래 내용이 곧 파일 내용, LF 개행,
+파일 끝 LF 있음)
+- `manifest.toml`:
+  `id = "fixture-min"\ninterface_version = 1\nkind = "advisory-pack"\nversion = "1.0.0"\ndigest = "<아래 계산값>"\n`
+  (digest 줄은 pack digest 계산 시 제거 대상)
+- `lens-a.md`: `ok\n`
+- `policy.toml`:
+  `[[nodes]]\nid = "scan"\nkind = "dispatch"\nstages = []\non_done = "done"\n\n[[nodes]]\nid = "done"\nkind = "route"\n[[nodes.branches]]\nwhen = "true"\ndo = "emit(InspectionPassed, summary)"\nentry = "scan"\n`
+  (r7-1 스키마 준수: emit은 HALT 암시)
+**독립 계산 지침**: §3.1 canonical(u64le 경로·내용 framing, manifest
+는 digest 라인(선행 공백 없는 `digest = ` 시작, LF 포함) 제거 후)
+— 예상 pack_digest·v4 leaf digest hex는 구현 첫 셀프테스트가
+**독립 스크립트로 먼저 계산·이 문서에 채워넣는 것**이 절차(구현
+산출물을 golden으로 채택하는 것이 아니라, 채워진 후 변경 불가).
+### A.2 거부 fixture (규칙별 1)
+route 순환(`a→b→a` true 폴백 상호참조), resume 순환(hold의
+resume_targets가 자기 predecessor), 예제 어긋(replan payload 누락),
+verify 없이 verdicts 참조, 마지막 branch true 아님, quoted digest 키,
+CRLF manifest, 끝 LF 부재 — 각 1파일, 로더가 전부 거부해야 함.
+### A.3 (구현 시점 확정) markdown 그룹 규칙 템플릿·dispatch 스테이지
+전체 예 — A.1/A.2가 구현 승인 조건, A.3는 구현 중 확정.
