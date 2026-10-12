@@ -504,7 +504,7 @@ async fn approve(order_id: String, intent: String, db: &str) -> i32 {
             println!("{order_id} → {st:?}");
             match line.publish(&order_id, &human()).await {
                 Ok(st2) => {
-                    println!("{order_id} → {st2:?}");
+                    println!("{order_id} → {:?}", st2.state);
                     0
                 }
                 Err(e) => {
@@ -698,8 +698,8 @@ async fn watch_cmd(once: bool, every: u64, repo: String, die: String, auto_appro
                         match line.approve(&oid, &token, &auto_approve, &human).await {
                             Ok(_) => match line.publish(&oid, &human).await {
                                 Ok(st) => {
-                                    println!("{oid} → {st:?}");
-                                    if st == foundry_domain::OrderState::Shipped {
+                                    println!("{oid} → {:?}", st.state);
+                                    if st.state == foundry_domain::OrderState::Shipped {
                                         notify(&mut notifier, "shipped", &oid);
                                     }
                                 }

@@ -217,7 +217,7 @@ async fn approval_then_publish_confirmed() {
     assert_eq!(st, OrderState::Publishing);
 
     let st = line.publish("o-c", &actor()).await.unwrap();
-    assert_eq!(st, OrderState::Shipped);
+    assert_eq!(st.state, OrderState::Shipped);
     // operation_id is order:attempt — deterministic
     assert_eq!(line.publisher.calls.lock().unwrap()[0], "o-c:1");
 }
@@ -252,7 +252,7 @@ async fn publish_unknown_records_state() {
 
     let st = line.publish("o-d", &actor()).await.unwrap();
     assert_eq!(
-        st,
+        st.state,
         OrderState::Unknown,
         "crash mid-publish → Unknown, not Shipped"
     );

@@ -12,6 +12,7 @@
 //! - **Approval ≠ published**: separate FurnaceHold → Publishing → Shipped
 //!   states; PR creation is fallible and re-verifies the digest (#1, §11).
 use crate::error::LineError;
+use crate::PublishReceipt;
 use foundry_domain::ports::{Gate, Harness, Ledger, Policy, PortError, PublishOutcome, Publisher};
 use foundry_domain::{ActorId, ActorKind, Order, OrderEvent, OrderState, workdir_path};
 use std::collections::HashMap;
@@ -361,7 +362,7 @@ where
     }
 
     /// Create the PR — idempotent via operation_id (critique #2).
-    pub async fn publish(&self, order_id: &str, actor: &ActorId) -> Result<OrderState, LineError> {
+    pub async fn publish(&self, order_id: &str, actor: &ActorId) -> Result<PublishReceipt, LineError> {
         let order = self
             .get(order_id)
             .await
@@ -370,15 +371,19 @@ where
         let operation_id = format!("{order_id}:{attempt}");
         let digest = order.artifact_digest.clone().unwrap_or_default();
 
+        let mut last_pr_url: Option<String> = None;
         match self.publisher.publish(&order, &operation_id, &digest).await {
             Ok(PublishOutcome::Confirmed { pr_url }) => {
                 self.commit(
                     order_id,
-                    OrderEvent::PublishConfirmed { pr_url },
+                    OrderEvent::PublishConfirmed {
+                        pr_url: pr_url.clone(),
+                    },
                     attempt,
                     actor,
                 )
                 .await?;
+                last_pr_url = Some(pr_url);
             }
             Ok(PublishOutcome::Unknown { .. }) => {
                 self.commit(
@@ -394,7 +399,10 @@ where
 
         self.get(order_id)
             .await
-            .map(|o| o.state())
+            .map(|o| PublishReceipt {
+                state: o.state(),
+                pr_url: last_pr_url,
+            })
             .ok_or_else(|| LineError::UnknownOrder(order_id.to_string()))
     }
 }
