@@ -81,10 +81,12 @@ goto  = "pass"
 id = "fixdie"        # ③ redrive: 같은 Die workdir에 findings를 실어 재디스패치
 kind = "redrive"     #    (라인 재주문 아님 — §2.4 시맨틱)
 # redrive 계약(신규 범용 엔진 연산 — r4-MAJOR-2):
-#  input: 이전 generation 산출물 경로 + payload(findings/수정 계획)
-#  executor: 주문의 implementer 식별자(die harness)에 전달 — Harness
-#    인터페이스 확장 없이 CLI 인자(--fix-context <file>)로 findings
-#    파일 경로 전달(호스트 어댑터 소유, 포트 불변)
+#  input 규약(r5-4): workdir/gen-N/in/manifest.json — {base_commit,
+#    payload_path, payload_digest, plan_ref}. gen-N 초기화 = 최신 검증
+#    통과 gen(없으면 원산물)의 immutable_commit 복제. Die 래퍼는
+#    in/manifest.json을 읽음 — 호스트가 CLI --fix-context <경로>로
+#    지시(포트 불변, 전달 규약은 workdir 파일 소유 — M0 경로 단일
+#    진실원 패턴 승계)
 #  격리: generation별 workdir 분리(gen-N), 실행별 로그(attempt-N.log)
 #  실패: exit≠0/timeout → on_redrive_error(팩 정책: hold|fail-run)
 #  산출: 새 result_commit → 다음 검증의 artifact 결속 + 이전 증거
@@ -100,16 +102,16 @@ kind = "redrive"     #    emit_failed로 도메인 백엣지(새 Die 시도)
 target = "die-workdir"
 pre_stage = "replan-stage"   # 팩 정의 스테이지(KEEP 추출·계획 수정)
 bump = "replans"
-on_done = "emit_failed_node"
+on_done = "lenses"   # 재구현 결과는 다시 검증으로 — 루프 폐쇄(r5
+                     # 정정: replans 0..5 전부 attempt=1, Inspecting
+                     # 유지 — 도메인 emit/시도 소모 없음)
 
 [[nodes]]
-id = "emit_failed_node"   # ④ emit: 도메인 이벤트
-kind = "emit"
-event = "InspectionFailed"
-payload_from = "cumulative_findings"
-on_done = "HALT"     # 도메인이 Queued(attempt++)로 재주문 — 그 다음
-                      # Inspecting 재진입 시 새 review-run이 저널의
-                      # 이전 run을 이어받아 counters 승계(§3.6)
+id = "emit_failed_node"   # ④ emit: 재주문 정책 경로 — 팩이 route에서
+kind = "emit"             #    명시 선택 시만. BMad 재계획은 미경유(§2.4a)
+event = "InspectionFailed"   #    재주문 산출물 정책: 기본 폐기(청정
+payload_from = "cumulative_findings"  # workdir). 새 run은 counters만
+on_done = "HALT"     # 승계, 산출물은 재검증 의무(§3.3a)
 
 [[nodes]]
 id = "pass"          # ④' emit(InspectionPassed)
@@ -172,9 +174,14 @@ event_id := 'InspectionPassed' | 'InspectionFailed'   ; 로드 검증
 payload_ref := id             ; 노드/스테이지 출력 참조(로드 검증)
 do_seq   := action ( ';' action )*     ; emit은 전 시퀀스에 최대 1회
 ```
-- entry: 그래프 `entry` 필드가 지정(로드 검증: dispatch 노드).
-  종단: emit 후 HALT, hold는 대기, 그래프 끝 도달은 로드 검증
-  거부(모든 경로는 emit/hold로 끝나야 함).
+- 식별자 namespace 분리(r5-7): counter_id / group_id / payload_ref
+  각각 자기 namespace 로드 검증(교차 오용 거부).
+- do_seq는 route branch 필드. emit/hold 뒤 후속 액션 금지(종단).
+  route는 무매치 불가 — 마지막 branch `true` 폴백 필수(로드 검증).
+  `fail-run` = 실행 중단+저널 review_aborted+Inspecting 유지+알림
+  (도메인 이벤트 없음 — 재주문은 운영/인간 정책).
+- 부록 A에 **수용 fixture(전체 팩)+거부 fixture(검증 규칙별 1개)**
+  필수 — 구현 승인 전 제출.
 - 우선순위 `!` > `&&` > `||`, 괄호 허용. `any`는 has_findings의
   **예약 와일드카드**(로드 검증에서 일반 태그명과 충돌 거부).
 - **provenance(r3-MAJOR-4, r4-MAJOR-8)**: 조건식 바인딩은 엔진이
@@ -182,10 +189,12 @@ do_seq   := action ( ';' action )*     ; emit은 전 시퀀스에 최대 1회
   스테이지의 출력만 verdicts/findings.group 스코프가 됨(로드 검증:
   verify 스테이지 정확히 1개, 미선언 시 조건식에서 verdicts/
   findings 참조 거부). 원시 렌즈 출력은 has_findings에서도 불가.
-  barrier 상태 5분류 상호 배타 정의: `no-valid-stage`/`all-error`
-  상태에서 엔진은 **pass로 가는 branch 평가 자체를 거부**(정책
-  필수: on_no_valid = hold|fail-run, 미선언 로드 거부) — `!
-  has_findings(any)` 통과 새는 경로 원천 차단.
+  **barrier 진리표(r5-9)** — (stage_total, stage_ok, verify_ok):
+  all-error / no-valid-stage / valid-partial(일부 유효+verify 유효)
+  / all-ok / **verify-invalid**(유효 stage 있어도 verify 오류·폐기)
+  — 배타적 5분류. pass 진입 가능은 all-ok·valid-partial뿐, 엔진이
+  상태별 branch 진입 집합 강제(조건식이 아니라 상태 머신 판정).
+  verify-invalid는 on_verify_invalid 정책(hold|fail-run)만.
 - `do` 시퀀스 문법: `action ( ';' action )*` — 다중 emit은 로드
   검증 거부(도메인 단일 전이 원칙).
 
@@ -216,11 +225,16 @@ review-run 소유의 범용 실행 회차(generation)로 정의한다.**
 - 라인 재주문 경로(Queued→새 주문 시도)는 오직 emit(InspectionFailed)
   로만 — 팩이 그래프에서 emit을 쓸 때만 도메인 시도가 소모된다.
   BMad 5회는 전부 generation으로, 도메인 시도 소모 없이 표현된다.
-- **인과 보존**: generation 산출물이 최종 emit(InspectionPassed)을
-  받으면 artifact_digest는 **그때의 generation HEAD**에서 결속
-  (finish_die_segment 패턴 승계) — 어떤 generation 결과가 발행되는지
-  원장이 정확히 가리킨다.
-- 비용 통제: generation마다 [run] 예산 차감(§2.4b).
+- **내구 산출물 결속(r5-2)**: 검증 통과 시 단일 커밋에 `(order,
+  attempt, run_id, generation, immutable_commit, artifact_location)`
+  저널 기록 + InspectionPassed 원자 확정. 복구·승인·Publisher는 이
+  튜플의 경로·digest만 사용(attempt 기본 경로 추론 폐지).
+  immutable_commit = 검증 완료 시점 gen HEAD 스냅샷(승격 시 불변
+  저장소 복제).
+- 비용 통제(r5-5): 외부 실행 전 내구 예약 → 완료 커밋에서 실소비
+  확정(초과 반환). retry마다 차감. 예산 소진 hold는 인간 commit_pass/
+  fail만 허용(실행 resume 엔진 거부). 사이클 검증은 resume·오류·
+  복구 전이 포함 — 모든 재개 경로에 예산 차감 노드 경유 강제.
 
 ### 2.4b 유한성 강제 (r4-MAJOR-3)
 
@@ -258,12 +272,13 @@ policy = "discard-finding" # 개별 finding 거부(부분 거부)
   `input = Σ (for file in sorted-by(UTF-8 bytes of POSIX path)):
   u64le(len(path)) ‖ path ‖ u64le(len(content)) ‖ content` (파일은
   매니페스트 참조 폐쇄 + manifest.toml 자체; manifest의 digest
-  필드는 **해당 줄 제거 후** 직렬화 — 줄 단위 정확 명세; NFC 유니코드
-  정규화 아님(원본 바이트), 경로 중복 거부). `pack_digest =
-  SHA256(input)`. v4 leaf = SHA256(u64le 각 len‖
-  "step_id","pack_id","pack_version","enforcement","pack_digest" 결합).
-  **fixture 1개(최소 팩: 빈 lens 1개+최소 policy)의 예상 digest를
-  구현 전에 독립 계산해 부록에 고정** — 구현이 이를 재현해야 함.
+  필드 제거(r5-10): manifest에서 `digest =`로 시작하는 **정확히 1개
+  최상위 key-value 라인 전체(LF 포함, 선행 공백 포함)를 원본 바이트
+  에서 삭제** — multiline·주석·CRLF는 원본 보존(정규화 없음, 경로
+  중복 거부). pack_digest = SHA256(input), hex 소문자 64자 표기.
+  v4 leaf = SHA256(len-prefix 결합 값들) — pack_digest는 **원시
+  32바이트**(hex 아님). **최소 팩 fixture의 입력 바이트+예상 digest
+  (hex)를 부록에 고정 — 구현 전 독립 계산, 구현은 재현 의무**.
 - 2회 검증(로드·디스패치 직전) + **불변 스냅샷**(run-dir 복제) 실행.
   스냅샷 영수증 → VerifiedSkill + Merkle 결속.
 - 프리셋 v4: `review_pack` 필드 + Merkle v3 정책 해시 유지 +
@@ -275,7 +290,7 @@ policy = "discard-finding" # 개별 finding 거부(부분 거부)
 ### 3.2 review-run (락 밖)
 1. run 생성: order·attempt·artifact·pack digest·스냅샷 결속,
    멱등키=run_id, **카운터 스냅샷**(이전 run의 주문 누계 승계 —
-   §3.6).
+   §3.3a).
 2. stages: session 참조(`session="trace"` = 같은 리뷰어), seal(선행
    완료 전 개봉 불가 — 호스트 경계), 같은 session 병렬 stage는
    **직렬화 강제**(같은 세션 동시성 모순 — 로드 검증 거부), barrier
@@ -288,13 +303,13 @@ policy = "discard-finding" # 개별 finding 거부(부분 거부)
    + stream ledger)은 단일 트랜잭션으로 못 묶는다 — **transactional
    outbox**: 모든 액션은 ①내구 intent(action_id, run·node·generation
    결속) 먼저 기록 ②외부 실행 ③결과+완료 표시 커밋. 재시작 시
-   intent 있고 완료 없는 action만 재실행. 외부 실행(redrive의 Die
-   프로세스)은 **절차 재실행 안전**하게 설계: generation별 분리
-   workdir이므로 재실행은 새 gen 디렉터리 생성(중복 부작용 없음 —
-   이전 gen은 고아로 남고 저널 superseded). emit(도메인 이벤트)은
-   outbox 소비 단계에서 단일 stream ledger 트랜잭션으로 — 중복
-   소비는 action_id 멱급 키로 차단. action_id = run_id#node_id#
-   generation(u64) — 크래시 후에도 결정적.
+   식별자 2단계(r5-3): activation_id = run_id#node_id#generation +
+   retry_seq(외부 재시도 회차) — action_id = activation_id#retry_seq.
+   크래시 규칙: (a) intent·완료 없음 → retry_seq+1 재실행(같은
+   activation, gen 불변). (b) 결과 커밋에 카운터·**그래프 커서**·후속
+   intent 포함 — 커밋이 곧 커서(유실 불가). (c) hold CAS 소비+resume
+   intent 동일 트랜잭션. (d) emit 재소비는 action_id 영수증 반환
+   (재실행 아닌 기존 결과 회수).
 5. **디스패치 fencing(r3-MAJOR-6, r4-MAJOR-7)**: (a) 응답 차단 —
    stage별 dispatch generation + 활성 실행 토큰 내구 기록, 응답
    수용 시 generation·토큰·run·attempt·artifact를 **단일 수용
@@ -318,11 +333,12 @@ policy = "discard-finding" # 개별 finding 거부(부분 거부)
   `abort`. 결속 재검사(run·attempt·artifact)와 커밋이 **동일 원자
   경계**(§3.2.4). API 멱등(중복 응답 폐기 — action_id).
 - `resume(node_id)`: **팩이 hold 노드에 선언한 허용 목적지 목록**
-  (`resume_targets`)으로 제한(로드 검증: 그래프 내 노드·사전조건
-  노드 완료 여부 런타임 검사 — 우회 시 거부). 인간 결정은
-  `hold_instance_id` 미소비 상태를 **동일 트랜잭션에서 CAS 소비** —
-  두 응답 경쟁 시 하나만 승리, 늦은 응답은 hold_instance 소멸로
-  폐기(검증자 지적 경합 경로 차단).
+  (`resume_targets`)으로 제한. 사전조건 완료 증거는 **현재
+  generation·activation 결속분만** 인정(gen-0 완료의 gen-1 전용
+  차단). 자동 Passed는 현재 gen의 유효 verify 필수 — 인간
+  commit_pass가 대체하려면 명시적 override: 신원+사유+원장 증거.
+  hold_instance_id 미소비 상태를 **동일 트랜잭션 CAS 소비** —
+  경합 시 하나만 승리(늦은 응답 폐기).
 
 ### 3.3a 카운터·세션 승계 (구 §3.6)
 - 주문 단위 누계(fix_rounds·replans 등): run 저널에서 주문 최신 run
