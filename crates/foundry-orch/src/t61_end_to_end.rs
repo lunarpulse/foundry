@@ -387,6 +387,52 @@ fn t61_end_to_end_reentry_bypass_crash_rebuild() {
     assert!(rows2.iter().any(|r| matches!(&r.kind, OrchestrationKind::ReentryAdmitted { order, .. } if order == "t-1")));
 }
 
+/// (M7.1 리뷰 MAJOR-4) 중복 디스패치 거부가 **영구 거부 레지스트리**에
+/// 기록된다(일시적 에러만 반환하는 게 아님).
+#[test]
+fn t61_duplicate_dispatch_refusal_recorded() {
+    let d = tmpdir("duprec");
+    let orch = OrchestrationLog::open(&d.join("orch.db")).unwrap();
+    orch.declare_plan(
+        "plan-dd",
+        vec![("t-dd".into(), vec![])],
+        vec![("t-dd".into(), "s-dd".into())],
+    )
+    .unwrap();
+    let mut ap = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
+    {
+        let digest = crate::chainer::sizing_digest("approved", "bmad-quickloop", "plan-dd");
+        ap.issue_grant("sizing-sz-dd", "tok-dd", &serde_json::json!({
+            "order_id": "sz-dd", "intent": "sizing", "artifact_digest": digest, "root_scope": "",
+        }))
+        .unwrap();
+        let sr = ap.reserve_grant("sizing-sz-dd", &serde_json::json!({
+            "order_id": "sz-dd", "intent": "sizing", "artifact_digest": digest, "root_scope": "",
+        }), "dd", 1).unwrap();
+        ap.begin_apply("sizing-sz-dd", "dd", 1, sr.fence_token).unwrap();
+        ap.finalize_grant("sizing-sz-dd", "dd", 1, sr.fence_token).unwrap();
+        let ch = Chainer::new(&orch, &ap);
+        ch.bind_preset_from_ledger("sz-dd", "bmad-quickloop", "plan-dd").unwrap();
+    }
+    let rt = StreamRuntime::new(OrchestrationLog::open(&d.join("orch.db")).unwrap());
+    rt.add_stream(Stream::new_with_root("s-dd", &d, "bmad-quickloop").unwrap()).unwrap();
+    rt.bind_approval_ledger(
+        foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
+    )
+    .unwrap();
+    rt.dispatch("t-dd", mkorder("t-dd", true)).unwrap();
+    // 중복 — 거부 + 영구 기록.
+    let dup = rt.dispatch("t-dd", mkorder("t-dd", true));
+    assert!(dup.is_err(), "duplicate dispatch refused");
+    let rows = rt.orch.read_all().unwrap();
+    assert!(
+        rows.iter().any(|r| matches!(&r.kind,
+            OrchestrationKind::Refusal { refusal_code, refused_request, .. }
+            if refusal_code == "DuplicateDispatch" && refused_request.contains("t-dd"))),
+        "duplicate-dispatch refusal durably recorded: {rows:?}"
+    );
+}
+
 /// (M7.1 리뷰 MAJOR-2) 거짓 drain 보고 — 원장에 예약이 남아 있는데
 /// 호출자가 완료 주장 → 회복은 타임아웃까지 기다린다(AbortedWithoutScan).
 #[test]

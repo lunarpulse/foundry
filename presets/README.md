@@ -99,3 +99,5 @@ feature-prd의 `prd-review`.
 | `QuiescenceBlocked` | 회복 정지(quiescence) 중입니다 — 새 디스패치가 차단되었습니다 | 회복 코디네이터의 재개(드레인 완료 또는 타임아웃)를 기다려야 합니다 | Escalate |
 | `NotReady` | 선행 주문이 아직 출하되지 않았습니다 | 의존성 그래프의 선행 주문이 Shipped 여야 합니다 | Escalate |
 | `CheckedIdMismatch` | 디스패치 요청 id가 주문 실제 id와 일치하지 않습니다 | 요청 id와 order.id 가 동일해야 합니다 | Escalate |
+| `FencedDispatch` | 스트림이 펜스 상태입니다 — 회복 실패 후 디스패치가 차단되었습니다 | 다음 회복 코디네이터 성공(unfence)이 유일한 해제 조건입니다 | Escalate |
+| `DuplicateDispatch` | 중복 디스패치입니다 — 주문이 이미 이 스트림에 등록됐습니다 | 동일 order.id 의 재등록은 불가능합니다(메모리 또는 저널 증거) | Escalate |

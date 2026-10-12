@@ -38,6 +38,9 @@ pub struct Stream {
     preset_root: String,
     /// (astra r3) 펜스 — 회복 실패 스트림의 enroll 차단(fail-closed).
     fenced: std::sync::atomic::AtomicBool,
+    /// (M7.1 리뷰 MAJOR-4) 오케스트레이션 로그 — enroll 거부의 영구 기록.
+    /// add_stream 시 런타임이 주입(독립 Stream은 None — 기록 없이 거부).
+    orch: Mutex<Option<Arc<OrchestrationLog>>>,
 }
 
 impl Stream {
@@ -83,6 +86,7 @@ impl Stream {
             fenced: std::sync::atomic::AtomicBool::new(false),
         
             preset_root: String::new(),
+            orch: Mutex::new(None),
         })
     }
 
@@ -116,7 +120,15 @@ impl Stream {
     /// 제거). 이중 디스패치 거부. (T61 astra r1) **크레이트 내부 전용** —
     /// 등록은 dispatch 정문(입장 차단·사이즈 게이트 경유)만 가능.
     pub(crate) fn enroll(&self, order: Order) -> Result<(), String> {
+        // (M7.1 리뷰 MAJOR-4) 거부는 **영구 기록** — 일시적 에러 반환만으
+        // 로 끝나지 않는다(감사·재디에이션 가능).
+        let record = |code: RefusalCode, oid: &str| {
+            if let Some(orch) = self.orch.lock().unwrap().as_ref() {
+                let _ = record_refusal(orch, code, oid, None);
+            }
+        };
         if self.is_fenced() {
+            record(RefusalCode::FencedDispatch, &order.id);
             return Err(format!(
                 "stream '{}' is fenced — recovery failed; dispatch refused until next recovery succeeds",
                 self.stream_id
@@ -125,6 +137,7 @@ impl Stream {
         let oid = order.id.clone();
         let mut disp = self.dispatched.lock().unwrap();
         if disp.contains(&oid) {
+            record(RefusalCode::DuplicateDispatch, &oid);
             return Err(format!("order '{oid}' already dispatched on stream {}", self.stream_id));
         }
         // (M7.1 리뷰 MAJOR-1) **내구 이중 디스패치 방지** — dispatched 는
@@ -135,6 +148,7 @@ impl Stream {
             .map(|rows| rows.iter().any(|r| r.order_id == oid))
             .unwrap_or(false);
         if journaled {
+            record(RefusalCode::DuplicateDispatch, &oid);
             return Err(format!(
                 "order '{oid}' already dispatched on stream {} (journal evidence)",
                 self.stream_id
@@ -255,7 +269,11 @@ impl StreamRuntime {
                 stream.journal_path.display()
             ));
         }
-        g.push(Arc::new(stream));
+        // (M7.1 리뷰 MAJOR-4) 런타임의 로그를 스트림에 주입 — enroll
+        // 거부가 영구 기록된다.
+        let arc = Arc::new(stream);
+        *arc.orch.lock().unwrap() = Some(self.orch.clone());
+        g.push(arc);
         Ok(())
     }
 

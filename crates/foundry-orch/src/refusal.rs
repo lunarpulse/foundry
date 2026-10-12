@@ -36,6 +36,10 @@ pub enum RefusalCode {
     NotReady,
     /// (T58 astra r2) dispatch 파라미터 id ≠ order.id.
     CheckedIdMismatch,
+    /// (M7.1 리뷰 MAJOR-4) 펜스된 스트림으로의 디스패치 시도.
+    FencedDispatch,
+    /// (M7.1 리뷰 MAJOR-4) 중복 디스패치(메모리 또는 저널 증거).
+    DuplicateDispatch,
 }
 
 impl RefusalCode {
@@ -54,6 +58,8 @@ impl RefusalCode {
         RefusalCode::QuiescenceBlocked,
         RefusalCode::NotReady,
         RefusalCode::CheckedIdMismatch,
+        RefusalCode::FencedDispatch,
+        RefusalCode::DuplicateDispatch,
     ];
 }
 
@@ -109,6 +115,8 @@ pub fn all_codes_exhaustive() -> Vec<RefusalCode> {
         PresetInvalid,
         QuiescenceBlocked,
         NotReady,
+        FencedDispatch,
+        DuplicateDispatch,
         CheckedIdMismatch,
     )
 }
@@ -165,6 +173,16 @@ pub fn entry_for(code: RefusalCode) -> RefusalEntry {
         RefusalCode::QuiescenceBlocked => (
             "회복 정지(quiescence) 중입니다 — 새 디스패치가 차단되었습니다",
             "회복 코디네이터의 재개(드레인 완료 또는 타임아웃)를 기다려야 합니다",
+            RemediationKind::Escalate,
+        ),
+        RefusalCode::FencedDispatch => (
+            "스트림이 펜스 상태입니다 — 회복 실패 후 디스패치가 차단되었습니다",
+            "다음 회복 코디네이터 성공(unfence)이 유일한 해제 조건입니다",
+            RemediationKind::Escalate,
+        ),
+        RefusalCode::DuplicateDispatch => (
+            "중복 디스패치입니다 — 주문이 이미 이 스트림에 등록됐습니다",
+            "동일 order.id 의 재등록은 불가능합니다(메모리 또는 저널 증거)",
             RemediationKind::Escalate,
         ),
         RefusalCode::NotReady => (
