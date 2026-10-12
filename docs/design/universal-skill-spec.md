@@ -1,7 +1,7 @@
 # Foundry Universal Skill Spec — 범용 실행 모델 (Universal Review Engine)
 
-- **버전**: v0.20 (2026-10-12) — r18 REWORK(MAJOR 4+MINOR 2) 반영.
-  노드 집합 동일성·의존 그래프 순서 검사. 재검증 대기.
+- **버전**: v0.21 (2026-10-12) — r19 REWORK(MAJOR 1+MINOR 3) 반영.
+  fixture 위반 실존·정상화 쌍 검사. 재검증 대기.
 - **의도(소유자)**: Foundry는 어떤 방법론도 돌릴 수 있는 유니버설
   플랫폼. BMad는 스킬 데이터의 첫 고객. **Rust 도메인에 방법론
   코드가 박히는 순간이 실패.** 엔진 고정·확장 선언(procedural macro
@@ -263,7 +263,10 @@ do_seq   := action ( ';' action )*     ; emit은 전 시퀀스에 최대 1회
   | emit | event, payload_from | — | on_done(HALT 암시) |
   | hold | resume_targets | notify_only | on_done |
   branch(r9-3 종단 규칙, r16-4): **do에 emit이 있으면 goto 금지**(emit
-  후 HALT). **emit 없는 bump/revert 시퀀스면 goto 필수**. revert 직후
+  후 HALT). **emit 없는 bump/revert 시퀀스면 goto 필수**. do 내 emit이
+  2회면 **E_MULTI_EMIT 우선 판정**(그 자체가 정확히 그 위반 — "첫 emit
+  뒤 후속 액션"과 중복 적이지만 규칙 식별은 다수 emit으로, r19-4).
+  revert 직후
   emit은 재검증 없이 금지(revert→…→dispatch 재실행→검증→emit 경로만
   허용 — fixture 18). {when, goto}
   단독 항상 허용. do는 emit/bump/**revert** 시퀀스(emit≤1, revert는

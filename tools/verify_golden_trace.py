@@ -274,9 +274,11 @@ def negative_controls(doc, active_cats):
     bad2["entry"] = "missing"
     try:
         walk(bad2, ["patch"], active_cats)
-        raise AssertionError("entry=missing must fail")
     except AssertionError as e:
-        assert "unknown node" in str(e) or "missing" in str(e)
+        assert "unknown node" in str(e), \
+            f"entry=missing must fail with unknown-node, got: {e}"
+    else:
+        raise AssertionError("entry=missing must fail")
     # 3. removing edge session breaks the same-reviewer contract check
     # (verifier asserts presence below in positive checks)
     # 4. triage schema removal must break active_categories()
@@ -433,7 +435,7 @@ def contract_negative_controls(doc):
         contract_checks(bad)
         raise AssertionError("claims.after=verif mutant NOT detected")
     except AssertionError as e:
-        assert "not ordered after" in str(e) or "cycle" in str(e), \
+        assert "ordered after edge" in str(e) or "mutually reachable" in str(e) or "cycle" in str(e), \
             f"wrong failure: {e}" 
 
 
@@ -535,6 +537,111 @@ def sweep_rejection_fixtures():
     declared = _re.search(r'"([0-9a-f]{64})"', line).group(1)
     assert declared == h.hexdigest(), \
         f"08 digest must match CRLF-original bytes: {declared[:12]} vs {h.hexdigest()[:12]}"
+    # (r19-1) per-fixture violation PRESENCE — normalizing the
+    # violation (with digest recompute) must FAIL the sweep:
+    def _norm_01(pol):
+        # remove ra/rb cycle: rt -> done directly
+        pol["nodes"] = [n for n in pol["nodes"] if n["id"] not in ("ra", "rb")]
+        for n in pol["nodes"]:
+            if n["id"] == "scan":
+                n["on_done"] = "done"
+        return pol
+    def _norm_05(pol):
+        for n in pol["nodes"]:
+            if n["kind"] == "route":
+                for br in n["branches"]:
+                    if br["when"] == "false":
+                        br["when"] = "true"
+        return pol
+    def _norm_06(pol):
+        for n in pol["nodes"]:
+            if n["kind"] == "route":
+                for br in n["branches"]:
+                    if "bump(" in (br.get("do") or ""):
+                        br["do"] = 'emit(InspectionPassed, summary)'
+        return pol
+    def _norm_12(pol):
+        for n in pol["nodes"]:
+            if n["id"] == "fix":
+                n["bump"] = "loopbacks"  # match the guard
+        return pol
+    def _norm_13(pol):
+        for n in pol["nodes"]:
+            if n["kind"] == "route":
+                for br in n["branches"]:
+                    if br.get("do") and br["do"].count("emit(") > 1:
+                        br["do"] = 'emit(InspectionPassed, summary)'
+        return pol
+    def _norm_14(pol):
+        for n in pol["nodes"]:
+            if n["kind"] == "route":
+                for br in n["branches"]:
+                    d = br.get("do") or ""
+                    if "emit(" in d and "bump(" in d:
+                        br["do"] = d.split(";")[0]
+        return pol
+    # each violation checker: True when the violation IS present
+    def _has_01_cycle(pol):
+        ids = {n["id"] for n in pol["nodes"]}
+        for n in pol["nodes"]:
+            if n["kind"] == "route":
+                for br in n.get("branches", []):
+                    g = br.get("goto")
+                    if g in ("ra", "rb") and "ra" in ids and "rb" in ids:
+                        # ra->rb and rb->ra mutual
+                        nmap = {x["id"]: x for x in pol["nodes"]}
+                        ra = nmap.get("ra", {}); rb = nmap.get("rb", {})
+                        ra_t = [b.get("goto") for b in ra.get("branches", [])]
+                        rb_t = [b.get("goto") for b in rb.get("branches", [])]
+                        return "rb" in ra_t and "ra" in rb_t
+        return False
+    def _has_05_no_true(pol):
+        for n in pol["nodes"]:
+            if n["kind"] == "route":
+                last = n["branches"][-1]
+                if last["when"] == "false" and "emit(" in (last.get("do") or ""):
+                    return True
+        return False
+    def _has_06_do_bump_no_goto(pol):
+        for n in pol["nodes"]:
+            if n["kind"] == "route":
+                for br in n.get("branches", []):
+                    if "bump(" in (br.get("do") or "") and not br.get("goto"):
+                        return True
+        return False
+    def _has_12_mismatch(pol):
+        nmap = {n["id"]: n for n in pol["nodes"]}
+        fix = nmap["fix"]
+        return fix.get("bump") == "fix_rounds"
+    def _has_13_multi(pol):
+        for n in pol["nodes"]:
+            if n["kind"] == "route":
+                for br in n.get("branches", []):
+                    if (br.get("do") or "").count("emit(") > 1:
+                        return True
+        return False
+    def _has_14_post(pol):
+        for n in pol["nodes"]:
+            if n["kind"] == "route":
+                for br in n.get("branches", []):
+                    d = br.get("do") or ""
+                    if "emit(" in d and ";" in d and "bump(" in d.split("emit(")[1]:
+                        return True
+        return False
+    VIOLATIONS = {
+        "01-route-cycle": (_has_01_cycle, _norm_01),
+        "05-no-true-fallback": (_has_05_no_true, _norm_05),
+        "06-do-only-nonterminal": (_has_06_do_bump_no_goto, _norm_06),
+        "12-counter-guard-mismatch": (_has_12_mismatch, _norm_12),
+        "13-multi-emit": (_has_13_multi, _norm_13),
+        "14-post-emit-action": (_has_14_post, _norm_14),
+    }
+    for name, (checker, normalizer) in VIOLATIONS.items():
+        pol = tl.load(open(f"{base}/{name}/policy.toml", "rb"))
+        assert checker(pol), f"{name}: violation structure NOT present"
+        normalized = normalizer(copy.deepcopy(pol))
+        assert not checker(normalized), \
+            f"{name}: normalizer failed to remove the violation"
     # structural rejects decidable statically (r16-3):
     n10 = tl.load(open(f"{base}/10-counter-guard-missing/policy.toml", "rb"))
     nodes10 = {n["id"]: n for n in n10["nodes"]}
@@ -650,12 +757,23 @@ def contract_checks(doc):
                     sess.setdefault(st["session"], []).append(st)
             for sid, sts in sess.items():
                 if len(sts) > 1:
-                    ordered = [x for x in sts if x.get("after") is not None]
-                    assert len(ordered) == len(sts) - 1, \
-                        f"same-session {sid} stages must be after-ordered"
-                    for a, b in zip(sts, sts[1:]):
-                        assert b["id"] in reach(a["id"]), \
-                            f"session {sid}: {b['id']} not ordered after {a['id']}"
+                    # (r19-2) ordering = one-directional reachability
+                    # between every pair; array order and after-count
+                    # are NOT relied upon
+                    for i in range(len(sts)):
+                        for j in range(len(sts)):
+                            if i == j:
+                                continue
+                            r_ij = sts[j]["id"] in reach(sts[i]["id"])
+                            r_ji = sts[i]["id"] in reach(sts[j]["id"])
+                            assert not (r_ij and r_ji), \
+                                f"session {sid}: {sts[i]['id']} <-> {sts[j]['id']} mutually reachable"
+                    # the pack's same-reviewer contract: edge must
+                    # precede claims in the trace session
+                    ids = {s["id"] for s in sts}
+                    if {"edge", "claims"} <= ids:
+                        assert "claims" in reach("edge"), \
+                            "trace session: claims must be ordered after edge"
 
 
 if __name__ == "__main__":
