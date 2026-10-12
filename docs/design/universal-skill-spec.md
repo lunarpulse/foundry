@@ -1,7 +1,7 @@
 # Foundry Universal Skill Spec — 범용 실행 모델 (Universal Review Engine)
 
-- **버전**: v0.7 (2026-10-12) — r5 BLOCKER(replan 그래프 모순)+MAJOR 9
-  반영. 재검증 대기.
+- **버전**: v0.8 (2026-10-12) — r6 REWORK(MAJOR 8) 반영. r6가 재계획/
+  MAX_ATTEMPTS 충돌 해소 확인. 재검증 대기.
 - **의도(소유자)**: Foundry는 어떤 방법론도 돌릴 수 있는 유니버설
   플랫폼. BMad는 스킬 데이터의 첫 고객. **Rust 도메인에 방법론
   코드가 박히는 순간이 실패.** 엔진 고정·확장 선언(procedural macro
@@ -80,9 +80,11 @@ goto  = "pass"
 id = "fixdie"        # ③ redrive: 같은 Die workdir에 findings를 실어 재디스패치
 kind = "redrive"     #    (라인 재주문 아님 — §2.4 시맨틱)
 # redrive 계약(신규 범용 엔진 연산 — r4-MAJOR-2):
-#  input 규약(r5-4): workdir/gen-N/in/manifest.json — {base_commit,
-#    payload_path, payload_digest, plan_ref}. gen-N 초기화 = 최신 검증
-#    통과 gen(없으면 원산물)의 immutable_commit 복제. Die 래퍼는
+#  input 규약(r5-4, r6-3): workdir/gen-N/in/manifest.json — {base_commit,
+#    payload_path, payload_digest, plan_ref}. gen-N base = **최신 수용
+#    artifact**(출력 수용≠리뷰 통과 — 분리 정의) — 없으면 원산물.
+#    원산물 롤백은 팩의 명시적 선택(base = "origin"). pre_stage의
+#    plan 출력은 plan_ref로 결속되어 Die 입력에 전달. Die 래퍼는
 #    in/manifest.json을 읽음 — 호스트가 CLI --fix-context <경로>로
 #    지시(포트 불변, 전달 규약은 workdir 파일 소유 — M0 경로 단일
 #    진실원 패턴 승계)
@@ -179,7 +181,12 @@ do_seq   := action ( ';' action )*     ; emit은 전 시퀀스에 최대 1회
   route는 무매치 불가 — 마지막 branch `true` 폴백 필수(로드 검증).
   `fail-run` = 실행 중단+저널 review_aborted+Inspecting 유지+알림
   (도메인 이벤트 없음 — 재주문은 운영/인간 정책).
-- 부록 A에 **수용 fixture(전체 팩)+거부 fixture(검증 규칙별 1개)**
+- 노드 필드 제약(§2.3a): dispatch{stages,side_records?,on_done},
+  route{branches(마지막 true)}, redrive{target,payload,bump?,
+  pre_stage?,on_done}, emit{event,payload_from}(on_done 금지 —
+  HALT 암시), hold{resume_targets,notify_only?}(on_done 금지).
+  entry는 dispatch 노드만. HALT는 예약어(on_done 값 불가).
+  부록 A에 **수용 fixture(전체 팩)+거부 fixture(검증 규칙별 1개)**
   필수 — 구현 승인 전 제출.
 - 우선순위 `!` > `&&` > `||`, 괄호 허용. `any`는 has_findings의
   **예약 와일드카드**(로드 검증에서 일반 태그명과 충돌 거부).
@@ -228,12 +235,15 @@ review-run 소유의 범용 실행 회차(generation)로 정의한다.**
   attempt, run_id, generation, immutable_commit, artifact_location)`
   저널 기록 + InspectionPassed 원자 확정. 복구·승인·Publisher는 이
   튜플의 경로·digest만 사용(attempt 기본 경로 추론 폐지).
-  immutable_commit = 검증 완료 시점 gen HEAD 스냅샷(승격 시 불변
-  저장소 복제).
-- 비용 통제(r5-5): 외부 실행 전 내구 예약 → 완료 커밋에서 실소비
-  확정(초과 반환). retry마다 차감. 예산 소진 hold는 인간 commit_pass/
-  fail만 허용(실행 resume 엔진 거부). 사이클 검증은 resume·오류·
-  복구 전이 포함 — 모든 재개 경로에 예산 차감 노드 경유 강제.
+  immutable_commit = **verify가 실제 검사한 불변 commit**(검증 대상
+  스냅샷 — "완료 시점 HEAD" 아님). order.artifact_digest 조회·복구
+  경로(line.rs 346 승계)는 이 튜플에서 파생됨을 명시.
+- 비용 통제(r5-5, r6-4): 2종 예산 — (a) 비용 예산(토큰 등): 실행 전
+  예약→완료 정산·반환. (b) **비환급 실행 횟수 예산**(u64, 주문 단위):
+  모든 외부 시도·재시도에서 **최소 1을 원자 차감**(정산 0이어도 횟수
+  는 소모) — 실소비 0 사이클의 무한 실행 차단. 복구·새 run 생성 시
+  승계. 소진 hold는 인간 commit_pass/fail만(실행 resume 엔진 거부).
+  사이클 검증은 resume·오류·복구 전이 포함.
 
 ### 2.4b 유한성 강제 (r4-MAJOR-3)
 
@@ -275,9 +285,14 @@ policy = "discard-finding" # 개별 finding 거부(부분 거부)
   최상위 key-value 라인 전체(LF 포함, 선행 공백 포함)를 원본 바이트
   에서 삭제** — multiline·주석·CRLF는 원본 보존(정규화 없음, 경로
   중복 거부). pack_digest = SHA256(input), hex 소문자 64자 표기.
-  v4 leaf = SHA256(len-prefix 결합 값들) — pack_digest는 **원시
-  32바이트**(hex 아님). **최소 팩 fixture의 입력 바이트+예상 digest
-  (hex)를 부록에 고정 — 구현 전 독립 계산, 구현은 재현 의무**.
+  v4 leaf(r6-8) = SHA256(결합: for f in [step_id,pack_id,pack_version,
+  enforcement(ASCII 소문자),pack_digest(원시 32바이트)]:
+  u64le(len(f))‖f — 문자열은 UTF-8 원본 바이트). manifest digest
+  필드 제거 규칙: `digest` 키는 **unquoted 소문자 리터럴만** 허용
+  (quoted 키·multiline 값·라인 내 복수 키 거부), 제거는 그 한 줄
+  전체(LF 포함; 파일 끝 LF 부재 허용 — 마지막 바이트까지 원본 보존).
+  **최소 팩 fixture의 입력 바이트+예상 digest(hex)를 부록에 고정 —
+  구현 전 독립 계산, 구현은 재현 의무**.
 - 2회 검증(로드·디스패치 직전) + **불변 스냅샷**(run-dir 복제) 실행.
   스냅샷 영수증 → VerifiedSkill + Merkle 결속.
 - 프리셋 v4: `review_pack` 필드 + Merkle v3 정책 해시 유지 +
@@ -302,13 +317,14 @@ policy = "discard-finding" # 개별 finding 거부(부분 거부)
    + stream ledger)은 단일 트랜잭션으로 못 묶는다 — **transactional
    outbox**: 모든 액션은 ①내구 intent(action_id, run·node·generation
    결속) 먼저 기록 ②외부 실행 ③결과+완료 표시 커밋. 재시작 시
-   식별자 2단계(r5-3): activation_id = run_id#node_id#generation +
-   retry_seq(외부 재시도 회차) — action_id = activation_id#retry_seq.
+   식별자 3단계(r6-1): `activation_seq`(u64 단조 — 노드 **방문마다**
+   발급, dispatch 재방문도 새 activation) → `activation_id =
+   run_id#node_id#activation_seq` → 외부 시도 id = activation_id#
+   retry_seq. 커서 전진과 다음 activation_seq 할당은 동일 트랜잭션.
    크래시 규칙: (a) intent·완료 없음 → retry_seq+1 재실행(같은
-   activation, gen 불변). (b) 결과 커밋에 카운터·**그래프 커서**·후속
-   intent 포함 — 커밋이 곧 커서(유실 불가). (c) hold CAS 소비+resume
-   intent 동일 트랜잭션. (d) emit 재소비는 action_id 영수증 반환
-   (재실행 아닌 기존 결과 회수).
+   activation). (b) 결과 커밋에 카운터·커서·후속 intent 포함.
+   (c) hold CAS 소비+resume intent 동일 트랜잭션. (d) emit 재소비는
+   action_id 영수증 반환.
 5. **디스패치 fencing(r3-MAJOR-6, r4-MAJOR-7)**: (a) 응답 차단 —
    stage별 dispatch generation + 활성 실행 토큰 내구 기록, 응답
    수용 시 generation·토큰·run·attempt·artifact를 **단일 수용
@@ -334,11 +350,12 @@ policy = "discard-finding" # 개별 finding 거부(부분 거부)
   `abort`. 결속 재검사(run·attempt·artifact)와 커밋이 **동일 원자
   경계**(§3.2.4). API 멱등(중복 응답 폐기 — action_id).
 - `resume(node_id)`: **팩이 hold 노드에 선언한 허용 목적지 목록**
-  (`resume_targets`)으로 제한. 사전조건 완료 증거는 **현재
-  generation·activation 결속분만** 인정(gen-0 완료의 gen-1 전용
-  차단). 자동 Passed는 현재 gen의 유효 verify 필수 — 인간
-  commit_pass가 대체하려면 명시적 override: 신원+사유+원장 증거.
-  hold_instance_id 미소비 상태를 **동일 트랜잭션 CAS 소비** —
+  (`resume_targets`)으로 제한. hold 진입 시 **선행 activation/evidence
+  id 집합 + 현재 artifact digest를 hold 레코드에 저장** — resume·
+  commit_pass·commit_fail·abort 전부 동일 hold 소비 규칙(CAS)으로
+  사전조건을 그 집합과 대조(구 활성화 증거 배제 — r6-7). 자동
+  Passed는 **현재 검증 회차의 verify 증거만** 인정. 인간
+  commit_pass 대체는 명시적 override: 신원+사유+원장 증거.
   경합 시 하나만 승리(늦은 응답 폐기).
 
 ### 3.3a 카운터·세션 승계 (구 §3.6)
