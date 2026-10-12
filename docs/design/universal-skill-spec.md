@@ -523,6 +523,24 @@ policy = "hold"
 [hold]
 timeout_s = 0
 ```
+**기대 trace**: T=1, E=0, 유효=1, V=absent → all-ok(absent) →
+route(true) → do=emit(InspectionPassed) → **적격성 게이트가 V=ok
+증거 부재로 거부** → hold_target(end_hold) 진입 — "verify 없는 자동
+pass 거부→hold" 수용 시험(성공 emit fixture가 아님).
+kind="review-pack" — advisory-pack은 emit 노드 포함 자체가 로드 거부.
+
+**FULL 팩(r10-3)**: `skills/bmad-review-full/v1/` — BMad FULL
+라우팅 수용 팩 실파일(counters·entry·stages 4[verify=triage]·
+side_records=deferred·replan pre_stage+lens-replan.md,
+pack=31a75c15a8ef68d309a1f4d765d3c05e8db7c09899001fa5272d4e78229080e5).
+§2.1 예제는 이 팩 policy.toml의 간략화, 기대 trace는
+GOLDEN_TRACE.md(혼합 범주·상한 경계 10케이스 — 부록 A.3 승인 전 확정).
+
+**digest(독립 계산, python hashlib §3.1 canonical)** — fixture-min:
+pack=0a0f70b75d8025080352e29c6dfb82cbd1916c3a14735828c7d1633cf924bfd3,
+leaf(quick-inspect,fixture-min,1.0.0,advisory)=b12266c3043f7dce60825bd39c59d94a4210ad47cef357361682ac19db6e8c0d —
+구현은 재현 의무(파일→canonical→digest 대조).
+
 ### A.2 거부 fixture — 9종 실제 파일 (r10-5: baseline 정합 + 기대 오류 코드)
 
 baseline = A.1 팩 전체(모든 필드 정합·TOML 유효·digest 정상).
