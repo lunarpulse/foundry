@@ -1,8 +1,7 @@
 # Foundry Universal Skill Spec — 범용 실행 모델 (Universal Review Engine)
 
-- **버전**: v0.5 (2026-10-12) — 소유자 판정 "범용실행 모델 확장" 반영
-  전면 재작성. r1~r3(각 BLOCKER 2·2·2, MAJOR 8·8·7) 누적 반영 + r3
-  BLOCKER-1(범용 실행 모델 부재) 해법. 재검증 대기.
+- **버전**: v0.7 (2026-10-12) — r5 BLOCKER(replan 그래프 모순)+MAJOR 9
+  반영. 재검증 대기.
 - **의도(소유자)**: Foundry는 어떤 방법론도 돌릴 수 있는 유니버설
   플랫폼. BMad는 스킬 데이터의 첫 고객. **Rust 도메인에 방법론
   코드가 박히는 순간이 실패.** 엔진 고정·확장 선언(procedural macro
@@ -313,9 +312,11 @@ policy = "discard-finding" # 개별 finding 거부(부분 거부)
 5. **디스패치 fencing(r3-MAJOR-6, r4-MAJOR-7)**: (a) 응답 차단 —
    stage별 dispatch generation + 활성 실행 토큰 내구 기록, 응답
    수용 시 generation·토큰·run·attempt·artifact를 **단일 수용
-   트랜잭션**에서 재검사(원자 경계). (b) **쓰기 차단** — 구 세대
-   프로세스의 workdir 오염은 generation별 디렉터리 분리로 원천
-   차단(구 프로세스는 구 gen 디렉터리에만 씀 — 새 gen과 무결함).
+   트랜잭션**에서 재검사(원자 경계). (b) **쓰기 차단(r5-8)** — 모든 외부 실행(dispatch·pre_stage·
+   redrive 공통)은 activation#retry별 쓰기 namespace(run-dir/exec/
+   <activation>/<retry>/)로 격리 — sibling·git refs·세션 저장소
+   포함(샌드박스 허용 경로가 그 namespace로 한정). 수용 출력만
+   승격(gen 디렉터리·불변 저장소), retry도 새 namespace(겹침 없음).
    프로세스 종료 확인(토큰 폐기)은 best-effort + 타임아웃 강제
    kill, 잔존 구 gen 결과는 폐기. pre_stage 포함 **모든 외부
    디스패치는 동일 dispatch 계약**(격리·예산·fencing·오류 정책).
