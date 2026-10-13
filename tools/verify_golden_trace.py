@@ -2039,8 +2039,16 @@ def contract_checks(doc):
                     _pure_or = any(
                         "count_lt" not in p.strip()
                         for p in _parts if p.strip())
-                    _neg_entry = any(
-                        re.match(r"^!\s*count_lt", p.strip())
+                    # negation governing count_lt — only a violation on
+                    # edges that RE-ENTER a cycle; exit edges (hold/
+                    # out-of-cycle targets) legitimately use !count_lt
+                    # as the cap-exhausted escape (canonical pattern)
+                    _to_node = _node_ids.get(g)
+                    _reenters = _to_node is not None and (
+                        _to_node["kind"] in ("redrive",)
+                        or g == n["id"])
+                    _neg_entry = _reenters and any(
+                        re.search(r"!\s*\(?\s*count_lt", p)
                         for p in _parts if p.strip())
                     if _pure_or or _neg_entry:
                         raise AssertionError(
@@ -2061,6 +2069,45 @@ def contract_checks(doc):
                 raise AssertionError(
                     f"cycle {cyc[:-1]}: guard counter {g_ctrs} never "
                     f"bumped in cycle (bumped: {b_ctrs}) — §2.2")
+            # (F21-1) per-traversal exactness: for each guarded ENTRY
+            # edge into the cycle, the bump must be on THAT branch's
+            # own do, or on the entered node's redrive bump field —
+            # bumps living on OTHER branches of the same route don't
+            # increment on this traversal
+            for e in edges:
+                if e not in _guard_ctrs:
+                    continue
+                gc = _guard_ctrs[e]
+                src_n = _node_ids.get(e[0])
+                dst_n = _node_ids.get(e[1])
+                bumped_here = False
+                if src_n and src_n["kind"] == "route":
+                    for br in src_n.get("branches", []):
+                        if br.get("goto") == e[1]:
+                            for a in _parse_actions_top(br.get("do")):
+                                if a[0] == "bump" and a[1] == gc:
+                                    bumped_here = True
+                if dst_n and dst_n.get("bump") == gc:
+                    bumped_here = True
+                    # if BOTH the entry branch bumps gc AND the entered
+                    # redrive bumps gc, one traversal increments TWICE —
+                    # §2.3 exactness violation
+                    if src_n and src_n["kind"] == "route":
+                        for br in src_n.get("branches", []):
+                            if br.get("goto") == e[1]:
+                                for a in _parse_actions_top(br.get("do")):
+                                    if a[0] == "bump" and a[1] == gc:
+                                        raise AssertionError(
+                                            f"cycle {cyc[:-1]}: counter "
+                                            f"{gc!r} bumped BOTH on the "
+                                            "entry branch and the entered "
+                                            "node — double increment "
+                                            "(§2.3)")
+                if not bumped_here:
+                    raise AssertionError(
+                        f"cycle {cyc[:-1]}: guarded edge {e} counter "
+                        f"{gc!r} is bumped only on OTHER branches — "
+                        "path-exactness violated (§2.3)")
             continue
         if not (guarded and bumped) and "hold" not in kinds_in:
             raise AssertionError(

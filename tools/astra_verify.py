@@ -460,7 +460,14 @@ def graph(policy):
                 guard_ctrs[(n_['id'], g_)] = m20.group(1)
                 parts_ = _re19.split(r'\|\|', _re19.sub(r'"[^"]*"', '""', w_))
                 pure_or = any('count_lt' not in p.strip() for p in parts_ if p.strip())
-                neg_entry = any(_re19.match(r'^!\s*count_lt', p.strip()) for p in parts_ if p.strip())
+                # negation only violates on edges RE-ENTERING a cycle;
+                # exit edges legitimately use !count_lt as cap escape
+                dst_n_ = nodes.get(g_)
+                reenters_ = dst_n_ is not None and (
+                    dst_n_['kind'] == 'redrive' or g_ == n_['id'])
+                neg_entry = reenters_ and any(
+                    _re19.search(r'!\s*\(?\s*count_lt', p)
+                    for p in parts_ if p.strip())
                 if pure_or or neg_entry:
                     raise AssertionError(f'guard on {n_["id"]}->{g_} is OR-weakened or negated entry: {w_!r} (§2.2)')
     for c19 in cycles19:
@@ -475,6 +482,30 @@ def graph(policy):
                 b_ctrs |= bump_ctr.get(x19, set())
             if not (g_ctrs & b_ctrs):
                 raise AssertionError(f'cycle {c19[:-1]}: guard counter never bumped in cycle — §2.2')
+            for e_ in edges19:
+                if e_ not in guard_ctrs:
+                    continue
+                gc_ = guard_ctrs[e_]
+                src_n_ = nodes.get(e_[0])
+                dst_n_ = nodes.get(e_[1])
+                bumped_here_ = False
+                branch_bumps_ = False
+                if src_n_ and src_n_['kind'] == 'route':
+                    for b_ in src_n_['branches']:
+                        if b_.get('goto') == e_[1]:
+                            for a_ in actions(b_.get('do'), {'counters': {}, 'events': []}):
+                                if a_[0] == 'bump' and a_[1] == gc_:
+                                    bumped_here_ = True
+                                    branch_bumps_ = True
+                node_bumps_gc_ = bool(dst_n_ and dst_n_.get('bump') == gc_)
+                if node_bumps_gc_:
+                    bumped_here_ = True
+                    if branch_bumps_:
+                        raise AssertionError(
+                            f'cycle {c19[:-1]}: counter {gc_!r} bumped BOTH on the entry branch and the entered node — double increment (§2.3)')
+                if not bumped_here_:
+                    raise AssertionError(
+                        f'cycle {c19[:-1]}: guarded edge {e_} counter {gc_!r} is bumped only on OTHER branches — path-exactness violated (§2.3)')
             continue
         if not (guarded19 and bumped19) and 'hold' not in kinds19:
             raise AssertionError(f'cycle {c19[:-1]} lacks a counter guard+bump (§2.2)')
