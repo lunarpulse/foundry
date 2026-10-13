@@ -1957,6 +1957,50 @@ def contract_checks(doc):
             if "base" in n:
                 assert n["base"] in ("origin", "latest"), \
                     f"redrive {n['id']} base {n['base']!r} invalid"
+    # (F18-1) defer contract: if any route branch mentions the
+    # 'defer' verdict, the pack MUST declare a 'deferred' output and
+    # no two schema outputs may share a 'from' source column
+    _defer_used = False
+    for n in doc["nodes"]:
+        if n["kind"] == "route":
+            for br in n.get("branches", []):
+                if re.search(r'"defer"', br.get("when", "")):
+                    _defer_used = True
+    if _defer_used:
+        _froms = []
+        import os as _os1
+        for _sf in sorted(os.listdir(PACK)):
+            if _sf.startswith("schema-"):
+                _sd = tomllib.load(open(f"{PACK}/{_sf}", "rb"))
+                for _o in _sd.get("output", []):
+                    _froms.append(_o.get("from"))
+        # unique from-columns (a renamed source must not duplicate
+        # another output's column)
+        non_null = [f for f in _froms if f]
+        assert len(non_null) == len(set(non_null)), \
+            f"duplicate 'from' columns across schema outputs: " \
+            f"{sorted(f for f in non_null if non_null.count(f) > 1)}"
+        _names = set()
+        for _sf in sorted(os.listdir(PACK)):
+            if _sf.startswith("schema-"):
+                _sd = tomllib.load(open(f"{PACK}/{_sf}", "rb"))
+                _names |= {o.get("name") for o in _sd.get("output", [])}
+        assert "deferred" in _names, \
+            "defer verdict used but no deferred output declared" 
+    # (F18-c) declared counter names follow the identifier grammar
+    import re as _re18
+    for cname in (doc.get("counters") or {}):
+        assert _re18.fullmatch(r"[a-z_][a-z0-9_]*", cname), \
+            f"counter name {cname!r} not a valid identifier"
+    # (F18-d) after fields are normalized: single string == [string]
+    for n in doc["nodes"]:
+        for st in n.get("stages", []) or []:
+            af = st.get("after")
+            if isinstance(af, str):
+                st["after"] = [af]
+    for ps in doc.get("pack_stages", []) or []:
+        if isinstance(ps.get("after"), str):
+            ps["after"] = [ps["after"]]
     # (F17-1b) on_done is mandatory on dispatch AND redrive nodes —
     # unused nodes included (load-time schema completeness)
     for n in doc["nodes"]:

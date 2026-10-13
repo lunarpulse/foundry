@@ -1,7 +1,7 @@
 # Foundry Universal Skill Spec — 범용 실행 모델 (Universal Review Engine)
 
-- **버전**: v0.52 (2026-10-12) — 17차 최종 검증 반영.
-  redrive hold_target 필수+hold-kind(양측)·전 노드 on_done 필수(미사용 포함)·revert→dispatch 재실행 경로 합법화(규범 정합).
+- **버전**: v0.53 (2026-10-12) — 18차 최종 검증 반영.
+  스키마 from 컬럼 유일성+defer→deferred 출력 결속·카운터 선언명 식별자 문법·after 문자열/배열 정규화(순환 검사 정합)·from 라벨 의미는 digest 핀 영역 명시.
 - **의도(소유자)**: Foundry는 어떤 방법론도 돌릴 수 있는 유니버설
   플랫폼. BMad는 스킬 데이터의 첫 고객. **Rust 도메인에 방법론
   코드가 박히는 순간이 실패.** 엔진 고정·확장 선언(procedural macro
@@ -22,6 +22,11 @@
   **emit 이벤트 집합은 InspectionPassed|InspectionFailed 폐쇄** —
   스키마 출력 선언으로 확장 불가.
 - `pack_stages`의 role도 폐쇄 집합 lens|verify|replan (등록 스테이지 동일 규칙).
+- **defer 계약**: route가 defer verdict를 참조하면 팩은 `deferred` 출력을
+  선언해야 하고, 전 스키마 출력의 `from` 칼럼은 유일해야 한다. 칼럼
+  라벨의 **의미**(어떤 항목이 deferred로 기록되는가)는 로드 검증 영역이
+  아니라 **digest 핀+골든 트레이스(A.3)** 의 구현 인수 조건이다 — 칼럼명은
+  팩 저자 자유여서 재계산 digest와 정합한 in-memory 검사로는 판별 불가.
 - emit의 payload_from은 팩 스키마가 선언한 출력(또는 summary)만 참조.
 - 현재 PASS는 **선언적 모델 검증** — 실제 세션 계승·원자성·fencing·엔진 diff 0의
   실행 증명은 구현 단계(§4)의 인수 조건이다.

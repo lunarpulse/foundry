@@ -364,12 +364,17 @@ def graph(policy):
     dep_adj_ = {}
     for ps_ in policy.get('pack_stages', []) or []:
         deps_ = ps_.get('after', []) or []
+        if isinstance(deps_, str):
+            deps_ = [deps_]
         for dep_ in deps_:
             assert dep_ in sset_, f'pack_stage {ps_.get("id")} depends on undefined {dep_!r}'
         dep_adj_[ps_.get('id')] = list(deps_)
     for n_ in nodes.values():
         for st_ in n_.get('stages', []) or []:
-            for dep_ in st_.get('after', []) or []:
+            af_ = st_.get('after', [])
+            if isinstance(af_, str):
+                af_ = [af_]
+            for dep_ in af_:
                 dep_adj_.setdefault(st_['id'], []).append(dep_)
     _mk = {}
     def _dfsc(u):
@@ -449,6 +454,10 @@ def graph(policy):
     assert ht is not None, 'top-level [hold] must declare timeout_s (0=infinite)'
     assert isinstance(ht, int) and not isinstance(ht, bool) and ht >= 0, \
         'top-level [hold] timeout_s must be >= 0 (0=infinite)'
+    import re as _re18
+    for cname in policy.get('counters', {}):
+        assert _re18.fullmatch(r'[a-z_][a-z0-9_]*', cname), \
+            f'counter name {cname!r} not a valid identifier'
     for cname, cval in policy.get('counters', {}).items():
         assert isinstance(cval, int) and not isinstance(cval, bool) \
             and 0 <= cval < 2**64, \
