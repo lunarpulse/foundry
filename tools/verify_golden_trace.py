@@ -44,7 +44,9 @@ def load(path=POLICY):
         return tomllib.load(f)
 
 
-CALL = re.compile(r"([a-z_]+)\s*\(\s*([^)]*)\s*\)")
+# r33-2: string-aware call matching — a ')' inside a quoted literal
+# does not terminate the argument list
+CALL = re.compile(r'([a-z_]+)\s*\(\s*((?:[^)"]|"[^"]*")*?)\s*\)')
 
 
 def atom(name, args, state):
@@ -66,7 +68,15 @@ def atom(name, args, state):
     raise ValueError(f"unknown predicate {name}")
 
 
+def check_grammar(expr):
+    """(r33-2) expression grammar: string literals are DOUBLE-quoted
+    only; a single quote is a syntax error (normative — both
+    evaluators reject identically)."""
+    if "'" in expr:
+        raise ValueError(f"single-quote literal not in grammar: {expr!r}")
+
 def evaluate(expr, state):
+    check_grammar(expr)
     # r32-2: strip whitespace ONLY outside string literals
     e = re.sub(r'"[^"]*"|.', lambda m: m.group(0) if m.group(0).startswith('"') else ("" if m.group(0).isspace() else m.group(0)), expr)
     while True:
@@ -79,6 +89,28 @@ def evaluate(expr, state):
     e = e.replace("T", " True ").replace("F", " False ")
     py = e.replace("&&", " and ").replace("||", " or ").replace("!", " not ")
     return bool(eval(py))
+
+
+def _parse_actions_top(do):
+    """(r33-3) module-level canonical action parser for the walker."""
+    if do is None:
+        return []
+    parts = do.split(";")
+    if any(not p.strip() for p in parts):
+        raise ValueError(f"empty action in sequence: {do!r}")
+    out = []
+    for a in map(str.strip, parts):
+        m = re.fullmatch(r"bump\s*[(]\s*([A-Za-z_]\w*)\s*[)]", a)
+        if m:
+            out.append(("bump", m.group(1))); continue
+        m = re.fullmatch(r"revert\s*[(]\s*(origin|latest)\s*[)]", a)
+        if m:
+            out.append(("revert", m.group(1))); continue
+        m = re.fullmatch(r"emit\s*[(]\s*([A-Za-z_]\w*)\s*,\s*([A-Za-z_]\w*)\s*[)]", a)
+        if m:
+            out.append(("emit", m.group(1), m.group(2))); continue
+        raise ValueError(f"malformed action: {a!r}")
+    return out
 
 
 def apply_do(do, state):
@@ -102,7 +134,10 @@ def apply_do(do, state):
 
 
 def walk(doc, verdicts, active_cats, max_steps=50):
-    """Walk the graph from entry. Returns (decisions, final_state)."""
+    """Walk the graph from entry. Returns (decisions, final_state).
+    (r33-3) §2.4 eligibility gate: an emit with NO verify evidence in
+    the flow is REFUSED and the flow diverts via the dispatch's
+    on_no_valid/hold_target — acceptance walks now reach hold:*."""
     nodes = {n["id"]: n for n in doc["nodes"]}
     state = {
         "verdicts": verdicts,
@@ -110,6 +145,7 @@ def walk(doc, verdicts, active_cats, max_steps=50):
         "counters": {k: 0 for k in doc.get("counters", {})},
         "reverted_base": None,
     }
+    evidence = False  # becomes True after a verify-carrying dispatch
     cur = doc["entry"]
     decisions = []
     for _ in range(max_steps):
@@ -119,6 +155,10 @@ def walk(doc, verdicts, active_cats, max_steps=50):
         kind = node["kind"]
         if kind == "dispatch":
             decisions.append(cur)
+            has_verify = any(st.get("role") == "verify"
+                             for st in node.get("stages", []))
+            if has_verify:
+                evidence = True
             cur = node["on_done"]
         elif kind == "route":
             for br in node["branches"]:
@@ -128,13 +168,30 @@ def walk(doc, verdicts, active_cats, max_steps=50):
                         acts = apply_do(d, state)
                     nxt = br.get("goto")
                     if nxt is None:
-                        # (r32-3) record HOW we halted: emit vs bare
+                        # (r32-3) record HOW we halted
                         term = "HALT"
                         if d:
-                            import re as _r
-                            if _r.search(r"emit\s*\(", d):
+                            if any(a[0] == "emit" for a in _parse_actions_top(d)):
+                                if not evidence:
+                                    # (r33-3) §2.4 gate: refuse auto-emit
+                                    # without verify evidence; divert
+                                    src_node = nodes[decisions[-1]] \
+                                        if decisions else None
+                                    divert = None
+                                    for did in reversed(decisions):
+                                        dn = nodes.get(did)
+                                        if dn and dn.get("kind") == "dispatch":
+                                            divert = dn.get("hold_target") or \
+                                                (dn.get("on_no_valid")
+                                                 if dn.get("on_no_valid") != "hold" else None)
+                                            break
+                                    if divert and divert in nodes:
+                                        return decisions + ["GATE:refused-emit",
+                                                            f"hold:{divert}"], state
+                                    raise AssertionError(
+                                        "emit refused by gate but no divert target")
                                 term = "HALT:emit"
-                            elif _r.search(r"revert\s*\(", d):
+                            elif any(a[0] == "revert" for a in _parse_actions_top(d)):
                                 term = "HALT:revert"
                         return decisions + [term], state
                     cur = nxt  # NOT appended here — the target node
@@ -177,6 +234,10 @@ def walk_from(nodes, doc, start, state, active_cats, max_steps=50):
         kind = node["kind"]
         if kind == "dispatch":
             decisions.append(cur)
+            has_verify = any(st.get("role") == "verify"
+                             for st in node.get("stages", []))
+            if has_verify:
+                evidence = True
             cur = node["on_done"]
         elif kind == "route":
             for br in node["branches"]:
@@ -186,13 +247,30 @@ def walk_from(nodes, doc, start, state, active_cats, max_steps=50):
                         acts = apply_do(d, state)
                     nxt = br.get("goto")
                     if nxt is None:
-                        # (r32-3) record HOW we halted: emit vs bare
+                        # (r32-3) record HOW we halted
                         term = "HALT"
                         if d:
-                            import re as _r
-                            if _r.search(r"emit\s*\(", d):
+                            if any(a[0] == "emit" for a in _parse_actions_top(d)):
+                                if not evidence:
+                                    # (r33-3) §2.4 gate: refuse auto-emit
+                                    # without verify evidence; divert
+                                    src_node = nodes[decisions[-1]] \
+                                        if decisions else None
+                                    divert = None
+                                    for did in reversed(decisions):
+                                        dn = nodes.get(did)
+                                        if dn and dn.get("kind") == "dispatch":
+                                            divert = dn.get("hold_target") or \
+                                                (dn.get("on_no_valid")
+                                                 if dn.get("on_no_valid") != "hold" else None)
+                                            break
+                                    if divert and divert in nodes:
+                                        return decisions + ["GATE:refused-emit",
+                                                            f"hold:{divert}"], state
+                                    raise AssertionError(
+                                        "emit refused by gate but no divert target")
                                 term = "HALT:emit"
-                            elif _r.search(r"revert\s*\(", d):
+                            elif any(a[0] == "revert" for a in _parse_actions_top(d)):
                                 term = "HALT:revert"
                         return decisions + [term], state
                     cur = nxt  # target node records itself
@@ -446,7 +524,10 @@ def main():
     assert not has_verify, "A.1 must not carry a verify stage"
     d1, s1 = walk(a1, [], set(), max_steps=10)
     # gate: no verify evidence -> engine diverts instead of emitting
-    assert d1[-1] == "HALT:emit" and not has_verify,         f"A.1 walker must reach a real emit for the gate to refuse: {d1}"
+    assert d1 == ["scan", "GATE:refused-emit", "hold:end_hold"], \
+        f"A.1 acceptance: gate must refuse the emit and divert to end_hold, got {d1}"
+    assert any(n["id"] == "end_hold" for n in a1["nodes"]), \
+        "A.1 must declare end_hold"
     print(f"A.1 acceptance walk: {d1}")
     print("ALL PASS — real-graph walk == original step-04 contract")
 
@@ -1328,8 +1409,7 @@ def sweep_rejection_fixtures():
         for n in pol["nodes"]:
             if n["kind"] == "route":
                 for br in n.get("branches", []):
-                    d = br.get("do") or ""
-                    if _emit_count(d) > 1:
+                    if _emit_count(br.get("do")) > 1:
                         return True
         return False
     def _norm_14(pol):
@@ -1361,7 +1441,7 @@ def sweep_rejection_fixtures():
         for n in pol["nodes"]:
             if n["kind"] == "route":
                 for br in n.get("branches", []):
-                    if _post_emit_action(br.get("do") or ""):
+                    if _post_emit_action(br.get("do")):
                         return True
         return False
     VIOLATIONS = {
@@ -1456,15 +1536,34 @@ def contract_checks(doc):
                 if n["id"] == "replan":
                     assert "lens-replan.md" in stages_by_pack[ps]["lenses"], \
                         "replan must run the partial amender"
-    # (r32-1) mandatory fields + resume-cycle (§2.4b) on the FULL pack
+    # (r32-1, r33-1) mandatory fields, enums, reference kinds — FULL pack
+    nids = {n["id"]: n for n in doc["nodes"]}
     for n in doc["nodes"]:
         k = n["kind"]
         if k == "dispatch":
             for f in ("on_no_valid", "on_verify_invalid", "hold_target"):
                 assert f in n, f"dispatch {n['id']} missing {f}"
+        elif k == "redrive":
+            for f in ("hold_target", "on_redrive_error"):
+                assert f in n, f"redrive {n['id']} missing {f}"
         elif k == "hold":
             assert n.get("resume_targets") is not None, \
                 f"hold {n['id']} missing resume_targets"
+        # error-policy fields must target a HOLD node (r33-1)
+        for f in ("hold_target",):
+            if f in n:
+                t = n[f]
+                assert t in nids, f"{n['id']}.{f}={t} dangling"
+                assert nids[t]["kind"] == "hold", \
+                    f"{n['id']}.{f}={t} must reference a hold node"
+        for f in ("on_verify_invalid", "on_no_valid", "on_redrive_error"):
+            if f in n:
+                v = n[f]
+                assert v == "hold" or v in nids, \
+                    f"{n['id']}.{f}={v} invalid (hold|node_id)"
+                if v != "hold":
+                    assert nids[v]["kind"] in ("hold",), \
+                        f"{n['id']}.{f} must divert to a hold"
     deduct = {n["id"] for n in doc["nodes"]
               if n["kind"] in ("dispatch", "redrive")}
     nids = {n["id"] for n in doc["nodes"]}
