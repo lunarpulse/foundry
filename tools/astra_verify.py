@@ -432,11 +432,50 @@ def graph(policy):
     for v19 in full_adj:
         if color19.get(v19, 0) == 0:
             cyc19(v19, [])
+    # (F20) per-cycle guard/bump semantics
+    bump_ctr = {}
+    for n_ in nodes.values():
+        bs_ = set()
+        if n_['kind'] == 'route':
+            for b_ in n_['branches']:
+                acts_b = actions(b_.get('do'), {'counters': {}, 'events': []})
+                bumps_here = [a_[1] for a_ in acts_b if a_[0] == 'bump']
+                for c_ in bumps_here:
+                    bs_.add(c_)
+                if len(bumps_here) != len(set(bumps_here)):
+                    raise AssertionError(f'route {n_["id"]} branch double-bumps a counter')
+        elif n_['kind'] == 'redrive' and n_.get('bump'):
+            bs_.add(n_['bump'])
+        if bs_:
+            bump_ctr[n_['id']] = bs_
+    guard_ctrs = {}
+    for n_ in nodes.values():
+        if n_['kind'] != 'route':
+            continue
+        for b_ in n_['branches']:
+            g_ = b_.get('goto')
+            w_ = b_.get('when', '')
+            m20 = _re19.search(r'count_lt\s*\(\s*([a-z_][a-z0-9_]*)', w_)
+            if g_ and m20:
+                guard_ctrs[(n_['id'], g_)] = m20.group(1)
+                parts_ = _re19.split(r'\|\|', _re19.sub(r'"[^"]*"', '""', w_))
+                pure_or = any('count_lt' not in p.strip() for p in parts_ if p.strip())
+                neg_entry = any(_re19.match(r'^!\s*count_lt', p.strip()) for p in parts_ if p.strip())
+                if pure_or or neg_entry:
+                    raise AssertionError(f'guard on {n_["id"]}->{g_} is OR-weakened or negated entry: {w_!r} (§2.2)')
     for c19 in cycles19:
         edges19 = list(zip(c19, c19[1:]))
         guarded19 = any(edge_guard.get(e_, False) for e_ in edges19)
         bumped19 = any(x19 in node_bumps for x19 in c19[:-1])
         kinds19 = {nodes[x19]['kind'] for x19 in c19[:-1]}
+        if (guarded19 and bumped19) and 'hold' not in kinds19:
+            g_ctrs = {guard_ctrs[e_] for e_ in edges19 if e_ in guard_ctrs}
+            b_ctrs = set()
+            for x19 in c19[:-1]:
+                b_ctrs |= bump_ctr.get(x19, set())
+            if not (g_ctrs & b_ctrs):
+                raise AssertionError(f'cycle {c19[:-1]}: guard counter never bumped in cycle — §2.2')
+            continue
         if not (guarded19 and bumped19) and 'hold' not in kinds19:
             raise AssertionError(f'cycle {c19[:-1]} lacks a counter guard+bump (§2.2)')
     # (F8-2) resume/route edges must form a DAG after removing deduct

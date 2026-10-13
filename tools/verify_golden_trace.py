@@ -2003,12 +2003,65 @@ def contract_checks(doc):
     for _v in _full_adj:
         if _color.get(_v, 0) == 0:
             _cyc(_v, [])
+    # (F20) per-cycle guard/bump SEMANTICS:
+    #  guard counter (from the guarded edge's count_lt) must be bumped
+    #  INSIDE the cycle (branch bumps AND redrive node bump fields),
+    #  exactly-once per traversal (no same-counter double bump in one
+    #  branch), and guards may not be OR-weakened or negated entries.
+    _bump_ctr = {}
+    for n in doc["nodes"]:
+        bs = set()
+        if n["kind"] == "route":
+            for br in n.get("branches", []):
+                _acts20 = _parse_actions_top(br.get("do"))
+                for a in _acts20:
+                    if a[0] == "bump":
+                        bs.add(a[1])
+                # same-counter double bump in ONE branch is a §2.2 error
+                bumps_here = [a[1] for a in _acts20 if a[0] == "bump"]
+                if len(bumps_here) != len(set(bumps_here)):
+                    raise AssertionError(
+                        f"route {n['id']} branch double-bumps a counter")
+        elif n["kind"] == "redrive" and n.get("bump"):
+            bs.add(n["bump"])
+        if bs:
+            _bump_ctr[n["id"]] = bs
+    _guard_ctrs = {}
+    for n in doc["nodes"]:
+        if n["kind"] == "route":
+            for br in n.get("branches", []):
+                g = br.get("goto")
+                w = br.get("when", "")
+                m20 = re.search(r"count_lt\s*\(\s*([a-z_][a-z0-9_]*)", w)
+                if g and m20:
+                    _guard_ctrs[(n["id"], g)] = m20.group(1)
+                    _parts = re.split(r"\|\|", re.sub(r'"[^"]*"', '""', w))
+                    _pure_or = any(
+                        "count_lt" not in p.strip()
+                        for p in _parts if p.strip())
+                    _neg_entry = any(
+                        re.match(r"^!\s*count_lt", p.strip())
+                        for p in _parts if p.strip())
+                    if _pure_or or _neg_entry:
+                        raise AssertionError(
+                            f"guard on {n['id']}->{g} is OR-weakened or "
+                            f"negated entry: {w!r} (§2.2)")
     for cyc in _cycles:
         edges = list(zip(cyc, cyc[1:]))
         guarded = any(_edge_guard.get(e, False) for e in edges)
         bumped = any(nid in {b[0] for b in _node_bumps} for nid in cyc[:-1])
         # hold-resumed cycles are human-capped; else need guard+bump
         kinds_in = {_node_ids[x]["kind"] for x in cyc[:-1]}
+        if (guarded and bumped) and "hold" not in kinds_in:
+            g_ctrs = {_guard_ctrs[e] for e in edges if e in _guard_ctrs}
+            b_ctrs = set()
+            for nid in cyc[:-1]:
+                b_ctrs |= _bump_ctr.get(nid, set())
+            if not (g_ctrs & b_ctrs):
+                raise AssertionError(
+                    f"cycle {cyc[:-1]}: guard counter {g_ctrs} never "
+                    f"bumped in cycle (bumped: {b_ctrs}) — §2.2")
+            continue
         if not (guarded and bumped) and "hold" not in kinds_in:
             raise AssertionError(
                 f"cycle {cyc[:-1]} lacks a counter guard+bump (§2.2)")
