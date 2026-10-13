@@ -160,7 +160,7 @@ def decision(policy, s, start=None):
         elif kind == 'route':
             for branch in n['branches']:
                 if Expr(branch['when'], s).run():
-                    actions(branch.get('do') or None, s)
+                    actions(branch.get('do'), s)
                     cursor = branch['goto']
                     break
             else:
@@ -184,6 +184,9 @@ def canonical(root):
     manifest = tomllib.loads(raw.decode())
     files = manifest['files']
     assert len(files) == len(set(files)), 'duplicate files'
+    # (r31-2) execution binding: the EXECUTED policy must be a member
+    assert 'policy.toml' in files, \
+        'manifest must declare policy.toml (execution binding)'
     assert 'manifest.toml' not in files, 'manifest listed twice'
     refs = set(files)
     for name in files:
@@ -236,7 +239,7 @@ def graph(policy):
             assert n['branches'][-1]['when'].strip() == 'true', 'missing last true fallback'
             for b in n['branches']:
                 Expr(b['when'], state()).run()
-                actions(b.get('do') or None, state())
+                actions(b.get('do'), state())
                 refs.append(b['goto'])
         if kind == 'hold':
             refs.extend(n['resume_targets'])

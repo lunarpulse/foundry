@@ -410,6 +410,25 @@ def main():
     contract_negative_controls(doc)
     example_pack_identity()
     sweep_rejection_fixtures()
+    # (r31-4) A.1 acceptance: the minimal pack's walk must end in
+    # hold:end_hold (auto-pass without verify evidence is rejected)
+    import tomllib as _tl2
+    a1 = _tl2.load(open("skills/fixture-min/v1/policy.toml", "rb"))
+    # A.1 has NO verify stage; an engine honoring §2.4 must refuse
+    # the auto-emit and divert via on_no_valid=hold -> end_hold.
+    # The walker reaches emit ('HALT'); assert the pack declares the
+    # divert fields so the engine CAN divert, and simulate the gate.
+    scan = [n for n in a1["nodes"] if n["id"] == "scan"][0]
+    assert scan.get("on_no_valid") == "hold",         "A.1 must declare on_no_valid=hold for the no-evidence gate"
+    assert scan.get("hold_target") == "end_hold",         "A.1 must divert to end_hold"
+    has_verify = any(st.get("role") == "verify"
+                     for n in a1["nodes"] if n.get("kind") == "dispatch"
+                     for st in n.get("stages", []))
+    assert not has_verify, "A.1 must not carry a verify stage"
+    d1, s1 = walk(a1, [], set(), max_steps=10)
+    # gate: no verify evidence -> engine diverts instead of emitting
+    assert d1[-1] == "HALT" and not has_verify,         f"A.1 walker reaches emit only for the gate to refuse: {d1}"
+    print(f"A.1 acceptance walk: {d1}")
     print("ALL PASS — real-graph walk == original step-04 contract")
 
 
@@ -652,6 +671,46 @@ def sweep_rejection_fixtures():
                         stack.append((nxt, path + [nxt]))
         return cycles
 
+    def _parse_actions(do):
+        """(r31-3) canonical action list; raises on malformed input."""
+        if do is None:
+            return []
+        parts = do.split(";")
+        if any(not p.strip() for p in parts):
+            raise ValueError(f"empty action in sequence: {do!r}")
+        out = []
+        for a in map(str.strip, parts):
+            m = re.fullmatch(r"bump\s*[(]\s*([A-Za-z_]\w*)\s*[)]", a)
+            if m:
+                out.append(("bump", m.group(1))); continue
+            m = re.fullmatch(r"revert\s*[(]\s*(origin|latest)\s*[)]", a)
+            if m:
+                out.append(("revert", m.group(1))); continue
+            m = re.fullmatch(r"emit\s*[(]\s*([A-Za-z_]\w*)\s*,\s*([A-Za-z_]\w*)\s*[)]", a)
+            if m:
+                out.append(("emit", m.group(1), m.group(2))); continue
+            raise ValueError(f"malformed action: {a!r}")
+        return out
+
+    def _emit_count(do):
+        return sum(1 for a in _parse_actions(do) if a[0] == "emit")
+
+    def _post_emit_action(do):
+        acts = _parse_actions(do)
+        for i, a in enumerate(acts):
+            if a[0] == "emit" and i + 1 < len(acts):
+                return True
+        return False
+
+    def _bumps_in(do):
+        """Counter occurrence counts — from the canonical parser
+        (r31-3; whitespace-tolerant)."""
+        out = {}
+        for a in _parse_actions(do):
+            if a[0] == "bump":
+                out[a[1]] = out.get(a[1], 0) + 1
+        return out
+
     def _enforced_guards(w):
         """(r30-1) c enforces iff NO reachable state with c >= its
         SMALLEST cap makes the condition true. State space: counter
@@ -670,7 +729,10 @@ def sweep_rejection_fixtures():
         uni = []
         for m in _re.finditer(r'any_in\s*\(\s*verdicts\s*,\s*\[(.*?)\]\s*\)', w):
             uni += _re.findall(r'"([^"]+)"', m.group(1))
-        uni = sorted(set(uni))[:4]
+        uni = sorted(set(uni))
+        if len(uni) > 12:
+            raise AssertionError(  # resource bound: fail, never trust
+                f"guard probe universe too large: {len(uni)} verdicts")
         verdict_sets = [()] + [tuple(c) for r in range(1, len(uni) + 1)
                               for c in _it.combinations(uni, r)]
         clocks = [(False, False), (True, False), (False, True), (True, True)]
@@ -707,13 +769,6 @@ def sweep_rejection_fixtures():
                     break
             if enforced:
                 out.add(c)
-        return out
-
-    def _bumps_in(do):
-        """Counter occurrence counts in an action sequence."""
-        out = {}
-        for m in re.finditer(r"bump\s*[(]\s*([A-Za-z_]\w*)\s*[)]", do or ""):
-            out[m.group(1)] = out.get(m.group(1), 0) + 1
         return out
 
     def _merge(dst, src):
@@ -846,15 +901,8 @@ def sweep_rejection_fixtures():
         return seen
 
     def _has_revert(do):
-        """(r28-2) true iff the action sequence contains a revert —
-        whitespace-tolerant, parsed per-action like apply_do."""
-        for action in (do or "").split(";"):
-            a = action.strip()
-            if a.lower().startswith("revert"):
-                rest = a[6:].lstrip()
-                if rest.startswith("(") :
-                    return True
-        return False
+        """(r31-3) parser-based revert detection (bogus bases raise)."""
+        return any(a[0] == "revert" for a in _parse_actions(do))
 
     def _refs_provenance(w):
         stripped = re.sub(r'"[^"]*"', '""', w)
@@ -922,7 +970,7 @@ def sweep_rejection_fixtures():
                         # (r28-2) revert invalidates evidence — decided
                         # by parsing the action sequence for real
                         ev2 = ev
-                        d = br.get("do") or ""
+                        d = br.get("do")
                         if _has_revert(d):
                             ev2 = False
                         yield (g, ev2)
@@ -1219,9 +1267,18 @@ def sweep_rejection_fixtures():
         for n in pol["nodes"]:
             if n["kind"] == "route":
                 for br in n["branches"]:
-                    d = br.get("do") or ""
-                    if "emit(" in d and "bump(" in d:
-                        br["do"] = d.split(";")[0]
+                    d = br.get("do")
+                    if d and _post_emit_action(d):
+                        # keep only the actions up to & incl. first emit
+                        acts = _parse_actions(d)
+                        keep = []
+                        for a in acts:
+                            keep.append(a)
+                            if a[0] == "emit":
+                                break
+                        br["do"] = "; ".join(
+                            a[0] + f"({a[1]}, {a[2]})" if a[0] == "emit"
+                            else a[0] + f"({a[1]})" for a in keep)
         return pol
     # each violation checker: True when the violation IS present
     def _has_01_cycle(pol):
@@ -1242,14 +1299,18 @@ def sweep_rejection_fixtures():
         for n in pol["nodes"]:
             if n["kind"] == "route":
                 last = n["branches"][-1]
-                if last["when"] == "false" and "emit(" in (last.get("do") or ""):
+                if last["when"] == "false" and _emit_count(last.get("do")) > 0:
                     return True
         return False
     def _has_06_do_bump_no_goto(pol):
         for n in pol["nodes"]:
             if n["kind"] == "route":
                 for br in n.get("branches", []):
-                    if "bump(" in (br.get("do") or "") and not br.get("goto"):
+                    d = br.get("do")
+                    if d is None:
+                        continue
+                    bumps = _bumps_in(d)
+                    if bumps and not br.get("goto"):
                         return True
         return False
     def _has_12_mismatch(pol):
@@ -1273,15 +1334,15 @@ def sweep_rejection_fixtures():
         for n in pol["nodes"]:
             if n["kind"] == "route":
                 for br in n.get("branches", []):
-                    if (br.get("do") or "").count("emit(") > 1:
+                    d = br.get("do") or ""
+                    if _emit_count(d) > 1:
                         return True
         return False
     def _has_14_post(pol):
         for n in pol["nodes"]:
             if n["kind"] == "route":
                 for br in n.get("branches", []):
-                    d = br.get("do") or ""
-                    if "emit(" in d and ";" in d and "bump(" in d.split("emit(")[1]:
+                    if _post_emit_action(br.get("do") or ""):
                         return True
         return False
     VIOLATIONS = {

@@ -1,7 +1,7 @@
 # Foundry Universal Skill Spec — 범용 실행 모델 (Universal Review Engine)
 
-- **버전**: v0.32 (2026-10-12) — r30 REWORK(MAJOR 3) 반영.
-  상태공간 전수 가드 probe·policy 실행결속·양 파서 통일. 재검증 대기.
+- **버전**: v0.33 (2026-10-12) — r31 REWORK(MAJOR 4) 반영.
+  universe 전수·astra 실행결속·파서 기반 검출기·A.1 게이트. 재검증 대기.
 - **의도(소유자)**: Foundry는 어떤 방법론도 돌릴 수 있는 유니버설
   플랫폼. BMad는 스킬 데이터의 첫 고객. **Rust 도메인에 방법론
   코드가 박히는 순간이 실패.** 엔진 고정·확장 선언(procedural macro
