@@ -1843,18 +1843,21 @@ def contract_checks(doc):
         if os.path.exists(p3):
             sd3 = tomllib.load(open(p3, "rb"))
             _ev_allowed |= {o.get("name") for o in sd3.get("output", [])}
-    _ev_allowed |= {"InspectionPassed", "InspectionFailed", "summary"}
     for n in doc["nodes"]:
         if n["kind"] == "emit":
             ev = n.get("event")
-            assert ev in _ev_allowed, \
-                f"emit {n['id']} event {ev!r} not in the closed event set"
+            assert ev in ("InspectionPassed", "InspectionFailed"), \
+                f"emit {n['id']} event {ev!r} not InspectionPassed|Failed"
     # (F11-2) dispatch nodes carry >=1 stage (§2.3)
     for n in doc["nodes"]:
         if n["kind"] == "dispatch":
             sts = n.get("stages") or []
             assert len(sts) >= 1, \
                 f"dispatch {n['id']} must declare at least one stage"
+        if n["kind"] == "redrive":
+            # (F12-2) payload is mandatory — unused nodes included
+            assert n.get("payload"), \
+                f"redrive {n['id']} missing payload (§2.3)"
     # (F11-3) every branch action references DECLARED counters —
     # dead branches included (load-time namespace validation)
     _declared_ctrs = set(doc.get("counters", {}).keys())

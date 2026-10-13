@@ -255,15 +255,19 @@ def graph(policy):
         if n['kind'] == 'emit':
             assert n.get('payload_from'), \
                 f'emit {n["id"]} missing payload_from'
-            # (F11-1) closed event set (canonical pair allowed)
+            # (F11-1/F12-1) closed event set — canonical pair ONLY
+            # (output declarations do NOT extend the event namespace)
             ev_ = n.get('event')
-            assert ev_ in ('InspectionPassed', 'InspectionFailed', 'summary') \
-                or ev_ in EV_DECLARED, \
-                f'emit {n["id"]} event {ev_!r} not in the closed event set'
+            assert ev_ in ('InspectionPassed', 'InspectionFailed'), \
+                f'emit {n["id"]} event {ev_!r} not InspectionPassed|Failed'
         if n['kind'] == 'dispatch':
             # (F11-2) >=1 stage per dispatch
             assert n.get('stages'), \
                 f'dispatch {n["id"]} must declare at least one stage'
+        if n['kind'] == 'redrive':
+            # (F12-2) payload mandatory — unused nodes included
+            assert n.get('payload'), \
+                f'redrive {n["id"]} missing payload (§2.3)'
         if n['kind'] == 'hold' and 'timeout_s' in n:
             t = n['timeout_s']
             assert isinstance(t, int) and not isinstance(t, bool) and t > 0, \

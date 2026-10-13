@@ -1,7 +1,7 @@
 # Foundry Universal Skill Spec — 범용 실행 모델 (Universal Review Engine)
 
-- **버전**: v0.46 (2026-10-12) — 11차 최종 검증 반영.
-  이벤트 폐쇄 집합·dispatch 최소 stage·미실행 분기 카운터 검증·동결 문서 정리(노드 집합·카운터 순서·정규화 범위).
+- **버전**: v0.47 (2026-10-12) — 12차 최종 검증 반영.
+  이벤트 집합 canonical 쌍으로 폐쇄(출력 이름 확장 차단)·redrive payload 필수(미실행 노드 포함)·hold 전용 timeout_s·팩 경로 에일리어스 기술.
 - **의도(소유자)**: Foundry는 어떤 방법론도 돌릴 수 있는 유니버설
   플랫폼. BMad는 스킬 데이터의 첫 고객. **Rust 도메인에 방법론
   코드가 박히는 순간이 실패.** 엔진 고정·확장 선언(procedural macro
@@ -16,8 +16,11 @@
 - 조건식은 완전 소비 파서가 처리: 괄호 안 `)` 포함 문자열(`"a)b"`)도 정상 토큰.
 - 검증 증거 게이트(§2.4): emit 노드·emit 액션 공통 적용, redrive(신산출물)·
   revert는 증거 무효화. 게이트 거부 시 상류 dispatch hold_target으로 divert.
-- 전역 `[hold] timeout_s`: 양의 정수(초) 또는 0(=무한 대기). 노드별 timeout은
-  양의 정수만. 카운터 초기값은 u64 범위 비부울 정수.
+- 전역 `[hold] timeout_s`: 양의 정수(초) 또는 0(=무한 대기). 노드별
+  timeout_s는 **hold 노드의 선택 필드로만** 존재(양의 정수) — 그 외
+  노드 kind의 timeout_s는 로드 거부. 카운터 초기값은 u64 비부울 정수.
+  **emit 이벤트 집합은 InspectionPassed|InspectionFailed 폐쇄** —
+  스키마 출력 선언으로 확장 불가.
 - `pack_stages`의 role도 폐쇄 집합 lens|verify|replan (등록 스테이지 동일 규칙).
 - emit의 payload_from은 팩 스키마가 선언한 출력(또는 summary)만 참조.
 - 현재 PASS는 **선언적 모델 검증** — 실제 세션 계승·원자성·fencing·엔진 diff 0의
@@ -545,7 +548,10 @@ policy = "discard-finding" # 개별 finding 거부(부분 거부)
    (위임) — 스펙 예제 전체 TOML+DSL 파싱·타입 검증 golden
 2. **그래프 실행기+원자성(append_validated_batch)+fencing**(직접)
    — 노드 5종만
-3. `skills/bmad-review/v1` — 렌즈 3+검증기+**액션 그래프(BMad 전
+3. 팩 배치: canonical 경로는 `skills/bmad-review-full/v1/`(digest
+   e925fd01…). §4의 `skills/bmad-review/v1` 표기는 런타임 설치
+   에일리어스(동일 digest)로, 별도 사본이 아니다.
+   렌즈 3+검증기+**액션 그래프(BMad 전
    라우팅: fix 루프+자동 재계획 5회+defer)** 이식
 4. e2e: 실 PR → 렌즈 → fix 루프 → 재계획 → hold → 인간 API 실주행
 5. `skills/plain-cr-review/v1` — 인수: **라우팅·루프·어휘 전부
