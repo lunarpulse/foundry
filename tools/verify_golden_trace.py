@@ -2112,14 +2112,17 @@ def contract_checks(doc):
         if bs:
             _bump_ctr[n["id"]] = bs
     _guard_ctrs = {}
+    _guard_all_ctrs = {}
     for n in doc["nodes"]:
         if n["kind"] == "route":
             for br in n.get("branches", []):
                 g = br.get("goto")
                 w = br.get("when", "")
-                m20 = re.search(r"count_lt\s*\(\s*([a-z_][a-z0-9_]*)", w)
-                if g and m20:
-                    _guard_ctrs[(n["id"], g)] = m20.group(1)
+                _ctrs_in_w = re.findall(
+                    r"count_lt\s*\(\s*([a-z_][a-z0-9_]*)", w)
+                if g and _ctrs_in_w:
+                    _guard_ctrs[(n["id"], g)] = _ctrs_in_w[0]
+                    _guard_all_ctrs[(n["id"], g)] = set(_ctrs_in_w)
                     _parts = re.split(r"\|\|", re.sub(r'"[^"]*"', '""', w))
                     _pure_or = any(
                         "count_lt" not in p.strip()
@@ -2165,14 +2168,17 @@ def contract_checks(doc):
         if bs:
             _bump_ctr[n["id"]] = bs
     _guard_ctrs = {}
+    _guard_all_ctrs = {}
     for n in doc["nodes"]:
         if n["kind"] == "route":
             for br in n.get("branches", []):
                 g = br.get("goto")
                 w = br.get("when", "")
-                m20 = re.search(r"count_lt\s*\(\s*([a-z_][a-z0-9_]*)", w)
-                if g and m20:
-                    _guard_ctrs[(n["id"], g)] = m20.group(1)
+                _ctrs_in_w = re.findall(
+                    r"count_lt\s*\(\s*([a-z_][a-z0-9_]*)", w)
+                if g and _ctrs_in_w:
+                    _guard_ctrs[(n["id"], g)] = _ctrs_in_w[0]
+                    _guard_all_ctrs[(n["id"], g)] = set(_ctrs_in_w)
                     _parts = re.split(r"\|\|", re.sub(r'"[^"]*"', '""', w))
                     _pure_or = any(
                         "count_lt" not in p.strip()
@@ -2279,6 +2285,44 @@ def contract_checks(doc):
                             f"route {u} branch to {w}: count_lt appears "
                             "under negation — that is an exit condition, "
                             "not a re-entry cap (§2.2)")
+                    # (F25-1) EVERY counter mentioned in the guard must
+                    # be bumped along the cycle — an OR-joined secondary
+                    # count_lt whose counter never increments keeps the
+                    # disjunct true forever (count_lt(a,3) ||
+                    # count_lt(loopbacks,5) with loopbacks stuck at 0)
+                    for gc_all in _guard_all_ctrs.get((u, w), set()):
+                        _b_here = any(
+                            a[0] == "bump" and a[1] == gc_all
+                            for br2 in _brs
+                            for a in _parse_actions_top(br2.get("do")))
+                        _b_node = (_node_ids[w].get("kind") == "redrive"
+                                   and _node_ids[w].get("bump") == gc_all)
+                        # (F25-1a) bump credited only on nodes that
+                        # lie on a path from w BACK to u (the cycle the
+                        # guard actually closes) — route1's OTHER
+                        # branches don't run on this loop
+                        _reach = set()
+                        _stack = [w]
+                        while _stack:
+                            _x = _stack.pop()
+                            if _x in _reach:
+                                continue
+                            _reach.add(_x)
+                            if _x == u:
+                                continue
+                            for _y in _full_adj.get(_x, ()):
+                                if _y not in _reach:
+                                    _stack.append(_y)
+                        _back = _reach - {u}
+                        _b_comp = any(
+                            gc_all in _bump_ctr.get(x, set())
+                            for x in _back)
+                        if not (_b_here or _b_node or _b_comp):
+                            raise AssertionError(
+                                f"route {u} branch to {w}: guard counter "
+                                f"{gc_all!r} is never bumped along the "
+                                "cycle — an OR-joined stale counter "
+                                "bypasses the cap (§2.2/§2.3)")
         # (F24-2) exactly-once per traversal: inside an automatic SCC,
         # at most ONE node may carry a redrive bump for a given guard
         # counter, and it must be the guard's entry node — fixdie ->
@@ -2302,6 +2346,21 @@ def contract_checks(doc):
                                 f"redrive nodes {_bumpers} — one "
                                 "traversal increments more than once "
                                 "(§2.3)")
+                        # (F25-2) route nodes inside the cycle bumping
+                        # the guard counter ALSO increment — a redrive
+                        # bump + a downstream route branch bump counts
+                        # twice per traversal
+                        _route_bumpers = [
+                            x for x in _comp
+                            if _node_ids[x].get("kind") == "route"
+                            and gc2 in _bump_ctr.get(x, set())]
+                        if _bumpers and _route_bumpers:
+                            raise AssertionError(
+                                f"automatic cycle {_sccs[_scc_of[u]]}: "
+                                f"counter {gc2!r} bumped by redrive "
+                                f"{_bumpers} AND route nodes "
+                                f"{_route_bumpers} — double increment "
+                                "per traversal (§2.3)")
 # (F18-1) defer contract: if any route branch mentions the
     # 'defer' verdict, the pack MUST declare a 'deferred' output and
     # no two schema outputs may share a 'from' source column

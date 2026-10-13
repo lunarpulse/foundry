@@ -1,7 +1,7 @@
 # Foundry Universal Skill Spec — 범용 실행 모델 (Universal Review Engine)
 
-- **버전**: v0.59 (2026-10-12) — 24차 최종 검증 반영.
-  가드 논리 상한(부정 하 count_lt=탈출 조건 — 괄호 인식 스캔)·사이클 당 redrive bump 정확히 1회(다중 bump 노드 거부)·DSL 재귀 하강 파서(eval 폐지 — 단락평가 문법 은폐 제거)·astra 구문 probe state 팩 선언 카운터만.
+- **버전**: v0.60 (2026-10-12) — 25차 최종 검증 반영.
+  가드 내 전 count_lt 카운터 경로 스코프 bump 검증(OR 보조 카운터 우회 거부 — w→u 복귀 경로상 bump만 인정)·redrive+route 혼합 이중 증가 거부.
 - **의도(소유자)**: Foundry는 어떤 방법론도 돌릴 수 있는 유니버설
   플랫폼. BMad는 스킬 데이터의 첫 고객. **Rust 도메인에 방법론
   코드가 박히는 순간이 실패.** 엔진 고정·확장 선언(procedural macro

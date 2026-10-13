@@ -459,15 +459,17 @@ def graph(policy):
             bump_ctr[n_['id']] = bs_
     # guard extraction + OR/neg checks
     guard_ctrs = {}
+    guard_all_ctrs = {}
     for n_ in nodes.values():
         if n_['kind'] != 'route':
             continue
         for b_ in n_['branches']:
             g_ = b_.get('goto')
             w_ = b_.get('when', '')
-            m20 = _re19.search(r'count_lt\s*\(\s*([a-z_][a-z0-9_]*)', w_)
-            if g_ and m20:
-                guard_ctrs[(n_['id'], g_)] = m20.group(1)
+            ctrs_in_w = _re19.findall(r'count_lt\s*\(\s*([a-z_][a-z0-9_]*)', w_)
+            if g_ and ctrs_in_w:
+                guard_ctrs[(n_['id'], g_)] = ctrs_in_w[0]
+                guard_all_ctrs[(n_['id'], g_)] = set(ctrs_in_w)
                 parts_ = _re19.split(r'\|\|', _re19.sub(r'"[^"]*"', '""', w_))
                 pure_or = any('count_lt' not in p.strip() for p in parts_ if p.strip())
                 dst_n_ = nodes.get(g_)
@@ -557,6 +559,35 @@ def graph(policy):
                         raise AssertionError(
                             f'route {u19} branch to {w19}: count_lt under '
                             'negation — exit condition, not a re-entry cap (§2.2)')
+                    # (F25-1) EVERY guard counter bumped on the cycle
+                    # path from w19 BACK to u19
+                    for gc_all in guard_all_ctrs.get((u19, w19), set()):
+                        b_here_ = any(
+                            a_[0] == 'bump' and a_[1] == gc_all
+                            for b2_ in brs_
+                            for a_ in actions(b2_.get('do'), {'counters': {}, 'events': []}))
+                        b_node_ = (nodes[w19].get('kind') == 'redrive'
+                                   and nodes[w19].get('bump') == gc_all)
+                        reach_ = set()
+                        stack_ = [w19]
+                        while stack_:
+                            x_ = stack_.pop()
+                            if x_ in reach_:
+                                continue
+                            reach_.add(x_)
+                            if x_ == u19:
+                                continue
+                            for y_ in auto_adj.get(x_, ()):
+                                if y_ not in reach_:
+                                    stack_.append(y_)
+                        back_ = reach_ - {u19}
+                        b_comp_ = any(gc_all in bump_ctr.get(x_, set())
+                                      for x_ in back_)
+                        if not (b_here_ or b_node_ or b_comp_):
+                            raise AssertionError(
+                                f'route {u19} branch to {w19}: guard counter '
+                                f'{gc_all!r} never bumped along the cycle — '
+                                'OR-joined stale counter bypasses the cap (§2.2/§2.3)')
         # (F24-2) exactly-once: at most ONE redrive node per guard
         # counter inside an automatic SCC
         for u19, ws19 in auto_adj.items():
@@ -575,6 +606,14 @@ def graph(policy):
                                 f'automatic cycle: counter {gc2_!r} bumped by '
                                 f'multiple redrive nodes {bumpers_} — double '
                                 'increment per traversal (§2.3)')
+                        rbumpers_ = [x_ for x_ in comp_
+                                     if nodes[x_].get('kind') == 'route'
+                                     and gc2_ in bump_ctr.get(x_, set())]
+                        if bumpers_ and rbumpers_:
+                            raise AssertionError(
+                                f'automatic cycle: counter {gc2_!r} bumped by '
+                                f'redrive {bumpers_} AND route {rbumpers_} — '
+                                'double increment per traversal (§2.3)')
     # (F8-2) resume/route edges must form a DAG after removing deduct
     non_deduct_ = {i for i, n in nodes.items()
                    if n['kind'] not in ('dispatch', 'redrive')}
