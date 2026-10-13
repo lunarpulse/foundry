@@ -231,6 +231,28 @@ def graph(policy):
     assert len(nodes) == len(policy['nodes']), 'duplicate node IDs'
     assert policy['entry'] in nodes, 'missing entry'
     stages = {s['id'] for s in policy.get('pack_stages', [])}
+    # (F2-1) general load validation: error policy enums, emit
+    # payload_from, timeout_s, counter u64, closed role set
+    for n in nodes.values():
+        if n['kind'] == 'emit':
+            assert n.get('payload_from'), \
+                f'emit {n["id"]} missing payload_from'
+        if n['kind'] == 'hold' and 'timeout_s' in n:
+            t = n['timeout_s']
+            assert isinstance(t, int) and not isinstance(t, bool) and t > 0, \
+                f'hold {n["id"]} timeout_s must be a positive int'
+        for f in ('on_verify_invalid', 'on_no_valid', 'on_redrive_error'):
+            if f in n:
+                assert n[f] in ('hold', 'fail-run'), \
+                    f'{n["id"]}.{f}={n[f]!r} invalid (hold|fail-run — §2.3)'
+        for st_ in n.get('stages', []) or []:
+            if 'role' in st_:
+                assert st_['role'] in ('lens', 'verify', 'replan'), \
+                    f'stage {st_["id"]} role {st_["role"]!r} not in lens|verify|replan'
+    for cname, cval in policy.get('counters', {}).items():
+        assert isinstance(cval, int) and not isinstance(cval, bool) \
+            and 0 <= cval < 2**64, \
+            f'counter {cname} initial value must be a u64 int'
     # (r32-1) mandatory fields + §2.4b resume-cycle on every pack
     deduct = {n['id'] for n in nodes.values()
               if n['kind'] in ('dispatch', 'redrive')}

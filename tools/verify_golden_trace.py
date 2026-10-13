@@ -60,6 +60,8 @@ def atom(name, args, state):
         return bool(state["findings"])
     if name == "count_lt":
         counter, n = [a.strip() for a in args.split(",")]
+        if counter not in state["counters"]:
+            raise ValueError(f"undeclared counter {counter!r}")
         return state["counters"][counter] < int(n)
     if name == "any_in":
         m = re.match(r"verdicts,(.*)", args, re.S)
@@ -88,6 +90,12 @@ def evaluate(expr, state):
     e = e.replace("true", "T").replace("false", "F")
     e = e.replace("T", " True ").replace("F", " False ")
     py = e.replace("&&", " and ").replace("||", " or ").replace("!", " not ")
+    # (F2-4) FULL-CONSUMPTION: only True/False/and/or/not/parens/space
+    # may remain — anything else (unknown predicates, operators like +,
+    # bare identifiers) is a syntax error, never silently True
+    # allowed tokens: True, False, and, or, not, parens, whitespace
+    if not re.fullmatch(r"(?:True|False|and|or|not|[()\s])+", py):
+        raise ValueError(f"expression not fully consumed: {py!r} (from {expr!r})")
     return bool(eval(py))
 
 
@@ -168,12 +176,13 @@ def walk(doc, verdicts, active_cats, max_steps=50):
                 divert = None
                 for did in reversed(decisions):
                     dn = nodes.get(did)
-                    if dn and dn.get("kind") == "dispatch":
-                        divert = dn.get("hold_target")
+                    if dn and dn.get("kind") in ("dispatch", "redrive") \
+                            and dn.get("hold_target"):
+                        divert = dn["hold_target"]
                         break
                 if not divert:
                     for dn in nodes.values():
-                        if dn.get("kind") == "dispatch" and \
+                        if dn.get("kind") in ("dispatch", "redrive") and \
                                 dn.get("hold_target"):
                             divert = dn["hold_target"]
                             break
@@ -190,6 +199,7 @@ def walk(doc, verdicts, active_cats, max_steps=50):
                     if d and any(a[0] == "revert"
                                  for a in _parse_actions_top(d)):
                         evidence = False  # (FINAL-3)
+                        state["evidence"] = False  # (F2-2)
                     if d:
                         apply_do(d, state)
                     nxt = br.get("goto")
@@ -199,17 +209,15 @@ def walk(doc, verdicts, active_cats, max_steps=50):
                         if d:
                             if any(a[0] == "emit" for a in _parse_actions_top(d)):
                                 if not evidence:
-                                    # (r33-3) §2.4 gate: refuse auto-emit
-                                    # without verify evidence; divert
-                                    src_node = nodes[decisions[-1]] \
-                                        if decisions else None
+                                    # (r33-3/F2-3) §2.4 gate + context
+                                    # succession (latest dispatch/redrive)
                                     divert = None
                                     for did in reversed(decisions):
                                         dn = nodes.get(did)
-                                        if dn and dn.get("kind") == "dispatch":
-                                            divert = dn.get("hold_target") or \
-                                                (dn.get("on_no_valid")
-                                                 if dn.get("on_no_valid") != "hold" else None)
+                                        if dn and dn.get("kind") in (
+                                                "dispatch", "redrive") and \
+                                                dn.get("hold_target"):
+                                            divert = dn["hold_target"]
                                             break
                                     if divert and divert in nodes:
                                         return decisions + ["GATE:refused-emit",
@@ -227,23 +235,25 @@ def walk(doc, verdicts, active_cats, max_steps=50):
         elif kind == "redrive":
             decisions.append(cur)
             evidence = False  # (FINAL-3) new artifact invalidates
+            state["evidence"] = False  # (F2-2) survives into resumes
             if node.get("bump"):  # node-level bump (non-loopback fix loops)
                 state["counters"][node["bump"]] = \
                     state["counters"].get(node["bump"], 0) + 1
             cur = node["on_done"]
         elif kind == "emit":
             if not evidence:
-                # (FINAL-3) gate on emit NODES
+                # (F2-3) §2.3 context succession: divert to the MOST
+                # RECENT dispatch OR redrive hold_target on the path
                 divert = None
                 for did in reversed(decisions):
                     dn = nodes.get(did)
-                    if dn and dn.get("kind") == "dispatch":
-                        divert = dn.get("hold_target")
+                    if dn and dn.get("kind") in ("dispatch", "redrive") \
+                            and dn.get("hold_target"):
+                        divert = dn["hold_target"]
                         break
                 if not divert:
-                    # fall back: the ENTRY dispatch of the pack
                     for dn in nodes.values():
-                        if dn.get("kind") == "dispatch" and \
+                        if dn.get("kind") in ("dispatch", "redrive") and \
                                 dn.get("hold_target"):
                             divert = dn["hold_target"]
                             break
@@ -275,6 +285,8 @@ def walk_from(nodes, doc, start, state, active_cats, max_steps=50):
     cur = start
     decisions = []
     evidence = state.get("evidence", False)
+    # walk_from starts at a RESUME target — a fresh dispatch run may
+    # re-establish evidence; invalidation persists until re-verify
     for _ in range(max_steps):
         node = nodes.get(cur)
         if node is None:
@@ -298,12 +310,13 @@ def walk_from(nodes, doc, start, state, active_cats, max_steps=50):
                 divert = None
                 for did in reversed(decisions):
                     dn = nodes.get(did)
-                    if dn and dn.get("kind") == "dispatch":
-                        divert = dn.get("hold_target")
+                    if dn and dn.get("kind") in ("dispatch", "redrive") \
+                            and dn.get("hold_target"):
+                        divert = dn["hold_target"]
                         break
                 if not divert:
                     for dn in nodes.values():
-                        if dn.get("kind") == "dispatch" and \
+                        if dn.get("kind") in ("dispatch", "redrive") and \
                                 dn.get("hold_target"):
                             divert = dn["hold_target"]
                             break
@@ -320,6 +333,7 @@ def walk_from(nodes, doc, start, state, active_cats, max_steps=50):
                     if d and any(a[0] == "revert"
                                  for a in _parse_actions_top(d)):
                         evidence = False  # (FINAL-3)
+                        state["evidence"] = False  # (F2-2)
                     if d:
                         apply_do(d, state)
                     nxt = br.get("goto")
@@ -329,17 +343,15 @@ def walk_from(nodes, doc, start, state, active_cats, max_steps=50):
                         if d:
                             if any(a[0] == "emit" for a in _parse_actions_top(d)):
                                 if not evidence:
-                                    # (r33-3) §2.4 gate: refuse auto-emit
-                                    # without verify evidence; divert
-                                    src_node = nodes[decisions[-1]] \
-                                        if decisions else None
+                                    # (r33-3/F2-3) §2.4 gate + context
+                                    # succession (latest dispatch/redrive)
                                     divert = None
                                     for did in reversed(decisions):
                                         dn = nodes.get(did)
-                                        if dn and dn.get("kind") == "dispatch":
-                                            divert = dn.get("hold_target") or \
-                                                (dn.get("on_no_valid")
-                                                 if dn.get("on_no_valid") != "hold" else None)
+                                        if dn and dn.get("kind") in (
+                                                "dispatch", "redrive") and \
+                                                dn.get("hold_target"):
+                                            divert = dn["hold_target"]
                                             break
                                     if divert and divert in nodes:
                                         return decisions + ["GATE:refused-emit",
@@ -357,23 +369,25 @@ def walk_from(nodes, doc, start, state, active_cats, max_steps=50):
         elif kind == "redrive":
             decisions.append(cur)
             evidence = False  # (FINAL-3) new artifact invalidates
+            state["evidence"] = False  # (F2-2) survives into resumes
             if node.get("bump"):  # node-level bump (non-loopback fix loops)
                 state["counters"][node["bump"]] = \
                     state["counters"].get(node["bump"], 0) + 1
             cur = node["on_done"]
         elif kind == "emit":
             if not evidence:
-                # (FINAL-3) gate on emit NODES
+                # (F2-3) §2.3 context succession: divert to the MOST
+                # RECENT dispatch OR redrive hold_target on the path
                 divert = None
                 for did in reversed(decisions):
                     dn = nodes.get(did)
-                    if dn and dn.get("kind") == "dispatch":
-                        divert = dn.get("hold_target")
+                    if dn and dn.get("kind") in ("dispatch", "redrive") \
+                            and dn.get("hold_target"):
+                        divert = dn["hold_target"]
                         break
                 if not divert:
-                    # fall back: the ENTRY dispatch of the pack
                     for dn in nodes.values():
-                        if dn.get("kind") == "dispatch" and \
+                        if dn.get("kind") in ("dispatch", "redrive") and \
                                 dn.get("hold_target"):
                             divert = dn["hold_target"]
                             break
@@ -484,8 +498,13 @@ def negative_controls(doc, active_cats):
             n["resume_targets"] = n["resume_targets"] + ["pass"]
     d, res = walk(bad, ["intent_gap"], active_cats, max_steps=30)
     _, outs = res
-    assert any(o[0] and o[0][0] == "emit:InspectionPassed" for o in outs), \
-        "mutated resume_targets+=pass must produce a detectable wrong pass"
+    # (F2-2) with evidence invalidation, the resume into pass hits
+    # the §2.4 gate (revert before the hold invalidated evidence) —
+    # gate refusal is an equally valid detection
+    detected = any(o[0] and (o[0][0] == "emit:InspectionPassed"
+                             or "GATE:refused-emit" in o[0]) for o in outs)
+    assert detected, \
+        "mutated resume_targets+=pass must surface (emit or gate refusal)"
     # 2. entry -> missing node must raise
     bad2 = copy.deepcopy(doc)
     bad2["entry"] = "missing"
@@ -1645,22 +1664,34 @@ def contract_checks(doc):
                         "replan must run the partial amender"
     # (r32-1, r33-1, FINAL-2) mandatory fields, enums, values — FULL pack
     nids = {n["id"]: n for n in doc["nodes"]}
-    # hold nodes carrying a timeout must declare timeout_s (§2.4)
+    # hold nodes: timeout_s when present must be a positive real int
+    # (bool excluded — bool is an int subclass in Python)
     for n in doc["nodes"]:
         if n["kind"] == "hold" and "timeout_s" in n:
-            assert isinstance(n["timeout_s"], (int, float)) and \
-                n["timeout_s"] > 0, \
-                f"hold {n['id']} timeout_s must be positive"
-    # counters must start at non-negative ints
+            t = n["timeout_s"]
+            assert isinstance(t, int) and not isinstance(t, bool) and \
+                t > 0, f"hold {n['id']} timeout_s must be a positive int"
+    # counters: non-negative int (bool excluded), u64-bounded
     for cname, cval in doc.get("counters", {}).items():
-        assert isinstance(cval, int) and cval >= 0, \
-            f"counter {cname} initial value must be a non-negative int"
+        assert isinstance(cval, int) and not isinstance(cval, bool) and \
+            0 <= cval < 2**64, \
+            f"counter {cname} initial value must be a u64 int"
     # emit nodes require payload_from; stage roles are a closed set
+    schema_outputs = set()
+    import os as _os2
+    for sf in ("schema-triage.toml", "schema-findings.toml",
+               "schema-defer.toml"):
+        p2 = f"{PACK}/{sf}"
+        if os.path.exists(p2):
+            sd = tomllib.load(open(p2, "rb"))
+            schema_outputs |= {o.get("name") for o in sd.get("output", [])}
     for n in doc["nodes"]:
         if n["kind"] == "emit":
-            assert n.get("payload_from"), \
-                f"emit {n['id']} missing payload_from"
-    ROLES = {"lens", "verify", "triage"}
+            pf = n.get("payload_from")
+            assert pf, f"emit {n['id']} missing payload_from"
+            assert pf in schema_outputs or pf in ("summary",), \
+                f"emit {n['id']} payload_from={pf!r} not a declared output"
+    ROLES = {"lens", "verify", "replan"}  # §2.3 normative
     for n in doc["nodes"]:
         for st in n.get("stages", []) or []:
             if "role" in st:
