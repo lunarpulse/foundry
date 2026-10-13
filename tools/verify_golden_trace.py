@@ -62,14 +62,16 @@ def atom(name, args, state):
             raise ValueError(f"{name} takes no arguments, got {args!r}")
         return state.get(name, False)
     if name == "has_findings":
-        if args.strip() not in ("any", ""):
-            raise ValueError(f"has_findings arg must be 'any', got {args!r}")
+        if args.strip() != "any":
+            raise ValueError(f"has_findings requires (any), got {args!r}")
         return bool(state["findings"])
     if name == "count_lt":
         m = re.fullmatch(r"([A-Za-z_]\w*)\s*,\s*(\d+)", args)
         if not m:
             raise ValueError(f"count_lt malformed args: {args!r}")
         counter, n = m.group(1), int(m.group(2))
+        if n >= 2**64:
+            raise ValueError(f"count_lt cap {n} exceeds u64")
         if counter not in state["counters"]:
             raise ValueError(f"undeclared counter {counter!r}")
         return state["counters"][counter] < n
@@ -91,16 +93,29 @@ def atom(name, args, state):
 
 
 def check_grammar(expr):
-    """(r33-2) expression grammar: string literals are DOUBLE-quoted
-    only; a single quote is a syntax error (normative — both
-    evaluators reject identically)."""
+    """(r33-2/F4-3) normative grammar: double-quoted string literals
+    only; whitespace may not appear INSIDE an identifier or number —
+    two word-chars separated only by whitespace (no operator, paren,
+    comma or quote between them) is a token-split error, because
+    whitespace-stripping would manufacture a single token."""
     if "'" in expr:
         raise ValueError(f"single-quote literal not in grammar: {expr!r}")
+    outside = re.sub(r'"[^"]*"', '""', expr)
+    for m in re.finditer(r"([A-Za-z0-9_]+)(\s+)([A-Za-z0-9_]+)", outside):
+        s, e = m.start(), m.end()
+        seg = outside[s:e]
+        # between the two word runs there must be an operator char
+        if not re.search(r"[()&,|!=<>+\-*/]", m.group(2) + seg[len(m.group(1)):len(seg)-len(m.group(3))]):
+            raise ValueError(f"whitespace inside token: {seg!r} in {expr!r}")
+
 
 def evaluate(expr, state):
     check_grammar(expr)
     # r32-2: strip whitespace ONLY outside string literals
     e = re.sub(r'"[^"]*"|.', lambda m: m.group(0) if m.group(0).startswith('"') else ("" if m.group(0).isspace() else m.group(0)), expr)
+    # (F4-3) 'true' is a literal, not a call — true() is malformed
+    if re.search(r"\btrue\s*\(", e):
+        raise ValueError("true is a literal; true() is malformed")
     while True:
         m = CALL.search(e)
         if not m:
@@ -1684,13 +1699,14 @@ def contract_checks(doc):
                         "replan must run the partial amender"
     # (r32-1, r33-1, FINAL-2) mandatory fields, enums, values — FULL pack
     nids = {n["id"]: n for n in doc["nodes"]}
-    # (F3-1) top-level [hold] config: timeout_s positive int or 0
-    # (= infinite wait per §2.4); bool excluded
-    hold_cfg = doc.get("hold", {})
-    ht = hold_cfg.get("timeout_s")
-    if ht is not None:
-        assert isinstance(ht, int) and not isinstance(ht, bool) and \
-            ht >= 0, "top-level [hold] timeout_s must be >= 0 (0=infinite)"
+    # (F3-1/F4-1) top-level [hold] config is MANDATORY (§3.3: omit
+    # => load rejection); timeout_s positive int or 0 (=infinite)
+    assert "hold" in doc, "pack must declare a top-level [hold] table"
+    ht = doc["hold"].get("timeout_s")
+    assert ht is not None, \
+        "top-level [hold] must declare timeout_s (0=infinite)"
+    assert isinstance(ht, int) and not isinstance(ht, bool) and \
+        ht >= 0, "top-level [hold] timeout_s must be >= 0 (0=infinite)"
     # hold nodes: timeout_s when present must be a positive real int
     # (bool excluded — bool is an int subclass in Python)
     for n in doc["nodes"]:
@@ -1729,6 +1745,13 @@ def contract_checks(doc):
         if "role" in ps:
             assert ps["role"] in ROLES, \
                 f"pack_stage {ps.get('id')} role {ps['role']!r} not in {ROLES}"
+    # (F4-2) every dispatch stage must list >=1 lens (§A.4)
+    for n in doc["nodes"]:
+        if n["kind"] == "dispatch":
+            for st in n.get("stages", []) or []:
+                ls = st.get("lenses")
+                assert isinstance(ls, list) and len(ls) >= 1, \
+                    f"stage {st['id']} must list at least one lens"
     for n in doc["nodes"]:
         k = n["kind"]
         if k == "dispatch":

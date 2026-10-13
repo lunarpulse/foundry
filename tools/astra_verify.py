@@ -249,6 +249,10 @@ def graph(policy):
             if 'role' in st_:
                 assert st_['role'] in ('lens', 'verify', 'replan'), \
                     f'stage {st_["id"]} role {st_["role"]!r} not in lens|verify|replan'
+            # (F4-2) every stage lists >=1 lens (§A.4)
+            ls_ = st_.get('lenses')
+            assert isinstance(ls_, list) and len(ls_) >= 1, \
+                f'stage {st_["id"]} must list at least one lens'
         # (F3-2) pack_stages roles share the closed set
         for ps_ in policy.get('pack_stages', []) or []:
             if 'role' in ps_:
@@ -257,11 +261,12 @@ def graph(policy):
         # (F3-3) emit payload_from must reference a declared output
         if n['kind'] == 'emit' and n.get('payload_from'):
             pass  # checked after schemas load (below)
-    # (F3-1) top-level [hold] timeout_s
-    ht = policy.get('hold', {}).get('timeout_s')
-    if ht is not None:
-        assert isinstance(ht, int) and not isinstance(ht, bool) and ht >= 0, \
-            'top-level [hold] timeout_s must be >= 0 (0=infinite)'
+    # (F3-1/F4-1) top-level [hold] table is MANDATORY
+    assert 'hold' in policy, 'pack must declare a top-level [hold] table'
+    ht = policy['hold'].get('timeout_s')
+    assert ht is not None, 'top-level [hold] must declare timeout_s (0=infinite)'
+    assert isinstance(ht, int) and not isinstance(ht, bool) and ht >= 0, \
+        'top-level [hold] timeout_s must be >= 0 (0=infinite)'
     for cname, cval in policy.get('counters', {}).items():
         assert isinstance(cval, int) and not isinstance(cval, bool) \
             and 0 <= cval < 2**64, \
