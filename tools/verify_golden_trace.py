@@ -554,6 +554,19 @@ def sweep_rejection_fixtures():
             files_ = {df: open(f"{base}/{name}/{df}", "rb").read()
                       for df in declared}
             files_["manifest.toml"] = man.replace(dl[0], "").encode()
+            # (r27-3) every lens the POLICY references must be declared
+            pdoc = _t2.load(open(f"{base}/{name}/policy.toml", "rb"))
+            policy_lens = set()
+            for n in pdoc.get("nodes", []):
+                for st in n.get("stages", []) or []:
+                    for lf in st.get("lenses", []) or []:
+                        policy_lens.add(lf)
+            for ps in pdoc.get("pack_stages", []) or []:
+                for lf in ps.get("lenses", []) or []:
+                    policy_lens.add(lf)
+            missing = policy_lens - set(declared)
+            assert not missing, \
+                f"{name}: policy references undeclared files: {missing}"
             h_ = _hl.sha256()
             for pn in sorted(files_):
                 cb = files_[pn]  # bytes (r23-4: original bytes)
@@ -611,63 +624,25 @@ def sweep_rejection_fixtures():
         return cycles
 
     def _enforced_guards(w):
-        """(r26-1) counters ENFORCED by this condition: count_lt
-        survives whitespace; a disjunct without the guard (… ||
-        true), a negated guard (!count_lt…), or count_lt inside an
-        ||-alternative that can be true regardless does NOT enforce.
-        Approximation: split top-level || (paren-aware); a count_lt
-        enforces only if EVERY disjunct containing it is guard-only
-        and it is not negated."""
-        def split_or(s):
-            parts, depth, cur = [], 0, []
-            for ch in s:
-                if ch == "(":
-                    depth += 1
-                elif ch == ")":
-                    depth -= 1
-                if ch == "|" and depth == 0 and s[s.index("|", sum(len(p) for p in parts) + len(parts) - 1):][:2] == "||" if False else False:
-                    pass
-                cur.append(ch)
-                if depth == 0 and ch == "|":
-                    pass
-            # simpler: manual scan
-            parts, depth, start = [], 0, 0
-            i = 0
-            while i < len(s):
-                if s[i] == "(":
-                    depth += 1
-                elif s[i] == ")":
-                    depth -= 1
-                elif depth == 0 and s[i] == "|" and i + 1 < len(s) and s[i+1] == "|":
-                    parts.append(s[start:i])
-                    i += 2
-                    start = i
-                    continue
-                i += 1
-            parts.append(s[start:])
-            return parts
+        """(r27-1) counters ENFORCED by this condition, decided
+        SEMANTICALLY with the real evaluator: a counter c enforces
+        iff the condition is False whenever c exceeds its cap.
+        Test: c at a huge value (others free) must falsify the whole
+        expression. Handles parens, negation, ||, whitespace."""
+        import re as _re
+        caps = {m.group(1): int(m.group(2)) for m in
+                _re.finditer(r"count_lt\s*[(]\s*([A-Za-z_]\w*)\s*,\s*(\d+)\s*[)]", w)}
         out = set()
-        disjuncts = split_or(w)
-        for d in disjuncts:
-            # strip string literals
-            ds = re.sub(r'"[^"]*"', '""', d)
-            # negated guard never enforces
-            for m in re.finditer(r"!\s*count_lt\s*[(]\s*([A-Za-z_]\w*)", ds):
-                pass  # negation: not enforcing
-            for m in re.finditer(r"count_lt\s*[(]\s*([A-Za-z_]\w*)", ds):
-                pre = ds[:m.start()]
-                if pre.rstrip().endswith("!"):
-                    continue  # negated
-                out.add(m.group(1))
-        # guard enforces only if present in EVERY disjunct that can be
-        # true independently — conservative: if any disjunct is a
-        # tautology (true) or lacks all guards, no guard is enforced
-        for d in disjuncts:
-            ds = re.sub(r'"[^"]*"', '""', d).strip()
-            gs = {m.group(1) for m in re.finditer(
-                r"(?<!!)\bcount_lt\s*[(]\s*([A-Za-z_]\w*)", ds)}
-            if not gs:
-                return set()  # an alternative path without any cap
+        for c, cap in caps.items():
+            # counter far above cap; all other counters at 0
+            st = {"counters": {k: 10**9 if k == c else 0 for k in caps},
+                  "verdicts": [], "findings": False, "reverted_base": None}
+            try:
+                ok = evaluate(w, st)
+            except Exception:
+                ok = None
+            if ok is False:
+                out.add(c)  # condition falsified by c over cap: enforced
         return out
 
     def _bumps_in(do):
@@ -848,53 +823,66 @@ def sweep_rejection_fixtures():
                 out |= seen
         return out
 
-    def _reaches_without(pol, frm, to, forbidden):
-        """DFS frm->to avoiding `forbidden` node set."""
-        nmap = {n["id"]: n for n in pol["nodes"]}
-        stack, seen = [frm], set()
-        while stack:
-            x = stack.pop()
-            if x == to:
-                return True
-            if x in seen or x not in nmap or x in forbidden:
-                continue
-            seen.add(x)
-            m = nmap[x]
-            if m["kind"] == "route":
-                stack += [b.get("goto") for b in m.get("branches", [])
-                          if b.get("goto")]
-            elif m["kind"] in ("dispatch", "redrive"):
-                if m.get("on_done"):
-                    stack.append(m["on_done"])
-                if m.get("hold_target"):
-                    stack.append(m["hold_target"])
-            elif m["kind"] == "hold":
-                stack += m.get("resume_targets", [])
-        return False
-
     def _has_04_verdicts_no_verify(pol):
-        # (r26-2) provenance: a ref is legal only if EVERY entry path
-        # to its node passes through a verify-carrying dispatch. If a
-        # path reaches the ref with all verify nodes forbidden, the
-        # ref can execute WITHOUT verified evidence — a violation.
+        """(r27-2) STATE-BASED provenance: evidence is valid only
+        downstream of a SUCCESSFUL verify completion, invalidated by
+        any intervening redrive (new artifact) or revert. Enumerate
+        evidence states via BFS over (node, evidence_valid); a ref
+        node reachable in a no-evidence state is a violation."""
         nmap = {n["id"]: n for n in pol["nodes"]}
-        vset = {n["id"] for n in pol["nodes"]
-                if n.get("kind") == "dispatch" and any(
-                    st.get("role") == "verify"
-                    for st in n.get("stages", []))}
         entry = pol.get("entry")
-        for n in pol["nodes"]:
-            if n["kind"] != "route":
+
+        def node_has_verify(n):
+            return n.get("kind") == "dispatch" and any(
+                st.get("role") == "verify"
+                for st in n.get("stages", []))
+
+        def successors(nid, ev):
+            """Yield (next_id, evidence_after) for all flow edges."""
+            n = nmap[nid]
+            if n["kind"] == "route":
+                for br in n.get("branches", []):
+                    g = br.get("goto")
+                    if g:
+                        # revert invalidates evidence
+                        ev2 = ev and "revert(" not in (br.get("do") or "")
+                        yield (g, ev2)
+            elif n["kind"] == "dispatch":
+                if n.get("on_done"):
+                    # verify stage SUCCESS completes with evidence
+                    yield (n["on_done"], node_has_verify(n) or ev)
+                if n.get("hold_target"):
+                    # error path: no new evidence
+                    yield (n["hold_target"], ev)
+            elif n["kind"] == "redrive":
+                if n.get("on_done"):
+                    yield (n["on_done"], False)  # new artifact
+                if n.get("hold_target"):
+                    yield (n["hold_target"], ev)
+            elif n["kind"] == "hold":
+                for t in n.get("resume_targets", []):
+                    yield (t, ev)
+
+        # BFS over states; collect ref-reachability per state
+        from collections import deque
+        start = (entry, False)
+        seen = {start}
+        q = deque([start])
+        ref_no_ev = []
+        while q:
+            nid, ev = q.popleft()
+            if nid not in nmap:
                 continue
-            refs_here = any(_refs_provenance(br.get("when") or "")
-                            for br in n.get("branches", []))
-            if not refs_here:
-                continue
-            # violation iff no verify exists at all, or the ref is
-            # reachable while avoiding EVERY verify node
-            if not vset or _reaches_without(pol, entry, n["id"], vset):
-                return True
-        return False
+            n = nmap[nid]
+            if n["kind"] == "route" and not ev:
+                if any(_refs_provenance(br.get("when") or "")
+                       for br in n.get("branches", [])):
+                    ref_no_ev.append(nid)
+            for nxt, ev2 in successors(nid, ev):
+                if (nxt, ev2) not in seen:
+                    seen.add((nxt, ev2))
+                    q.append((nxt, ev2))
+        return bool(ref_no_ev)
 
     def _norm_04(pol):
         # remove ALL provenance references from branch conditions
@@ -1082,10 +1070,15 @@ def sweep_rejection_fixtures():
     assert b"\r\n" in b8, "08 must carry real CRLF"
     b9 = open(f"{base}/09-no-trailing-lf/manifest.toml", "rb").read()
     assert not b9.endswith(b"\n"), "09 must lack trailing LF"
-    files = {"lens-a.md": open(f"{base}/08-crlf-manifest/lens-a.md", "rb").read(),
-             "policy.toml": open(f"{base}/08-crlf-manifest/policy.toml", "rb").read()}
     man = b8.decode()
     line = [l for l in man.splitlines(True) if l.startswith("digest =")][0]
+    import tomllib as _t8
+    m8 = _t8.loads(man.replace(line, "digest = \"x\"\n"))
+    files = {df: open(f"{base}/08-crlf-manifest/{df}", "rb").read()
+             for df in m8.get("files", [])}
+    for df in files:
+        assert os.path.exists(f"{base}/08-crlf-manifest/{df}"), \
+            f"08: declared file {df} missing"
     files["manifest.toml"] = man.replace(line, "").encode()
     import hashlib
     h = hashlib.sha256()
