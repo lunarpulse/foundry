@@ -389,6 +389,56 @@ def graph(policy):
     for v_ in dep_adj_:
         if _mk.get(v_, 0) == 0:
             assert _dfsc(v_), f'stage dependency cycle involving {v_!r}'
+    # (F19) EVERY cycle in the FULL graph must be counter-guarded
+    import re as _re19
+    full_adj = {}
+    edge_guard = {}
+    node_bumps = set()
+    for n_ in nodes.values():
+        k_ = n_['kind']
+        outs = []
+        if k_ == 'route':
+            for b_ in n_['branches']:
+                if b_.get('goto'):
+                    outs.append(b_['goto'])
+                    edge_guard[(n_['id'], b_['goto'])] = bool(
+                        _re19.search(r'count_lt\s*\(', b_.get('when', '')))
+                for a_ in actions(b_.get('do'), {'counters': {}, 'events': []}):
+                    if a_[0] == 'bump':
+                        node_bumps.add(n_['id'])
+        elif k_ in ('dispatch', 'redrive'):
+            if n_.get('on_done'):
+                outs.append(n_['on_done'])
+                edge_guard[(n_['id'], n_['on_done'])] = False
+        elif k_ == 'hold':
+            for t_ in n_.get('resume_targets', []):
+                outs.append(t_)
+                edge_guard[(n_['id'], t_)] = True
+        full_adj[n_['id']] = outs
+    color19 = {}
+    cycles19 = []
+    def cyc19(u, stack):
+        color19[u] = 1
+        stack.append(u)
+        for w_ in full_adj.get(u, ()):
+            if color19.get(w_) == 1:
+                cycles19.append(stack[stack.index(w_):] + [w_])
+            elif color19.get(w_, 0) == 0:
+                cyc19(w_, stack)
+        stack.pop()
+        color19[u] = 2
+    import sys as _s19
+    _s19.setrecursionlimit(10000)
+    for v19 in full_adj:
+        if color19.get(v19, 0) == 0:
+            cyc19(v19, [])
+    for c19 in cycles19:
+        edges19 = list(zip(c19, c19[1:]))
+        guarded19 = any(edge_guard.get(e_, False) for e_ in edges19)
+        bumped19 = any(x19 in node_bumps for x19 in c19[:-1])
+        kinds19 = {nodes[x19]['kind'] for x19 in c19[:-1]}
+        if not (guarded19 and bumped19) and 'hold' not in kinds19:
+            raise AssertionError(f'cycle {c19[:-1]} lacks a counter guard+bump (§2.2)')
     # (F8-2) resume/route edges must form a DAG after removing deduct
     non_deduct_ = {i for i, n in nodes.items()
                    if n['kind'] not in ('dispatch', 'redrive')}

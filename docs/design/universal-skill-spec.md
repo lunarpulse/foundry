@@ -1,7 +1,7 @@
 # Foundry Universal Skill Spec — 범용 실행 모델 (Universal Review Engine)
 
-- **버전**: v0.53 (2026-10-12) — 18차 최종 검증 반영.
-  스키마 from 컬럼 유일성+defer→deferred 출력 결속·카운터 선언명 식별자 문법·after 문자열/배열 정규화(순환 검사 정합)·from 라벨 의미는 digest 핀 영역 명시.
+- **버전**: v0.54 (2026-10-12) — 19차 최종 검증 반영.
+  전체 그래프 사이클별 카운터 가드+bump 검증(DFS 백엣지 — deduct 노드 포함, hold 경유=인간 상한 예외).
 - **의도(소유자)**: Foundry는 어떤 방법론도 돌릴 수 있는 유니버설
   플랫폼. BMad는 스킬 데이터의 첫 고객. **Rust 도메인에 방법론
   코드가 박히는 순간이 실패.** 엔진 고정·확장 선언(procedural macro

@@ -1957,6 +1957,61 @@ def contract_checks(doc):
             if "base" in n:
                 assert n["base"] in ("origin", "latest"), \
                     f"redrive {n['id']} base {n['base']!r} invalid"
+    # (F19) EVERY cycle in the FULL graph (deduct nodes included)
+    # must be counter-guarded: at least one edge into the cycle
+    # carries a count_lt guard and one cycle node bumps the guard
+    _full_adj = {}
+    _edge_guard = {}  # (src,dst) -> has count_lt in when
+    _node_bumps = set()
+    for n in doc["nodes"]:
+        k = n["kind"]
+        outs = []
+        if k == "route":
+            for br in n.get("branches", []):
+                if br.get("goto"):
+                    outs.append(br["goto"])
+                    _edge_guard[(n["id"], br["goto"])] = bool(
+                        re.search(r"count_lt\s*\(", br.get("when", "")))
+                for a in _parse_actions_top(br.get("do")):
+                    if a[0] == "bump":
+                        _node_bumps.add((n["id"], a[1]))
+        elif k in ("dispatch", "redrive"):
+            if n.get("on_done"):
+                outs.append(n["on_done"])
+                _edge_guard[(n["id"], n["on_done"])] = False
+        elif k == "hold":
+            for t in n.get("resume_targets", []):
+                outs.append(t)
+                _edge_guard[(n["id"], t)] = True  # human resume = capped
+        _full_adj[n["id"]] = outs
+    # find cycles via DFS back-edges
+    _color = {}
+    _cycles = []
+    def _cyc(u, stack):
+        _color[u] = 1
+        stack.append(u)
+        for w in _full_adj.get(u, ()):
+            if _color.get(w) == 1:
+                idx = stack.index(w)
+                _cycles.append(stack[idx:] + [w])
+            elif _color.get(w, 0) == 0:
+                _cyc(w, stack)
+        stack.pop()
+        _color[u] = 2
+    import sys as _sys19
+    _sys19.setrecursionlimit(10000)
+    for _v in _full_adj:
+        if _color.get(_v, 0) == 0:
+            _cyc(_v, [])
+    for cyc in _cycles:
+        edges = list(zip(cyc, cyc[1:]))
+        guarded = any(_edge_guard.get(e, False) for e in edges)
+        bumped = any(nid in {b[0] for b in _node_bumps} for nid in cyc[:-1])
+        # hold-resumed cycles are human-capped; else need guard+bump
+        kinds_in = {_node_ids[x]["kind"] for x in cyc[:-1]}
+        if not (guarded and bumped) and "hold" not in kinds_in:
+            raise AssertionError(
+                f"cycle {cyc[:-1]} lacks a counter guard+bump (§2.2)")
     # (F18-1) defer contract: if any route branch mentions the
     # 'defer' verdict, the pack MUST declare a 'deferred' output and
     # no two schema outputs may share a 'from' source column
