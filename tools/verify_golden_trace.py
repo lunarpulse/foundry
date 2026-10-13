@@ -531,9 +531,29 @@ def sweep_rejection_fixtures():
                 man = man + "\n"
             dl = [l for l in man.splitlines(True) if l.startswith("digest =")]
             assert dl, f"{name}: no digest line"
-            files_ = {"lens-a.md": open(f"{base}/{name}/lens-a.md", "rb").read(),
-                      "policy.toml": open(f"{base}/{name}/policy.toml", "rb").read(),
-                      "manifest.toml": man.replace(dl[0], "").encode()}
+            # (r26-3) manifest closure: hash exactly the files the
+            # manifest DECLARES — ghost entries or missing files fail
+            import tomllib as _t2
+            mdoc = _t2.loads(man)
+            declared = [f for f in mdoc.get("files", [])]
+            assert declared, f"{name}: manifest declares no files"
+            for df in declared:
+                fp = f"{base}/{name}/{df}"
+                assert os.path.exists(fp), \
+                    f"{name}: declared file {df} missing (ghost entry)"
+                # LF eligibility: every file must be LF-clean UNLESS
+                # the fixture's intended violation is a format one
+                fb = open(fp, "rb").read()
+                if b"\r" in fb:
+                    assert name in ("08-crlf-manifest",) or \
+                        (name.endswith("crlf") or "crlf" in name), \
+                        f"{name}/{df}: unintended CR bytes (single-violation premise)"
+                if not fb.endswith(b"\n"):
+                    assert "no-trailing-lf" in name, \
+                        f"{name}/{df}: unintended missing trailing LF"
+            files_ = {df: open(f"{base}/{name}/{df}", "rb").read()
+                      for df in declared}
+            files_["manifest.toml"] = man.replace(dl[0], "").encode()
             h_ = _hl.sha256()
             for pn in sorted(files_):
                 cb = files_[pn]  # bytes (r23-4: original bytes)
@@ -590,6 +610,66 @@ def sweep_rejection_fixtures():
                         stack.append((nxt, path + [nxt]))
         return cycles
 
+    def _enforced_guards(w):
+        """(r26-1) counters ENFORCED by this condition: count_lt
+        survives whitespace; a disjunct without the guard (… ||
+        true), a negated guard (!count_lt…), or count_lt inside an
+        ||-alternative that can be true regardless does NOT enforce.
+        Approximation: split top-level || (paren-aware); a count_lt
+        enforces only if EVERY disjunct containing it is guard-only
+        and it is not negated."""
+        def split_or(s):
+            parts, depth, cur = [], 0, []
+            for ch in s:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                if ch == "|" and depth == 0 and s[s.index("|", sum(len(p) for p in parts) + len(parts) - 1):][:2] == "||" if False else False:
+                    pass
+                cur.append(ch)
+                if depth == 0 and ch == "|":
+                    pass
+            # simpler: manual scan
+            parts, depth, start = [], 0, 0
+            i = 0
+            while i < len(s):
+                if s[i] == "(":
+                    depth += 1
+                elif s[i] == ")":
+                    depth -= 1
+                elif depth == 0 and s[i] == "|" and i + 1 < len(s) and s[i+1] == "|":
+                    parts.append(s[start:i])
+                    i += 2
+                    start = i
+                    continue
+                i += 1
+            parts.append(s[start:])
+            return parts
+        out = set()
+        disjuncts = split_or(w)
+        for d in disjuncts:
+            # strip string literals
+            ds = re.sub(r'"[^"]*"', '""', d)
+            # negated guard never enforces
+            for m in re.finditer(r"!\s*count_lt\s*[(]\s*([A-Za-z_]\w*)", ds):
+                pass  # negation: not enforcing
+            for m in re.finditer(r"count_lt\s*[(]\s*([A-Za-z_]\w*)", ds):
+                pre = ds[:m.start()]
+                if pre.rstrip().endswith("!"):
+                    continue  # negated
+                out.add(m.group(1))
+        # guard enforces only if present in EVERY disjunct that can be
+        # true independently — conservative: if any disjunct is a
+        # tautology (true) or lacks all guards, no guard is enforced
+        for d in disjuncts:
+            ds = re.sub(r'"[^"]*"', '""', d).strip()
+            gs = {m.group(1) for m in re.finditer(
+                r"(?<!!)\bcount_lt\s*[(]\s*([A-Za-z_]\w*)", ds)}
+            if not gs:
+                return set()  # an alternative path without any cap
+        return out
+
     def _bumps_in(do):
         """Counter occurrence counts in an action sequence."""
         out = {}
@@ -636,9 +716,8 @@ def sweep_rejection_fixtures():
                     if br is None:
                         continue
                     w = br.get("when") or ""
-                    for m2 in re.finditer(
-                            r"count_lt[(]([A-Za-z_]\w*)", w):
-                        guards.add(m2.group(1))
+                    for c in _enforced_guards(w):
+                        guards.add(c)
                     _merge(tot, _bumps_in(br.get("do")))
                 traversals.append((guards, tot))
             results.append(traversals)
@@ -727,28 +806,94 @@ def sweep_rejection_fixtures():
                 stack += n.get("resume_targets", [])
         return seen
 
-    def _has_04_verdicts_no_verify(pol):
-        # (r25-2) provenance: verdicts / findings / has_findings —
-        # raw lens output used without a REACHABLE verify stage
-        # producing it (an unreachable verify does not bless the flow)
-        reach = _reachable_ids(pol)
+    def _refs_provenance(w):
+        stripped = re.sub(r'"[^"]*"', '""', w)
+        for pat in (r"(?<![\w.])verdicts(?![\w])",
+                    r"(?<![\w.])findings(?![\w])",
+                    r"(?<![\w.])has_findings(?![\w])"):
+            if re.search(pat, stripped):
+                return True
+        return False
+
+    def _verify_evidence_ids(pol):
+        """(r26-2) node ids that carry verified evidence: dispatch
+        nodes with a verify stage, plus everything reachable FROM them
+        through normal flow (on_done/goto) AND through hold resume —
+        evidence survives into holds resumed after verification."""
         nmap = {n["id"]: n for n in pol["nodes"]}
-        has_verify = any(nid in reach and nmap[nid].get("kind") == "dispatch"
-                         and any(st.get("role") == "verify"
-                                 for st in nmap[nid].get("stages", []))
-                         for nid in reach)
-        if has_verify:
-            return False
+        out = set()
         for n in pol["nodes"]:
-            if n["kind"] == "route" and n["id"] in reach:
-                for br in n.get("branches", []):
-                    w = br.get("when") or ""
-                    stripped = re.sub(r'"[^"]*"', '""', w)
-                    for pat in (r"(?<![\w.])verdicts(?![\w])",
-                                r"(?<![\w.])findings(?![\w])",
-                                r"(?<![\w.])has_findings(?![\w])"):
-                        if re.search(pat, stripped):
-                            return True
+            if n.get("kind") == "dispatch" and any(
+                    st.get("role") == "verify"
+                    for st in n.get("stages", [])):
+                # forward closure from the verified dispatch
+                stack = [n["id"]]
+                seen = set()
+                while stack:
+                    x = stack.pop()
+                    if x in seen or x not in nmap:
+                        continue
+                    seen.add(x)
+                    m = nmap[x]
+                    if m["kind"] == "route":
+                        stack += [b.get("goto") for b in m.get("branches", [])
+                                  if b.get("goto")]
+                    elif m["kind"] in ("dispatch", "redrive"):
+                        if m.get("on_done"):
+                            stack.append(m["on_done"])
+                        if m.get("hold_target"):
+                            stack.append(m["hold_target"])
+                    elif m["kind"] == "hold":
+                        stack += m.get("resume_targets", [])
+                out |= seen
+        return out
+
+    def _reaches_without(pol, frm, to, forbidden):
+        """DFS frm->to avoiding `forbidden` node set."""
+        nmap = {n["id"]: n for n in pol["nodes"]}
+        stack, seen = [frm], set()
+        while stack:
+            x = stack.pop()
+            if x == to:
+                return True
+            if x in seen or x not in nmap or x in forbidden:
+                continue
+            seen.add(x)
+            m = nmap[x]
+            if m["kind"] == "route":
+                stack += [b.get("goto") for b in m.get("branches", [])
+                          if b.get("goto")]
+            elif m["kind"] in ("dispatch", "redrive"):
+                if m.get("on_done"):
+                    stack.append(m["on_done"])
+                if m.get("hold_target"):
+                    stack.append(m["hold_target"])
+            elif m["kind"] == "hold":
+                stack += m.get("resume_targets", [])
+        return False
+
+    def _has_04_verdicts_no_verify(pol):
+        # (r26-2) provenance: a ref is legal only if EVERY entry path
+        # to its node passes through a verify-carrying dispatch. If a
+        # path reaches the ref with all verify nodes forbidden, the
+        # ref can execute WITHOUT verified evidence — a violation.
+        nmap = {n["id"]: n for n in pol["nodes"]}
+        vset = {n["id"] for n in pol["nodes"]
+                if n.get("kind") == "dispatch" and any(
+                    st.get("role") == "verify"
+                    for st in n.get("stages", []))}
+        entry = pol.get("entry")
+        for n in pol["nodes"]:
+            if n["kind"] != "route":
+                continue
+            refs_here = any(_refs_provenance(br.get("when") or "")
+                            for br in n.get("branches", []))
+            if not refs_here:
+                continue
+            # violation iff no verify exists at all, or the ref is
+            # reachable while avoiding EVERY verify node
+            if not vset or _reaches_without(pol, entry, n["id"], vset):
+                return True
         return False
 
     def _norm_04(pol):
@@ -794,6 +939,19 @@ def sweep_rejection_fixtures():
                                            "do": "emit(InspectionPassed, summary)"}]})
     assert _has_04_verdicts_no_verify(unreach), \
         "04: unreachable verify must not clear the provenance violation"
+    # (r26-2) verify AFTER the ref (resume into future verify) must
+    # NOT bless the earlier reference
+    late = copy.deepcopy(pol04)
+    late["nodes"].append({
+        "id": "future_verify", "kind": "dispatch",
+        "stages": [{"id": "v2", "lenses": ["lens-a.md"], "role": "verify"}],
+        "on_done": "done", "hold_target": "end_hold",
+    })
+    for n in late["nodes"]:
+        if n["id"] == "end_hold":
+            n["resume_targets"] = ["future_verify"]
+    assert _has_04_verdicts_no_verify(late), \
+        "04: verify reached only via later resume must not bless the ref"
     str_lit = copy.deepcopy(pol04)
     for n in str_lit["nodes"]:
         if n["kind"] == "route":
