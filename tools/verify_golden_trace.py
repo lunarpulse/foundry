@@ -1750,6 +1750,22 @@ def sweep_rejection_fixtures():
           " structural rejects 10/11/15/16/17 verified")
 
 
+
+
+def _reach_set(adj, start, universe):
+    """Nodes reachable from start within universe (inclusive)."""
+    seen = set()
+    stack = [start]
+    while stack:
+        x = stack.pop()
+        if x in seen or x not in universe:
+            continue
+        seen.add(x)
+        for y in adj.get(x, ()):
+            if y not in seen:
+                stack.append(y)
+    return seen
+
 def contract_checks(doc):
     """(r16-2) pack-contract regressions: pre_stage wiring and
     same-session ordering — the two mutants r15 slipped through."""
@@ -2121,8 +2137,9 @@ def contract_checks(doc):
                 _ctrs_in_w = re.findall(
                     r"count_lt\s*\(\s*([a-z_][a-z0-9_]*)", w)
                 if g and _ctrs_in_w:
-                    _guard_ctrs[(n["id"], g)] = _ctrs_in_w[0]
-                    _guard_all_ctrs[(n["id"], g)] = set(_ctrs_in_w)
+                    _bi = n["branches"].index(br)
+                    _guard_ctrs[(n["id"], g, _bi)] = _ctrs_in_w[0]
+                    _guard_all_ctrs[(n["id"], g, _bi)] = set(_ctrs_in_w)
                     _parts = re.split(r"\|\|", re.sub(r'"[^"]*"', '""', w))
                     _pure_or = any(
                         "count_lt" not in p.strip()
@@ -2177,8 +2194,9 @@ def contract_checks(doc):
                 _ctrs_in_w = re.findall(
                     r"count_lt\s*\(\s*([a-z_][a-z0-9_]*)", w)
                 if g and _ctrs_in_w:
-                    _guard_ctrs[(n["id"], g)] = _ctrs_in_w[0]
-                    _guard_all_ctrs[(n["id"], g)] = set(_ctrs_in_w)
+                    _bi = n["branches"].index(br)
+                    _guard_ctrs[(n["id"], g, _bi)] = _ctrs_in_w[0]
+                    _guard_all_ctrs[(n["id"], g, _bi)] = set(_ctrs_in_w)
                     _parts = re.split(r"\|\|", re.sub(r'"[^"]*"', '""', w))
                     _pure_or = any(
                         "count_lt" not in p.strip()
@@ -2194,10 +2212,10 @@ def contract_checks(doc):
                         raise AssertionError(
                             f"guard on {n['id']}->{g} is OR-weakened or "
                             f"negated entry: {w!r} (§2.2)")
-    for (u, w) in list(_guard_ctrs.keys()):
+    for (u, w, _bidx27) in list(_guard_ctrs.keys()):
         if _scc_of.get(u) != _scc_of.get(w) or u not in _scc_of:
             continue  # not a cycle-closing edge
-        gc = _guard_ctrs[(u, w)]
+        gc = _guard_ctrs[(u, w, _bidx27)]
         src_n = _node_ids[u]
         dst_n = _node_ids[w]
         _dst_branches = [br for br in src_n.get("branches", [])
@@ -2289,7 +2307,11 @@ def contract_checks(doc):
                     # count_lt whose counter never increments keeps the
                     # disjunct true forever (count_lt(a,3) ||
                     # count_lt(loopbacks,5) with loopbacks stuck at 0)
-                    for gc_all in _guard_all_ctrs.get((u, w), set()):
+                    _ga27 = set()
+                    for _k27, _v27 in _guard_all_ctrs.items():
+                        if _k27[0] == u and _k27[1] == w:
+                            _ga27 |= _v27
+                    for gc_all in _ga27:
                         _b_here = any(
                             a[0] == "bump" and a[1] == gc_all
                             for br2 in _brs
@@ -2322,57 +2344,66 @@ def contract_checks(doc):
                                 f"{gc_all!r} is never bumped along the "
                                 "cycle — an OR-joined stale counter "
                                 "bypasses the cap (§2.2/§2.3)")
-        # (F24-2) exactly-once per traversal: inside an automatic SCC,
-        # at most ONE node may carry a redrive bump for a given guard
-        # counter, and it must be the guard's entry node — fixdie ->
-        # fix_again -> lenses with both bumping fix_rounds increments
-        # twice per loop
+        # (F27-2/F27-3) exactly-once for EVERY guard counter, judged
+        # on CO-REACHABLE bump owners (same execution path) — mutually
+        # exclusive alternate paths each bumping once are LEGAL
         for u, ws in _full_adj.items():
             if _node_ids.get(u, {}).get("kind") != "route":
                 continue
             for w in ws:
-                if _scc_of.get(u) == _scc_of.get(w) and u in _scc_of:
-                    if (u, w) in _guard_ctrs:
-                        gc2 = _guard_ctrs[(u, w)]
-                        _comp = set(_sccs[_scc_of[u]])
-                        _bumpers = [x for x in _comp
-                                    if _node_ids[x].get("kind") == "redrive"
-                                    and _node_ids[x].get("bump") == gc2]
-                        if len(_bumpers) > 1:
-                            raise AssertionError(
-                                f"automatic cycle {_sccs[_scc_of[u]]}: "
-                                f"counter {gc2!r} is bumped by multiple "
-                                f"redrive nodes {_bumpers} — one "
-                                "traversal increments more than once "
-                                "(§2.3)")
-                        # (F25-2) route nodes inside the cycle bumping
-                        # the guard counter ALSO increment — a redrive
-                        # bump + a downstream route branch bump counts
-                        # twice per traversal
-                        _route_bumpers = [
-                            x for x in _comp
+                if not (_scc_of.get(u) == _scc_of.get(w) and u in _scc_of):
+                    continue
+                _g27 = {v for k, v in _guard_ctrs.items()
+                        if k[0] == u and k[1] == w}
+                for _k27, _v27 in _guard_all_ctrs.items():
+                    if _k27[0] == u and _k27[1] == w:
+                        _g27 |= _v27
+                _comp = set(_sccs[_scc_of[u]])
+                for gc2 in _g27:
+                    _red = [x for x in _comp
+                            if _node_ids[x].get("kind") == "redrive"
+                            and _node_ids[x].get("bump") == gc2]
+                    _rou = [x for x in _comp
                             if _node_ids[x].get("kind") == "route"
                             and gc2 in _bump_ctr.get(x, set())]
-                        if _bumpers and _route_bumpers:
-                            raise AssertionError(
-                                f"automatic cycle {_sccs[_scc_of[u]]}: "
-                                f"counter {gc2!r} bumped by redrive "
-                                f"{_bumpers} AND route nodes "
-                                f"{_route_bumpers} — double increment "
-                                "per traversal (§2.3)")
-                        # (F26-1) route+route double increment: the
-                        # guarding route's own branch bump is the ONE
-                        # increment; any OTHER route inside the cycle
-                        # bumping the same counter doubles it
-                        _other_routes = [
-                            x for x in _route_bumpers if x != u]
-                        if len(_route_bumpers) - (1 if u in _route_bumpers else 0) > 1 or (
-                                len(_route_bumpers) >= 1 and _other_routes and u in _route_bumpers and len(_route_bumpers) > 1):
-                            raise AssertionError(
-                                f"automatic cycle {_sccs[_scc_of[u]]}: "
-                                f"counter {gc2!r} bumped by multiple route "
-                                f"nodes {_route_bumpers} — double "
-                                "increment per traversal (§2.3)")
+                    _owners = _red + _rou
+                    # (F27-2a) the guarding BRANCH's own do bump always
+                    # co-runs with everything on the w->u return path
+                    _br_do_bumps = any(
+                        a[0] == "bump" and a[1] == gc2
+                        for _k27 in _guard_ctrs
+                        if _k27[0] == u and _k27[1] == w
+                        for _br27 in [_node_ids[u]["branches"][_k27[2]]]
+                        for a in _parse_actions_top(_br27.get("do")))
+                    _wpath = _reach_set(_full_adj, w, _comp - {u})
+                    if _br_do_bumps and any(
+                            x != w and x in _owners for x in _wpath):
+                        raise AssertionError(
+                            f"automatic cycle {sorted(_comp)}: counter "
+                            f"{gc2!r} bumped on the guard branch AND on "
+                            "the return path — double increment (§2.3)")
+                    for _a in range(len(_owners)):
+                        for _b in range(_a + 1, len(_owners)):
+                            _oa, _ob = _owners[_a], _owners[_b]
+                            if _oa == _ob:
+                                continue
+                            # same execution path = reachable WITHOUT
+                            # passing back through the guarding route u
+                            # (u re-selection = a NEW traversal)
+                            # same-execution co-traversal: b is on the
+                            # path from a back to u, or a is on the path
+                            # from b back to u (one loop contains both)
+                            _rab = _reach_set(_full_adj, _oa, _comp - {u})
+                            _rba = _reach_set(_full_adj, _ob, _comp - {u})
+                            _ab = _ob in _rab
+                            _ba = _oa in _rba
+                            if _ab and _ba:
+                                raise AssertionError(
+                                    f"automatic cycle {sorted(_comp)}: "
+                                    f"counter {gc2!r} bumped by co-reachable "
+                                    f"nodes {_oa},{_ob} — more than one "
+                                    "increment per traversal (§2.3)")
+
 # (F18-1) defer contract: if any route branch mentions the
     # 'defer' verdict, the pack MUST declare a 'deferred' output and
     # no two schema outputs may share a 'from' source column
@@ -2639,3 +2670,4 @@ def contract_checks(doc):
 
 if __name__ == "__main__":
     sys.exit(main())
+

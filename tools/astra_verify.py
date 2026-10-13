@@ -256,6 +256,21 @@ def _outs19(n):
     return []
 
 
+
+
+def _reach_set19(adj, start, universe):
+    seen_ = set()
+    stk_ = [start]
+    while stk_:
+        x_ = stk_.pop()
+        if x_ in seen_ or x_ not in universe:
+            continue
+        seen_.add(x_)
+        for y_ in adj.get(x_, ()):
+            if y_ not in seen_:
+                stk_.append(y_)
+    return seen_
+
 def graph(policy):
     nodes = {n['id']: n for n in policy['nodes']}
     # (F26-3) entry must be a DISPATCH node (§2.3)
@@ -472,8 +487,9 @@ def graph(policy):
             w_ = b_.get('when', '')
             ctrs_in_w = _re19.findall(r'count_lt\s*\(\s*([a-z_][a-z0-9_]*)', w_)
             if g_ and ctrs_in_w:
-                guard_ctrs[(n_['id'], g_)] = ctrs_in_w[0]
-                guard_all_ctrs[(n_['id'], g_)] = set(ctrs_in_w)
+                bi_ = n_['branches'].index(b_)
+                guard_ctrs[(n_['id'], g_, bi_)] = ctrs_in_w[0]
+                guard_all_ctrs[(n_['id'], g_, bi_)] = set(ctrs_in_w)
                 parts_ = _re19.split(r'\|\|', _re19.sub(r'"[^"]*"', '""', w_))
                 pure_or = any('count_lt' not in p.strip() for p in parts_ if p.strip())
                 dst_n_ = nodes.get(g_)
@@ -490,13 +506,13 @@ def graph(policy):
                 if pure_or or neg_entry:
                     raise AssertionError(f'guard on {n_["id"]}->{g_} is OR-weakened or negated entry: {w_!r} (§2.2)')
     # per-edge rules
-    for (u19, w19) in list(guard_ctrs.keys()):
+    for (u19, w19, bi27_) in list(guard_ctrs.keys()):
         if scc_of19.get(u19) != scc_of19.get(w19) or u19 not in scc_of19:
             continue
-        gc_ = guard_ctrs[(u19, w19)]
+        gc_ = guard_ctrs[(u19, w19, bi27_)]
         src_n_ = nodes[u19]
         dst_n_ = nodes[w19]
-        dst_br = [b_ for b_ in src_n_['branches'] if b_.get('goto') == w19]
+        dst_br = [src_n_['branches'][bi27_]]
         node_b = dst_n_.get('bump') if dst_n_['kind'] == 'redrive' else None
         if node_b == gc_:
             for b_ in dst_br:
@@ -565,7 +581,11 @@ def graph(policy):
                             'negation — exit condition, not a re-entry cap (§2.2)')
                     # (F25-1) EVERY guard counter bumped on the cycle
                     # path from w19 BACK to u19
-                    for gc_all in guard_all_ctrs.get((u19, w19), set()):
+                    _ga27 = set()
+                    for _k27, _v27 in guard_all_ctrs.items():
+                        if _k27[0] == u19 and _k27[1] == w19:
+                            _ga27 |= _v27
+                    for gc_all in _ga27:
                         b_here_ = any(
                             a_[0] == 'bump' and a_[1] == gc_all
                             for b2_ in brs_
@@ -599,30 +619,46 @@ def graph(policy):
                 continue
             for w19 in ws19:
                 if scc_of19.get(u19) == scc_of19.get(w19) and u19 in scc_of19:
-                    if (u19, w19) in guard_ctrs:
-                        gc2_ = guard_ctrs[(u19, w19)]
-                        comp_ = set(sccs19[scc_of19[u19]])
-                        bumpers_ = [x_ for x_ in comp_
-                                    if nodes[x_].get('kind') == 'redrive'
-                                    and nodes[x_].get('bump') == gc2_]
-                        if len(bumpers_) > 1:
+                    _g27 = {v_ for k_, v_ in guard_ctrs.items()
+                            if k_[0] == u19 and k_[1] == w19}
+                    for _k27, _v27 in guard_all_ctrs.items():
+                        if _k27[0] == u19 and _k27[1] == w19:
+                            _g27 |= _v27
+                    comp_ = set(sccs19[scc_of19[u19]])
+                    for gc2_ in _g27:
+                        red_ = [x_ for x_ in comp_
+                                if nodes[x_].get('kind') == 'redrive'
+                                and nodes[x_].get('bump') == gc2_]
+                        rou_ = [x_ for x_ in comp_
+                                if nodes[x_].get('kind') == 'route'
+                                and gc2_ in bump_ctr.get(x_, set())]
+                        owners_ = red_ + rou_
+                        # (F27-2a) guard branch do bump + return path
+                        br_do_bumps_ = any(
+                            a_[0] == 'bump' and a_[1] == gc2_
+                            for k_ in guard_ctrs
+                            if k_[0] == u19 and k_[1] == w19
+                            for br_ in [nodes[u19]['branches'][k_[2]]]
+                            for a_ in actions(br_.get('do'), {'counters': {}, 'events': []}))
+                        wpath_ = _reach_set19(auto_adj, w19, comp_ - {u19})
+                        if br_do_bumps_ and any(
+                                x_ != w19 and x_ in owners_ for x_ in wpath_):
                             raise AssertionError(
-                                f'automatic cycle: counter {gc2_!r} bumped by '
-                                f'multiple redrive nodes {bumpers_} — double '
-                                'increment per traversal (§2.3)')
-                        rbumpers_ = [x_ for x_ in comp_
-                                     if nodes[x_].get('kind') == 'route'
-                                     and gc2_ in bump_ctr.get(x_, set())]
-                        if bumpers_ and rbumpers_:
-                            raise AssertionError(
-                                f'automatic cycle: counter {gc2_!r} bumped by '
-                                f'redrive {bumpers_} AND route {rbumpers_} — '
-                                'double increment per traversal (§2.3)')
-                        if len(rbumpers_) > 1:
-                            raise AssertionError(
-                                f'automatic cycle: counter {gc2_!r} bumped by '
-                                f'multiple route nodes {rbumpers_} — double '
-                                'increment per traversal (§2.3)')
+                                f'automatic cycle: counter {gc2_!r} bumped on '
+                                'the guard branch AND on the return path — '
+                                'double increment (§2.3)')
+                        for a_ in range(len(owners_)):
+                            for b_ in range(a_ + 1, len(owners_)):
+                                oa_, ob_ = owners_[a_], owners_[b_]
+                                if oa_ == ob_:
+                                    continue
+                                ab_ = ob_ in _reach_set19(auto_adj, oa_, comp_ - {u19})
+                                ba_ = oa_ in _reach_set19(auto_adj, ob_, comp_ - {u19})
+                                if ab_ and ba_:
+                                    raise AssertionError(
+                                        f'automatic cycle: counter {gc2_!r} '
+                                        f'bumped by co-reachable nodes '
+                                        f'{oa_},{ob_} — double increment (§2.3)')
     # (F8-2) resume/route edges must form a DAG after removing deduct
     non_deduct_ = {i for i, n in nodes.items()
                    if n['kind'] not in ('dispatch', 'redrive')}
