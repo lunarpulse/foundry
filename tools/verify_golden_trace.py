@@ -1870,6 +1870,22 @@ def _tree_const_value(t):
     return None  # call / ident / num / list are non-constant
 
 
+def _tree_implies_cap(t):
+    """(F32-1) truth of this subtree IMPLIES a count_lt cap holds:
+    count_lt itself, conjunction with an implying conjunct, or an OR
+    whose EVERY alternative implies a cap. A weakened sibling like
+    '(count_lt(a,3) || true)' does NOT imply a cap."""
+    if not isinstance(t, tuple):
+        return False
+    if t[0] == "call" and t[1] == "count_lt":
+        return True
+    if t[0] == "and":
+        return any(_tree_implies_cap(c) for c in t[1])
+    if t[0] == "or":
+        return all(_tree_implies_cap(c) for c in t[1])
+    return False
+
+
 def _tree_or_weakened(t, outer_cap=False):
     """(F29-3/F30-3) structure-aware OR-weakening. An OR is weakened
     only when some child lacks count_lt, is not constant-false, AND a
@@ -1894,8 +1910,11 @@ def _tree_or_weakened(t, outer_cap=False):
         # its own outer cap: 'X && (count_lt(a,3) || true)' is still
         # weakened because when X holds the cap never gates re-entry
         for _i31, k in enumerate(t[1]):
+            # (F32-1) a sibling counts as an outer cap only if its
+            # truth IMPLIES a cap — a '(count_lt || true)' sibling
+            # must not credit its weakened twin
             capped31 = outer_cap or any(
-                _tree_has_count_lt(s) for _j31, s in enumerate(t[1])
+                _tree_implies_cap(s) for _j31, s in enumerate(t[1])
                 if _j31 != _i31)
             if _tree_or_weakened(k, capped31):
                 return True
@@ -1903,6 +1922,47 @@ def _tree_or_weakened(t, outer_cap=False):
     if t[0] == "not":
         return _tree_or_weakened(t[1], outer_cap)
     return False
+
+
+
+def _all_paths_bump(u, w, gc, adj, node_ids):
+    """(F32-2) EVERY simple w->u path must pass a gc bump owner
+    (redrive node bump or route-branch do bump on the taken branch).
+    Returns True if all paths bump (or no path exists)."""
+    budget = [600]
+
+    def dfs(x, bumped, on_path):
+        if x == u:
+            return bumped
+        budget[0] -= 1
+        if budget[0] < 0:
+            raise AssertionError(
+                "return-path bump check exceeded path budget")
+        n = node_ids[x]
+        ok = True
+        if n["kind"] == "redrive":
+            nb = n.get("bump") == gc
+            for y in adj.get(x, ()):
+                if y in on_path:
+                    continue
+                ok = dfs(y, bumped or nb, on_path | {y}) and ok
+        elif n["kind"] == "route":
+            for br in n.get("branches", []):
+                g = br.get("goto")
+                if g is None:
+                    continue
+                bb = any(a[0] == "bump" and a[1] == gc
+                         for a in _parse_actions_top(br.get("do")))
+                if g not in on_path:
+                    ok = dfs(g, bumped or bb, on_path | {g}) and ok
+        else:
+            for y in adj.get(x, ()):
+                if y in on_path:
+                    continue
+                ok = dfs(y, bumped, on_path | {y}) and ok
+        return ok
+
+    return dfs(w, False, {w})
 
 def contract_checks(doc):
     """(r16-2) pack-contract regressions: pre_stage wiring and
@@ -2297,7 +2357,68 @@ def contract_checks(doc):
                         raise AssertionError(
                             f"guard on {n['id']}->{g} is OR-weakened or "
                             f"negated entry: {w!r} (§2.2)")
-        # (F29-2) EVERY automatic cycle — including cycles with no
+        # (F32-3) provenance: verdicts/findings references are valid
+    # only downstream of a SUCCESSFUL verify completion (state-based
+    # BFS; redrive invalidates, revert invalidates)
+    def _pv_refs(txt):
+        return bool(re.search(r"\bverdicts\b|\bhas_findings\b", txt or ""))
+
+    def _pv_has_verify(n):
+        return n.get("kind") == "dispatch" and any(
+            st.get("role") == "verify"
+            for st in n.get("stages", []))
+
+    def _pv_revert(d):
+        return any(a[0] == "revert"
+                   for a in _parse_actions_top(d))
+
+    from collections import deque as _dq32
+    _pv_nmap = _node_ids
+    _pv_start = (doc.get("entry"), False)
+    _pv_seen = {_pv_start}
+    _pv_q = _dq32([_pv_start])
+    while _pv_q:
+        _nid, _ev = _pv_q.popleft()
+        if _nid not in _pv_nmap:
+            continue
+        _n = _pv_nmap[_nid]
+        if _n["kind"] == "route" and not _ev:
+            if any(_pv_refs(br.get("when"))
+                   for br in _n.get("branches", [])):
+                raise AssertionError(
+                    f"provenance: route {_nid} references "
+                    "verdicts/findings reachable without a completed "
+                    "verify stage (§2.4)")
+        if _n["kind"] == "route":
+            _succs = []
+            for br in _n.get("branches", []):
+                if br.get("goto"):
+                    _succs.append((br["goto"],
+                                   False if _pv_revert(br.get("do"))
+                                   else _ev))
+        elif _n["kind"] == "dispatch":
+            _succs = []
+            if _n.get("on_done"):
+                _succs.append((_n["on_done"],
+                               _pv_has_verify(_n) or _ev))
+            if _n.get("hold_target"):
+                _succs.append((_n["hold_target"], _ev))
+        elif _n["kind"] == "redrive":
+            _succs = []
+            if _n.get("on_done"):
+                _succs.append((_n["on_done"], False))
+            if _n.get("hold_target"):
+                _succs.append((_n["hold_target"], _ev))
+        elif _n["kind"] == "hold":
+            _succs = [(t, _ev)
+                      for t in _n.get("resume_targets", [])]
+        else:
+            _succs = []
+        for _nx, _ev2 in _succs:
+            if (_nx, _ev2) not in _pv_seen:
+                _pv_seen.add((_nx, _ev2))
+                _pv_q.append((_nx, _ev2))
+    # (F29-2) EVERY automatic cycle — including cycles with no
         # route node at all (pure redrive chains) — must carry a
         # counter bump somewhere on the cycle; a bump-less automatic
         # SCC can only loop forever (§2.2)
@@ -2422,9 +2543,8 @@ def contract_checks(doc):
                     for _y31 in _full_adj.get(_x31, ()):
                         if _y31 not in _reach31:
                             _stk31.append(_y31)
-                _path31 = any(
-                    gc30 in _bump_ctr.get(x, set())
-                    for x in _reach31 - {u})
+                _path31 = _all_paths_bump(u, w, gc30,
+                                          _full_adj, _node_ids)
                 for br in _dst_branches:
                     _has = any(a[0] == "bump" and a[1] == gc30
                                for a in _parse_actions_top(br.get("do")))

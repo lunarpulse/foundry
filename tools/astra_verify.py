@@ -365,6 +365,18 @@ def _tree_const_a(t):
     return None
 
 
+def _tree_implies_cap_a(t):
+    if not isinstance(t, tuple):
+        return False
+    if t[0] == 'call' and t[1] == 'count_lt':
+        return True
+    if t[0] == 'and':
+        return any(_tree_implies_cap_a(c) for c in t[1])
+    if t[0] == 'or':
+        return all(_tree_implies_cap_a(c) for c in t[1])
+    return False
+
+
 def _tree_or_weak_a(t, outer_cap=False):
     if not isinstance(t, tuple):
         return False
@@ -381,8 +393,10 @@ def _tree_or_weak_a(t, outer_cap=False):
     if t[0] == 'and':
         # (F31-1) the OR's own nested count_lt is NOT its outer cap
         for _i31_, k in enumerate(t[1]):
+            # (F32-1) sibling counts as outer cap only if its truth
+            # IMPLIES a cap — a weakened twin cannot credit itself
             capped31_ = outer_cap or any(
-                _tree_has_cl_a(s) for _j31_, s in enumerate(t[1])
+                _tree_implies_cap_a(s) for _j31_, s in enumerate(t[1])
                 if _j31_ != _i31_)
             if _tree_or_weak_a(k, capped31_):
                 return True
@@ -417,6 +431,44 @@ def _reach_set19(adj, start, universe):
             if y_ not in seen_:
                 stk_.append(y_)
     return seen_
+
+
+
+def _all_paths_bump_a(u, w, gc, adj, nodes):
+    """(F32-2) every simple w->u path must pass a gc bump owner."""
+    budget = [600]
+
+    def dfs(x, bumped, on_path):
+        if x == u:
+            return bumped
+        budget[0] -= 1
+        if budget[0] < 0:
+            raise AssertionError('return-path bump check exceeded budget')
+        n = nodes[x]
+        ok = True
+        if n['kind'] == 'redrive':
+            nb = n.get('bump') == gc
+            for y in adj.get(x, ()):
+                if y in on_path:
+                    continue
+                ok = dfs(y, bumped or nb, on_path | {y}) and ok
+        elif n['kind'] == 'route':
+            for br in n.get('branches', []):
+                g = br.get('goto')
+                if g is None:
+                    continue
+                bb = any(a_[0] == 'bump' and a_[1] == gc
+                         for a_ in actions(br.get('do'), {'counters': {}, 'events': []}))
+                if g not in on_path:
+                    ok = dfs(g, bumped or bb, on_path | {g}) and ok
+        else:
+            for y in adj.get(x, ()):
+                if y in on_path:
+                    continue
+                ok = dfs(y, bumped, on_path | {y}) and ok
+        return ok
+
+    return dfs(w, False, {w})
 
 PACK_DIR_ = Path('skills/bmad-review-full/v1')
 
@@ -715,6 +767,58 @@ def graph(policy):
                 neg_entry = reenters_ and _tree_neg_cl_a(_guard_tree_a(w_))
                 if pure_or or neg_entry:
                     raise AssertionError(f'guard on {n_["id"]}->{g_} is OR-weakened or negated entry: {w_!r} (§2.2)')
+    # (F32-3) provenance: verdicts/findings refs valid only after a
+    # successful verify completion (state BFS; redrive/revert reset)
+    def _pv_refs_(txt):
+        return bool(re.search(r'\bverdicts\b|\bhas_findings\b', txt or ''))
+
+    def _pv_verify_(n_):
+        return n_.get('kind') == 'dispatch' and any(
+            s_.get('role') == 'verify' for s_ in n_.get('stages', []))
+
+    from collections import deque as _dq_
+    _st_ = (policy.get('entry'), False)
+    _seen_ = {_st_}
+    _q_ = _dq_([_st_])
+    while _q_:
+        _nid_, _ev_ = _q_.popleft()
+        if _nid_ not in nodes:
+            continue
+        _n_ = nodes[_nid_]
+        if _n_['kind'] == 'route' and not _ev_:
+            if any(_pv_refs_(b_.get('when'))
+                   for b_ in _n_.get('branches', [])):
+                raise AssertionError(
+                    f'provenance: route {_nid_} references '
+                    'verdicts/findings reachable without a completed '
+                    'verify stage (§2.4)')
+        if _n_['kind'] == 'route':
+            _s_ = []
+            for b_ in _n_.get('branches', []):
+                if b_.get('goto'):
+                    _rv_ = any(a_[0] == 'revert' for a_ in
+                               actions(b_.get('do'), {'counters': {}, 'events': []}))
+                    _s_.append((b_['goto'], False if _rv_ else _ev_))
+        elif _n_['kind'] == 'dispatch':
+            _s_ = []
+            if _n_.get('on_done'):
+                _s_.append((_n_['on_done'], _pv_verify_(_n_) or _ev_))
+            if _n_.get('hold_target'):
+                _s_.append((_n_['hold_target'], _ev_))
+        elif _n_['kind'] == 'redrive':
+            _s_ = []
+            if _n_.get('on_done'):
+                _s_.append((_n_['on_done'], False))
+            if _n_.get('hold_target'):
+                _s_.append((_n_['hold_target'], _ev_))
+        elif _n_['kind'] == 'hold':
+            _s_ = [(t_, _ev_) for t_ in _n_.get('resume_targets', [])]
+        else:
+            _s_ = []
+        for _nx_, _ev2_ in _s_:
+            if (_nx_, _ev2_) not in _seen_:
+                _seen_.add((_nx_, _ev2_))
+                _q_.append((_nx_, _ev2_))
     # (F29-4) route-branch do emit payloads must be declared outputs
     _outs29_ = _declared_outputs()
     for n_ in nodes.values():
@@ -784,8 +888,8 @@ def graph(policy):
                     for y31_ in auto_adj.get(x31_, ()):
                         if y31_ not in reach31_:
                             stk31_.append(y31_)
-                path31_ = any(gc30_ in bump_ctr.get(x31_, set())
-                              for x31_ in reach31_ - {u19})
+                path31_ = _all_paths_bump_a(u19, w19, gc30_,
+                                            auto_adj, nodes)
                 for b_ in dst_br:
                     has_ = any(a_[0] == 'bump' and a_[1] == gc30_
                                for a_ in actions(b_.get('do'), {'counters': {}, 'events': []}))
