@@ -154,7 +154,59 @@ def evaluate(expr, state):
         raise ValueError(f"bare and/or/not not in grammar: {expr!r}")
     if not re.fullmatch(r"(?:True|False|and|or|not|[()\s])+", py):
         raise ValueError(f"expression not fully consumed: {py!r} (from {expr!r})")
-    return bool(eval(py))
+    # (F24-3) recursive-descent evaluation — no Python eval: short-
+    # circuit evaluation must not mask malformed call syntax that
+    # survived substitution (e.g. 'true || (true)(false)').
+    _pos = [0]
+    _s = py
+    def _skip():
+        while _pos[0] < len(_s) and _s[_pos[0]].isspace():
+            _pos[0] += 1
+    def _peek():
+        _skip()
+        return _s[_pos[0]:_pos[0] + 5] if _pos[0] < len(_s) else ""
+    def _eat(tok):
+        _skip()
+        if _s.startswith(tok, _pos[0]):
+            _pos[0] += len(tok)
+            return True
+        return False
+    def _prim():
+        if _eat("("):
+            v = _orexpr()
+            if not _eat(")"):
+                raise ValueError(f"unbalanced parens in {py!r}")
+            return v
+        if _eat("True"):
+            return True
+        if _eat("False"):
+            return False
+        if _eat("not"):
+            return not _prim()
+        raise ValueError(f"syntax error at {_s[_pos[0]:]!r} in {py!r}")
+    def _andexpr():
+        v = _prim()
+        while _peek() == "and " or _s[_pos[0]:_pos[0] + 3] == "and":
+            _skip()
+            if not _eat("and"):
+                break
+            r = _prim()
+            v = v and r
+        return v
+    def _orexpr():
+        v = _andexpr()
+        while True:
+            _skip()
+            if not _eat("or"):
+                break
+            r = _andexpr()
+            v = v or r
+        return v
+    _val = _orexpr()
+    _skip()
+    if _pos[0] != len(_s):
+        raise ValueError(f"trailing syntax error at {_s[_pos[0]:]!r} in {py!r}")
+    return _val
 
 
 def _parse_actions_top(do):
@@ -2177,11 +2229,79 @@ def contract_checks(doc):
                 _brs = [br for br in _node_ids[u].get("branches", [])
                         if br.get("goto") == w]
                 for br in _brs:
-                    if not re.search(r"count_lt\s*\(", br.get("when", "")):
+                    w_b = br.get("when", "")
+                    if not re.search(r"count_lt\s*\(", w_b):
                         raise AssertionError(
                             f"route {u} branch to {w} re-enters an "
                             "automatic cycle without a count_lt guard "
                             "on THAT branch (§2.2)")
+                    # (F24-1) the guard must hold POSITIVELY: a count_lt
+                    # under any negation is an exit condition, not a
+                    # cap — !(true && count_lt(c,n)) only limits when
+                    # the counter EXCEEDS the cap (uncapped re-entry)
+                    _depth = 0
+                    _negated = False
+                    _ok = True
+                    _in_str = False
+                    _k = 0
+                    while _k < len(w_b):
+                        _ch = w_b[_k]
+                        if _ch == '"':
+                            _in_str = not _in_str
+                        elif not _in_str and _ch == "(":
+                            _depth += 1
+                        elif not _in_str and _ch == ")":
+                            _depth -= 1
+                        elif (not _in_str and _ch == "!"
+                              and not _negated
+                              and w_b[_k:_k + 8].replace(" ", "")
+                              .startswith("!count_lt")):
+                            _negated = True
+                        elif (not _in_str and _ch == "!"
+                              and w_b[_k + 1:].lstrip().startswith("(")):
+                            # negated group — everything until the
+                            # matching close is under negation
+                            _d2 = 0
+                            _m2 = _k + 1
+                            while _m2 < len(w_b):
+                                if w_b[_m2] == "(":
+                                    _d2 += 1
+                                elif w_b[_m2] == ")":
+                                    _d2 -= 1
+                                    if _d2 == 0:
+                                        break
+                                _m2 += 1
+                            if "count_lt" in w_b[_k:_m2]:
+                                _ok = False
+                        _k += 1
+                    if _negated or not _ok:
+                        raise AssertionError(
+                            f"route {u} branch to {w}: count_lt appears "
+                            "under negation — that is an exit condition, "
+                            "not a re-entry cap (§2.2)")
+        # (F24-2) exactly-once per traversal: inside an automatic SCC,
+        # at most ONE node may carry a redrive bump for a given guard
+        # counter, and it must be the guard's entry node — fixdie ->
+        # fix_again -> lenses with both bumping fix_rounds increments
+        # twice per loop
+        for u, ws in _full_adj.items():
+            if _node_ids.get(u, {}).get("kind") != "route":
+                continue
+            for w in ws:
+                if _scc_of.get(u) == _scc_of.get(w) and u in _scc_of:
+                    if (u, w) in _guard_ctrs:
+                        gc2 = _guard_ctrs[(u, w)]
+                        _comp = set(_sccs[_scc_of[u]])
+                        _bumpers = [x for x in _comp
+                                    if _node_ids[x].get("kind") == "redrive"
+                                    and _node_ids[x].get("bump") == gc2]
+                        if len(_bumpers) > 1:
+                            raise AssertionError(
+                                f"automatic cycle {_sccs[_scc_of[u]]}: "
+                                f"counter {gc2!r} is bumped by multiple "
+                                f"redrive nodes {_bumpers} — one "
+                                "traversal increments more than once "
+                                "(§2.3)")
 # (F18-1) defer contract: if any route branch mentions the
     # 'defer' verdict, the pack MUST declare a 'deferred' output and
     # no two schema outputs may share a 'from' source column

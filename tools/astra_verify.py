@@ -513,11 +513,68 @@ def graph(policy):
                 brs_ = [b_ for b_ in nodes[u19]['branches']
                         if b_.get('goto') == w19]
                 for b_ in brs_:
-                    if not _re19.search(r'count_lt\s*\(', b_.get('when', '')):
+                    wb_ = b_.get('when', '')
+                    if not _re19.search(r'count_lt\s*\(', wb_):
                         raise AssertionError(
                             f'route {u19} branch to {w19} re-enters an '
                             'automatic cycle without a count_lt guard on '
                             'THAT branch (§2.2)')
+                    # (F24-1) guard must hold POSITIVELY — count_lt under
+                    # any negation is an exit condition, not a cap
+                    depth_ = 0
+                    neg_ = False
+                    ok_ = True
+                    instr_ = False
+                    k_ = 0
+                    while k_ < len(wb_):
+                        ch_ = wb_[k_]
+                        if ch_ == '"':
+                            instr_ = not instr_
+                        elif not instr_ and ch_ == '(':
+                            depth_ += 1
+                        elif not instr_ and ch_ == ')':
+                            depth_ -= 1
+                        elif (not instr_ and ch_ == '!'
+                              and not neg_
+                              and wb_[k_:k_ + 8].replace(' ', '').startswith('!count_lt')):
+                            neg_ = True
+                        elif (not instr_ and ch_ == '!'
+                              and wb_[k_ + 1:].lstrip().startswith('(')):
+                            d2_ = 0
+                            m2_ = k_ + 1
+                            while m2_ < len(wb_):
+                                if wb_[m2_] == '(':
+                                    d2_ += 1
+                                elif wb_[m2_] == ')':
+                                    d2_ -= 1
+                                    if d2_ == 0:
+                                        break
+                                m2_ += 1
+                            if 'count_lt' in wb_[k_:m2_]:
+                                ok_ = False
+                        k_ += 1
+                    if neg_ or not ok_:
+                        raise AssertionError(
+                            f'route {u19} branch to {w19}: count_lt under '
+                            'negation — exit condition, not a re-entry cap (§2.2)')
+        # (F24-2) exactly-once: at most ONE redrive node per guard
+        # counter inside an automatic SCC
+        for u19, ws19 in auto_adj.items():
+            if nodes.get(u19, {}).get('kind') != 'route':
+                continue
+            for w19 in ws19:
+                if scc_of19.get(u19) == scc_of19.get(w19) and u19 in scc_of19:
+                    if (u19, w19) in guard_ctrs:
+                        gc2_ = guard_ctrs[(u19, w19)]
+                        comp_ = set(sccs19[scc_of19[u19]])
+                        bumpers_ = [x_ for x_ in comp_
+                                    if nodes[x_].get('kind') == 'redrive'
+                                    and nodes[x_].get('bump') == gc2_]
+                        if len(bumpers_) > 1:
+                            raise AssertionError(
+                                f'automatic cycle: counter {gc2_!r} bumped by '
+                                f'multiple redrive nodes {bumpers_} — double '
+                                'increment per traversal (§2.3)')
     # (F8-2) resume/route edges must form a DAG after removing deduct
     non_deduct_ = {i for i, n in nodes.items()
                    if n['kind'] not in ('dispatch', 'redrive')}
@@ -616,8 +673,15 @@ def graph(policy):
                 # (F15-4) declared counters seeded so count_lt on a
                 # pack-declared counter cannot KeyError
                 _st = state()
-                _st['counters'].update({c: 0 for c in policy.get('counters', {})})
-                Expr(b['when'], _st).run()
+                # (F24-4) syntax-check state contains ONLY pack-declared
+                # counters — the state() convenience seeds must not
+                # mask undeclared-counter usage after a rename
+                _st['counters'] = {c: 0 for c in policy.get('counters', {})}
+                try:
+                    Expr(b['when'], _st).run()
+                except KeyError as _ke:
+                    raise AssertionError(
+                        f'branch references undeclared counter {_ke.args[0]!r}')
                 acts_ = actions(b.get('do'), state())
                 # (F11-3) bump targets must be DECLARED — dead branches too
                 for a_ in acts_:
