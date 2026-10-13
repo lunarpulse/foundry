@@ -1,7 +1,7 @@
 # Foundry Universal Skill Spec — 범용 실행 모델 (Universal Review Engine)
 
-- **버전**: v0.44 (2026-10-12) — 9차 최종 검증 반영.
-  스테이지 의존 전체 그래프 순환 검사·혼합 연산자·문자열 내부 오검출 해소.
+- **버전**: v0.45 (2026-10-12) — 10차 최종 검증 반영.
+  emit 종단 규칙 전팩 적용·route on_done 금지·이연 술어 규범 제거·영단어 연산자 문법 밖.
 - **의도(소유자)**: Foundry는 어떤 방법론도 돌릴 수 있는 유니버설
   플랫폼. BMad는 스킬 데이터의 첫 고객. **Rust 도메인에 방법론
   코드가 박히는 순간이 실패.** 엔진 고정·확장 선언(procedural macro
@@ -241,7 +241,7 @@ primary  := '(' expr ')'
 [동결 범위 v0.41] 위 6술어가 v1 구현 범위 전부다. all_in·
 any_in(findings.group)·has_findings(group_id)는 **규범에서 제거**
 (구현 시 확장은 마이너 버전+양 검증기 동시 업데이트로만).
-         | missing_field ( ) | ext_over ( int )
+         
 
 set      := '[' ( literal ( ',' literal )* )? ']'
 literal  := string-literal(TOML 1.0 문자열)
@@ -414,9 +414,9 @@ policy = "discard-finding" # 개별 finding 거부(부분 거부)
   배타적. no-valid-stage·all-error·verify-invalid은 route 평가
   진입 **전** 오류 정책(on_no_valid 등)으로 강제 이송(통과 불가).
   verify 스테이지 ≤1(0 허용)은 팩 전체 범위 — §2.3과 일치(r9-4).
-  `missing_field`
-  필수 집합·`ext_over` 단위(bytes)·markdown 그룹 규칙 형식은
-  정규화 스키마 표준 템플릿(§부록 A, 구현 시점 확정)에 명시.
+  `missing_field` 필수 집합·`ext_over` 단위·markdown 그룹 규칙 형식은
+  **v1 규범 범위 밖**(§2.3 동결 문법에 없음) — 구현 시 마이너 버전으로
+  도입. DSL 연산자는 &&, ||, !, () 만 — and/or 영단어는 문법 밖.
 
 ## 3. 실행 계약
 

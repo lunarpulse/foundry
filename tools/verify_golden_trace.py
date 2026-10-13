@@ -146,7 +146,12 @@ def evaluate(expr, state):
     # (F2-4) FULL-CONSUMPTION: only True/False/and/or/not/parens/space
     # may remain — anything else (unknown predicates, operators like +,
     # bare identifiers) is a syntax error, never silently True
-    # allowed tokens: True, False, and, or, not, parens, whitespace
+    # allowed tokens: True, False, and, or, not, parens, whitespace.
+    # The DSL surface is &&/||/!/() — bare English 'and'/'or'/'not'
+    # in the ORIGINAL expression are grammar errors (the Python
+    # aliases exist only post-substitution).
+    if re.search(r"\b(and|or|not)\b", re.sub(r'"[^"]*"', '""', expr)):
+        raise ValueError(f"bare and/or/not not in grammar: {expr!r}")
     if not re.fullmatch(r"(?:True|False|and|or|not|[()\s])+", py):
         raise ValueError(f"expression not fully consumed: {py!r} (from {expr!r})")
     return bool(eval(py))
@@ -1828,6 +1833,22 @@ def contract_checks(doc):
         all_stage_ids.append(ps.get("id"))
     dupes = [x for x in all_stage_ids if all_stage_ids.count(x) > 1]
     assert not dupes, f"duplicate stage IDs: {sorted(set(dupes))}"
+    # (F10-1) emit is TERMINAL per branch: no actions after an emit,
+    # no double emit, and route nodes carry no on_done (§2.3)
+    for n in doc["nodes"]:
+        if n["kind"] == "route":
+            assert "on_done" not in n, \
+                f"route {n['id']} must not declare on_done (§2.3)"
+            for br in n.get("branches", []):
+                acts = _parse_actions_top(br.get("do"))
+                for i, a in enumerate(acts):
+                    if a[0] == "emit":
+                        assert i == len(acts) - 1, \
+                            f"route {n['id']} branch has action after emit"
+                        assert not br.get("goto"), \
+                            f"route {n['id']} branch emits AND gotos (§2.3)"
+                assert sum(1 for a in acts if a[0] == "emit") <= 1, \
+                    f"route {n['id']} branch multi-emit (§2.3)"
     # (F8-1/F9-1) registered-stage deps: defined targets, acyclic
     sid_set = set(all_stage_ids)
     dep_adj = {}

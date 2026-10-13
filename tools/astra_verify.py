@@ -131,30 +131,33 @@ def state(categories=(), fix=0, loops=0, active=None):
 
 
 def actions(text, s):
-    # (r30-3) full-normative parser: emit(2-arg, whitespace-tolerant),
-    # revert latest|origin, empty actions REJECTED; no do = no-op
+    """(r30-3/F10-1) full-normative parser; returns parsed action list."""
     if text is None:
-        return
+        return []
     parts = text.split(';')
     if any(not p.strip() for p in parts):
         raise ValueError('empty action in sequence: ' + repr(text))
+    out = []
     for action in map(str.strip, parts):
         m = re.fullmatch(r'(bump|revert)\s*\(\s*([a-z_][a-z0-9_]*)\s*\)', action)
         if m:
             op, arg = m.groups()
             if op == 'bump':
-                s['counters'][arg] += 1
+                s['counters'][arg] = s['counters'].get(arg, 0) + 1
             elif arg in ('origin', 'latest'):
                 s['reverted'] = True
             else:
                 raise ValueError('unsupported revert base: ' + arg)
             s['events'].append(f'{op}({arg})')
+            out.append((op, arg))
             continue
         m = re.fullmatch(r'emit\s*\(\s*([A-Za-z_]\w*)\s*,\s*([A-Za-z_]\w*)\s*\)', action)
         if m:
             s['events'].append(f'emit({m.group(1)}, {m.group(2)})')
+            out.append(('emit', m.group(1)))
             continue
         raise ValueError('unsupported action: ' + action)
+    return out
 
 
 def decision(policy, s, start=None):
@@ -393,10 +396,19 @@ def graph(policy):
                 f'hold {n["id"]} missing resume_targets'
         refs = [n[k] for k in ('on_done', 'hold_target') if k in n]
         if kind == 'route':
+            assert 'on_done' not in n, f'route {n["id"]} must not declare on_done (§2.3)'
             assert n['branches'][-1]['when'].strip() == 'true', 'missing last true fallback'
             for b in n['branches']:
                 Expr(b['when'], state()).run()
-                actions(b.get('do'), state())
+                acts_ = actions(b.get('do'), state())
+                # (F10-1) emit is terminal: nothing after, no goto
+                emits_ = [i for i, a in enumerate(acts_) if a[0] == 'emit']
+                for i_ in emits_:
+                    assert i_ == len(acts_) - 1, \
+                        f'route {n["id"]} branch has action after emit'
+                    assert not b.get('goto'), \
+                        f'route {n["id"]} branch emits AND gotos (§2.3)'
+                assert len(emits_) <= 1, f'route {n["id"]} branch multi-emit (§2.3)'
                 refs.append(b['goto'])
         if kind == 'hold':
             refs.extend(n['resume_targets'])
