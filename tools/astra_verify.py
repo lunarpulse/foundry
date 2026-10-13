@@ -274,15 +274,35 @@ def graph(policy):
             pls_ = ps_.get('lenses')
             assert isinstance(pls_, list) and len(pls_) >= 1, \
                 f'pack_stage {ps_.get("id")} must list at least one lens'
-    # (F5-1) §2.5 on_error completeness + closed policy set
+    # (F5-1/F6-2) §2.5 on_error completeness + state→policy mapping
     NS = {'ok', 'dispatch_error', 'parse_error', 'timeout'}
     NP = {'accept-stage', 'discard-stage', 'discard-finding', 'hold'}
+    SP = {'ok': 'accept-stage', 'dispatch_error': 'discard-stage',
+          'parse_error': 'discard-finding', 'timeout': 'hold'}
     declared = set()
     for oe_ in policy.get('output', {}).get('on_error', []) or []:
         assert oe_.get('state') in NS, f'on_error state {oe_.get("state")!r} not normative'
         assert oe_.get('policy') in NP, f'on_error policy {oe_.get("policy")!r} not in {NP}'
+        assert oe_['policy'] == SP[oe_['state']], \
+            f'on_error {oe_["state"]} must be {SP[oe_["state"]]!r}, got {oe_["policy"]!r} (§2.5)'
         declared.add(oe_['state'])
     assert NS <= declared, f'on_error missing: {NS - declared}'
+    # (F6-1) verify<=1 per pack; stage IDs unique across BOTH node
+    # stages and pack_stages; verify stages declare after deps
+    sid_list = []
+    nverify = 0
+    for n_ in nodes.values():
+        for st_ in n_.get('stages', []) or []:
+            sid_list.append(st_['id'])
+            if st_.get('role') == 'verify':
+                nverify += 1
+                assert st_.get('after'), \
+                    f'verify stage {st_["id"]} must declare after dependencies'
+    for ps_ in policy.get('pack_stages', []) or []:
+        sid_list.append(ps_.get('id'))
+    assert nverify <= 1, f'pack declares {nverify} verify stages (max 1, §2.3)'
+    dupes_ = {x for x in sid_list if sid_list.count(x) > 1}
+    assert not dupes_, f'duplicate stage IDs: {sorted(dupes_)}'
     # (F3-3) emit payload_from validated after schemas load (main)
     # (F3-1/F4-1) top-level [hold] table is MANDATORY
     assert 'hold' in policy, 'pack must declare a top-level [hold] table'

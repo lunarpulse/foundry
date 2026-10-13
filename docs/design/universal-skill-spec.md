@@ -1,7 +1,7 @@
 # Foundry Universal Skill Spec — 범용 실행 모델 (Universal Review Engine)
 
-- **버전**: v0.40 (2026-10-12) — 5차 최종 검증 반영.
-  on_error 완전성·등록스테이지 렌즈 최소·DSL 양측 통일(T/F·has_findings(any)·이스케이프 비재디코딩·문자열 내 어포스트로피).
+- **버전**: v0.41 (2026-10-12) — 6차 최종 검증 반영.
+  verify≤1·stage ID 통합 네임스페이스·after 의존·상태별 정책 매핑·DSL 문법 동결 범위 고정.
 - **의도(소유자)**: Foundry는 어떤 방법론도 돌릴 수 있는 유니버설
   플랫폼. BMad는 스킬 데이터의 첫 고객. **Rust 도메인에 방법론
   코드가 박히는 순간이 실패.** 엔진 고정·확장 선언(procedural macro
@@ -234,10 +234,13 @@ and_expr := un_expr ( '&&' un_expr )*
 un_expr  := '!' un_expr | primary
 primary  := '(' expr ')'
          | 'true' | 'false'
-         | all_in ( verdicts , set ) | any_in ( verdicts , set )
-         | any_in ( findings.group , set )
-         | count_lt ( id , int ) | has_findings ( group_id | 'any' )
+         | any_in ( verdicts , set )
+         | count_lt ( id , int ) | has_findings ( 'any' )
          | timeout ( ) | budget_exhausted ( )
+
+[동결 범위 v0.41] 위 6술어가 v1 구현 범위 전부다. all_in·
+any_in(findings.group)·has_findings(group_id)는 **규범에서 제거**
+(구현 시 확장은 마이너 버전+양 검증기 동시 업데이트로만).
          | missing_field ( ) | ext_over ( int )
 
 set      := '[' ( literal ( ',' literal )* )? ']'
