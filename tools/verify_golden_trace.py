@@ -61,13 +61,14 @@ def atom(name, args, state):
         return state["counters"][counter] < int(n)
     if name == "any_in":
         m = re.match(r"verdicts,(.*)", args, re.S)
-        vals = re.findall(r'"([a-z_]+)"', m.group(1))
+        vals = re.findall(r'"([^"]*)"', m.group(1))  # r32-2: any token
         return bool(set(vals) & set(state["verdicts"]))
     raise ValueError(f"unknown predicate {name}")
 
 
 def evaluate(expr, state):
-    e = expr.replace(" ", "").replace("\n", "")
+    # r32-2: strip whitespace ONLY outside string literals
+    e = re.sub(r'"[^"]*"|.', lambda m: m.group(0) if m.group(0).startswith('"') else ("" if m.group(0).isspace() else m.group(0)), expr)
     while True:
         m = CALL.search(e)
         if not m:
@@ -122,11 +123,20 @@ def walk(doc, verdicts, active_cats, max_steps=50):
         elif kind == "route":
             for br in node["branches"]:
                 if evaluate(br["when"], state):
-                    if br.get("do"):
-                        apply_do(br["do"], state)
+                    d = br.get("do")
+                    if d:
+                        acts = apply_do(d, state)
                     nxt = br.get("goto")
                     if nxt is None:
-                        return decisions + ["HALT"], state
+                        # (r32-3) record HOW we halted: emit vs bare
+                        term = "HALT"
+                        if d:
+                            import re as _r
+                            if _r.search(r"emit\s*\(", d):
+                                term = "HALT:emit"
+                            elif _r.search(r"revert\s*\(", d):
+                                term = "HALT:revert"
+                        return decisions + [term], state
                     cur = nxt  # NOT appended here — the target node
                     break     # records itself on its own visit
             else:
@@ -171,11 +181,20 @@ def walk_from(nodes, doc, start, state, active_cats, max_steps=50):
         elif kind == "route":
             for br in node["branches"]:
                 if evaluate(br["when"], state):
-                    if br.get("do"):
-                        apply_do(br["do"], state)
+                    d = br.get("do")
+                    if d:
+                        acts = apply_do(d, state)
                     nxt = br.get("goto")
                     if nxt is None:
-                        return decisions + ["HALT"], state
+                        # (r32-3) record HOW we halted: emit vs bare
+                        term = "HALT"
+                        if d:
+                            import re as _r
+                            if _r.search(r"emit\s*\(", d):
+                                term = "HALT:emit"
+                            elif _r.search(r"revert\s*\(", d):
+                                term = "HALT:revert"
+                        return decisions + [term], state
                     cur = nxt  # target node records itself
                     break
             else:
@@ -427,7 +446,7 @@ def main():
     assert not has_verify, "A.1 must not carry a verify stage"
     d1, s1 = walk(a1, [], set(), max_steps=10)
     # gate: no verify evidence -> engine diverts instead of emitting
-    assert d1[-1] == "HALT" and not has_verify,         f"A.1 walker reaches emit only for the gate to refuse: {d1}"
+    assert d1[-1] == "HALT:emit" and not has_verify,         f"A.1 walker must reach a real emit for the gate to refuse: {d1}"
     print(f"A.1 acceptance walk: {d1}")
     print("ALL PASS — real-graph walk == original step-04 contract")
 
@@ -1259,85 +1278,11 @@ def sweep_rejection_fixtures():
     def _norm_13(pol):
         for n in pol["nodes"]:
             if n["kind"] == "route":
-                for br in n["branches"]:
-                    if br.get("do") and br["do"].count("emit(") > 1:
-                        br["do"] = 'emit(InspectionPassed, summary)'
+                for br in n.get("branches", []):
+                    if _emit_count(br.get("do")) > 1:
+                        br["do"] = "emit(InspectionPassed, summary)"
         return pol
-    def _norm_14(pol):
-        for n in pol["nodes"]:
-            if n["kind"] == "route":
-                for br in n["branches"]:
-                    d = br.get("do")
-                    if d and _post_emit_action(d):
-                        # keep only the actions up to & incl. first emit
-                        acts = _parse_actions(d)
-                        keep = []
-                        for a in acts:
-                            keep.append(a)
-                            if a[0] == "emit":
-                                break
-                        br["do"] = "; ".join(
-                            a[0] + f"({a[1]}, {a[2]})" if a[0] == "emit"
-                            else a[0] + f"({a[1]})" for a in keep)
-        return pol
-    # each violation checker: True when the violation IS present
-    def _has_01_cycle(pol):
-        ids = {n["id"] for n in pol["nodes"]}
-        for n in pol["nodes"]:
-            if n["kind"] == "route":
-                for br in n.get("branches", []):
-                    g = br.get("goto")
-                    if g in ("ra", "rb") and "ra" in ids and "rb" in ids:
-                        # ra->rb and rb->ra mutual
-                        nmap = {x["id"]: x for x in pol["nodes"]}
-                        ra = nmap.get("ra", {}); rb = nmap.get("rb", {})
-                        ra_t = [b.get("goto") for b in ra.get("branches", [])]
-                        rb_t = [b.get("goto") for b in rb.get("branches", [])]
-                        return "rb" in ra_t and "ra" in rb_t
-        return False
-    def _has_05_no_true(pol):
-        for n in pol["nodes"]:
-            if n["kind"] == "route":
-                last = n["branches"][-1]
-                if last["when"] == "false" and _emit_count(last.get("do")) > 0:
-                    return True
-        return False
-    def _has_06_do_bump_no_goto(pol):
-        for n in pol["nodes"]:
-            if n["kind"] == "route":
-                for br in n.get("branches", []):
-                    d = br.get("do")
-                    if d is None:
-                        continue
-                    bumps = _bumps_in(d)
-                    if bumps and not br.get("goto"):
-                        return True
-        return False
-    def _has_12_mismatch(pol):
-        # (r20-1) compare the GUARD'S counter against the actual bump:
-        # mismatch exists iff the count_lt counter on the guarded
-        # cycle differs from the bump target
-        nmap = {n["id"]: n for n in pol["nodes"]}
-        fix = nmap["fix"]
-        bump = fix.get("bump")
-        for n in pol["nodes"]:
-            if n["kind"] == "route":
-                for br in n.get("branches", []):
-                    w = br.get("when") or ""
-                    if br.get("goto") == "fix" and "count_lt(" in w:
-                        import re as _r
-                        m = _r.search(r"count_lt\((\w+)", w)
-                        if m and m.group(1) != bump:
-                            return True
-        return False
-    def _has_13_multi(pol):
-        for n in pol["nodes"]:
-            if n["kind"] == "route":
-                for br in n.get("branches", []):
-                    d = br.get("do") or ""
-                    if _emit_count(d) > 1:
-                        return True
-        return False
+
     def _has_14_post(pol):
         for n in pol["nodes"]:
             if n["kind"] == "route":
@@ -1437,6 +1382,24 @@ def contract_checks(doc):
                 if n["id"] == "replan":
                     assert "lens-replan.md" in stages_by_pack[ps]["lenses"], \
                         "replan must run the partial amender"
+    # (r32-1) mandatory fields + resume-cycle (§2.4b) on the FULL pack
+    for n in doc["nodes"]:
+        k = n["kind"]
+        if k == "dispatch":
+            for f in ("on_no_valid", "on_verify_invalid", "hold_target"):
+                assert f in n, f"dispatch {n['id']} missing {f}"
+        elif k == "hold":
+            assert n.get("resume_targets") is not None, \
+                f"hold {n['id']} missing resume_targets"
+    deduct = {n["id"] for n in doc["nodes"]
+              if n["kind"] in ("dispatch", "redrive")}
+    nids = {n["id"] for n in doc["nodes"]}
+    for n in doc["nodes"]:
+        if n["kind"] == "hold":
+            for t in n.get("resume_targets", []):
+                assert t in nids, f"hold {n['id']} resume target {t} dangling"
+                assert t in deduct, \
+                    f"hold {n['id']} resumes into {t} (non-deduct) — §2.4b cycle"
     for n in doc["nodes"]:
         if n["kind"] == "dispatch":
             # (r18-3) full stage dependency graph over this dispatch:

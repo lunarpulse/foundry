@@ -231,9 +231,21 @@ def graph(policy):
     assert len(nodes) == len(policy['nodes']), 'duplicate node IDs'
     assert policy['entry'] in nodes, 'missing entry'
     stages = {s['id'] for s in policy.get('pack_stages', [])}
+    # (r32-1) mandatory fields + §2.4b resume-cycle on every pack
+    deduct = {n['id'] for n in nodes.values()
+              if n['kind'] in ('dispatch', 'redrive')}
     for n in nodes.values():
         kind = n['kind']
         assert kind in ('dispatch', 'route', 'redrive', 'emit', 'hold'), 'unknown node kind'
+        if kind == 'dispatch':
+            for f in ('on_no_valid', 'on_verify_invalid', 'hold_target'):
+                assert f in n, f'dispatch {n["id"]} missing {f}'
+        if kind == 'hold':
+            assert n.get('resume_targets') is not None, \
+                f'hold {n["id"]} missing resume_targets'
+            for t in n['resume_targets']:
+                assert t in deduct, \
+                    f'hold {n["id"]} resumes into {t} (non-deduct) — §2.4b cycle'
         refs = [n[k] for k in ('on_done', 'hold_target') if k in n]
         if kind == 'route':
             assert n['branches'][-1]['when'].strip() == 'true', 'missing last true fallback'
