@@ -2161,28 +2161,27 @@ def contract_checks(doc):
                     f"edge {u}->{w}: guarded cycle edge's counter {gc!r} "
                     "not bumped on every branch (no-do duplicate would "
                     "loop unguarded — §2.2/§2.3)")
-    # edges in an SCC WITHOUT any guard at all:
+    # (F23) every ROUTE branch into an automatic SCC must carry its
+    # own count_lt guard (dispatch/redrive on_done edges carry no
+    # condition — the cap lives on the route entry that re-selects
+    # the cycle); a guard elsewhere in the SCC does not justify an
+    # unguarded branch
     for u, ws in _full_adj.items():
+        if _node_ids.get(u, {}).get("kind") != "route":
+            continue
         for w in ws:
             if _scc_of.get(u) == _scc_of.get(w) and u in _scc_of:
-                if (u, w) not in _guard_ctrs:
-                    # unguarded edge inside an automatic SCC — legal only
-                    # if a DIFFERENT edge into w (or out of u) is guarded
-                    # with a matching bump; simple check: some guarded
-                    # edge shares the SCC
-                    _scc = _scc_of[u]
-                    _comp = _sccs[_scc]
-                    _ok = any(
-                        (_g1, _g2) in _guard_ctrs and
-                        _scc_of.get(_g1) == _scc and
-                        _bump_ctr.get(_x)
-                        for (_g1, _g2) in [(_a, _b) for _a in _comp
-                                           for _b in _full_adj.get(_a, [])]
-                        for _x in _comp)
-                    if not _ok:
+                # EVERY branch to w must carry its own guard — a new
+                # unguarded branch to an already-guarded destination
+                # still loops uncapped when IT is selected
+                _brs = [br for br in _node_ids[u].get("branches", [])
+                        if br.get("goto") == w]
+                for br in _brs:
+                    if not re.search(r"count_lt\s*\(", br.get("when", "")):
                         raise AssertionError(
-                            f"automatic cycle in SCC {sorted(_comp)} has "
-                            f"unguarded edge {u}->{w} (§2.2)")
+                            f"route {u} branch to {w} re-enters an "
+                            "automatic cycle without a count_lt guard "
+                            "on THAT branch (§2.2)")
 # (F18-1) defer contract: if any route branch mentions the
     # 'defer' verdict, the pack MUST declare a 'deferred' output and
     # no two schema outputs may share a 'from' source column

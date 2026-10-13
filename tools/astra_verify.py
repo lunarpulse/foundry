@@ -503,19 +503,21 @@ def graph(policy):
                            for a_ in actions(b_.get('do'), {'counters': {}, 'events': []}))
                 assert has_, (f'edge {u19}->{w19}: guarded cycle edge counter {gc_!r} '
                               'not bumped on every branch (§2.2/§2.3)')
+    # (F23) every ROUTE branch re-entering an automatic SCC carries
+    # its OWN guard — per-branch, not per-edge
     for u19, ws19 in auto_adj.items():
+        if nodes.get(u19, {}).get('kind') != 'route':
+            continue
         for w19 in ws19:
             if scc_of19.get(u19) == scc_of19.get(w19) and u19 in scc_of19:
-                if (u19, w19) not in guard_ctrs:
-                    scci = scc_of19[u19]
-                    comp = sccs19[scci]
-                    ok_ = any(
-                        (a_, b__) in guard_ctrs and scc_of19.get(a_) == scci
-                        and bump_ctr.get(x_)
-                        for a_ in comp for b__ in auto_adj.get(a_, [])
-                        for x_ in comp)
-                    if not ok_:
-                        raise AssertionError(f'automatic cycle in SCC {sorted(comp)} has unguarded edge {u19}->{w19} (§2.2)')
+                brs_ = [b_ for b_ in nodes[u19]['branches']
+                        if b_.get('goto') == w19]
+                for b_ in brs_:
+                    if not _re19.search(r'count_lt\s*\(', b_.get('when', '')):
+                        raise AssertionError(
+                            f'route {u19} branch to {w19} re-enters an '
+                            'automatic cycle without a count_lt guard on '
+                            'THAT branch (§2.2)')
     # (F8-2) resume/route edges must form a DAG after removing deduct
     non_deduct_ = {i for i, n in nodes.items()
                    if n['kind'] not in ('dispatch', 'redrive')}
