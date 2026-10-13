@@ -93,13 +93,14 @@ def atom(name, args, state):
 
 
 def check_grammar(expr):
-    # (F8-3) operator integrity BEFORE whitespace-stripping: '& &'
-    # or '| |' (space-split operators) must not merge into && / ||
+    # (F8-3/F9-2) operator integrity OUTSIDE string literals only:
+    # split '& &' / '| |' must not merge via whitespace stripping.
+    # String CONTENT (e.g. "true()") is exempt from every check.
     _outside = re.sub(r'"[^"]*"', '""', expr)
-    if re.search(r"&\s*&", _outside) and "&&" not in _outside:
-        raise ValueError(f"space-split operator: {expr!r}")
-    if re.search(r"\|\s*\|", _outside) and "||" not in _outside:
-        raise ValueError(f"space-split operator: {expr!r}")
+    _ops = re.findall(r"&&|&\s*&|\|\||\|\s*\|", _outside)
+    for _o in _ops:
+        if _o not in ("&&", "||"):
+            raise ValueError(f"space-split operator {_o!r} in {expr!r}")
     """(r33-2/F4-3) normative grammar: double-quoted string literals
     only; whitespace may not appear INSIDE an identifier or number —
     two word-chars separated only by whitespace (no operator, paren,
@@ -126,8 +127,9 @@ def evaluate(expr, state):
     check_grammar(expr)
     # r32-2: strip whitespace ONLY outside string literals
     e = re.sub(r'"[^"]*"|.', lambda m: m.group(0) if m.group(0).startswith('"') else ("" if m.group(0).isspace() else m.group(0)), expr)
-    # (F4-3) 'true' is a literal, not a call — true() is malformed
-    if re.search(r"\btrue\s*\(", e):
+    # (F4-3/F9-2) 'true' is a literal, not a call — true() outside
+    # string literals is malformed (string content is exempt)
+    if re.search(r"\btrue\s*\(", _outside := re.sub(r'"[^"]*"', '""', expr)):
         raise ValueError("true is a literal; true() is malformed")
     while True:
         m = CALL.search(e)
@@ -1826,14 +1828,35 @@ def contract_checks(doc):
         all_stage_ids.append(ps.get("id"))
     dupes = [x for x in all_stage_ids if all_stage_ids.count(x) > 1]
     assert not dupes, f"duplicate stage IDs: {sorted(set(dupes))}"
-    # (F8-1) registered-stage deps: defined targets, no self/cycle
+    # (F8-1/F9-1) registered-stage deps: defined targets, acyclic
     sid_set = set(all_stage_ids)
+    dep_adj = {}
     for ps in doc.get("pack_stages", []) or []:
-        for dep in ps.get("after", []) or []:
+        deps = ps.get("after", []) or []
+        for dep in deps:
             assert dep in sid_set, \
                 f"pack_stage {ps.get('id')} depends on undefined {dep!r}"
-            assert dep != ps.get("id"), \
-                f"pack_stage {ps.get('id')} self-dependency"
+        dep_adj[ps.get("id")] = list(deps)
+    # node-stage deps join the graph
+    for n in doc["nodes"]:
+        for st in n.get("stages", []) or []:
+            for dep in st.get("after", []) or []:
+                dep_adj.setdefault(st["id"], []).append(dep)
+    # cycle check over the FULL dependency graph
+    _mark = {}
+    def _dfs(u):
+        _mark[u] = 1
+        for w in dep_adj.get(u, ()):
+            if _mark.get(w) == 1:
+                return False
+            if _mark.get(w, 0) == 0 and not _dfs(w):
+                return False
+        _mark[u] = 2
+        return True
+    for v in dep_adj:
+        if _mark.get(v, 0) == 0:
+            assert _dfs(v), \
+                f"stage dependency cycle involving {v!r}"
     for n in doc["nodes"]:
         k = n["kind"]
         if k == "dispatch":

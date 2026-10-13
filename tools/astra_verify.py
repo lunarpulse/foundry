@@ -314,12 +314,32 @@ def graph(policy):
     assert nverify <= 1, f'pack declares {nverify} verify stages (max 1, §2.3)'
     dupes_ = {x for x in sid_list if sid_list.count(x) > 1}
     assert not dupes_, f'duplicate stage IDs: {sorted(dupes_)}'
-    # (F8-1) registered-stage deps: defined, no self/cycles
+    # (F8-1/F9-1) registered-stage deps: defined + ACYCLIC over the
+    # full stage dependency graph (node stages + pack_stages)
     sset_ = set(sid_list)
+    dep_adj_ = {}
     for ps_ in policy.get('pack_stages', []) or []:
-        for dep_ in ps_.get('after', []) or []:
+        deps_ = ps_.get('after', []) or []
+        for dep_ in deps_:
             assert dep_ in sset_, f'pack_stage {ps_.get("id")} depends on undefined {dep_!r}'
-            assert dep_ != ps_.get('id'), f'pack_stage {ps_.get("id")} self-dependency'
+        dep_adj_[ps_.get('id')] = list(deps_)
+    for n_ in nodes.values():
+        for st_ in n_.get('stages', []) or []:
+            for dep_ in st_.get('after', []) or []:
+                dep_adj_.setdefault(st_['id'], []).append(dep_)
+    _mk = {}
+    def _dfsc(u):
+        _mk[u] = 1
+        for w in dep_adj_.get(u, ()):
+            if _mk.get(w) == 1:
+                return False
+            if _mk.get(w, 0) == 0 and not _dfsc(w):
+                return False
+        _mk[u] = 2
+        return True
+    for v_ in dep_adj_:
+        if _mk.get(v_, 0) == 0:
+            assert _dfsc(v_), f'stage dependency cycle involving {v_!r}'
     # (F8-2) resume/route edges must form a DAG after removing deduct
     non_deduct_ = {i for i, n in nodes.items()
                    if n['kind'] not in ('dispatch', 'redrive')}
