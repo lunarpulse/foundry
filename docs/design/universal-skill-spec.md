@@ -1,7 +1,7 @@
 # Foundry Universal Skill Spec — 범용 실행 모델 (Universal Review Engine)
 
-- **버전**: v0.56 (2026-10-12) — 21차 최종 검증 반영.
-  경로 정확성(가드 진입 분기·진입 노드 bump만 인정 — 타 분기 bump 무효)·이중 증가(분기+노드 동시) 거부·괄호 부정 가드·탈출 간선 !count_lt 합법 명시.
+- **버전**: v0.57 (2026-10-12) — 22차 최종 검증 반영.
+  간선 단위 사이클 검증(hold 제거 Tarjan SCC — per-edge 가드·경로 정확 bump·동일 목적지 전 분기 bump·중첩 부정 OR·bridge 우회·no-do 대체 분기 전부 거부).
 - **의도(소유자)**: Foundry는 어떤 방법론도 돌릴 수 있는 유니버설
   플랫폼. BMad는 스킬 데이터의 첫 고객. **Rust 도메인에 방법론
   코드가 박히는 순간이 실패.** 엔진 고정·확장 선언(procedural macro

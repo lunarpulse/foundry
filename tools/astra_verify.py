@@ -244,6 +244,18 @@ def canonical(root):
 EV_DECLARED = set()  # filled by main() from schema outputs after load
 
 
+
+def _outs19(n):
+    k = n['kind']
+    if k == 'route':
+        return [b.get('goto') for b in n['branches'] if b.get('goto')]
+    if k in ('dispatch', 'redrive'):
+        return [n['on_done']] if n.get('on_done') else []
+    if k == 'hold':
+        return list(n.get('resume_targets', []))
+    return []
+
+
 def graph(policy):
     nodes = {n['id']: n for n in policy['nodes']}
     assert len(nodes) == len(policy['nodes']), 'duplicate node IDs'
@@ -389,50 +401,47 @@ def graph(policy):
     for v_ in dep_adj_:
         if _mk.get(v_, 0) == 0:
             assert _dfsc(v_), f'stage dependency cycle involving {v_!r}'
-    # (F19) EVERY cycle in the FULL graph must be counter-guarded
+    # (F22) per-edge cycle validation: hold nodes removed (they cap
+    # cycles by human resume), Tarjan SCC, then EVERY cycle-closing
+    # edge must be guarded with path-exact bumps
     import re as _re19
-    full_adj = {}
-    edge_guard = {}
-    node_bumps = set()
-    for n_ in nodes.values():
-        k_ = n_['kind']
-        outs = []
-        if k_ == 'route':
-            for b_ in n_['branches']:
-                if b_.get('goto'):
-                    outs.append(b_['goto'])
-                    edge_guard[(n_['id'], b_['goto'])] = bool(
-                        _re19.search(r'count_lt\s*\(', b_.get('when', '')))
-                for a_ in actions(b_.get('do'), {'counters': {}, 'events': []}):
-                    if a_[0] == 'bump':
-                        node_bumps.add(n_['id'])
-        elif k_ in ('dispatch', 'redrive'):
-            if n_.get('on_done'):
-                outs.append(n_['on_done'])
-                edge_guard[(n_['id'], n_['on_done'])] = False
-        elif k_ == 'hold':
-            for t_ in n_.get('resume_targets', []):
-                outs.append(t_)
-                edge_guard[(n_['id'], t_)] = True
-        full_adj[n_['id']] = outs
-    color19 = {}
-    cycles19 = []
-    def cyc19(u, stack):
-        color19[u] = 1
-        stack.append(u)
-        for w_ in full_adj.get(u, ()):
-            if color19.get(w_) == 1:
-                cycles19.append(stack[stack.index(w_):] + [w_])
-            elif color19.get(w_, 0) == 0:
-                cyc19(w_, stack)
-        stack.pop()
-        color19[u] = 2
+    hold_ids = {i_ for i_, n_ in nodes.items() if n_['kind'] == 'hold'}
+    auto_adj = {u: [w for w in ws if w not in hold_ids]
+                for u, ws in
+                {i_: _outs19(nodes[i_]) for i_ in nodes}.items()
+                if u not in hold_ids}
+    # Tarjan SCC on auto_adj
+    idx19, low19, onstk19, stk19, sccs19, ctr19 = {}, {}, {}, [], [], [0]
+    def strong19(v):
+        idx19[v] = low19[v] = ctr19[0]
+        ctr19[0] += 1
+        stk19.append(v)
+        onstk19[v] = True
+        for w in auto_adj.get(v, ()):
+            if w not in idx19:
+                strong19(w)
+                low19[v] = min(low19[v], low19[w])
+            elif onstk19.get(w):
+                low19[v] = min(low19[v], idx19[w])
+        if low19[v] == idx19[v]:
+            comp = []
+            while True:
+                x = stk19.pop()
+                onstk19[x] = False
+                comp.append(x)
+                if x == v:
+                    break
+            sccs19.append(comp)
     import sys as _s19
     _s19.setrecursionlimit(10000)
-    for v19 in full_adj:
-        if color19.get(v19, 0) == 0:
-            cyc19(v19, [])
-    # (F20) per-cycle guard/bump semantics
+    for v19 in list(auto_adj):
+        if v19 not in idx19:
+            strong19(v19)
+    scc_of19 = {}
+    for ci19, comp in enumerate(sccs19):
+        for u19 in comp:
+            scc_of19[u19] = ci19
+    # bump aggregation
     bump_ctr = {}
     for n_ in nodes.values():
         bs_ = set()
@@ -448,6 +457,7 @@ def graph(policy):
             bs_.add(n_['bump'])
         if bs_:
             bump_ctr[n_['id']] = bs_
+    # guard extraction + OR/neg checks
     guard_ctrs = {}
     for n_ in nodes.values():
         if n_['kind'] != 'route':
@@ -460,55 +470,52 @@ def graph(policy):
                 guard_ctrs[(n_['id'], g_)] = m20.group(1)
                 parts_ = _re19.split(r'\|\|', _re19.sub(r'"[^"]*"', '""', w_))
                 pure_or = any('count_lt' not in p.strip() for p in parts_ if p.strip())
-                # negation only violates on edges RE-ENTERING a cycle;
-                # exit edges legitimately use !count_lt as cap escape
                 dst_n_ = nodes.get(g_)
                 reenters_ = dst_n_ is not None and (
                     dst_n_['kind'] == 'redrive' or g_ == n_['id'])
-                neg_entry = reenters_ and any(
-                    _re19.search(r'!\s*\(?\s*count_lt', p)
-                    for p in parts_ if p.strip())
+                neg_entry = False
+                if reenters_:
+                    for p in parts_:
+                        p = p.strip()
+                        if not p:
+                            continue
+                        if _re19.search(r'!\s*\(*\s*count_lt', p):
+                            neg_entry = True
                 if pure_or or neg_entry:
                     raise AssertionError(f'guard on {n_["id"]}->{g_} is OR-weakened or negated entry: {w_!r} (§2.2)')
-    for c19 in cycles19:
-        edges19 = list(zip(c19, c19[1:]))
-        guarded19 = any(edge_guard.get(e_, False) for e_ in edges19)
-        bumped19 = any(x19 in node_bumps for x19 in c19[:-1])
-        kinds19 = {nodes[x19]['kind'] for x19 in c19[:-1]}
-        if (guarded19 and bumped19) and 'hold' not in kinds19:
-            g_ctrs = {guard_ctrs[e_] for e_ in edges19 if e_ in guard_ctrs}
-            b_ctrs = set()
-            for x19 in c19[:-1]:
-                b_ctrs |= bump_ctr.get(x19, set())
-            if not (g_ctrs & b_ctrs):
-                raise AssertionError(f'cycle {c19[:-1]}: guard counter never bumped in cycle — §2.2')
-            for e_ in edges19:
-                if e_ not in guard_ctrs:
-                    continue
-                gc_ = guard_ctrs[e_]
-                src_n_ = nodes.get(e_[0])
-                dst_n_ = nodes.get(e_[1])
-                bumped_here_ = False
-                branch_bumps_ = False
-                if src_n_ and src_n_['kind'] == 'route':
-                    for b_ in src_n_['branches']:
-                        if b_.get('goto') == e_[1]:
-                            for a_ in actions(b_.get('do'), {'counters': {}, 'events': []}):
-                                if a_[0] == 'bump' and a_[1] == gc_:
-                                    bumped_here_ = True
-                                    branch_bumps_ = True
-                node_bumps_gc_ = bool(dst_n_ and dst_n_.get('bump') == gc_)
-                if node_bumps_gc_:
-                    bumped_here_ = True
-                    if branch_bumps_:
-                        raise AssertionError(
-                            f'cycle {c19[:-1]}: counter {gc_!r} bumped BOTH on the entry branch and the entered node — double increment (§2.3)')
-                if not bumped_here_:
-                    raise AssertionError(
-                        f'cycle {c19[:-1]}: guarded edge {e_} counter {gc_!r} is bumped only on OTHER branches — path-exactness violated (§2.3)')
+    # per-edge rules
+    for (u19, w19) in list(guard_ctrs.keys()):
+        if scc_of19.get(u19) != scc_of19.get(w19) or u19 not in scc_of19:
             continue
-        if not (guarded19 and bumped19) and 'hold' not in kinds19:
-            raise AssertionError(f'cycle {c19[:-1]} lacks a counter guard+bump (§2.2)')
+        gc_ = guard_ctrs[(u19, w19)]
+        src_n_ = nodes[u19]
+        dst_n_ = nodes[w19]
+        dst_br = [b_ for b_ in src_n_['branches'] if b_.get('goto') == w19]
+        node_b = dst_n_.get('bump') if dst_n_['kind'] == 'redrive' else None
+        if node_b == gc_:
+            for b_ in dst_br:
+                for a_ in actions(b_.get('do'), {'counters': {}, 'events': []}):
+                    if a_[0] == 'bump' and a_[1] == gc_:
+                        raise AssertionError(f'edge {u19}->{w19}: counter {gc_!r} bumped BOTH on branch and node — double increment (§2.3)')
+        else:
+            for b_ in dst_br:
+                has_ = any(a_[0] == 'bump' and a_[1] == gc_
+                           for a_ in actions(b_.get('do'), {'counters': {}, 'events': []}))
+                assert has_, (f'edge {u19}->{w19}: guarded cycle edge counter {gc_!r} '
+                              'not bumped on every branch (§2.2/§2.3)')
+    for u19, ws19 in auto_adj.items():
+        for w19 in ws19:
+            if scc_of19.get(u19) == scc_of19.get(w19) and u19 in scc_of19:
+                if (u19, w19) not in guard_ctrs:
+                    scci = scc_of19[u19]
+                    comp = sccs19[scci]
+                    ok_ = any(
+                        (a_, b__) in guard_ctrs and scc_of19.get(a_) == scci
+                        and bump_ctr.get(x_)
+                        for a_ in comp for b__ in auto_adj.get(a_, [])
+                        for x_ in comp)
+                    if not ok_:
+                        raise AssertionError(f'automatic cycle in SCC {sorted(comp)} has unguarded edge {u19}->{w19} (§2.2)')
     # (F8-2) resume/route edges must form a DAG after removing deduct
     non_deduct_ = {i for i, n in nodes.items()
                    if n['kind'] not in ('dispatch', 'redrive')}

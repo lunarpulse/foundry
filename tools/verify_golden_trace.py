@@ -1984,25 +1984,58 @@ def contract_checks(doc):
                 outs.append(t)
                 _edge_guard[(n["id"], t)] = True  # human resume = capped
         _full_adj[n["id"]] = outs
-    # find cycles via DFS back-edges
-    _color = {}
-    _cycles = []
-    def _cyc(u, stack):
-        _color[u] = 1
-        stack.append(u)
-        for w in _full_adj.get(u, ()):
-            if _color.get(w) == 1:
-                idx = stack.index(w)
-                _cycles.append(stack[idx:] + [w])
-            elif _color.get(w, 0) == 0:
-                _cyc(w, stack)
-        stack.pop()
-        _color[u] = 2
+    # (F22-3) Tarjan SCC enumeration: EVERY cyclic strongly-connected
+    # component is checked (DFS back-edges miss cycles closed via
+    # cross-edges to finished nodes). Each SCC with an internal edge
+    # is treated as a cycle candidate.
+    # (F22-3) holds BREAK automatic cycles (human cap): enumerate
+    # SCCs on the hold-REMOVED graph; every remaining SCC edge set is
+    # an automatic cycle requiring guard+bump
+    _hold_ids = {n["id"] for n in doc["nodes"] if n["kind"] == "hold"}
+    _auto_adj = {u: [w for w in ws if w not in _hold_ids]
+                 for u, ws in _full_adj.items() if u not in _hold_ids}
+    _full_adj = _auto_adj
     import sys as _sys19
     _sys19.setrecursionlimit(10000)
-    for _v in _full_adj:
-        if _color.get(_v, 0) == 0:
-            _cyc(_v, [])
+    _index = {}
+    _low = {}
+    _onstk = {}
+    _stk = []
+    _sccs = []
+    _ctr = [0]
+    def _strong(v):
+        _index[v] = _low[v] = _ctr[0]
+        _ctr[0] += 1
+        _stk.append(v)
+        _onstk[v] = True
+        for w in _full_adj.get(v, ()):
+            if w not in _index:
+                _strong(w)
+                _low[v] = min(_low[v], _low[w])
+            elif _onstk.get(w):
+                _low[v] = min(_low[v], _index[w])
+        if _low[v] == _index[v]:
+            comp = []
+            while True:
+                w = _stk.pop()
+                _onstk[w] = False
+                comp.append(w)
+                if w == v:
+                    break
+            _sccs.append(comp)
+    for _v in list(_full_adj):
+        if _v not in _index:
+            _strong(_v)
+    _cycles = []
+    for comp in _sccs:
+        _cset = set(comp)
+        _auto = len(comp) > 1 or (len(comp) == 1
+                                  and comp[0] in _full_adj.get(comp[0], ()))
+        if not _auto:
+            continue
+        # treat the SCC as one cycle unit; per-edge checks below use
+        # the REAL internal edges enumerated from _full_adj
+        _cycles.append(comp + [comp[0]])
     # (F20) per-cycle guard/bump SEMANTICS:
     #  guard counter (from the guarded edge's count_lt) must be bumped
     #  INSIDE the cycle (branch bumps AND redrive node bump fields),
@@ -2048,71 +2081,109 @@ def contract_checks(doc):
                         _to_node["kind"] in ("redrive",)
                         or g == n["id"])
                     _neg_entry = _reenters and any(
-                        re.search(r"!\s*\(?\s*count_lt", p)
+                        re.search(r"!\s*\(*\s*count_lt", p)
                         for p in _parts if p.strip())
                     if _pure_or or _neg_entry:
                         raise AssertionError(
                             f"guard on {n['id']}->{g} is OR-weakened or "
                             f"negated entry: {w!r} (§2.2)")
-    for cyc in _cycles:
-        edges = list(zip(cyc, cyc[1:]))
-        guarded = any(_edge_guard.get(e, False) for e in edges)
-        bumped = any(nid in {b[0] for b in _node_bumps} for nid in cyc[:-1])
-        # hold-resumed cycles are human-capped; else need guard+bump
-        kinds_in = {_node_ids[x]["kind"] for x in cyc[:-1]}
-        if (guarded and bumped) and "hold" not in kinds_in:
-            g_ctrs = {_guard_ctrs[e] for e in edges if e in _guard_ctrs}
-            b_ctrs = set()
-            for nid in cyc[:-1]:
-                b_ctrs |= _bump_ctr.get(nid, set())
-            if not (g_ctrs & b_ctrs):
-                raise AssertionError(
-                    f"cycle {cyc[:-1]}: guard counter {g_ctrs} never "
-                    f"bumped in cycle (bumped: {b_ctrs}) — §2.2")
-            # (F21-1) per-traversal exactness: for each guarded ENTRY
-            # edge into the cycle, the bump must be on THAT branch's
-            # own do, or on the entered node's redrive bump field —
-            # bumps living on OTHER branches of the same route don't
-            # increment on this traversal
-            for e in edges:
-                if e not in _guard_ctrs:
-                    continue
-                gc = _guard_ctrs[e]
-                src_n = _node_ids.get(e[0])
-                dst_n = _node_ids.get(e[1])
-                bumped_here = False
-                if src_n and src_n["kind"] == "route":
-                    for br in src_n.get("branches", []):
-                        if br.get("goto") == e[1]:
-                            for a in _parse_actions_top(br.get("do")):
-                                if a[0] == "bump" and a[1] == gc:
-                                    bumped_here = True
-                if dst_n and dst_n.get("bump") == gc:
-                    bumped_here = True
-                    # if BOTH the entry branch bumps gc AND the entered
-                    # redrive bumps gc, one traversal increments TWICE —
-                    # §2.3 exactness violation
-                    if src_n and src_n["kind"] == "route":
-                        for br in src_n.get("branches", []):
-                            if br.get("goto") == e[1]:
-                                for a in _parse_actions_top(br.get("do")):
-                                    if a[0] == "bump" and a[1] == gc:
-                                        raise AssertionError(
-                                            f"cycle {cyc[:-1]}: counter "
-                                            f"{gc!r} bumped BOTH on the "
-                                            "entry branch and the entered "
-                                            "node — double increment "
-                                            "(§2.3)")
-                if not bumped_here:
+        # (F22) PER-EDGE rule: every edge whose endpoints share an SCC
+    # (i.e. the edge closes a cycle) must be counter-guarded with
+    # path-exact bumps; the earlier whole-cycle heuristic conflated
+    # distinct loops inside one SCC.
+    _scc_of = {}
+    for _ci, comp in enumerate(_sccs):
+        for _u in comp:
+            _scc_of[_u] = _ci
+    _bump_ctr = {}
+    for n in doc["nodes"]:
+        bs = set()
+        if n["kind"] == "route":
+            for br in n.get("branches", []):
+                _acts20 = _parse_actions_top(br.get("do"))
+                for a in _acts20:
+                    if a[0] == "bump":
+                        bs.add(a[1])
+                bumps_here = [a[1] for a in _acts20 if a[0] == "bump"]
+                if len(bumps_here) != len(set(bumps_here)):
                     raise AssertionError(
-                        f"cycle {cyc[:-1]}: guarded edge {e} counter "
-                        f"{gc!r} is bumped only on OTHER branches — "
-                        "path-exactness violated (§2.3)")
-            continue
-        if not (guarded and bumped) and "hold" not in kinds_in:
-            raise AssertionError(
-                f"cycle {cyc[:-1]} lacks a counter guard+bump (§2.2)")
-    # (F18-1) defer contract: if any route branch mentions the
+                        f"route {n['id']} branch double-bumps a counter")
+        elif n["kind"] == "redrive" and n.get("bump"):
+            bs.add(n["bump"])
+        if bs:
+            _bump_ctr[n["id"]] = bs
+    _guard_ctrs = {}
+    for n in doc["nodes"]:
+        if n["kind"] == "route":
+            for br in n.get("branches", []):
+                g = br.get("goto")
+                w = br.get("when", "")
+                m20 = re.search(r"count_lt\s*\(\s*([a-z_][a-z0-9_]*)", w)
+                if g and m20:
+                    _guard_ctrs[(n["id"], g)] = m20.group(1)
+                    _parts = re.split(r"\|\|", re.sub(r'"[^"]*"', '""', w))
+                    _pure_or = any(
+                        "count_lt" not in p.strip()
+                        for p in _parts if p.strip())
+                    _to_node = _node_ids.get(g)
+                    _reenters = _to_node is not None and (
+                        _to_node["kind"] in ("redrive",)
+                        or g == n["id"])
+                    _neg_entry = _reenters and any(
+                        re.search(r"!\s*\(*\s*count_lt", p)
+                        for p in _parts if p.strip())
+                    if _pure_or or _neg_entry:
+                        raise AssertionError(
+                            f"guard on {n['id']}->{g} is OR-weakened or "
+                            f"negated entry: {w!r} (§2.2)")
+    for (u, w) in list(_guard_ctrs.keys()):
+        if _scc_of.get(u) != _scc_of.get(w) or u not in _scc_of:
+            continue  # not a cycle-closing edge
+        gc = _guard_ctrs[(u, w)]
+        src_n = _node_ids[u]
+        dst_n = _node_ids[w]
+        _dst_branches = [br for br in src_n.get("branches", [])
+                         if br.get("goto") == w]
+        node_b = dst_n.get("bump") if dst_n["kind"] == "redrive" else None
+        if node_b == gc:
+            for br in _dst_branches:
+                for a in _parse_actions_top(br.get("do")):
+                    if a[0] == "bump" and a[1] == gc:
+                        raise AssertionError(
+                            f"edge {u}->{w}: counter {gc!r} bumped BOTH "
+                            "on branch and node — double increment (§2.3)")
+        else:
+            # every branch to w must bump gc on its own do
+            for br in _dst_branches:
+                _has = any(a[0] == "bump" and a[1] == gc
+                           for a in _parse_actions_top(br.get("do")))
+                assert _has, (
+                    f"edge {u}->{w}: guarded cycle edge's counter {gc!r} "
+                    "not bumped on every branch (no-do duplicate would "
+                    "loop unguarded — §2.2/§2.3)")
+    # edges in an SCC WITHOUT any guard at all:
+    for u, ws in _full_adj.items():
+        for w in ws:
+            if _scc_of.get(u) == _scc_of.get(w) and u in _scc_of:
+                if (u, w) not in _guard_ctrs:
+                    # unguarded edge inside an automatic SCC — legal only
+                    # if a DIFFERENT edge into w (or out of u) is guarded
+                    # with a matching bump; simple check: some guarded
+                    # edge shares the SCC
+                    _scc = _scc_of[u]
+                    _comp = _sccs[_scc]
+                    _ok = any(
+                        (_g1, _g2) in _guard_ctrs and
+                        _scc_of.get(_g1) == _scc and
+                        _bump_ctr.get(_x)
+                        for (_g1, _g2) in [(_a, _b) for _a in _comp
+                                           for _b in _full_adj.get(_a, [])]
+                        for _x in _comp)
+                    if not _ok:
+                        raise AssertionError(
+                            f"automatic cycle in SCC {sorted(_comp)} has "
+                            f"unguarded edge {u}->{w} (§2.2)")
+# (F18-1) defer contract: if any route branch mentions the
     # 'defer' verdict, the pack MUST declare a 'deferred' output and
     # no two schema outputs may share a 'from' source column
     _defer_used = False
