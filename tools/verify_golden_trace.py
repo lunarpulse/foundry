@@ -72,19 +72,23 @@ def evaluate(expr, state):
 
 
 def apply_do(do, state):
-    """branch do-sequence: bump(id); revert(base)"""
+    """branch do-sequence: bump(id); revert(base) — FULL-CONSUMPTION
+    parser (r29-3): whitespace-tolerant, trailing garbage rejected"""
     for action in do.split(";"):
         action = action.strip()
-        m = re.match(r"bump\((\w+)\)", action)
+        m = re.fullmatch(r"bump\s*\(\s*(\w+)\s*\)", action)
         if m:
             state["counters"][m.group(1)] = \
                 state["counters"].get(m.group(1), 0) + 1
             continue
-        m = re.match(r"revert\((\w+)\)", action)
+        m = re.fullmatch(r"revert\s*\(\s*(\w+)\s*\)", action)
         if m:
             state["reverted_base"] = m.group(1)  # durable, observed
             continue
-        raise ValueError(f"unknown action {action}")
+        m = re.fullmatch(r"emit\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)", action)
+        if m:
+            continue  # emits handled by the walker
+        raise ValueError(f"unknown action {action!r}")
 
 
 def walk(doc, verdicts, active_cats, max_steps=50):
@@ -574,6 +578,15 @@ def sweep_rejection_fixtures():
             missing = policy_refs - set(declared)
             assert not missing, \
                 f"{name}: policy references undeclared files: {missing}"
+            # (r29-2) the EXECUTED policy must be a manifest member
+            assert "policy.toml" in declared, \
+                f"{name}: manifest must declare policy.toml (execution binding)"
+            # pack_stages output_schema references too
+            pschema = {ps.get("output_schema") for ps in pdoc.get("pack_stages", [])
+                       if ps.get("output_schema")}
+            missing2 = pschema - set(declared)
+            assert not missing2, \
+                f"{name}: pack_stages reference undeclared schemas: {missing2}"
             h_ = _hl.sha256()
             for pn in sorted(files_):
                 cb = files_[pn]  # bytes (r23-4: original bytes)
@@ -639,35 +652,49 @@ def sweep_rejection_fixtures():
         import re as _re
         caps = {m.group(1): int(m.group(2)) for m in
                 _re.finditer(r"count_lt\s*[(]\s*([A-Za-z_]\w*)\s*,\s*(\d+)\s*[)]", w)}
-        # (r28-1b) argument-free clock predicates (timeout,
-        # budget_exhausted) can be TRUE at any moment — an OR over
-        # them never enforces
-        if re.search(r"\|\|\s*!?(timeout|budget_exhausted)\s*\(", w) or                 re.search(r"(timeout|budget_exhausted)\s*\(\s*\)\s*\|\|", w) or                 re.search(r"\|\|\s*(timeout|budget_exhausted)\s*\(", w):
-            probe_extra = True
-        else:
-            probe_extra = False
+        # (r29-1) clock predicates anywhere; verdict samples from
+        # the expression's own any_in lists
+        clock_present = bool(_re.search(r"timeout\s*\(", w)
+                             or _re.search(r"budget_exhausted\s*\(", w))
+        vsamples = []
+        for m in _re.finditer(r'any_in\s*\(\s*verdicts\s*,\s*\[(.*?)\]\s*\)', w):
+            vsamples += _re.findall(r'"([^"]+)"', m.group(1))
+        vlists = [[], ["patch"]]
+        if vsamples:
+            vlists += [sorted(set(vsamples)),
+                       sorted(set(vsamples)) + ["patch"]]
         out = set()
         for c, cap in caps.items():
-            enforced = not probe_extra
+            enforced = True
             for cval in (cap, cap + 1, cap + 10):
-                for others in ({}, {k: max(v - 1, 0) for k, v in caps.items()
-                                  if k != c}):
-                    for verdicts in ([], ["patch"], ["patch", "defer"]):
+                for others in ({k: 0 for k in caps},
+                               {k: max(v - 1, 0) for k, v in caps.items()}):
+                    for verdicts in vlists or [[]]:
                         for findings in (False, True):
                             st = {"counters": {**others, c: cval},
                                   "verdicts": verdicts,
                                   "findings": findings,
                                   "reverted_base": None}
-                            try:
-                                ok = evaluate(w, st)
-                            except Exception:
-                                ok = None
-                            if ok is True:
+                            ok = evaluate(w, st)
+                            # (r29-1) evaluation failure is NOT
+                            # evidence of enforcement — treat as True
+                            if ok is not False:
                                 enforced = False
                                 break
                         if not enforced: break
                     if not enforced: break
                 if not enforced: break
+            if clock_present and "|" in w:
+                # a clock predicate in an OR-adjacent position: probe
+                # by rewriting it to true — if that admits c>=cap,
+                # no enforcement
+                w2 = re.sub(r"(timeout|budget_exhausted)\s*\(\s*\)", "true", w)
+                if w2 != w:
+                    st = {"counters": {k: 0 for k in caps} | {c: cap + 1},
+                          "verdicts": [], "findings": False,
+                          "reverted_base": None}
+                    if evaluate(w2, st) is not False:
+                        enforced = False
             if enforced:
                 out.add(c)
         return out
@@ -1301,7 +1328,7 @@ def sweep_rejection_fixtures():
     n18 = tl.load(open(f"{base}/18-revert-then-emit/policy.toml", "rb"))
     revert_br = [br for n in n18["nodes"] if n["kind"] == "route"
                  for br in n["branches"]
-                 if "revert(" in (br.get("do") or "")]
+                 if re.search(r"revert\s*\(", br.get("do") or "")]
     assert revert_br, "18 must contain a revert branch"
     nmap = {n["id"]: n for n in n18["nodes"]}
     tgt = revert_br[0].get("goto")

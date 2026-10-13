@@ -120,7 +120,7 @@ def state(categories=(), fix=0, loops=0, active=None):
 
 def actions(text, s):
     for action in filter(None, map(str.strip, text.split(';'))):
-        m = re.fullmatch(r'(bump|revert)\(\s*([a-z_][a-z0-9_]*)\s*\)', action)
+        m = re.fullmatch(r'(bump|revert)\s*\(\s*([a-z_][a-z0-9_]*)\s*\)', action)
         if not m:
             raise ValueError('unsupported action: ' + action)
         op, arg = m.groups()
