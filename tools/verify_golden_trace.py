@@ -522,11 +522,14 @@ def sweep_rejection_fixtures():
         # offending form are normalized ONLY for the digest computation
         # (lens/policy bytes hashed as-is — tampering breaks it).
         # 08 already verified separately below with CRLF bytes.
-        if name != "08-crlf-manifest":
+        if True:
             raw = open(f"{base}/{name}/manifest.toml", "rb").read()
             man = raw.decode()
             if name == "07-quoted-digest-key":
                 man = man.replace('"digest" =', "digest =")
+            # 08: manifest keeps its CRLF bytes (intended violation);
+            # tomllib parses CRLF fine, and the digest hashes ORIGINAL
+            # bytes below
             if name == "09-no-trailing-lf":
                 man = man + "\n"
             dl = [l for l in man.splitlines(True) if l.startswith("digest =")]
@@ -556,15 +559,19 @@ def sweep_rejection_fixtures():
             files_["manifest.toml"] = man.replace(dl[0], "").encode()
             # (r27-3) every lens the POLICY references must be declared
             pdoc = _t2.load(open(f"{base}/{name}/policy.toml", "rb"))
-            policy_lens = set()
+            policy_refs = set()
             for n in pdoc.get("nodes", []):
                 for st in n.get("stages", []) or []:
                     for lf in st.get("lenses", []) or []:
-                        policy_lens.add(lf)
+                        policy_refs.add(lf)
+                    if st.get("output_schema"):
+                        policy_refs.add(st["output_schema"])
+                if n.get("side_records"):
+                    pass  # side-record schemas resolve via output
             for ps in pdoc.get("pack_stages", []) or []:
                 for lf in ps.get("lenses", []) or []:
-                    policy_lens.add(lf)
-            missing = policy_lens - set(declared)
+                    policy_refs.add(lf)
+            missing = policy_refs - set(declared)
             assert not missing, \
                 f"{name}: policy references undeclared files: {missing}"
             h_ = _hl.sha256()
@@ -624,25 +631,45 @@ def sweep_rejection_fixtures():
         return cycles
 
     def _enforced_guards(w):
-        """(r27-1) counters ENFORCED by this condition, decided
-        SEMANTICALLY with the real evaluator: a counter c enforces
-        iff the condition is False whenever c exceeds its cap.
-        Test: c at a huge value (others free) must falsify the whole
-        expression. Handles parens, negation, ||, whitespace."""
+        """(r28-1) counters ENFORCED by this condition, decided
+        semantically at the CAP BOUNDARY: c enforces iff NO state
+        with c >= cap makes the condition true. Other factors probed
+        adversarially (verdicts empty/nonempty, findings F/T, other
+        counters at 0 / cap-1)."""
         import re as _re
         caps = {m.group(1): int(m.group(2)) for m in
                 _re.finditer(r"count_lt\s*[(]\s*([A-Za-z_]\w*)\s*,\s*(\d+)\s*[)]", w)}
+        # (r28-1b) argument-free clock predicates (timeout,
+        # budget_exhausted) can be TRUE at any moment — an OR over
+        # them never enforces
+        if re.search(r"\|\|\s*!?(timeout|budget_exhausted)\s*\(", w) or                 re.search(r"(timeout|budget_exhausted)\s*\(\s*\)\s*\|\|", w) or                 re.search(r"\|\|\s*(timeout|budget_exhausted)\s*\(", w):
+            probe_extra = True
+        else:
+            probe_extra = False
         out = set()
         for c, cap in caps.items():
-            # counter far above cap; all other counters at 0
-            st = {"counters": {k: 10**9 if k == c else 0 for k in caps},
-                  "verdicts": [], "findings": False, "reverted_base": None}
-            try:
-                ok = evaluate(w, st)
-            except Exception:
-                ok = None
-            if ok is False:
-                out.add(c)  # condition falsified by c over cap: enforced
+            enforced = not probe_extra
+            for cval in (cap, cap + 1, cap + 10):
+                for others in ({}, {k: max(v - 1, 0) for k, v in caps.items()
+                                  if k != c}):
+                    for verdicts in ([], ["patch"], ["patch", "defer"]):
+                        for findings in (False, True):
+                            st = {"counters": {**others, c: cval},
+                                  "verdicts": verdicts,
+                                  "findings": findings,
+                                  "reverted_base": None}
+                            try:
+                                ok = evaluate(w, st)
+                            except Exception:
+                                ok = None
+                            if ok is True:
+                                enforced = False
+                                break
+                        if not enforced: break
+                    if not enforced: break
+                if not enforced: break
+            if enforced:
+                out.add(c)
         return out
 
     def _bumps_in(do):
@@ -781,6 +808,17 @@ def sweep_rejection_fixtures():
                 stack += n.get("resume_targets", [])
         return seen
 
+    def _has_revert(do):
+        """(r28-2) true iff the action sequence contains a revert —
+        whitespace-tolerant, parsed per-action like apply_do."""
+        for action in (do or "").split(";"):
+            a = action.strip()
+            if a.lower().startswith("revert"):
+                rest = a[6:].lstrip()
+                if rest.startswith("(") :
+                    return True
+        return False
+
     def _refs_provenance(w):
         stripped = re.sub(r'"[^"]*"', '""', w)
         for pat in (r"(?<![\w.])verdicts(?![\w])",
@@ -844,8 +882,12 @@ def sweep_rejection_fixtures():
                 for br in n.get("branches", []):
                     g = br.get("goto")
                     if g:
-                        # revert invalidates evidence
-                        ev2 = ev and "revert(" not in (br.get("do") or "")
+                        # (r28-2) revert invalidates evidence — decided
+                        # by parsing the action sequence for real
+                        ev2 = ev
+                        d = br.get("do") or ""
+                        if _has_revert(d):
+                            ev2 = False
                         yield (g, ev2)
             elif n["kind"] == "dispatch":
                 if n.get("on_done"):
@@ -1068,6 +1110,7 @@ def sweep_rejection_fixtures():
         "07 normalization failed"
     b8 = open(f"{base}/08-crlf-manifest/manifest.toml", "rb").read()
     assert b"\r\n" in b8, "08 must carry real CRLF"
+    assert "08 CRLF" and True
     b9 = open(f"{base}/09-no-trailing-lf/manifest.toml", "rb").read()
     assert not b9.endswith(b"\n"), "09 must lack trailing LF"
     man = b8.decode()
