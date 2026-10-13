@@ -1275,6 +1275,80 @@ def sweep_rejection_fixtures():
                     br["when"] = br["when"].replace("count_lt(loopbacks",
                                                      "count_lt(fix_rounds")
         return pol
+    def _has_01_cycle(pol):
+        ids = {n["id"] for n in pol["nodes"]}
+        for n in pol["nodes"]:
+            if n["kind"] == "route":
+                for br in n.get("branches", []):
+                    g = br.get("goto")
+                    if g in ("ra", "rb") and "ra" in ids and "rb" in ids:
+                        # ra->rb and rb->ra mutual
+                        nmap = {x["id"]: x for x in pol["nodes"]}
+                        ra = nmap.get("ra", {}); rb = nmap.get("rb", {})
+                        ra_t = [b.get("goto") for b in ra.get("branches", [])]
+                        rb_t = [b.get("goto") for b in rb.get("branches", [])]
+                        return "rb" in ra_t and "ra" in rb_t
+        return False
+    def _has_05_no_true(pol):
+        for n in pol["nodes"]:
+            if n["kind"] == "route":
+                last = n["branches"][-1]
+                if last["when"] == "false" and _emit_count(last.get("do")) > 0:
+                    return True
+        return False
+    def _has_06_do_bump_no_goto(pol):
+        for n in pol["nodes"]:
+            if n["kind"] == "route":
+                for br in n.get("branches", []):
+                    d = br.get("do")
+                    if d is None:
+                        continue
+                    bumps = _bumps_in(d)
+                    if bumps and not br.get("goto"):
+                        return True
+        return False
+    def _has_12_mismatch(pol):
+        # (r20-1) compare the GUARD'S counter against the actual bump:
+        # mismatch exists iff the count_lt counter on the guarded
+        # cycle differs from the bump target
+        nmap = {n["id"]: n for n in pol["nodes"]}
+        fix = nmap["fix"]
+        bump = fix.get("bump")
+        for n in pol["nodes"]:
+            if n["kind"] == "route":
+                for br in n.get("branches", []):
+                    w = br.get("when") or ""
+                    if br.get("goto") == "fix" and "count_lt(" in w:
+                        import re as _r
+                        m = _r.search(r"count_lt\((\w+)", w)
+                        if m and m.group(1) != bump:
+                            return True
+        return False
+    def _has_13_multi(pol):
+        for n in pol["nodes"]:
+            if n["kind"] == "route":
+                for br in n.get("branches", []):
+                    d = br.get("do") or ""
+                    if _emit_count(d) > 1:
+                        return True
+        return False
+    def _norm_14(pol):
+        for n in pol["nodes"]:
+            if n["kind"] == "route":
+                for br in n["branches"]:
+                    d = br.get("do")
+                    if d and _post_emit_action(d):
+                        # keep only the actions up to & incl. first emit
+                        acts = _parse_actions(d)
+                        keep = []
+                        for a in acts:
+                            keep.append(a)
+                            if a[0] == "emit":
+                                break
+                        br["do"] = "; ".join(
+                            a[0] + f"({a[1]}, {a[2]})" if a[0] == "emit"
+                            else a[0] + f"({a[1]})" for a in keep)
+        return pol
     def _norm_13(pol):
         for n in pol["nodes"]:
             if n["kind"] == "route":
