@@ -1,7 +1,7 @@
 # Foundry Universal Skill Spec — 범용 실행 모델 (Universal Review Engine)
 
-- **버전**: v0.47 (2026-10-12) — 12차 최종 검증 반영.
-  이벤트 집합 canonical 쌍으로 폐쇄(출력 이름 확장 차단)·redrive payload 필수(미실행 노드 포함)·hold 전용 timeout_s·팩 경로 에일리어스 기술.
+- **버전**: v0.48 (2026-10-12) — 13차 최종 검증 반영.
+  kind별 필드 제한(timeout_s hold 전용)·redrive target 필수·전 branch 조건식 로드 파싱(미실행 포함·폴백 리터럴 true).
 - **의도(소유자)**: Foundry는 어떤 방법론도 돌릴 수 있는 유니버설
   플랫폼. BMad는 스킬 데이터의 첫 고객. **Rust 도메인에 방법론
   코드가 박히는 순간이 실패.** 엔진 고정·확장 선언(procedural macro

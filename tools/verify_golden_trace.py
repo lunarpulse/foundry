@@ -1858,6 +1858,14 @@ def contract_checks(doc):
             # (F12-2) payload is mandatory — unused nodes included
             assert n.get("payload"), \
                 f"redrive {n['id']} missing payload (§2.3)"
+            # (F13-2) target is mandatory — unused nodes included
+            assert n.get("target"), \
+                f"redrive {n['id']} missing target (§2.3)"
+        if n["kind"] != "hold" and "timeout_s" in n:
+            # (F13-1) timeout_s is a hold-only optional field
+            raise AssertionError(
+                f"{n['id']} ({n['kind']}) declares timeout_s — "
+                f"hold-only field (§2.3)")
     # (F11-3) every branch action references DECLARED counters —
     # dead branches included (load-time namespace validation)
     _declared_ctrs = set(doc.get("counters", {}).keys())
@@ -1869,6 +1877,25 @@ def contract_checks(doc):
                         assert a[1] in _declared_ctrs, \
                             f"branch bumps undeclared counter {a[1]!r} " \
                             f"(route {n['id']})"
+    # (F13-3) EVERY branch condition parses at load — unreachable
+    # branches included; final fallback must be the LITERAL 'true'
+    _probe_st = {"verdicts": [], "findings": False, "counters": {},
+                 "timeout": False, "budget_exhausted": False}
+    for n in doc["nodes"]:
+        if n["kind"] == "route":
+            for br in n.get("branches", []):
+                check_grammar(br.get("when", ""))
+                try:
+                    evaluate(br.get("when", ""), dict(_probe_st))
+                except ValueError as e:
+                    if "not fully consumed" not in str(e) and \
+                            "counter" not in str(e):
+                        raise AssertionError(
+                            f"route {n['id']} branch condition "
+                            f"invalid: {br.get('when')!r} ({e})")
+            last_when = (n.get("branches") or [{}])[-1].get("when", "")
+            assert last_when.strip() == "true", \
+                f"route {n['id']} final fallback must be literal true"
     # (F10-1) emit is TERMINAL per branch: no actions after an emit,
     # no double emit, and route nodes carry no on_done (§2.3)
     for n in doc["nodes"]:

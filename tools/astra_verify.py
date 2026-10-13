@@ -268,6 +268,13 @@ def graph(policy):
             # (F12-2) payload mandatory — unused nodes included
             assert n.get('payload'), \
                 f'redrive {n["id"]} missing payload (§2.3)'
+            # (F13-2) target mandatory — unused nodes included
+            assert n.get('target'), \
+                f'redrive {n["id"]} missing target (§2.3)'
+        if n['kind'] != 'hold' and 'timeout_s' in n:
+            # (F13-1) timeout_s is a hold-only optional field
+            raise AssertionError(
+                f'{n["id"]} ({n["kind"]}) declares timeout_s — hold-only')
         if n['kind'] == 'hold' and 'timeout_s' in n:
             t = n['timeout_s']
             assert isinstance(t, int) and not isinstance(t, bool) and t > 0, \
