@@ -249,6 +249,19 @@ def graph(policy):
             if 'role' in st_:
                 assert st_['role'] in ('lens', 'verify', 'replan'), \
                     f'stage {st_["id"]} role {st_["role"]!r} not in lens|verify|replan'
+        # (F3-2) pack_stages roles share the closed set
+        for ps_ in policy.get('pack_stages', []) or []:
+            if 'role' in ps_:
+                assert ps_['role'] in ('lens', 'verify', 'replan'), \
+                    f'pack_stage {ps_.get("id")} role {ps_["role"]!r} invalid'
+        # (F3-3) emit payload_from must reference a declared output
+        if n['kind'] == 'emit' and n.get('payload_from'):
+            pass  # checked after schemas load (below)
+    # (F3-1) top-level [hold] timeout_s
+    ht = policy.get('hold', {}).get('timeout_s')
+    if ht is not None:
+        assert isinstance(ht, int) and not isinstance(ht, bool) and ht >= 0, \
+            'top-level [hold] timeout_s must be >= 0 (0=infinite)'
     for cname, cval in policy.get('counters', {}).items():
         assert isinstance(cval, int) and not isinstance(cval, bool) \
             and 0 <= cval < 2**64, \
@@ -328,6 +341,19 @@ def main():
     except StopIteration:
         pass  # expected: findings schema has no verdicts output
     active = next(o['active_categories'] for o in schema['output'] if o['name'] == 'verdicts')
+    # (F3-3) emit payload_from must reference a DECLARED output across
+    # ALL schema files in the pack (or the reserved 'summary')
+    _files = tomllib.loads((args.pack / 'manifest.toml').read_text())['files']
+    declared_out = {o['name'] for s in
+                    [tomllib.loads((args.pack / f).read_text())
+                     for f in _files if f.startswith('schema-')]
+                    for o in s.get('output', [])}
+    for n in policy['nodes']:
+        if n.get('kind') == 'emit':
+            pf = n.get('payload_from')
+            assert pf, f'emit {n["id"]} missing payload_from'
+            assert pf in declared_out or pf == 'summary', \
+                f'emit {n["id"]} payload_from={pf!r} not a declared output'
     check('graph structure', lambda: graph(policy))
 
     def expression_tests():

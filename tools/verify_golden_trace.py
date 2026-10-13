@@ -50,22 +50,42 @@ CALL = re.compile(r'([a-z_]+)\s*\(\s*((?:[^)"]|"[^"]*")*?)\s*\)')
 
 
 def atom(name, args, state):
+    """(F3-4) every argument is FULLY validated: arity, token shapes
+    and complete consumption — malformed input raises instead of
+    silently dropping garbage."""
     if name == "true":
+        if args != "":
+            raise ValueError(f"true takes no arguments, got {args!r}")
         return True
-    if name == "budget_exhausted":
-        return state.get("budget_exhausted", False)
-    if name == "timeout":
-        return state.get("timeout", False)
+    if name in ("budget_exhausted", "timeout"):
+        if args.strip():
+            raise ValueError(f"{name} takes no arguments, got {args!r}")
+        return state.get(name, False)
     if name == "has_findings":
+        if args.strip() not in ("any", ""):
+            raise ValueError(f"has_findings arg must be 'any', got {args!r}")
         return bool(state["findings"])
     if name == "count_lt":
-        counter, n = [a.strip() for a in args.split(",")]
+        m = re.fullmatch(r"([A-Za-z_]\w*)\s*,\s*(\d+)", args)
+        if not m:
+            raise ValueError(f"count_lt malformed args: {args!r}")
+        counter, n = m.group(1), int(m.group(2))
         if counter not in state["counters"]:
             raise ValueError(f"undeclared counter {counter!r}")
-        return state["counters"][counter] < int(n)
+        return state["counters"][counter] < n
     if name == "any_in":
-        m = re.match(r"verdicts,(.*)", args, re.S)
-        vals = re.findall(r'"([^"]*)"', m.group(1))  # r32-2: any token
+        m = re.fullmatch(r"verdicts\s*,\s*\[(.*)\]", args, re.S)
+        if not m:
+            raise ValueError(f"any_in malformed args: {args!r}")
+        inner = m.group(1).strip()
+        if inner == "":
+            vals = []
+        else:
+            # comma-separated quoted strings ONLY — full consumption
+            m2 = re.fullmatch(r'"([^"]*)"(?:\s*,\s*"([^"]*)")*', inner)
+            if not m2:
+                raise ValueError(f"any_in set has non-string/extra tokens: {inner!r}")
+            vals = re.findall(r'"([^"]*)"', inner)
         return bool(set(vals) & set(state["verdicts"]))
     raise ValueError(f"unknown predicate {name}")
 
@@ -1664,6 +1684,13 @@ def contract_checks(doc):
                         "replan must run the partial amender"
     # (r32-1, r33-1, FINAL-2) mandatory fields, enums, values — FULL pack
     nids = {n["id"]: n for n in doc["nodes"]}
+    # (F3-1) top-level [hold] config: timeout_s positive int or 0
+    # (= infinite wait per §2.4); bool excluded
+    hold_cfg = doc.get("hold", {})
+    ht = hold_cfg.get("timeout_s")
+    if ht is not None:
+        assert isinstance(ht, int) and not isinstance(ht, bool) and \
+            ht >= 0, "top-level [hold] timeout_s must be >= 0 (0=infinite)"
     # hold nodes: timeout_s when present must be a positive real int
     # (bool excluded — bool is an int subclass in Python)
     for n in doc["nodes"]:
@@ -1697,6 +1724,11 @@ def contract_checks(doc):
             if "role" in st:
                 assert st["role"] in ROLES, \
                     f"stage {st['id']} role {st['role']!r} not in {ROLES}"
+    # (F3-2) pack_stages roles are in the same closed set
+    for ps in doc.get("pack_stages", []) or []:
+        if "role" in ps:
+            assert ps["role"] in ROLES, \
+                f"pack_stage {ps.get('id')} role {ps['role']!r} not in {ROLES}"
     for n in doc["nodes"]:
         k = n["kind"]
         if k == "dispatch":

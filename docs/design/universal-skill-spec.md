@@ -1,7 +1,7 @@
 # Foundry Universal Skill Spec — 범용 실행 모델 (Universal Review Engine)
 
-- **버전**: v0.37 (2026-10-12) — 2차 최종 검증 반영.
-  로드 값 u64/bool·payload 참조·role 규범·증거 무효화 영속·컨텍스트 승계·완전소비 평가.
+- **버전**: v0.38 (2026-10-12) — 3차 최종 검증 반영.
+  최상위 [hold]·pack_stages role·payload 참조 양측·atom 인자 완전검증·문서 정리.
 - **의도(소유자)**: Foundry는 어떤 방법론도 돌릴 수 있는 유니버설
   플랫폼. BMad는 스킬 데이터의 첫 고객. **Rust 도메인에 방법론
   코드가 박히는 순간이 실패.** 엔진 고정·확장 선언(procedural macro
@@ -16,6 +16,10 @@
 - 조건식은 완전 소비 파서가 처리: 괄호 안 `)` 포함 문자열(`"a)b"`)도 정상 토큰.
 - 검증 증거 게이트(§2.4): emit 노드·emit 액션 공통 적용, redrive(신산출물)·
   revert는 증거 무효화. 게이트 거부 시 상류 dispatch hold_target으로 divert.
+- 전역 `[hold] timeout_s`: 양의 정수(초) 또는 0(=무한 대기). 노드별 timeout은
+  양의 정수만. 카운터 초기값은 u64 범위 비부울 정수.
+- `pack_stages`의 role도 폐쇄 집합 lens|verify|replan (등록 스테이지 동일 규칙).
+- emit의 payload_from은 팩 스키마가 선언한 출력(또는 summary)만 참조.
 - 현재 PASS는 **선언적 모델 검증** — 실제 세션 계승·원자성·fencing·엔진 diff 0의
   실행 증명은 구현 단계(§4)의 인수 조건이다.
 
@@ -212,8 +216,8 @@ resume_targets = ["fixdie"]
   (loopbacks 0→5, attempt 불변) — 원본 "롤백 후 재계획"
 - intent_gap → human(hold) → resume("replan_full") — 원본 "인간 해결"
 - defer → pass + side_records=deferred 저널 — 원본 "기록 후 진행"
-- loopbacks=5 도달 시 공통 상한 branch 미매치 → has_findings → human
-  (HALT 인간 승격 — 원본 상한 5→HALT와 동등)
+- loopbacks=5 도달 시 공통 상한 branch do='bump(loopbacks)' → human
+  hold (6번째 진입 loopbacks=6 — 원본 상한 5→HALT와 동등한 인간 승격)
 - continuation = fixdie의 논리 구현자 세션 계승 계약(--fix-context 전달,
   §2.4a generation) — 별도 노드 아님.
 
@@ -303,9 +307,7 @@ do_seq   := action ( ';' action )*     ; emit은 전 시퀀스에 최대 1회
   커서에 **dispatch/redrive 진입 시 승계 저장**(내구 컨텍스트 —
   route/emit은 hold_target 없음, 진입 시점의 활성 값 사용). 간선
   dispatch/redrive→hold_target도 DAG 검증에 포함. route의 bump
-  overflow hold는 같은 컨텍스트로 이송. 예제 정합(반영): replan+payload="replan", pass+
-  payload_from="summary", human+resume_targets=["replan","…"],
-  emit_failed_node의 on_done="HALT" 제거(HALT 암시).
+  overflow hold는 같은 컨텍스트로 이송.
   부록 A에 **수용 fixture(전체 팩)+거부 fixture(검증 규칙별 1개)**
   필수 — 구현 승인 전 제출(아래 부록에 실제 수록).
 - 우선순위 `!` > `&&` > `||`, 괄호 허용. `any`는 has_findings의
