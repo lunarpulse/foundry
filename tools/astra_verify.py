@@ -314,6 +314,40 @@ def graph(policy):
     assert nverify <= 1, f'pack declares {nverify} verify stages (max 1, §2.3)'
     dupes_ = {x for x in sid_list if sid_list.count(x) > 1}
     assert not dupes_, f'duplicate stage IDs: {sorted(dupes_)}'
+    # (F8-1) registered-stage deps: defined, no self/cycles
+    sset_ = set(sid_list)
+    for ps_ in policy.get('pack_stages', []) or []:
+        for dep_ in ps_.get('after', []) or []:
+            assert dep_ in sset_, f'pack_stage {ps_.get("id")} depends on undefined {dep_!r}'
+            assert dep_ != ps_.get('id'), f'pack_stage {ps_.get("id")} self-dependency'
+    # (F8-2) resume/route edges must form a DAG after removing deduct
+    non_deduct_ = {i for i, n in nodes.items()
+                   if n['kind'] not in ('dispatch', 'redrive')}
+    adj_ = {}
+    for i, n in nodes.items():
+        if i not in non_deduct_:
+            continue
+        outs = []
+        if n['kind'] == 'route':
+            outs = [b['goto'] for b in n['branches'] if b.get('goto')]
+        elif n['kind'] == 'hold':
+            outs = list(n.get('resume_targets', []))
+        for o in outs:
+            if o in non_deduct_:
+                adj_.setdefault(i, set()).add(o)
+    state_ = {}
+    def dfs_(u):
+        state_[u] = 1
+        for w in adj_.get(u, ()):
+            if state_.get(w) == 1:
+                return False
+            if state_.get(w, 0) == 0 and not dfs_(w):
+                return False
+        state_[u] = 2
+        return True
+    for v_ in non_deduct_:
+        if state_.get(v_, 0) == 0:
+            assert dfs_(v_), 'hold/route graph has a cycle after deduct removal (§2.4b)'
     # (F3-3) emit payload_from validated after schemas load (main)
     # (F3-1/F4-1) top-level [hold] table is MANDATORY
     assert 'hold' in policy, 'pack must declare a top-level [hold] table'
@@ -337,9 +371,6 @@ def graph(policy):
         if kind == 'hold':
             assert n.get('resume_targets') is not None, \
                 f'hold {n["id"]} missing resume_targets'
-            for t in n['resume_targets']:
-                assert t in deduct, \
-                    f'hold {n["id"]} resumes into {t} (non-deduct) — §2.4b cycle'
         refs = [n[k] for k in ('on_done', 'hold_target') if k in n]
         if kind == 'route':
             assert n['branches'][-1]['when'].strip() == 'true', 'missing last true fallback'

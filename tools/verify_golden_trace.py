@@ -93,6 +93,13 @@ def atom(name, args, state):
 
 
 def check_grammar(expr):
+    # (F8-3) operator integrity BEFORE whitespace-stripping: '& &'
+    # or '| |' (space-split operators) must not merge into && / ||
+    _outside = re.sub(r'"[^"]*"', '""', expr)
+    if re.search(r"&\s*&", _outside) and "&&" not in _outside:
+        raise ValueError(f"space-split operator: {expr!r}")
+    if re.search(r"\|\s*\|", _outside) and "||" not in _outside:
+        raise ValueError(f"space-split operator: {expr!r}")
     """(r33-2/F4-3) normative grammar: double-quoted string literals
     only; whitespace may not appear INSIDE an identifier or number —
     two word-chars separated only by whitespace (no operator, paren,
@@ -1819,6 +1826,14 @@ def contract_checks(doc):
         all_stage_ids.append(ps.get("id"))
     dupes = [x for x in all_stage_ids if all_stage_ids.count(x) > 1]
     assert not dupes, f"duplicate stage IDs: {sorted(set(dupes))}"
+    # (F8-1) registered-stage deps: defined targets, no self/cycle
+    sid_set = set(all_stage_ids)
+    for ps in doc.get("pack_stages", []) or []:
+        for dep in ps.get("after", []) or []:
+            assert dep in sid_set, \
+                f"pack_stage {ps.get('id')} depends on undefined {dep!r}"
+            assert dep != ps.get("id"), \
+                f"pack_stage {ps.get('id')} self-dependency"
     for n in doc["nodes"]:
         k = n["kind"]
         if k == "dispatch":
@@ -1845,12 +1860,45 @@ def contract_checks(doc):
     deduct = {n["id"] for n in doc["nodes"]
               if n["kind"] in ("dispatch", "redrive")}
     nids = {n["id"] for n in doc["nodes"]}
+    # (F8-2) resume edges must close to a DAG after removing deduct
+    # nodes (dispatch/redrive) — §2.4b. The target may be ANY node
+    # kind (e.g. a route bridge into a redrive), as long as the
+    # hold-graph is acyclic.
+    import itertools as _it8
+    edges = []  # (src_kind_node_id, dst)
     for n in doc["nodes"]:
-        if n["kind"] == "hold":
+        k = n["kind"]
+        if k in ("dispatch", "redrive"):
+            continue  # deduct nodes
+        if k == "route":
+            for br in n.get("branches", []):
+                if br.get("goto"):
+                    edges.append((n["id"], br["goto"]))
+        elif k == "hold":
             for t in n.get("resume_targets", []):
-                assert t in nids, f"hold {n['id']} resume target {t} dangling"
-                assert t in deduct, \
-                    f"hold {n['id']} resumes into {t} (non-deduct) — §2.4b cycle"
+                assert t in nids, \
+                    f"hold {n['id']} resume target {t} dangling"
+                edges.append((n["id"], t))
+    non_deduct = {n["id"] for n in doc["nodes"]
+                  if n["kind"] not in ("dispatch", "redrive")}
+    adj = {}
+    for a, b in edges:
+        if a in non_deduct and b in non_deduct:
+            adj.setdefault(a, set()).add(b)
+    # cycle check (DFS)
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color = {v: WHITE for v in non_deduct}
+    def dfs(u):
+        color[u] = GRAY
+        for w in adj.get(u, ()):  # noqa
+            if color[w] == GRAY:
+                return False
+            if color[w] == WHITE and not dfs(w):
+                return False
+        color[u] = BLACK
+        return True
+    assert all(dfs(v) for v in list(non_deduct) if color[v] == WHITE), \
+        "hold/route graph has a cycle after deduct-node removal (§2.4b)"
     for n in doc["nodes"]:
         if n["kind"] == "dispatch":
             # (r18-3) full stage dependency graph over this dispatch:

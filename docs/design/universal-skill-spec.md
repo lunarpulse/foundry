@@ -1,7 +1,7 @@
 # Foundry Universal Skill Spec — 범용 실행 모델 (Universal Review Engine)
 
-- **버전**: v0.42 (2026-10-12) — 7차 최종 검증 반영.
-  pack_stages verify 집계·verify→전 렌즈 의존(팩 계약)·상태별 허용 집합(팩 소유)·토큰 경계 치환.
+- **버전**: v0.43 (2026-10-12) — 8차 최종 검증 반영.
+  등록스테이지 의존 검증·resume DAG 실측 검사(대상 kind 제한 해제)·연산자 공백 합성 차단.
 - **의도(소유자)**: Foundry는 어떤 방법론도 돌릴 수 있는 유니버설
   플랫폼. BMad는 스킬 데이터의 첫 고객. **Rust 도메인에 방법론
   코드가 박히는 순간이 실패.** 엔진 고정·확장 선언(procedural macro
