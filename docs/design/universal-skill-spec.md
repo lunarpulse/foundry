@@ -1,7 +1,7 @@
 # Foundry Universal Skill Spec — 범용 실행 모델 (Universal Review Engine)
 
-- **버전**: v0.35 (2026-10-12) — r33 REWORK(MAJOR 3+MEDIUM 1) 반영.
-  필드 enum·kind 참조·문자열 경계 파서·§2.4 게이트 실증. 최종 검증 대기.
+- **버전**: v0.36 (2026-10-12) — 최종 독립 검증(FINAL) 반영.
+  오류정책 규범 정합·일반 로드 검증·게이트 전경로 적용·DSL 규범 고정.
 - **의도(소유자)**: Foundry는 어떤 방법론도 돌릴 수 있는 유니버설
   플랫폼. BMad는 스킬 데이터의 첫 고객. **Rust 도메인에 방법론
   코드가 박히는 순간이 실패.** 엔진 고정·확장 선언(procedural macro
@@ -115,6 +115,16 @@ kind = "redrive"     #    재디스패치 — 새 generation workdir(물리 격�
 #    지시(포트 불변, 전달 규약은 workdir 파일 소유 — M0 경로 단일
 #    진실원 패턴 승계)
 #  격리: generation별 workdir 분리(gen-N), 실행별 로그(attempt-N.log)
+
+## DSL 문자열 규범 (FINAL-4)
+- 문자열 리터럴은 **큰따옴표만**. 작은따옴표는 문법 오류(양 검증기 일관 거부).
+- 이스케이프(`\u0070atch` 등)는 **TOML 파싱이 소유** — DSL은 디코딩된 값만 비교.
+- 조건식은 완전 소비 파서가 처리: 괄호 안 `)` 포함 문자열(`"a)b"`)도 정상 토큰.
+- 검증 증거 게이트(§2.4): emit 노드·emit 액션 공통 적용, redrive(신산출물)·
+  revert는 증거 무효화. 게이트 거부 시 상류 dispatch hold_target으로 divert.
+- 현재 PASS는 **선언적 모델 검증** — 실제 세션 계승·원자성·fencing·엔진 diff 0의
+  실행 증명은 구현 단계(§4)의 인수 조건이다.
+
 #  실패: exit≠0/timeout → on_redrive_error(팩 정책: hold|fail-run)
 #  산출: 새 result_commit → 다음 검증의 artifact 결속 + 이전 증거
 #    superseded 처리(§2.4a)
@@ -198,10 +208,10 @@ resume_targets = ["fixdie"]
 - patch → fixdie(논리 구현자 세션 계승, base=latest) → lenses 재검증
   (fix_rounds 0→3, 전부 도메인 attempt 불변) — 원본 "같은 구현자 최소 수정"
 - bad_plan → replan(pre_stage KEEP, **base=origin 롤백**) → lenses
-  (replans 0→5, attempt 불변) — 원본 "롤백 후 재계획"
+  (loopbacks 0→5, attempt 불변) — 원본 "롤백 후 재계획"
 - intent_gap → human(hold) → resume("replan_full") — 원본 "인간 해결"
 - defer → pass + side_records=deferred 저널 — 원본 "기록 후 진행"
-- replans=5 도달 시 bad_plan branch 미매치 → has_findings → human
+- loopbacks=5 도달 시 공통 상한 branch 미매치 → has_findings → human
   (HALT 인간 승격 — 원본 상한 5→HALT와 동등)
 - continuation = fixdie의 논리 구현자 세션 계승 계약(--fix-context 전달,
   §2.4a generation) — 별도 노드 아님.
