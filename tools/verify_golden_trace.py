@@ -1833,6 +1833,39 @@ def contract_checks(doc):
         all_stage_ids.append(ps.get("id"))
     dupes = [x for x in all_stage_ids if all_stage_ids.count(x) > 1]
     assert not dupes, f"duplicate stage IDs: {sorted(set(dupes))}"
+    # (F11-1) closed event set: emit events must be declared pack
+    # outputs (or the canonical InspectionPassed/Failed pair)
+    _ev_allowed = set()
+    for sf in ("schema-triage.toml", "schema-findings.toml",
+               "schema-defer.toml"):
+        import os as _os3
+        p3 = f"{PACK}/{sf}"
+        if os.path.exists(p3):
+            sd3 = tomllib.load(open(p3, "rb"))
+            _ev_allowed |= {o.get("name") for o in sd3.get("output", [])}
+    _ev_allowed |= {"InspectionPassed", "InspectionFailed", "summary"}
+    for n in doc["nodes"]:
+        if n["kind"] == "emit":
+            ev = n.get("event")
+            assert ev in _ev_allowed, \
+                f"emit {n['id']} event {ev!r} not in the closed event set"
+    # (F11-2) dispatch nodes carry >=1 stage (§2.3)
+    for n in doc["nodes"]:
+        if n["kind"] == "dispatch":
+            sts = n.get("stages") or []
+            assert len(sts) >= 1, \
+                f"dispatch {n['id']} must declare at least one stage"
+    # (F11-3) every branch action references DECLARED counters —
+    # dead branches included (load-time namespace validation)
+    _declared_ctrs = set(doc.get("counters", {}).keys())
+    for n in doc["nodes"]:
+        if n["kind"] == "route":
+            for br in n.get("branches", []):
+                for a in _parse_actions_top(br.get("do")):
+                    if a[0] == "bump":
+                        assert a[1] in _declared_ctrs, \
+                            f"branch bumps undeclared counter {a[1]!r} " \
+                            f"(route {n['id']})"
     # (F10-1) emit is TERMINAL per branch: no actions after an emit,
     # no double emit, and route nodes carry no on_done (§2.3)
     for n in doc["nodes"]:

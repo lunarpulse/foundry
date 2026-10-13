@@ -241,6 +241,9 @@ def canonical(root):
     return f'version={manifest["version"]}, files={len(files)}+manifest, sha256={actual}'
 
 
+EV_DECLARED = set()  # filled by main() from schema outputs after load
+
+
 def graph(policy):
     nodes = {n['id']: n for n in policy['nodes']}
     assert len(nodes) == len(policy['nodes']), 'duplicate node IDs'
@@ -252,6 +255,15 @@ def graph(policy):
         if n['kind'] == 'emit':
             assert n.get('payload_from'), \
                 f'emit {n["id"]} missing payload_from'
+            # (F11-1) closed event set (canonical pair allowed)
+            ev_ = n.get('event')
+            assert ev_ in ('InspectionPassed', 'InspectionFailed', 'summary') \
+                or ev_ in EV_DECLARED, \
+                f'emit {n["id"]} event {ev_!r} not in the closed event set'
+        if n['kind'] == 'dispatch':
+            # (F11-2) >=1 stage per dispatch
+            assert n.get('stages'), \
+                f'dispatch {n["id"]} must declare at least one stage'
         if n['kind'] == 'hold' and 'timeout_s' in n:
             t = n['timeout_s']
             assert isinstance(t, int) and not isinstance(t, bool) and t > 0, \
@@ -401,6 +413,11 @@ def graph(policy):
             for b in n['branches']:
                 Expr(b['when'], state()).run()
                 acts_ = actions(b.get('do'), state())
+                # (F11-3) bump targets must be DECLARED — dead branches too
+                for a_ in acts_:
+                    if a_[0] == 'bump':
+                        assert a_[1] in policy.get('counters', {}), \
+                            f'branch bumps undeclared counter {a_[1]!r} (route {n["id"]})'
                 # (F10-1) emit is terminal: nothing after, no goto
                 emits_ = [i for i, a in enumerate(acts_) if a[0] == 'emit']
                 for i_ in emits_:
@@ -470,6 +487,9 @@ def main():
                     [tomllib.loads((args.pack / f).read_text())
                      for f in _files if f.startswith('schema-')]
                     for o in s.get('output', [])}
+    # (F11-1) schema outputs double as the declared event set
+    global EV_DECLARED
+    EV_DECLARED = set(declared_out)
     for n in policy['nodes']:
         if n.get('kind') == 'emit':
             pf = n.get('payload_from')

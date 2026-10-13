@@ -1,7 +1,7 @@
 # Foundry Universal Skill Spec — 범용 실행 모델 (Universal Review Engine)
 
-- **버전**: v0.45 (2026-10-12) — 10차 최종 검증 반영.
-  emit 종단 규칙 전팩 적용·route on_done 금지·이연 술어 규범 제거·영단어 연산자 문법 밖.
+- **버전**: v0.46 (2026-10-12) — 11차 최종 검증 반영.
+  이벤트 폐쇄 집합·dispatch 최소 stage·미실행 분기 카운터 검증·동결 문서 정리(노드 집합·카운터 순서·정규화 범위).
 - **의도(소유자)**: Foundry는 어떤 방법론도 돌릴 수 있는 유니버설
   플랫폼. BMad는 스킬 데이터의 첫 고객. **Rust 도메인에 방법론
   코드가 박히는 순간이 실패.** 엔진 고정·확장 선언(procedural macro
@@ -80,8 +80,10 @@ on_no_valid = "hold"
 id = "route1"        # ② route: 조건식 → 다음 노드 선택
 kind = "route"
 # (r16-1) 아래 그래프 발췌는 skills/bmad-review-full/v1/policy.toml의
-# **축약이 아니라 동일 노드 집합의 추출** — 검증기가 문서 예제를 파싱해
+# **축약이 아니라 공유 노드 집합의 추출** — 검증기가 문서 예제를 파싱해
 # canonical 팩 노드와 동일성(diff) 검사한다(아래 "예제-팩 동일성").
+# 예외: 문서 데모 전용 emit_failed_node 1개는 canonical에 없으며
+# 검증기가 명시적으로 제외한다(엄밀한 전체 집합 동일성이 아님).
 [[nodes.branches]]
 when  = 'budget_exhausted() || timeout()'
 goto  = "human"
@@ -386,8 +388,10 @@ review-run 소유의 범용 실행 회차(generation)로 정의한다.**
 - **모든 redrive/dispatch 노드 실행은 예산을 차감**하고, 소진 시
   엔진이 해당 노드 진입 자체를 거부(→ hold). 조건식의 count_lt와
   무관하게 **우회 불가** — "상한 경로 포함"이 아니라 진입 차단.
-- 카운터: u64, run 생성 시 0, bump만 증가, 감소 없음, overflow 시
-  엔진 hold(래핑 방지). run 간 승계는 §3.3a(주문 단위 누계).
+- 카운터: u64, bump만 증가, 감소 없음, overflow 시 엔진 hold(래핑 방지).
+  **초기화 순서**: 로드 시 팩 policy.toml의 [counters] 초기값을 검증
+  (비음수 u64 정수) → run 생성 시 0으로 리셋 → §3.3a 주문 단위 누계
+  승계는 리셋 이후 run 경계에서만 적용.
 - 그래프 로드 검증(r7-2): **차감 노드(dispatch/redrive)를 제거한
   전이 그래프가 비순환(DAG)인지** 정적 검사 — route↔route 상호
   참조·hold→resume→hold 사이클(resume_targets 그래프 포함) 전부
@@ -662,6 +666,9 @@ baseline = A.1 팩 전체(모든 필드 정합·TOML·DSL 문법 유효·digest
 계산된 digest ③09의 끝 LF 부재를 실행 검증한다. 구현 로더의 셀프테스트는
 A.1 수용 + 18종의 기대 오류 코드 정확 대조가 회귀 조건. 정규화
 템플릿 "구현 중 확정" 항목(A.5)은 첫 구현 마일스톤 승인 범위 밖.
+§4 첫 구현 단계의 정규화는 §2.5의 4분류 정책표(on/parse_error/
+dispatch_error/timeout) 실행까지만 — A.5의 markdown 그룹 정규화
+템플릿은 별도 승인 후 도입.
 
 ### A.3 골든 트레이스 — bmad-review-full v1.2.0
 실파일: skills/bmad-review-full/v1/GOLDEN_TRACE.md(pack=e925fd01…).
