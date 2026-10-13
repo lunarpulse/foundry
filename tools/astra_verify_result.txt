@@ -1,5 +1,6 @@
 PASS manifest closure + canonical digest: version=1.2.0, files=10+manifest, sha256=e925fd014d367c4c7f3d83fe92d03cd4bc4d3b7cbc1ecdf0d4e77320acab1db8
 PASS graph structure: 8 nodes, entry/references/fallback/resume/emit valid
+PASS schema output uniqueness
 PASS independent expression interpreter: precedence, parentheses, functions, flags, malformed input
 PASS case 01 intent_gap fix=2 loops=4
 PASS case 02 intent_gap fix=2 loops=5
@@ -76,5 +77,8 @@ PASS negative control legal double negation: legal double-negation cap accepted
 PASS negative control after string+transitive: normalized/transitive after accepted
 PASS negative control unregistered node kind: mutant rejected: unknown node kind
 PASS negative control duplicate node id: mutant rejected: duplicate node IDs
+PASS negative control De Morgan cap: mutant rejected: route route1 branch to fixdie: guard does not enforce the declared cap for counter(s) ['fix_rounds'] — De Morgan-neutralized or non-binding count_lt (§2.2)
+PASS negative control OR-added bypass: mutant rejected: route route1 branch to fixdie: guard does not enforce the declared cap for counter(s) ['fix_rounds'] — De Morgan-neutralized or non-binding count_lt (§2.2)
+PASS negative control schema from/name duplicate: from/name duplicates rejected
 SCOPE: declarative model; no live engine/subagent execution. Prompt compliance and actual session reuse are not proven.
 RESULT: PASS; 0 failed checks

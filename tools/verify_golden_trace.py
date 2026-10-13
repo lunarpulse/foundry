@@ -868,6 +868,61 @@ def contract_negative_controls(doc):
         raise AssertionError("duplicate-id mutant NOT detected (33-4)")
     except AssertionError as e:
         assert "duplicate node IDs" in str(e), f"wrong failure: {e}"
+    # (F34-1a) De Morgan-neutralized cap must be REJECTED — parity is
+    # even but the guard is always true at/over the cap
+    bad = copy.deepcopy(doc)
+    for n in bad["nodes"]:
+        if n["id"] == "route1":
+            for br in n.get("branches", []):
+                if br.get("goto") == "fixdie":
+                    br["when"] = ('any_in(verdicts, ["patch"]) && '
+                                  '!(!count_lt(fix_rounds, 3) && false)')
+    try:
+        contract_checks(bad)
+        raise AssertionError("De Morgan cap mutant NOT detected (34-1)")
+    except AssertionError as e:
+        assert "enforce the declared cap" in str(e), f"wrong failure: {e}"
+    # (F34-1b) OR-added always-true alternative must be REJECTED
+    bad = copy.deepcopy(doc)
+    for n in bad["nodes"]:
+        if n["id"] == "route1":
+            for br in n.get("branches", []):
+                if br.get("goto") == "fixdie":
+                    br["when"] = ('(any_in(verdicts, ["patch"]) && '
+                                  'count_lt(fix_rounds, 3)) || '
+                                  '(any_in(verdicts, ["pass"]) && '
+                                  '!(!count_lt(fix_rounds, 3) && false))')
+    try:
+        contract_checks(bad)
+        raise AssertionError("OR-added bypass mutant NOT detected (34-1)")
+    except AssertionError as e:
+        assert "enforce the declared cap" in str(e), f"wrong failure: {e}"
+    # (F34-2) schema from-column and output-name uniqueness —
+    # vocabulary-independent structure contract (mutated pack copy)
+    import tempfile as _tf34
+    import shutil as _sh34
+    import os as _os34
+    for _mode34 in ("from", "name"):
+        with _tf34.TemporaryDirectory() as _td34:
+            _pk34 = f"{_td34}/pack"
+            _sh34.copytree(PACK, _pk34)
+            _sp34 = f"{_pk34}/schema-triage.toml"
+            _txt34 = open(_sp34).read()
+            if _mode34 == "from":
+                _txt34 = _txt34.replace(
+                    'from = "triage_log_rows"',
+                    'from = "entries_routed_defer"')
+            else:
+                _txt34 = _txt34.replace(
+                    'name = "carried_rows"',
+                    'name = "deferred"')
+            open(_sp34, "w").write(_txt34)
+            try:
+                _schema_output_uniqueness(_pk34)
+                raise AssertionError(
+                    f"{_mode34}-duplicate schema mutant NOT detected (34-2)")
+            except AssertionError as e:
+                assert "duplicate" in str(e), f"wrong failure: {e}"
 
 
 def example_pack_identity():
@@ -1975,6 +2030,88 @@ def _tree_guard_parse(w):
         return None
 
 
+def _guard_enforces_caps(w):
+    """(F34-1) SEMANTIC cap enforcement. Parity/structure checks are
+    insufficient: De Morgan forms like !(!count_lt(c,n) && false) are
+    parity-even yet always true. A counter enforces iff NO reachable
+    state with the counter at/over its smallest declared cap makes
+    the guard true. State space mirrors _enforced_guards: counters at
+    {0, t-1, t, t+1} per threshold, verdict subsets of the guard's
+    own any_in samples (plus empty/full), clocks F/T x F/T, findings
+    F/T. Returns the list of count_lt counters that do NOT enforce."""
+    import itertools as _it
+    t = _tree_guard_parse(w)
+    if t is None or not _tree_count_lt_ctrs(t):
+        return []
+    caps = {}
+    for _c, _b in _tree_count_lt_caps(t):
+        caps.setdefault(_c, []).append(_b)
+    uni = sorted(set(re.findall(r'"([^"]+)"', w)))
+    if len(uni) > 12:
+        raise AssertionError(  # resource bound: fail, never trust
+            f"guard verdict universe {len(uni)} > 12: {w!r}")
+    verdict_sets = [()]
+    for _r in range(1, len(uni) + 1):
+        verdict_sets += list(combinations(uni, _r))
+    unenforced = []
+    for c in sorted(caps):
+        vals_per = []
+        for k in sorted(caps):
+            s = {0}
+            for th in caps[k]:
+                s |= {max(th - 1, 0), th, th + 1}
+            if k == c:
+                s |= {min(caps[k]), max(caps[k]) + 1}
+            vals_per.append((k, sorted(s)))
+        enforced = True
+        for counters in _it.product(*[v for _, v in vals_per]):
+            cmap = dict(zip([k for k, _ in vals_per], counters))
+            if cmap[c] < min(caps[c]):
+                continue  # only states where c can be over cap
+            for verdicts in verdict_sets:
+                for to, bo in ((False, False), (False, True),
+                               (True, False), (True, True)):
+                    for findings in (False, True):
+                        st = {"counters": cmap, "verdicts": list(verdicts),
+                              "findings": findings, "timeout": to,
+                              "budget_exhausted": bo, "reverted_base": None}
+                        ok = evaluate(w, st)
+                        if ok is not False:
+                            enforced = False
+                            break
+                    if not enforced:
+                        break
+                if not enforced:
+                    break
+            if not enforced:
+                break
+        if not enforced:
+            unenforced.append(c)
+    return unenforced
+
+
+def _schema_output_uniqueness(pack_dir):
+    """(F34-2) output names unique and non-null from-columns unique
+    across ALL schema files — a pack STRUCTURE contract, enforced
+    independently of routing vocabulary (the old check only ran when
+    the literal 'defer' appeared in a route condition, so the
+    canonical pack — which expresses defer via !has_findings(any) —
+    skipped it entirely; 34th round, finding 2)."""
+    froms = []
+    names = []
+    for sf in sorted(os.listdir(pack_dir)):
+        if sf.startswith("schema-"):
+            sd = tomllib.load(open(f"{pack_dir}/{sf}", "rb"))
+            for o in sd.get("output", []):
+                froms.append(o.get("from"))
+                names.append(o.get("name"))
+    non_null = [f for f in froms if f]
+    dup_f = sorted({x for x in non_null if non_null.count(x) > 1})
+    assert not dup_f, f"duplicate 'from' columns across schema outputs: {dup_f}"
+    dup_n = sorted({x for x in names if names.count(x) > 1})
+    assert not dup_n, f"duplicate output names across schema outputs: {dup_n}"
+
+
 def _tree_const_value(t):
     """Return constant bool if the subtree is constant, else None."""
     if not isinstance(t, tuple):
@@ -2739,6 +2876,18 @@ def contract_checks(doc):
                             f"route {u} branch to {w}: count_lt under "
                             "odd negation — exit condition, not a "
                             "re-entry cap (§2.2)")
+                    # (F34-1) SEMANTIC cap enforcement — parity and
+                    # structure alone are insufficient: De Morgan forms
+                    # (!(!count_lt(c,n) && false)) are parity-even yet
+                    # always true. Every count_lt counter in a re-entry
+                    # guard must enforce its smallest declared cap.
+                    _bad34 = _guard_enforces_caps(w_b)
+                    if _bad34:
+                        raise AssertionError(
+                            f"route {u} branch to {w}: guard does not "
+                            f"enforce the declared cap for counter(s) "
+                            f"{sorted(set(_bad34))} — De Morgan-"
+                            "neutralized or non-binding count_lt (§2.2)")
                     # (F25-1) EVERY counter mentioned in the guard must
                     # be bumped along the cycle — an OR-joined secondary
                     # count_lt whose counter never increments keeps the
@@ -2852,9 +3001,13 @@ def contract_checks(doc):
                                     "more than one increment per "
                                     "traversal (§2.3)")
 
-# (F18-1) defer contract: if any route branch mentions the
-    # 'defer' verdict, the pack MUST declare a 'deferred' output and
-    # no two schema outputs may share a 'from' source column
+    # (F18-1/F34-2) defer contract: if any route branch mentions the
+    # 'defer' verdict, the pack MUST declare a 'deferred' output.
+    # Output-name and from-column uniqueness are pack STRUCTURE
+    # contracts — enforced unconditionally, independent of routing
+    # vocabulary (the old '"defer"'-in-condition gate let the
+    # canonical pack skip the checks; 34th round, finding 2).
+    _schema_output_uniqueness(PACK)
     _defer_used = False
     for n in doc["nodes"]:
         if n["kind"] == "route":
@@ -2862,26 +3015,14 @@ def contract_checks(doc):
                 if re.search(r'"defer"', br.get("when", "")):
                     _defer_used = True
     if _defer_used:
-        _froms = []
-        import os as _os1
-        for _sf in sorted(os.listdir(PACK)):
-            if _sf.startswith("schema-"):
-                _sd = tomllib.load(open(f"{PACK}/{_sf}", "rb"))
-                for _o in _sd.get("output", []):
-                    _froms.append(_o.get("from"))
-        # unique from-columns (a renamed source must not duplicate
-        # another output's column)
-        non_null = [f for f in _froms if f]
-        assert len(non_null) == len(set(non_null)), \
-            f"duplicate 'from' columns across schema outputs: " \
-            f"{sorted(f for f in non_null if non_null.count(f) > 1)}"
         _names = set()
+        import os as _os1
         for _sf in sorted(os.listdir(PACK)):
             if _sf.startswith("schema-"):
                 _sd = tomllib.load(open(f"{PACK}/{_sf}", "rb"))
                 _names |= {o.get("name") for o in _sd.get("output", [])}
         assert "deferred" in _names, \
-            "defer verdict used but no deferred output declared" 
+            "defer verdict used but no deferred output declared"
     # (F18-c) declared counter names follow the identifier grammar
     import re as _re18
     for cname in (doc.get("counters") or {}):

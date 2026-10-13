@@ -450,6 +450,107 @@ def _tree_guard_parse_a(w):
     except ValueError:
         return None
 
+
+def _tree_cl_caps_a(t):
+    """(F34-1) (counter, bound) pairs from count_lt call nodes."""
+    out_ = []
+    def rec_(x):
+        if not isinstance(x, tuple):
+            return
+        if x[0] == 'call' and x[1] == 'count_lt' and len(x[2]) >= 2:
+            a_, b_ = x[2][0], x[2][1]
+            if a_[0] == 'ident' and b_[0] == 'num':
+                out_.append((a_[1], int(b_[1])))
+            return
+        if x[0] == 'not':
+            rec_(x[1])
+        elif x[0] in ('and', 'or'):
+            for c_ in x[1]:
+                rec_(c_)
+    rec_(t)
+    return out_
+
+
+def _guard_enforces_caps_a(w):
+    """(F34-1) SEMANTIC cap enforcement — parity/structure checks are
+    insufficient (De Morgan: !(!count_lt(c,n) && false) is parity-even
+    yet always true). A counter enforces iff NO reachable state with
+    the counter at/over its smallest declared cap makes the guard
+    true, evaluated with the pack's own interpreter. Returns the list
+    of count_lt counters that do NOT enforce."""
+    import itertools as _it2
+    t_ = _tree_guard_parse_a(w)
+    if t_ is None or not _tree_cl_ctrs_a(t_):
+        return []
+    caps_ = {}
+    for c_, b_ in _tree_cl_caps_a(t_):
+        caps_.setdefault(c_, []).append(b_)
+    uni_ = sorted(set(re.findall(r'"([^"]+)"', w)))
+    if len(uni_) > 12:
+        raise AssertionError(  # resource bound: fail, never trust
+            f'guard verdict universe {len(uni_)} > 12: {w!r}')
+    vsets_ = [()]
+    for r_ in range(1, len(uni_) + 1):
+        vsets_ += list(_it2.combinations(uni_, r_))
+    bad_ = []
+    for c_ in sorted(caps_):
+        vals_ = []
+        for k_ in sorted(caps_):
+            s_ = {0}
+            for th_ in caps_[k_]:
+                s_ |= {max(th_ - 1, 0), th_, th_ + 1}
+            if k_ == c_:
+                s_ |= {min(caps_[k_]), max(caps_[k_]) + 1}
+            vals_.append((k_, sorted(s_)))
+        enforced_ = True
+        for combo_ in _it2.product(*[v for _, v in vals_]):
+            cmap_ = dict(zip([k for k, _ in vals_], combo_))
+            if cmap_[c_] < min(caps_[c_]):
+                continue  # only states where c_ can be over cap
+            for vs_ in vsets_:
+                for to_ in (False, True):
+                    for bo_ in (False, True):
+                        st_ = {'verdicts': set(vs_), 'counters': cmap_,
+                               'active': set(uni_), 'budget_exhausted': bo_,
+                               'timeout': to_, 'reverted': False,
+                               'events': []}
+                        try:
+                            ok_ = Expr(w, st_).run()
+                        except (ValueError, KeyError):
+                            ok_ = True  # unresolvable = untrusted
+                        if ok_ is not False:
+                            enforced_ = False
+                            break
+                    if not enforced_:
+                        break
+                if not enforced_:
+                    break
+            if not enforced_:
+                break
+        if not enforced_:
+            bad_.append(c_)
+    return bad_
+
+
+def schema_output_uniqueness(pack_dir):
+    """(F34-2) output names unique and non-null from-columns unique
+    across ALL schema files — a pack STRUCTURE contract, independent
+    of routing vocabulary (the old '"defer"'-in-condition gate let
+    the canonical pack skip the check; 34th round, finding 2)."""
+    froms_ = []
+    names_ = []
+    for f_ in sorted(p_.name for p_ in pack_dir.iterdir()
+                     if p_.name.startswith('schema-')):
+        d_ = tomllib.loads((pack_dir / f_).read_text())
+        for o_ in d_.get('output', []):
+            froms_.append(o_.get('from'))
+            names_.append(o_.get('name'))
+    nn_ = [x for x in froms_ if x]
+    dup_f = sorted({x for x in nn_ if nn_.count(x) > 1})
+    assert not dup_f, f"duplicate 'from' columns across schema outputs: {dup_f}"
+    dup_n = sorted({x for x in names_ if names_.count(x) > 1})
+    assert not dup_n, f'duplicate output names across schema outputs: {dup_n}'
+
 def _reach_set19(adj, start, universe):
     seen_ = set()
     stk_ = [start]
@@ -975,6 +1076,18 @@ def graph(policy):
                             f'route {u19} branch to {w19}: count_lt under '
                             'odd negation — exit condition, not a '
                             're-entry cap (§2.2)')
+                    # (F34-1) SEMANTIC cap enforcement — parity and
+                    # structure alone are insufficient: De Morgan forms
+                    # (!(!count_lt(c,n) && false)) are parity-even yet
+                    # always true. Every count_lt counter in a re-entry
+                    # guard must enforce its smallest declared cap.
+                    bad34_ = _guard_enforces_caps_a(wb_)
+                    if bad34_:
+                        raise AssertionError(
+                            f'route {u19} branch to {w19}: guard does not '
+                            f'enforce the declared cap for counter(s) '
+                            f'{sorted(set(bad34_))} — De Morgan-neutralized '
+                            'or non-binding count_lt (§2.2)')
                     # (F25-1) EVERY guard counter bumped on the cycle
                     # path from w19 BACK to u19
                     # (F28-2) per-BRANCH bump credit
@@ -1272,6 +1385,7 @@ def main():
             assert pf in declared_out or pf == 'summary', \
                 f'emit {n["id"]} payload_from={pf!r} not a declared output'
     check('graph structure', lambda: graph(policy))
+    check('schema output uniqueness', lambda: schema_output_uniqueness(args.pack))
 
     def expression_tests():
         s = state(['patch'], fix=2, loops=5)
@@ -1454,6 +1568,65 @@ def main():
             return 'mutant rejected: ' + str(e)
         raise AssertionError('duplicate node id NOT detected (33-4)')
     check('negative control duplicate node id', negative_duplicate_id)
+
+    # (34-1) De Morgan-neutralized cap must be REJECTED
+    def negative_de_morgan_cap():
+        mutant = copy.deepcopy(policy)
+        rt = next(n for n in mutant['nodes'] if n['id'] == 'route1')
+        for b_ in rt['branches']:
+            if b_.get('goto') == 'fixdie':
+                b_['when'] = ('any_in(verdicts, ["patch"]) && '
+                              '!(!count_lt(fix_rounds, 3) && false)')
+        try:
+            graph(mutant)
+        except AssertionError as e:
+            return 'mutant rejected: ' + str(e)
+        raise AssertionError('De Morgan cap mutant NOT detected (34-1)')
+    check('negative control De Morgan cap', negative_de_morgan_cap)
+
+    # (34-1) OR-added always-true alternative must be REJECTED
+    def negative_or_added_bypass():
+        mutant = copy.deepcopy(policy)
+        rt = next(n for n in mutant['nodes'] if n['id'] == 'route1')
+        for b_ in rt['branches']:
+            if b_.get('goto') == 'fixdie':
+                b_['when'] = ('(any_in(verdicts, ["patch"]) && '
+                              'count_lt(fix_rounds, 3)) || '
+                              '(any_in(verdicts, ["pass"]) && '
+                              '!(!count_lt(fix_rounds, 3) && false))')
+        try:
+            graph(mutant)
+        except AssertionError as e:
+            return 'mutant rejected: ' + str(e)
+        raise AssertionError('OR-added bypass mutant NOT detected (34-1)')
+    check('negative control OR-added bypass', negative_or_added_bypass)
+
+    # (34-2) schema from-column / output-name uniqueness mutants
+    def negative_schema_dup():
+        import tempfile as tf_
+        import shutil as sh_
+        for mode_ in ('from', 'name'):
+            with tf_.TemporaryDirectory() as td_:
+                pk_ = Path(td_) / 'pack'
+                sh_.copytree(args.pack, pk_)
+                sp_ = pk_ / 'schema-triage.toml'
+                txt_ = sp_.read_text()
+                if mode_ == 'from':
+                    txt_ = txt_.replace('from = "triage_log_rows"',
+                                        'from = "entries_routed_defer"')
+                else:
+                    txt_ = txt_.replace('name = "carried_rows"',
+                                        'name = "deferred"')
+                sp_.write_text(txt_)
+                try:
+                    schema_output_uniqueness(pk_)
+                except AssertionError as e:
+                    assert 'duplicate' in str(e), f'wrong failure: {e}'
+                    continue
+            raise AssertionError(
+                f'{mode_}-duplicate schema mutant NOT detected (34-2)')
+        return 'from/name duplicates rejected'
+    check('negative control schema from/name duplicate', negative_schema_dup)
 
     print('SCOPE: declarative model; no live engine/subagent execution. Prompt compliance and actual session reuse are not proven.')
     print(f'RESULT: {"FAIL" if failures else "PASS"}; {len(failures)} failed checks')
