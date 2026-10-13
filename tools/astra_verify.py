@@ -273,8 +273,16 @@ def graph(policy):
                 f'redrive {n["id"]} missing target (§2.3)'
             assert n.get('on_done'), \
                 f'redrive {n["id"]} missing on_done (§2.3)'
+            assert n['on_done'] in nodes, \
+                f'redrive {n["id"]} on_done {n["on_done"]!r} dangling'
             assert n.get('on_redrive_error') is not None, \
                 f'redrive {n["id"]} missing on_redrive_error (§2.3)'
+            assert n.get('hold_target'), \
+                f'redrive {n["id"]} missing hold_target (§2.3)'
+            assert n['hold_target'] in nodes, \
+                f'redrive {n["id"]} hold_target {n["hold_target"]!r} dangling'
+            assert nodes[n['hold_target']]['kind'] == 'hold', \
+                f'redrive {n["id"]} hold_target must reference a hold node'
             if 'base' in n:
                 assert n['base'] in ('origin', 'latest'), \
                     f'redrive {n["id"]} base {n["base"]!r} invalid'
@@ -424,8 +432,8 @@ def graph(policy):
                 for a_ in actions(br_.get('do'), {'counters': {}, 'events': []}):
                     if a_[0] == 'emit' and not br_.get('goto'):
                         return True
-        if nd['kind'] in ('dispatch', 'redrive') and nd.get('on_done'):
-            return reaches_emit(nd['on_done'], seen)
+        # hold AND dispatch re-execution both imply re-verification
+        # (§2.3) — a revert path through either is legal
         return False  # hold = re-verification, legal
     for n_ in nodes.values():
         if n_['kind'] == 'route':
@@ -452,7 +460,7 @@ def graph(policy):
         kind = n['kind']
         assert kind in ('dispatch', 'route', 'redrive', 'emit', 'hold'), 'unknown node kind'
         if kind == 'dispatch':
-            for f in ('on_no_valid', 'on_verify_invalid', 'hold_target'):
+            for f in ('on_no_valid', 'on_verify_invalid', 'hold_target', 'on_done'):
                 assert f in n, f'dispatch {n["id"]} missing {f}'
             assert n['hold_target'] in nodes, \
                 f'dispatch {n["id"]} hold_target {n["hold_target"]!r} dangling'

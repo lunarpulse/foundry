@@ -1936,10 +1936,9 @@ def contract_checks(doc):
                 for a_ in _parse_actions_top(br_.get("do")):
                     if a_[0] == "emit" and not br_.get("goto"):
                         return True
-        if nd["kind"] in ("dispatch", "redrive") and nd.get("on_done"):
-            return _reaches_emit(nd["on_done"], seen)
-        # hold = human checkpoint; resuming from it implies
-        # re-verification, so a revert path THROUGH a hold is legal
+        # hold (human resume) AND dispatch re-execution both imply
+        # re-verification, so a revert path through either is legal
+        # (§2.3: revert→...→dispatch 재실행→검증→emit 허용 — fixture 18)
         return False
     for n in doc["nodes"]:
         if n["kind"] == "route":
@@ -1958,6 +1957,14 @@ def contract_checks(doc):
             if "base" in n:
                 assert n["base"] in ("origin", "latest"), \
                     f"redrive {n['id']} base {n['base']!r} invalid"
+    # (F17-1b) on_done is mandatory on dispatch AND redrive nodes —
+    # unused nodes included (load-time schema completeness)
+    for n in doc["nodes"]:
+        if n["kind"] in ("dispatch", "redrive"):
+            assert n.get("on_done"), \
+                f"{n['kind']} {n['id']} missing on_done (§2.3)"
+            assert n["on_done"] in {x["id"] for x in doc["nodes"]}, \
+                f"{n['id']} on_done {n['on_done']!r} dangling"
     # (F14-1) redrive bump targets must be DECLARED counters
     _declared_ctrs0 = set(doc.get("counters", {}).keys())
     for n in doc["nodes"]:

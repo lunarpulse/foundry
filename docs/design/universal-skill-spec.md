@@ -1,7 +1,7 @@
 # Foundry Universal Skill Spec — 범용 실행 모델 (Universal Review Engine)
 
-- **버전**: v0.51 (2026-10-12) — 16차 최종 검증 반영.
-  비emit 분기 goto 필수·노드 간 revert→emit 로드 거부(hold 경유 합법)·astra on_redrive_error 필수·hold_target hold-kind 검사·hold 표 timeout_s.
+- **버전**: v0.52 (2026-10-12) — 17차 최종 검증 반영.
+  redrive hold_target 필수+hold-kind(양측)·전 노드 on_done 필수(미사용 포함)·revert→dispatch 재실행 경로 합법화(규범 정합).
 - **의도(소유자)**: Foundry는 어떤 방법론도 돌릴 수 있는 유니버설
   플랫폼. BMad는 스킬 데이터의 첫 고객. **Rust 도메인에 방법론
   코드가 박히는 순간이 실패.** 엔진 고정·확장 선언(procedural macro
