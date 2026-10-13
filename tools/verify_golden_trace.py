@@ -1877,6 +1877,14 @@ def contract_checks(doc):
                         assert a[1] in _declared_ctrs, \
                             f"branch bumps undeclared counter {a[1]!r} " \
                             f"(route {n['id']})"
+    # (F14-1) redrive bump targets must be DECLARED counters
+    _declared_ctrs0 = set(doc.get("counters", {}).keys())
+    for n in doc["nodes"]:
+        if n["kind"] == "redrive":
+            bp = n.get("bump")
+            if bp:
+                assert bp in _declared_ctrs0, \
+                    f"redrive {n['id']} bumps undeclared counter {bp!r}"
     # (F13-3) EVERY branch condition parses at load — unreachable
     # branches included; final fallback must be the LITERAL 'true'
     _probe_st = {"verdicts": [], "findings": False, "counters": {},
@@ -1885,14 +1893,21 @@ def contract_checks(doc):
         if n["kind"] == "route":
             for br in n.get("branches", []):
                 check_grammar(br.get("when", ""))
+                # (F14-2) undeclared-counter errors are expected in
+                # probe state ONLY if the counter is genuinely absent
+                # from the pack declaration; all other failures are
+                # load errors
+                # probe state includes declared counters at 0 so
+                # 'undeclared counter' can only mean a pack-level
+                # namespace violation -> load rejection
+                _ps = dict(_probe_st)
+                _ps["counters"] = {c: 0 for c in _declared_ctrs0}
                 try:
-                    evaluate(br.get("when", ""), dict(_probe_st))
+                    evaluate(br.get("when", ""), _ps)
                 except ValueError as e:
-                    if "not fully consumed" not in str(e) and \
-                            "counter" not in str(e):
-                        raise AssertionError(
-                            f"route {n['id']} branch condition "
-                            f"invalid: {br.get('when')!r} ({e})")
+                    raise AssertionError(
+                        f"route {n['id']} branch condition invalid: "
+                        f"{br.get('when')!r} ({e})")
             last_when = (n.get("branches") or [{}])[-1].get("when", "")
             assert last_when.strip() == "true", \
                 f"route {n['id']} final fallback must be literal true"

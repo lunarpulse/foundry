@@ -275,6 +275,9 @@ def graph(policy):
             # (F13-1) timeout_s is a hold-only optional field
             raise AssertionError(
                 f'{n["id"]} ({n["kind"]}) declares timeout_s — hold-only')
+        if n['kind'] == 'redrive' and n.get('bump'):
+            # (F14-1) redrive bump must reference a DECLARED counter
+            assert n['bump'] in policy.get('counters', {}),                 f'redrive {n["id"]} bumps undeclared counter {n["bump"]!r}'
         if n['kind'] == 'hold' and 'timeout_s' in n:
             t = n['timeout_s']
             assert isinstance(t, int) and not isinstance(t, bool) and t > 0, \
@@ -437,7 +440,10 @@ def graph(policy):
                     assert not b.get('goto'), \
                         f'route {n["id"]} branch emits AND gotos (§2.3)'
                 assert len(emits_) <= 1, f'route {n["id"]} branch multi-emit (§2.3)'
-                refs.append(b['goto'])
+                # (F14-3) an emitting branch has no goto — only append
+                # refs for branches that actually carry one
+                if b.get('goto'):
+                    refs.append(b['goto'])
         if kind == 'hold':
             refs.extend(n['resume_targets'])
             assert 'on_done' not in n, 'hold has on_done'
