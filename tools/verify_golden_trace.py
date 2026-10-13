@@ -804,7 +804,70 @@ def contract_negative_controls(doc):
         raise AssertionError("claims.after=verif mutant NOT detected")
     except AssertionError as e:
         assert "must be ordered" in str(e) or "cycle" in str(e), \
-            f"wrong failure: {e}" 
+            f"wrong failure: {e}"
+    # (F33-1) fake string-literal cap: 'count_lt(...)' inside quotes is
+    # not a cap — the branch must be REJECTED as unguarded re-entry
+    bad = copy.deepcopy(doc)
+    for n in bad["nodes"]:
+        if n["id"] == "route1":
+            for br in n.get("branches", []):
+                if br.get("goto") == "fixdie":
+                    br["when"] = ('any_in(verdicts, ["patch"]) && (true || '
+                                  'any_in(verdicts, '
+                                  '["count_lt(fix_rounds,3)"]))')
+    try:
+        contract_checks(bad)
+        raise AssertionError("fake string-cap mutant NOT detected (33-1)")
+    except AssertionError as e:
+        assert "count_lt guard" in str(e) or "unguarded" in str(e), e
+    # (F33-2) legal double negation (parity-even) must be ACCEPTED
+    good = copy.deepcopy(doc)
+    _hit = False
+    for n in good["nodes"]:
+        if n["id"] == "route1":
+            for br in n.get("branches", []):
+                if br.get("goto") == "fixdie" and \
+                        "count_lt(fix_rounds, 3)" in br.get("when", ""):
+                    br["when"] = br["when"].replace(
+                        "count_lt(fix_rounds, 3)",
+                        "!!count_lt(fix_rounds, 3)")
+                    _hit = True
+    assert _hit, "33-2 pin failed to mutate the pack"
+    try:
+        contract_checks(good)
+    except AssertionError as e:
+        raise AssertionError(f"legal double-negation rejected: {e}")
+    # (F33-3) bare-string after + transitive lens deps must be ACCEPTED
+    good3 = copy.deepcopy(doc)
+    for n in good3["nodes"]:
+        if n.get("kind") == "dispatch":
+            for st in n.get("stages", []):
+                if st.get("role") == "verify":
+                    # edge is reached transitively via claims.after=edge;
+                    # claims keeps its bare-string form (normalization)
+                    st["after"] = ["verif", "claims"]
+    try:
+        contract_checks(good3)
+    except AssertionError as e:
+        raise AssertionError(f"normalized/transitive after rejected: {e}")
+    # (F33-4a) unregistered node kind must be REJECTED
+    bad = copy.deepcopy(doc)
+    bad["nodes"].append({"id": "alien", "kind": "custom"})
+    try:
+        contract_checks(bad)
+        raise AssertionError("unregistered-kind mutant NOT detected (33-4)")
+    except AssertionError as e:
+        assert "unknown node kind" in str(e), f"wrong failure: {e}"
+    # (F33-4b) duplicate node ID must be REJECTED
+    bad = copy.deepcopy(doc)
+    bad["nodes"].append({"id": "pass", "kind": "emit",
+                         "event": "InspectionPassed",
+                         "payload_from": "summary"})
+    try:
+        contract_checks(bad)
+        raise AssertionError("duplicate-id mutant NOT detected (33-4)")
+    except AssertionError as e:
+        assert "duplicate node IDs" in str(e), f"wrong failure: {e}"
 
 
 def example_pack_identity():
@@ -1057,10 +1120,15 @@ def sweep_rejection_fixtures():
         <=4^counters * 4 * 2^|samples| * 2 <= ~10k evaluations."""
         import re as _re
         import itertools as _it
-        # ALL thresholds per counter (dict-overwrite bug fixed)
+        # ALL thresholds per counter — from CALL nodes only (F33-1);
+        # a 'count_lt(c,3)' inside a string literal is not a real cap
         caps = {}
-        for m in _re.finditer(r"count_lt\s*[(]\s*([A-Za-z_]\w*)\s*,\s*(\d+)\s*[)]", w):
-            caps.setdefault(m.group(1), []).append(int(m.group(2)))
+        try:
+            _t33 = _guard_tree(w)
+        except ValueError:
+            _t33 = None
+        for _c33, _b33 in (_tree_count_lt_caps(_t33) if _t33 else []):
+            caps.setdefault(_c33, []).append(_b33)
         # verdict universe from any_in samples
         uni = []
         for m in _re.finditer(r'any_in\s*\(\s*verdicts\s*,\s*\[(.*?)\]\s*\)', w):
@@ -1635,11 +1703,11 @@ def sweep_rejection_fixtures():
             if n["kind"] == "route":
                 for br in n.get("branches", []):
                     w = br.get("when") or ""
-                    if br.get("goto") == "fix" and "count_lt(" in w:
-                        import re as _r
-                        m = _r.search(r"count_lt\((\w+)", w)
-                        if m and m.group(1) != bump:
-                            return True
+                    if br.get("goto") == "fix":
+                        _t12 = _tree_guard_parse(w)
+                        for _c12 in (_tree_count_lt_ctrs(_t12) if _t12 else []):
+                            if _c12 != bump:
+                                return True
         return False
     def _has_13_multi(pol):
         for n in pol["nodes"]:
@@ -1853,6 +1921,60 @@ def _tree_has_count_lt(t):
     return False
 
 
+def _tree_count_lt_ctrs(t):
+    """(F33-1) first-arg counter idents of count_lt CALL nodes only.
+    A 'count_lt(...)' inside a string literal never becomes a call
+    node, so text-extraction (regex over the raw when) is a verifier
+    gap — 33rd round, finding 1. Returns [] in source order."""
+    out = []
+    def rec(x):
+        if not isinstance(x, tuple):
+            return
+        if x[0] == "call" and x[1] == "count_lt":
+            a = x[2][0] if len(x[2]) >= 1 else None
+            if isinstance(a, tuple) and a[0] == "ident":
+                out.append(a[1])
+            return
+        if x[0] == "not":
+            rec(x[1])
+        elif x[0] in ("and", "or"):
+            for c in x[1]:
+                rec(c)
+    rec(t)
+    return out
+
+
+def _tree_count_lt_caps(t):
+    """(F33-1) (counter, bound) pairs from count_lt call nodes —
+    same class fix as _tree_count_lt_ctrs, for the cap state-space
+    builder (_enforced_guards)."""
+    out = []
+    def rec(x):
+        if not isinstance(x, tuple):
+            return
+        if x[0] == "call" and x[1] == "count_lt" and len(x[2]) >= 2:
+            a, b = x[2][0], x[2][1]
+            if a[0] == "ident" and b[0] == "num":
+                out.append((a[1], int(b[1])))
+            return
+        if x[0] == "not":
+            rec(x[1])
+        elif x[0] in ("and", "or"):
+            for c in x[1]:
+                rec(c)
+    rec(t)
+    return out
+
+
+def _tree_guard_parse(w):
+    """Parse a guard; an unparseable guard counts as unguarded
+    (None) — load-time syntax checks own the error message."""
+    try:
+        return _guard_tree(w)
+    except ValueError:
+        return None
+
+
 def _tree_const_value(t):
     """Return constant bool if the subtree is constant, else None."""
     if not isinstance(t, tuple):
@@ -1967,6 +2089,17 @@ def _all_paths_bump(u, w, gc, adj, node_ids):
 def contract_checks(doc):
     """(r16-2) pack-contract regressions: pre_stage wiring and
     same-session ordering — the two mutants r15 slipped through."""
+    # (F33-4) closed node-kind set + unique node IDs — the load
+    # contract of the closed executor, enforced FIRST so kind/id
+    # mutants cannot surface as a different check's error (33rd
+    # round, finding 4; the independent verifier already did).
+    _closed33 = {"dispatch", "route", "redrive", "emit", "hold"}
+    for _n33 in doc["nodes"]:
+        assert _n33.get("kind") in _closed33, \
+            f"unknown node kind {_n33.get('kind')!r} on {_n33.get('id')!r}"
+    _ids33 = [_n33["id"] for _n33 in doc["nodes"]]
+    _dup33 = sorted({x for x in _ids33 if _ids33.count(x) > 1})
+    assert not _dup33, f"duplicate node IDs: {_dup33}"
     stages_by_pack = {s["id"]: s for s in doc.get("pack_stages", [])}
     for n in doc["nodes"]:
         if n["kind"] == "redrive":
@@ -2085,7 +2218,24 @@ def contract_checks(doc):
                 # stages in its dispatch (full-finding verification)
                 lens_ids = [s["id"] for s in n.get("stages", [])
                             if s.get("role") == "lens"]
-                missing = set(lens_ids) - set(after)
+                # (F33-3) bare string normalizes to one dep (raw
+                # set(after) split it into a char set), and a lens
+                # reached ONLY via another stage's after-chain still
+                # counts — transitive reachability (33rd round, fdg 3)
+                after_l = after if isinstance(after, list) else [after]
+                dep33 = {}
+                for s2 in n.get("stages", []):
+                    a2 = s2.get("after") or []
+                    dep33[s2["id"]] = a2 if isinstance(a2, list) else [a2]
+                _reach33 = set()
+                stack = list(after_l)
+                while stack:
+                    d_ = stack.pop()
+                    if d_ in _reach33:
+                        continue
+                    _reach33.add(d_)
+                    stack.extend(dep33.get(d_, []))
+                missing = set(lens_ids) - _reach33
                 assert not missing, \
                     f"verify stage {st['id']} must run after ALL lens " \
                     f"stages; missing deps: {sorted(missing)}"
@@ -2236,8 +2386,9 @@ def contract_checks(doc):
             for br in n.get("branches", []):
                 if br.get("goto"):
                     outs.append(br["goto"])
+                    _eg33 = _tree_guard_parse(br.get("when", ""))
                     _edge_guard[(n["id"], br["goto"])] = bool(
-                        re.search(r"count_lt\s*\(", br.get("when", "")))
+                        _eg33 is not None and _tree_count_lt_ctrs(_eg33))
                 for a in _parse_actions_top(br.get("do")):
                     if a[0] == "bump":
                         _node_bumps.add((n["id"], a[1]))
@@ -2332,8 +2483,8 @@ def contract_checks(doc):
             for br in n.get("branches", []):
                 g = br.get("goto")
                 w = br.get("when", "")
-                _ctrs_in_w = re.findall(
-                    r"count_lt\s*\(\s*([a-z_][a-z0-9_]*)", w)
+                _gt33 = _tree_guard_parse(w)
+                _ctrs_in_w = _tree_count_lt_ctrs(_gt33) if _gt33 else []
                 if g and _ctrs_in_w:
                     _bi = n["branches"].index(br)
                     _guard_ctrs[(n["id"], g, _bi)] = _ctrs_in_w[0]
@@ -2481,8 +2632,8 @@ def contract_checks(doc):
             for br in n.get("branches", []):
                 g = br.get("goto")
                 w = br.get("when", "")
-                _ctrs_in_w = re.findall(
-                    r"count_lt\s*\(\s*([a-z_][a-z0-9_]*)", w)
+                _gt33 = _tree_guard_parse(w)
+                _ctrs_in_w = _tree_count_lt_ctrs(_gt33) if _gt33 else []
                 if g and _ctrs_in_w:
                     _bi = n["branches"].index(br)
                     _guard_ctrs[(n["id"], g, _bi)] = _ctrs_in_w[0]
@@ -2569,54 +2720,25 @@ def contract_checks(doc):
                         if br.get("goto") == w]
                 for br in _brs:
                     w_b = br.get("when", "")
-                    if not re.search(r"count_lt\s*\(", w_b):
+                    # (F33-1) presence by CALL node, not raw text — a
+                    # 'count_lt(' inside a string literal is not a cap
+                    _gt24 = _tree_guard_parse(w_b)
+                    if _gt24 is None or not _tree_count_lt_ctrs(_gt24):
                         raise AssertionError(
                             f"route {u} branch to {w} re-enters an "
                             "automatic cycle without a count_lt guard "
                             "on THAT branch (§2.2)")
-                    # (F24-1) the guard must hold POSITIVELY: a count_lt
-                    # under any negation is an exit condition, not a
-                    # cap — !(true && count_lt(c,n)) only limits when
-                    # the counter EXCEEDS the cap (uncapped re-entry)
-                    _depth = 0
-                    _negated = False
-                    _ok = True
-                    _in_str = False
-                    _k = 0
-                    while _k < len(w_b):
-                        _ch = w_b[_k]
-                        if _ch == '"':
-                            _in_str = not _in_str
-                        elif not _in_str and _ch == "(":
-                            _depth += 1
-                        elif not _in_str and _ch == ")":
-                            _depth -= 1
-                        elif (not _in_str and _ch == "!"
-                              and not _negated
-                              and re.match(r"!\s*count_lt", w_b[_k:])):
-                            _negated = True
-                        elif (not _in_str and _ch == "!"
-                              and w_b[_k + 1:].lstrip().startswith("(")):
-                            # negated group — everything until the
-                            # matching close is under negation
-                            _d2 = 0
-                            _m2 = _k + 1
-                            while _m2 < len(w_b):
-                                if w_b[_m2] == "(":
-                                    _d2 += 1
-                                elif w_b[_m2] == ")":
-                                    _d2 -= 1
-                                    if _d2 == 0:
-                                        break
-                                _m2 += 1
-                            if "count_lt" in w_b[_k:_m2]:
-                                _ok = False
-                        _k += 1
-                    if _negated or not _ok:
+                    # (F24-1/F33-2) the guard must hold POSITIVELY, by
+                    # negation PARITY on the structural tree: count_lt
+                    # under an odd number of !s is an exit condition,
+                    # not a cap. Double negation (!!, !(!x)) is
+                    # parity-even and legal — the raw-text scan rejected
+                    # it (33rd round, finding 2).
+                    if _tree_neg_count_lt(_gt24):
                         raise AssertionError(
-                            f"route {u} branch to {w}: count_lt appears "
-                            "under negation — that is an exit condition, "
-                            "not a re-entry cap (§2.2)")
+                            f"route {u} branch to {w}: count_lt under "
+                            "odd negation — exit condition, not a "
+                            "re-entry cap (§2.2)")
                     # (F25-1) EVERY counter mentioned in the guard must
                     # be bumped along the cycle — an OR-joined secondary
                     # count_lt whose counter never increments keeps the

@@ -71,5 +71,10 @@ PASS emergency budget_exhausted
 PASS emergency timeout
 PASS negative control remove gap pre-hold actions: mutant rejected: hold entered before bump/revert
 PASS negative control dangling resume: mutant rejected: dangling node reference from human_gap
+PASS negative control fake string-literal cap: mutant rejected: route route1 branch to fixdie re-enters an automatic cycle without a count_lt guard on THAT branch (§2.2)
+PASS negative control legal double negation: legal double-negation cap accepted
+PASS negative control after string+transitive: normalized/transitive after accepted
+PASS negative control unregistered node kind: mutant rejected: unknown node kind
+PASS negative control duplicate node id: mutant rejected: duplicate node IDs
 SCOPE: declarative model; no live engine/subagent execution. Prompt compliance and actual session reuse are not proven.
 RESULT: PASS; 0 failed checks

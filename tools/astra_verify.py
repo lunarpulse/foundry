@@ -419,6 +419,37 @@ def _tree_neg_cl_a(t):
         return False
     return rec(t, False)
 
+
+def _tree_cl_ctrs_a(t):
+    """(F33-1) first-arg counter idents of count_lt CALL nodes only —
+    a 'count_lt(...)' inside a string literal never becomes a call
+    node. Text-extraction over raw `when` was a verifier gap (33rd
+    round, finding 1)."""
+    out_ = []
+    def rec_(x):
+        if not isinstance(x, tuple):
+            return
+        if x[0] == 'call' and x[1] == 'count_lt':
+            a_ = x[2][0] if len(x[2]) >= 1 else None
+            if isinstance(a_, tuple) and a_[0] == 'ident':
+                out_.append(a_[1])
+            return
+        if x[0] == 'not':
+            rec_(x[1])
+        elif x[0] in ('and', 'or'):
+            for c_ in x[1]:
+                rec_(c_)
+    rec_(t)
+    return out_
+
+
+def _tree_guard_parse_a(w):
+    """Parse a guard; unparseable counts as unguarded (None)."""
+    try:
+        return _guard_tree_a(w)
+    except ValueError:
+        return None
+
 def _reach_set19(adj, start, universe):
     seen_ = set()
     stk_ = [start]
@@ -596,7 +627,25 @@ def graph(policy):
                     f'verify stage {st_["id"]} must declare after dependencies'
                 lens_ids_ = [s['id'] for s in n_.get('stages', [])
                              if s.get('role') == 'lens']
-                miss_ = set(lens_ids_) - set(st_['after'])
+                # (F33-3) bare string normalizes to one dep (raw
+                # set(after) split it into a char set); a lens reached
+                # ONLY via another stage's after-chain still counts —
+                # transitive reachability (33rd round, finding 3)
+                af_l_ = (st_['after'] if isinstance(st_['after'], list)
+                         else [st_['after']])
+                dep33_ = {}
+                for s2_ in n_.get('stages', []):
+                    a2_ = s2_.get('after') or []
+                    dep33_[s2_['id']] = a2_ if isinstance(a2_, list) else [a2_]
+                reach33_ = set()
+                stk33_ = list(af_l_)
+                while stk33_:
+                    d33_ = stk33_.pop()
+                    if d33_ in reach33_:
+                        continue
+                    reach33_.add(d33_)
+                    stk33_.extend(dep33_.get(d33_, []))
+                miss_ = set(lens_ids_) - reach33_
                 assert not miss_, \
                     f'verify stage {st_["id"]} must run after ALL lens stages; missing: {sorted(miss_)}'
     # (F29-4) after dependencies must reference DECLARED stage ids
@@ -753,7 +802,8 @@ def graph(policy):
         for b_ in n_['branches']:
             g_ = b_.get('goto')
             w_ = b_.get('when', '')
-            ctrs_in_w = _re19.findall(r'count_lt\s*\(\s*([a-z_][a-z0-9_]*)', w_)
+            _gt33 = _tree_guard_parse_a(w_)
+            ctrs_in_w = _tree_cl_ctrs_a(_gt33) if _gt33 else []
             if g_ and ctrs_in_w:
                 bi_ = n_['branches'].index(b_)
                 guard_ctrs[(n_['id'], g_, bi_)] = ctrs_in_w[0]
@@ -907,49 +957,24 @@ def graph(policy):
                         if b_.get('goto') == w19]
                 for b_ in brs_:
                     wb_ = b_.get('when', '')
-                    if not _re19.search(r'count_lt\s*\(', wb_):
+                    # (F33-1) presence by CALL node — a 'count_lt('
+                    # inside a string literal is not a cap
+                    gt24_ = _tree_guard_parse_a(wb_)
+                    if gt24_ is None or not _tree_cl_ctrs_a(gt24_):
                         raise AssertionError(
                             f'route {u19} branch to {w19} re-enters an '
                             'automatic cycle without a count_lt guard on '
                             'THAT branch (§2.2)')
-                    # (F24-1) guard must hold POSITIVELY — count_lt under
-                    # any negation is an exit condition, not a cap
-                    depth_ = 0
-                    neg_ = False
-                    ok_ = True
-                    instr_ = False
-                    k_ = 0
-                    while k_ < len(wb_):
-                        ch_ = wb_[k_]
-                        if ch_ == '"':
-                            instr_ = not instr_
-                        elif not instr_ and ch_ == '(':
-                            depth_ += 1
-                        elif not instr_ and ch_ == ')':
-                            depth_ -= 1
-                        elif (not instr_ and ch_ == '!'
-                              and not neg_
-                              and _re19.match(r'!\s*count_lt', wb_[k_:])):
-                            neg_ = True
-                        elif (not instr_ and ch_ == '!'
-                              and wb_[k_ + 1:].lstrip().startswith('(')):
-                            d2_ = 0
-                            m2_ = k_ + 1
-                            while m2_ < len(wb_):
-                                if wb_[m2_] == '(':
-                                    d2_ += 1
-                                elif wb_[m2_] == ')':
-                                    d2_ -= 1
-                                    if d2_ == 0:
-                                        break
-                                m2_ += 1
-                            if 'count_lt' in wb_[k_:m2_]:
-                                ok_ = False
-                        k_ += 1
-                    if neg_ or not ok_:
+                    # (F24-1/F33-2) the guard must hold POSITIVELY by
+                    # negation PARITY on the structural tree: count_lt
+                    # under an odd number of !s is an exit condition;
+                    # double negation (!!, !(!x)) is parity-even and
+                    # legal — the raw-text scan rejected it (33rd, fdg 2)
+                    if _tree_neg_cl_a(gt24_):
                         raise AssertionError(
                             f'route {u19} branch to {w19}: count_lt under '
-                            'negation — exit condition, not a re-entry cap (§2.2)')
+                            'odd negation — exit condition, not a '
+                            're-entry cap (§2.2)')
                     # (F25-1) EVERY guard counter bumped on the cycle
                     # path from w19 BACK to u19
                     # (F28-2) per-BRANCH bump credit
@@ -958,9 +983,10 @@ def graph(policy):
                             continue
                         _br27 = nodes[u19]['branches'][_k27[2]]
                         for gc_all in guard_all_ctrs[_k27]:
-                            if gc_all not in _re19.findall(
-                                    r'count_lt\s*\(\s*([a-z_][a-z0-9_]*)',
-                                    _br27.get('when', '')):
+                            _gt27 = _tree_guard_parse_a(
+                                _br27.get('when', ''))
+                            if gc_all not in (_tree_cl_ctrs_a(_gt27)
+                                              if _gt27 else []):
                                 continue
                             b_here_ = any(
                                 a_[0] == 'bump' and a_[1] == gc_all
@@ -1356,6 +1382,79 @@ def main():
             return 'mutant rejected: ' + str(e)
         raise AssertionError('bad graph accepted')
     check('negative control dangling resume', negative_graph)
+
+    # (33-1) fake string-literal cap must be REJECTED
+    def negative_fake_string_cap():
+        mutant = copy.deepcopy(policy)
+        rt = next(n for n in mutant['nodes'] if n['id'] == 'route1')
+        for b_ in rt['branches']:
+            if b_.get('goto') == 'fixdie':
+                b_['when'] = ('any_in(verdicts, ["patch"]) && (true || '
+                              'any_in(verdicts, ["count_lt(fix_rounds,3)"]))')
+        try:
+            graph(mutant)
+        except AssertionError as e:
+            return 'mutant rejected: ' + str(e)
+        raise AssertionError('fake string-cap guard NOT detected (33-1)')
+    check('negative control fake string-literal cap', negative_fake_string_cap)
+
+    # (33-2) legal double negation (parity-even) must be ACCEPTED
+    def negative_double_negation():
+        mutant = copy.deepcopy(policy)
+        rt = next(n for n in mutant['nodes'] if n['id'] == 'route1')
+        hit = False
+        for b_ in rt['branches']:
+            if b_.get('goto') == 'fixdie' and \
+                    'count_lt(fix_rounds, 3)' in b_.get('when', ''):
+                b_['when'] = b_['when'].replace(
+                    'count_lt(fix_rounds, 3)', '!!count_lt(fix_rounds, 3)')
+                hit = True
+        assert hit, '33-2 pin failed to mutate the pack'
+        try:
+            graph(mutant)
+            return 'legal double-negation cap accepted'
+        except AssertionError as e:
+            raise AssertionError('legal double-negation cap rejected: ' + str(e))
+    check('negative control legal double negation', negative_double_negation)
+
+    # (33-3) bare-string after + transitive lens deps must be ACCEPTED
+    def negative_after_string_transitive():
+        mutant = copy.deepcopy(policy)
+        for n_ in mutant['nodes']:
+            for st_ in n_.get('stages', []) or []:
+                if st_.get('role') == 'verify':
+                    # edge reached transitively via claims.after='edge'
+                    st_['after'] = ['verif', 'claims']
+        try:
+            graph(mutant)
+            return 'normalized/transitive after accepted'
+        except AssertionError as e:
+            raise AssertionError('normalized/transitive after rejected: ' + str(e))
+    check('negative control after string+transitive', negative_after_string_transitive)
+
+    # (33-4) unregistered kind / duplicate id must be REJECTED
+    def negative_alien_kind():
+        mutant = copy.deepcopy(policy)
+        mutant['nodes'].append({'id': 'alien', 'kind': 'custom'})
+        try:
+            graph(mutant)
+        except AssertionError as e:
+            return 'mutant rejected: ' + str(e)
+        raise AssertionError('unregistered node kind NOT detected (33-4)')
+    check('negative control unregistered node kind', negative_alien_kind)
+
+    def negative_duplicate_id():
+        mutant = copy.deepcopy(policy)
+        mutant['nodes'].append({'id': 'pass', 'kind': 'emit',
+                                'event': 'InspectionPassed',
+                                'payload_from': 'summary'})
+        try:
+            graph(mutant)
+        except AssertionError as e:
+            return 'mutant rejected: ' + str(e)
+        raise AssertionError('duplicate node id NOT detected (33-4)')
+    check('negative control duplicate node id', negative_duplicate_id)
+
     print('SCOPE: declarative model; no live engine/subagent execution. Prompt compliance and actual session reuse are not proven.')
     print(f'RESULT: {"FAIL" if failures else "PASS"}; {len(failures)} failed checks')
     return bool(failures)
