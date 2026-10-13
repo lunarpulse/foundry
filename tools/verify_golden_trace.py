@@ -2260,8 +2260,7 @@ def contract_checks(doc):
                             _depth -= 1
                         elif (not _in_str and _ch == "!"
                               and not _negated
-                              and w_b[_k:_k + 8].replace(" ", "")
-                              .startswith("!count_lt")):
+                              and re.match(r"!\s*count_lt", w_b[_k:])):
                             _negated = True
                         elif (not _in_str and _ch == "!"
                               and w_b[_k + 1:].lstrip().startswith("(")):
@@ -2361,6 +2360,19 @@ def contract_checks(doc):
                                 f"{_bumpers} AND route nodes "
                                 f"{_route_bumpers} — double increment "
                                 "per traversal (§2.3)")
+                        # (F26-1) route+route double increment: the
+                        # guarding route's own branch bump is the ONE
+                        # increment; any OTHER route inside the cycle
+                        # bumping the same counter doubles it
+                        _other_routes = [
+                            x for x in _route_bumpers if x != u]
+                        if len(_route_bumpers) - (1 if u in _route_bumpers else 0) > 1 or (
+                                len(_route_bumpers) >= 1 and _other_routes and u in _route_bumpers and len(_route_bumpers) > 1):
+                            raise AssertionError(
+                                f"automatic cycle {_sccs[_scc_of[u]]}: "
+                                f"counter {gc2!r} bumped by multiple route "
+                                f"nodes {_route_bumpers} — double "
+                                "increment per traversal (§2.3)")
 # (F18-1) defer contract: if any route branch mentions the
     # 'defer' verdict, the pack MUST declare a 'deferred' output and
     # no two schema outputs may share a 'from' source column
@@ -2405,6 +2417,11 @@ def contract_checks(doc):
     for ps in doc.get("pack_stages", []) or []:
         if isinstance(ps.get("after"), str):
             ps["after"] = [ps["after"]]
+    # (F26-3) entry must be a DISPATCH node (§2.3)
+    _entry = doc.get("entry")
+    _entry_n = _node_ids.get(_entry) if _entry else None
+    assert _entry_n is not None and _entry_n["kind"] == "dispatch", \
+        f"entry { _entry!r} must reference a dispatch node"
     # (F17-1b) on_done is mandatory on dispatch AND redrive nodes —
     # unused nodes included (load-time schema completeness)
     for n in doc["nodes"]:

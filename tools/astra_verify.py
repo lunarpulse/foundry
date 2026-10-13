@@ -258,6 +258,10 @@ def _outs19(n):
 
 def graph(policy):
     nodes = {n['id']: n for n in policy['nodes']}
+    # (F26-3) entry must be a DISPATCH node (§2.3)
+    _ent = nodes.get(policy.get('entry'))
+    assert _ent is not None and _ent['kind'] == 'dispatch', \
+        f"entry {policy.get('entry')!r} must reference a dispatch node"
     assert len(nodes) == len(policy['nodes']), 'duplicate node IDs'
     assert policy['entry'] in nodes, 'missing entry'
     stages = {s['id'] for s in policy.get('pack_stages', [])}
@@ -538,7 +542,7 @@ def graph(policy):
                             depth_ -= 1
                         elif (not instr_ and ch_ == '!'
                               and not neg_
-                              and wb_[k_:k_ + 8].replace(' ', '').startswith('!count_lt')):
+                              and _re19.match(r'!\s*count_lt', wb_[k_:])):
                             neg_ = True
                         elif (not instr_ and ch_ == '!'
                               and wb_[k_ + 1:].lstrip().startswith('(')):
@@ -614,6 +618,11 @@ def graph(policy):
                                 f'automatic cycle: counter {gc2_!r} bumped by '
                                 f'redrive {bumpers_} AND route {rbumpers_} — '
                                 'double increment per traversal (§2.3)')
+                        if len(rbumpers_) > 1:
+                            raise AssertionError(
+                                f'automatic cycle: counter {gc2_!r} bumped by '
+                                f'multiple route nodes {rbumpers_} — double '
+                                'increment per traversal (§2.3)')
     # (F8-2) resume/route edges must form a DAG after removing deduct
     non_deduct_ = {i for i, n in nodes.items()
                    if n['kind'] not in ('dispatch', 'redrive')}
