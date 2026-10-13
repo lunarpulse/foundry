@@ -581,15 +581,19 @@ def graph(policy):
                             'negation — exit condition, not a re-entry cap (§2.2)')
                     # (F25-1) EVERY guard counter bumped on the cycle
                     # path from w19 BACK to u19
-                    _ga27 = set()
-                    for _k27, _v27 in guard_all_ctrs.items():
-                        if _k27[0] == u19 and _k27[1] == w19:
-                            _ga27 |= _v27
-                    for gc_all in _ga27:
-                        b_here_ = any(
-                            a_[0] == 'bump' and a_[1] == gc_all
-                            for b2_ in brs_
-                            for a_ in actions(b2_.get('do'), {'counters': {}, 'events': []}))
+                    # (F28-2) per-BRANCH bump credit
+                    for _k27 in guard_all_ctrs:
+                        if not (_k27[0] == u19 and _k27[1] == w19):
+                            continue
+                        _br27 = nodes[u19]['branches'][_k27[2]]
+                        for gc_all in guard_all_ctrs[_k27]:
+                            if gc_all not in _re19.findall(
+                                    r'count_lt\s*\(\s*([a-z_][a-z0-9_]*)',
+                                    _br27.get('when', '')):
+                                continue
+                            b_here_ = any(
+                                a_[0] == 'bump' and a_[1] == gc_all
+                                for a_ in actions(_br27.get('do'), {'counters': {}, 'events': []}))
                         b_node_ = (nodes[w19].get('kind') == 'redrive'
                                    and nodes[w19].get('bump') == gc_all)
                         reach_ = set()
@@ -654,7 +658,9 @@ def graph(policy):
                                     continue
                                 ab_ = ob_ in _reach_set19(auto_adj, oa_, comp_ - {u19})
                                 ba_ = oa_ in _reach_set19(auto_adj, ob_, comp_ - {u19})
-                                if ab_ and ba_:
+                                # (F28-1) serial one-directional reach
+                                # also runs both bumps in one traversal
+                                if ab_ or ba_:
                                     raise AssertionError(
                                         f'automatic cycle: counter {gc2_!r} '
                                         f'bumped by co-reachable nodes '

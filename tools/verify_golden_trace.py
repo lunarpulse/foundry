@@ -1064,7 +1064,7 @@ def sweep_rejection_fixtures():
         # verdict universe from any_in samples
         uni = []
         for m in _re.finditer(r'any_in\s*\(\s*verdicts\s*,\s*\[(.*?)\]\s*\)', w):
-            uni += _re.findall(r'"([^"]+)"', m.group(1))
+            uni += re.findall(r'"([^"]+)"', m.group(1))
         uni = sorted(set(uni))
         if len(uni) > 12:
             raise AssertionError(  # resource bound: fail, never trust
@@ -2307,15 +2307,22 @@ def contract_checks(doc):
                     # count_lt whose counter never increments keeps the
                     # disjunct true forever (count_lt(a,3) ||
                     # count_lt(loopbacks,5) with loopbacks stuck at 0)
-                    _ga27 = set()
-                    for _k27, _v27 in _guard_all_ctrs.items():
-                        if _k27[0] == u and _k27[1] == w:
-                            _ga27 |= _v27
-                    for gc_all in _ga27:
-                        _b_here = any(
-                            a[0] == "bump" and a[1] == gc_all
-                            for br2 in _brs
-                            for a in _parse_actions_top(br2.get("do")))
+                    # (F28-2) per-BRANCH: each branch whose own when
+                    # mentions gc_all must bump it on ITS do (or the
+                    # entered node / return path) — a LATER branch's
+                    # bump must not credit an EARLIER branch's guard
+                    for _k27 in _guard_all_ctrs:
+                        if not (_k27[0] == u and _k27[1] == w):
+                            continue
+                        _br27 = _node_ids[u]["branches"][_k27[2]]
+                        for gc_all in _guard_all_ctrs[_k27]:
+                            if gc_all not in re.findall(
+                                    r"count_lt\s*\(\s*([a-z_][a-z0-9_]*)",
+                                    _br27.get("when", "")):
+                                continue  # not this branch's counter
+                            _b_here = any(
+                                a[0] == "bump" and a[1] == gc_all
+                                for a in _parse_actions_top(_br27.get("do")))
                         _b_node = (_node_ids[w].get("kind") == "redrive"
                                    and _node_ids[w].get("bump") == gc_all)
                         # (F25-1a) bump credited only on nodes that
@@ -2397,12 +2404,17 @@ def contract_checks(doc):
                             _rba = _reach_set(_full_adj, _ob, _comp - {u})
                             _ab = _ob in _rab
                             _ba = _oa in _rba
-                            if _ab and _ba:
+                            # (F28-1) one-directional reachability is
+                            # enough: a SERIAL chain a->b runs both bumps
+                            # in one traversal; only mutually UNreachable
+                            # (exclusive alternate) owners are legal
+                            if _ab or _ba:
                                 raise AssertionError(
                                     f"automatic cycle {sorted(_comp)}: "
-                                    f"counter {gc2!r} bumped by co-reachable "
-                                    f"nodes {_oa},{_ob} — more than one "
-                                    "increment per traversal (§2.3)")
+                                    f"counter {gc2!r} bumped by serial/"
+                                    f"co-reachable nodes {_oa},{_ob} — "
+                                    "more than one increment per "
+                                    "traversal (§2.3)")
 
 # (F18-1) defer contract: if any route branch mentions the
     # 'defer' verdict, the pack MUST declare a 'deferred' output and
