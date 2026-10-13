@@ -80,6 +80,7 @@ PASS negative control duplicate node id: mutant rejected: duplicate node IDs
 PASS negative control De Morgan cap: mutant rejected: route route1 branch to fixdie: guard does not enforce the declared cap for counter(s) ['fix_rounds'] — De Morgan-neutralized or non-binding count_lt (§2.2)
 PASS negative control OR-added bypass: mutant rejected: route route1 branch to fixdie: guard does not enforce the declared cap for counter(s) ['fix_rounds'] — De Morgan-neutralized or non-binding count_lt (§2.2)
 PASS negative control schema from/name duplicate: from/name/rename duplicates rejected
+PASS negative control schema nested/empty-from: nested + empty-from duplicates rejected
 PASS negative control empty-string verdict: mutant rejected: route route1 branch to fixdie: guard does not enforce the declared cap for counter(s) ['fix_rounds'] — De Morgan-neutralized or non-binding count_lt (§2.2)
 PASS negative control findings-based cap bypass: mutant rejected: route route1 branch to fixdie: guard does not enforce the declared cap for counter(s) ['fix_rounds'] — De Morgan-neutralized or non-binding count_lt (§2.2)
 SCOPE: declarative model; no live engine/subagent execution. Prompt compliance and actual session reuse are not proven.

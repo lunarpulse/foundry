@@ -589,9 +589,9 @@ def schema_output_uniqueness(pack_dir=None, files=None):
     if files is None:
         assert pack_dir is not None
         files = {}
-        for p_ in sorted(pack_dir.iterdir()):
-            if p_.name.endswith('.toml'):
-                files[p_.name] = p_.read_text()
+        # (F36-1) recursive: subdirectory schemas evaded flat iterdir
+        for p_ in sorted(pack_dir.rglob('*.toml')):
+            files[str(p_.relative_to(pack_dir))] = p_.read_text()
     froms_ = []
     names_ = []
     for f_ in sorted(files):
@@ -604,7 +604,12 @@ def schema_output_uniqueness(pack_dir=None, files=None):
         for o_ in outs_:
             froms_.append(o_.get('from'))
             names_.append(o_.get('name'))
-    nn_ = [x for x in froms_ if x]
+    nn_ = [x for x in froms_ if x is not None]
+    # (F36-2) empty-string from is NOT null — the truthy filter `if x`
+    # let duplicate from="" columns through both verifiers
+    empty_f = sorted({x for x in nn_ if x == ''})
+    assert not empty_f, \
+        f"empty-string 'from' columns across schema outputs: {empty_f}"
     dup_f = sorted({x for x in nn_ if nn_.count(x) > 1})
     assert not dup_f, f"duplicate 'from' columns across schema outputs: {dup_f}"
     dup_n = sorted({x for x in names_ if names_.count(x) > 1})
@@ -1700,6 +1705,35 @@ def main():
                 f'{mode_} schema mutant NOT detected (34-2/35-3)')
         return 'from/name/rename duplicates rejected'
     check('negative control schema from/name duplicate', negative_schema_dup)
+
+    # (F36-1/F36-2) subdirectory schemas and from="" must be covered
+    def negative_schema_nested_empty():
+        files_ = {str(p_.relative_to(args.pack)): p_.read_text()
+                  for p_ in sorted(args.pack.rglob('*.toml'))}
+        f1_ = dict(files_)
+        f1_['nested/mapping.toml'] = ('[[output]]\nname = "carried_rows"\n'
+                                      'from = "triage_log_rows"\n')
+        try:
+            schema_output_uniqueness(files=f1_)
+        except AssertionError as e:
+            assert 'across schema outputs' in str(e), f'wrong failure: {e}'
+        else:
+            raise AssertionError(
+                'nested-dir schema duplicate NOT detected (36-1)')
+        f2_ = dict(files_)
+        f2_['schema-triage.toml'] = f2_['schema-triage.toml'] + (
+            '\n[[output]]\nname = "extra_one"\nfrom = ""\n'
+            '[[output]]\nname = "extra_two"\nfrom = ""\n')
+        try:
+            schema_output_uniqueness(files=f2_)
+        except AssertionError as e:
+            assert "empty-string 'from' columns" in str(e), \
+                f'wrong failure: {e}'
+        else:
+            raise AssertionError(
+                'empty-string from duplicate NOT detected (36-2)')
+        return 'nested + empty-from duplicates rejected'
+    check('negative control schema nested/empty-from', negative_schema_nested_empty)
 
     # (35-1) empty-string verdict bypass must be REJECTED
     def negative_empty_string_verdict():

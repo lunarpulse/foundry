@@ -951,6 +951,27 @@ def contract_negative_controls(doc):
         raise AssertionError("empty-string verdict mutant NOT detected (35-1)")
     except AssertionError as e:
         assert "enforce the declared cap" in str(e), f"wrong failure: {e}"
+    # (F36-1/F36-2) schema uniqueness must reach SUBDIRECTORY schemas
+    # and treat from="" as non-null
+    _f36 = dict(_files35)
+    _f36["nested/mapping.toml"] = (
+        "[[output]]\nname = \"carried_rows\"\n"
+        "from = \"triage_log_rows\"\n")
+    try:
+        _schema_output_uniqueness(files=_f36)
+        raise AssertionError("nested-dir schema duplicate NOT detected (36-1)")
+    except AssertionError as e:
+        assert "across schema outputs" in str(e), f"wrong failure: {e}"
+    _f36b = dict(_files35)
+    _f36b["schema-triage.toml"] = _f36b["schema-triage.toml"] + (
+        "\n[[output]]\nname = \"extra_one\"\nfrom = \"\"\n"
+        "[[output]]\nname = \"extra_two\"\nfrom = \"\"\n")
+    try:
+        _schema_output_uniqueness(files=_f36b)
+        raise AssertionError("empty-string from duplicate NOT detected (36-2)")
+    except AssertionError as e:
+        assert "empty-string 'from' columns" in str(e), \
+            f"wrong failure: {e}"
 
 
 def example_pack_identity():
@@ -2154,10 +2175,16 @@ def _schema_output_uniqueness(pack_dir=None, files=None):
     file that declares [[output]] tables. `files` = in-memory
     {name: text} override (read-only-sandbox regression pins)."""
     if files is None:
+        assert pack_dir is not None
         files = {}
-        for sf in sorted(os.listdir(pack_dir)):
-            if sf.endswith(".toml"):
-                files[sf] = open(f"{pack_dir}/{sf}", encoding="utf-8").read()
+        # (F36-1) recursive: a schema declared in a SUBDIRECTORY
+        # (nested/mapping.toml) evaded the flat listdir/iterdir scan
+        for root, _dirs, fs in os.walk(pack_dir):
+            for sf in sorted(fs):
+                if sf.endswith(".toml"):
+                    rp = os.path.relpath(os.path.join(root, sf), pack_dir)
+                    files[rp] = open(os.path.join(root, sf),
+                                     encoding="utf-8").read()
     froms = []
     names = []
     for sf in sorted(files):
@@ -2170,7 +2197,12 @@ def _schema_output_uniqueness(pack_dir=None, files=None):
         for o in outs:
             froms.append(o.get("from"))
             names.append(o.get("name"))
-    non_null = [f for f in froms if f]
+    non_null = [f for f in froms if f is not None]
+    # (F36-2) empty-string from is NOT null — the truthy filter `if f`
+    # let duplicate from="" columns through both verifiers
+    empty_f = sorted({f for f in non_null if f == ""})
+    assert not empty_f, \
+        f"empty-string 'from' columns across schema outputs: {empty_f}"
     dup_f = sorted({x for x in non_null if non_null.count(x) > 1})
     assert not dup_f, f"duplicate 'from' columns across schema outputs: {dup_f}"
     dup_n = sorted({x for x in names if names.count(x) > 1})

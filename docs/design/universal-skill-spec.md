@@ -1,6 +1,17 @@
 # Foundry Universal Skill Spec — 범용 실행 모델 (Universal Review Engine)
 
-- **버전**: v0.70 (2026-10-14) — 35차 최종 검증 반영.
+- **버전**: v0.71 (2026-10-14) — 36차 최종 검증 반영·**동결(FROZEN)**.
+  스키마 파일 수집의 재귀화(유일성 검사 대상을 팩 전체 재귀 탐색의
+  *.toml로 — 하위 디렉터리 nested/mapping.toml이 평면 스캔을 우회했던
+  verifier gap 폐쇄)·`from=""`의 비null 취급(빈 문자열은 null이 아니므로
+  유일성 대상 포함 + 빈 칼럼명 자체 거부 — truthy 필터가 빈 문자열
+  중복을 놓쳤던 gap 폐쇄)·**계약 경계 조항 신설**(BMad 팩 인수시험
+  전용 계약 — 노드 ID·verdict 어휘·상한 수치·defer→deferred 의무·
+  기대 trace — 은 검증 하니스 소유로 Rust 도메인에 이식하지 않고,
+  범용 로더·실행기 규범은 방법론 고유 어휘零의 구조 계약만 포함).
+  회귀 핀 +1(nested/empty-from 동시 검사). B안 유한 중단(34~36차
+  3라운드) 소진으로 본 버전을 동결한다 — 이후 결함은 구현 단계
+  검증 라운드(M8 인수시험)가 소유한다. 35차:
   문자열 표본의 AST 리터럴 추출(상태공간 verdict 우주를 파서 트리의
   리스트 리터럴에서 수집 — 빈 문자열 "" 포함. 원시 정규식 [^"]+가 ""
   를 누락해 any_in(verdicts, [""]) De Morgan 대안이 상한 검사를 우회했
@@ -58,7 +69,8 @@
   **emit 이벤트 집합은 InspectionPassed|InspectionFailed 폐쇄** —
   스키마 출력 선언으로 확장 불가.
 - `pack_stages`의 role도 폐쇄 집합 lens|verify|replan (등록 스테이지 동일 규칙).
-- **defer 계약**: route가 defer verdict를 참조하면 팩은 `deferred` 출력을
+- **defer 계약(BMad 팩 인수시험 전용 — 36차 경계 확정)**: route가 defer
+  verdict를 참조하면 팩은 `deferred` 출력을
   선언해야 하고, 전 스키마 출력의 `from` 칼럼은 유일해야 한다. 칼럼
   라벨의 **의미**(어떤 항목이 deferred로 기록되는가)는 로드 검증 영역이
   아니라 **digest 핀+골든 트레이스(A.3)** 의 구현 인수 조건이다 — 칼럼명은
@@ -68,7 +80,27 @@
   어휘와 무관 — 특정 verdict 문자열의 등장 여부로 게이트하면 그 어휘를
   쓰지 않는 팩이 검사를 통째로 스킵한다). emit `payload_from`·스키마
   `schema`·`when`의 참조 해석은 digest 핀과 골든 트레이스가 소유한다.
+- **스키마 파일 수집(36차)**: 유일성 검사의 수집 범위는 팩 전체
+  **재귀** 탐색의 모든 `*.toml` 중 `[[output]]` 배열을 선언한 파일
+  (하위 디렉터리 포함 — 평면 스캔이 `nested/mapping.toml`을 놓쳤던
+  verifier gap 폐쇄). `from=""`은 null이 **아니므로** 유일성 검사
+  대상에 포함되고, 빈 칼럼명 자체가 거부된다.
 - emit의 payload_from은 팩 스키마가 선언한 출력(또는 summary)만 참조.
+- **계약 경계 — BMad 팩 인수시험 전용 vs 범용 로더 규범(36차)**:
+  동결 시점에 다음 구분이 확정된다.
+  - **BMad 팩 인수시험 전용(Verification harness 소유 — Rust 도메인에
+    이식하지 않는다)**: 노드 ID(`route1`·`fixdie`·`replan_full` 등)·
+    스테이지(`edge/claims`, `trace`)·verdict 어휘(`patch`·`defer` 등)·
+    상한 수치(3·5)·**`defer` verdict 사용 시 `deferred` 출력 선언 의무**·
+    원본 기대 trace(A.1/A.2/A.3 전사·digest 핀). 이들은 정규 팩
+    `bmad-review-full/v1`의 인수 조건이지 엔진 계약이 아니다.
+  - **범용 로더·실행기 규범(Rust 도메인으로 이식되는 전부)**: 폐쇄
+    노드종(dispatch|route|redrive|emit|hold)·폐쇄 이벤트 집합·문법·
+    타입(u64 카운터·bool 플래그)·참조 유해성·출력 name/`from` 유일성
+    (재귀 수집·빈 문자열 포함)·provenance·의존 순환 금지·카운터 상한
+    강제(의미론 판정)·증가 규칙·예산·선언된 출력·side_records 처리.
+    이 계층에는 어떤 방법론 고유 어휘(ID·verdict·상한 수치)도
+    등장하지 않는다.
 - 현재 PASS는 **선언적 모델 검증** — 실제 세션 계승·원자성·fencing·엔진 diff 0의
   실행 증명은 구현 단계(§4)의 인수 조건이다.
 
