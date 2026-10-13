@@ -517,12 +517,18 @@ def sweep_rejection_fixtures():
         assert exp == EXPECTED[name], \
             f"{name}: expected {EXPECTED[name]!r}, found {exp!r}"
         tl.load(open(f"{base}/{name}/policy.toml", "rb"))  # parses
-        # (r22-MINOR) manifest digest over ORIGINAL bytes — except the
-        # intended byte-format violations 08/09 and key-format 07
-        if name not in ("07-quoted-digest-key", "08-crlf-manifest",
-                        "09-no-trailing-lf"):
+        # (r22-MINOR, r25-MINOR) manifest digest over ORIGINAL bytes.
+        # 07 (key format) and 09 (no trailing LF): digest line and the
+        # offending form are normalized ONLY for the digest computation
+        # (lens/policy bytes hashed as-is — tampering breaks it).
+        # 08 already verified separately below with CRLF bytes.
+        if name != "08-crlf-manifest":
             raw = open(f"{base}/{name}/manifest.toml", "rb").read()
             man = raw.decode()
+            if name == "07-quoted-digest-key":
+                man = man.replace('"digest" =', "digest =")
+            if name == "09-no-trailing-lf":
+                man = man + "\n"
             dl = [l for l in man.splitlines(True) if l.startswith("digest =")]
             assert dl, f"{name}: no digest line"
             files_ = {"lens-a.md": open(f"{base}/{name}/lens-a.md", "rb").read(),
@@ -625,16 +631,16 @@ def sweep_rejection_fixtures():
             for combo in itertools.product(*[
                     opts if opts else [None] for opts in route_options]):
                 tot = dict(node_bumps)
-                guard = None
+                guards = set()
                 for br in combo:
                     if br is None:
                         continue
                     w = br.get("when") or ""
-                    m2 = re.search(r"count_lt[(]([A-Za-z_]\w*)", w)
-                    if m2:
-                        guard = m2.group(1)
+                    for m2 in re.finditer(
+                            r"count_lt[(]([A-Za-z_]\w*)", w):
+                        guards.add(m2.group(1))
                     _merge(tot, _bumps_in(br.get("do")))
-                traversals.append((guard, tot))
+                traversals.append((guards, tot))
             results.append(traversals)
         return results
 
@@ -699,17 +705,42 @@ def sweep_rejection_fixtures():
                 n["payload"] = "findings"
         return pol
 
+    def _reachable_ids(pol):
+        """(r25-2) node ids reachable from entry (on_done/goto edges;
+        hold resumes count as possible continuations)."""
+        entry = pol.get("entry")
+        nmap = {n["id"]: n for n in pol["nodes"]}
+        seen, stack = set(), [entry]
+        while stack:
+            nid = stack.pop()
+            if nid in seen or nid not in nmap:
+                continue
+            seen.add(nid)
+            n = nmap[nid]
+            if n["kind"] == "route":
+                stack += [b.get("goto") for b in n.get("branches", [])
+                          if b.get("goto")]
+            elif n["kind"] in ("dispatch", "redrive"):
+                if n.get("on_done"):
+                    stack.append(n["on_done"])
+            elif n["kind"] == "hold":
+                stack += n.get("resume_targets", [])
+        return seen
+
     def _has_04_verdicts_no_verify(pol):
-        # (r24-2) provenance: verdicts / findings / has_findings —
-        # raw lens output used without a verify stage producing it
-        has_verify = any(n.get("kind") == "dispatch"
+        # (r25-2) provenance: verdicts / findings / has_findings —
+        # raw lens output used without a REACHABLE verify stage
+        # producing it (an unreachable verify does not bless the flow)
+        reach = _reachable_ids(pol)
+        nmap = {n["id"]: n for n in pol["nodes"]}
+        has_verify = any(nid in reach and nmap[nid].get("kind") == "dispatch"
                          and any(st.get("role") == "verify"
-                                 for st in n.get("stages", []))
-                         for n in pol["nodes"])
+                                 for st in nmap[nid].get("stages", []))
+                         for nid in reach)
         if has_verify:
             return False
         for n in pol["nodes"]:
-            if n["kind"] == "route":
+            if n["kind"] == "route" and n["id"] in reach:
                 for br in n.get("branches", []):
                     w = br.get("when") or ""
                     stripped = re.sub(r'"[^"]*"', '""', w)
@@ -751,6 +782,18 @@ def sweep_rejection_fixtures():
     # 04 semantic regressions (r23-3): string-literal verdicts alone is
     # NOT a verdicts ref — but findings IS a provenance ref either way
     pol04 = tl.load(open(f"{base}/04-verdicts-no-verify/policy.toml", "rb"))
+    # (r25-2) unreachable verify must NOT bless the flow
+    unreach = copy.deepcopy(pol04)
+    unreach["nodes"].append({
+        "id": "orphan", "kind": "dispatch",
+        "stages": [{"id": "v", "lenses": ["lens-a.md"], "role": "verify"}],
+        "on_done": "done2", "hold_target": "end_hold",
+    })
+    unreach["nodes"].append({"id": "done2", "kind": "route",
+                             "branches": [{"when": "true",
+                                           "do": "emit(InspectionPassed, summary)"}]})
+    assert _has_04_verdicts_no_verify(unreach), \
+        "04: unreachable verify must not clear the provenance violation"
     str_lit = copy.deepcopy(pol04)
     for n in str_lit["nodes"]:
         if n["kind"] == "route":
@@ -782,19 +825,24 @@ def sweep_rejection_fixtures():
         pol = tl.load(open(f"{base}/{fname}/policy.toml", "rb"))
         results = _cycle_counter_analysis(pol)
         assert results, f"{fname}: no cycle found"
-        guarded = [(g, t) for travs in results for g, t in travs
-                   if g is not None]
-        assert guarded, f"{fname}: no guarded cycle found: {results}"
+        flat = [(g, t) for travs in results for g, t in travs]
+        # every traversal must carry >=1 guard — an unguarded AUTO cycle
+        # (always re-enters) is itself a violation
+        assert all(g for g, t in flat), \
+            f"{fname}: unguarded auto-cycle traversal present: {flat}"
         if fname.endswith("missing"):
-            assert all(t.get(g, 0) == 0 for g, t in guarded), \
-                f"{fname}: expected 0 guard-bumps/traversal: {guarded}"
+            # every guard of every traversal is bumped 0 times
+            assert all(t.get(c, 0) == 0 for g, t in flat for c in g), \
+                f"{fname}: expected 0 guard-bumps/traversal: {flat}"
         elif fname.endswith("double"):
-            assert all(t.get(g, 0) >= 2 for g, t in guarded), \
-                f"{fname}: expected >=2 guard-bumps/traversal: {guarded}"
+            # every traversal bumps EVERY guard >= 2 times
+            assert all(t.get(c, 0) >= 2 for g, t in flat for c in g), \
+                f"{fname}: expected >=2 guard-bumps/traversal: {flat}"
         else:
-            assert all(t.get("loopbacks", 0) == 0 and any(t.values())
-                       for g, t in guarded if g == "loopbacks"), \
-                f"{fname}: expected loopbacks never bumped: {guarded}"
+            # at least one guard never bumped while another counter is
+            assert all(any(t.get(c, 0) == 0 for c in g) and any(t.values())
+                       for g, t in flat), \
+                f"{fname}: expected an unbumped guard per traversal: {flat}"
         # branch-exclusivity regression (r22-1): splitting the node bump
         # into two same-target branches must NOT read as double
         if fname.endswith("double"):
@@ -823,8 +871,8 @@ def sweep_rejection_fixtures():
                     fx = [b for b in n["branches"] if b.get("goto") == "fix"]
                     assert len(fx) == 2, f"regression needs 2 fix branches, got {len(fx)}"
             res2 = _cycle_counter_analysis(excl)
-            g2 = [(g, t) for travs in res2 for g, t in travs if g is not None]
-            assert g2 and all(t.get(g, 0) == 1 for g, t in g2), \
+            g2 = [(g, t) for travs in res2 for g, t in travs]
+            assert g2 and all(t.get(c, 0) == 1 for g, t in g2 for c in g), \
                 f"{fname}: exclusive split must be 1/traversal: {g2}"
             # double action in ONE branch = 2 (r23-2)
             dbl = copy.deepcopy(pol)
@@ -836,8 +884,8 @@ def sweep_rejection_fixtures():
                         if br.get("goto") == "fix":
                             br["do"] = "bump(loopbacks); bump(loopbacks)"
             res3 = _cycle_counter_analysis(dbl)
-            g3 = [(g, t) for travs in res3 for g, t in travs if g is not None]
-            assert g3 and all(t.get(g, 0) == 2 for g, t in g3), \
+            g3 = [(g, t) for travs in res3 for g, t in travs]
+            assert g3 and all(t.get(c, 0) == 2 for g, t in g3 for c in g), \
                 f"{fname}: single-branch double bump must be 2/traversal: {g3}"
         # cycle-removal mutation clears the analysis
         mut = copy.deepcopy(pol)
@@ -846,6 +894,20 @@ def sweep_rejection_fixtures():
                 n["on_done"] = "end_hold"
         assert not _cycle_counter_analysis(mut), \
             f"{fname}: cycle-removal must clear the analysis"
+        # (r25-1) multi-guard regression: two guards on one branch,
+        # only loopbacks bumped — fix_rounds guard is unbumped so the
+        # analysis must still see a violation-shaped traversal
+        mg = copy.deepcopy(pol)
+        for n in mg["nodes"]:
+            if n.get("kind") == "route":
+                for br in n.get("branches", []):
+                    if br.get("goto") == "fix" and "count_lt(" in (br.get("when") or ""):
+                        br["when"] = \
+                            "count_lt(loopbacks, 5) && count_lt(fix_rounds, 3)"
+        mres = _cycle_counter_analysis(mg)
+        mflat = [(g, t) for travs in mres for g, t in travs]
+        assert all(len(g) == 2 for g, t in mflat if g), \
+            f"{fname}: multi-guard branch must preserve BOTH guards: {mflat}"
 
     # (r22-3) fixture 07: quoted digest key as a real TOML KEY TOKEN —
     # a line starting with "digest" (comments stripped), not a mention
