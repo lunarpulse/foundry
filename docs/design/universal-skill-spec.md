@@ -1,7 +1,7 @@
 # Foundry Universal Skill Spec — 범용 실행 모델 (Universal Review Engine)
 
-- **버전**: v0.50 (2026-10-12) — 15차 최종 검증 반영.
-  emit 액션 이벤트·payload 검증·revert-then-emit/비emit dead-end 금지·redrive on_done·base enum·astra 프로브 선언 카운터 주입.
+- **버전**: v0.51 (2026-10-12) — 16차 최종 검증 반영.
+  비emit 분기 goto 필수·노드 간 revert→emit 로드 거부(hold 경유 합법)·astra on_redrive_error 필수·hold_target hold-kind 검사·hold 표 timeout_s.
 - **의도(소유자)**: Foundry는 어떤 방법론도 돌릴 수 있는 유니버설
   플랫폼. BMad는 스킬 데이터의 첫 고객. **Rust 도메인에 방법론
   코드가 박히는 순간이 실패.** 엔진 고정·확장 선언(procedural macro
@@ -284,7 +284,7 @@ do_seq   := action ( ';' action )*     ; emit은 전 시퀀스에 최대 1회
   | route | branches(마지막 원소 when="true") | — | on_done |
   | redrive | target, payload, on_done, hold_target, on_redrive_error(hold\|fail-run) | pre_stage, base("latest"\|"origin", 기본 latest), bump(비루프백 fix 루프용 — 노드 필드) | — |
   | emit | event, payload_from | — | on_done(HALT 암시) |
-  | hold | resume_targets | notify_only | on_done |
+  | hold | resume_targets | notify_only, timeout_s(양의 정수) | on_done |
   branch(r9-3 종단 규칙, r16-4): **do에 emit이 있으면 goto 금지**(emit
   후 HALT). **emit 없는 bump/revert 시퀀스면 goto 필수**. do 내 emit이
   2회면 **E_MULTI_EMIT 우선 판정**(그 자체가 정확히 그 위반 — "첫 emit

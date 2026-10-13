@@ -273,6 +273,8 @@ def graph(policy):
                 f'redrive {n["id"]} missing target (§2.3)'
             assert n.get('on_done'), \
                 f'redrive {n["id"]} missing on_done (§2.3)'
+            assert n.get('on_redrive_error') is not None, \
+                f'redrive {n["id"]} missing on_redrive_error (§2.3)'
             if 'base' in n:
                 assert n['base'] in ('origin', 'latest'), \
                     f'redrive {n["id"]} base {n["base"]!r} invalid'
@@ -402,6 +404,36 @@ def graph(policy):
     for v_ in non_deduct_:
         if state_.get(v_, 0) == 0:
             assert dfs_(v_), 'hold/route graph has a cycle after deduct removal (§2.4b)'
+
+
+    # (F16-2) cross-node revert->emit: a revert action's goto chain
+    # must not reach an emit without passing a hold (re-verification)
+    def reaches_emit(start, seen=None):
+        if seen is None:
+            seen = set()
+        if start in seen or start not in nodes:
+            return False
+        seen.add(start)
+        nd = nodes[start]
+        if nd['kind'] == 'emit':
+            return True
+        if nd['kind'] == 'route':
+            for br_ in nd['branches']:
+                if br_.get('goto') and reaches_emit(br_['goto'], seen):
+                    return True
+                for a_ in actions(br_.get('do'), {'counters': {}, 'events': []}):
+                    if a_[0] == 'emit' and not br_.get('goto'):
+                        return True
+        if nd['kind'] in ('dispatch', 'redrive') and nd.get('on_done'):
+            return reaches_emit(nd['on_done'], seen)
+        return False  # hold = re-verification, legal
+    for n_ in nodes.values():
+        if n_['kind'] == 'route':
+            for br_ in n_['branches']:
+                acts_r = actions(br_.get('do'), {'counters': {}, 'events': []})
+                if any(a_[0] == 'revert' for a_ in acts_r):
+                    assert not reaches_emit(br_.get('goto')), \
+                        f'revert path reaches emit (route {n_["id"]}, §2.3)'
     # (F3-3) emit payload_from validated after schemas load (main)
     # (F3-1/F4-1) top-level [hold] table is MANDATORY
     assert 'hold' in policy, 'pack must declare a top-level [hold] table'
@@ -422,6 +454,11 @@ def graph(policy):
         if kind == 'dispatch':
             for f in ('on_no_valid', 'on_verify_invalid', 'hold_target'):
                 assert f in n, f'dispatch {n["id"]} missing {f}'
+            assert n['hold_target'] in nodes, \
+                f'dispatch {n["id"]} hold_target {n["hold_target"]!r} dangling'
+            ht_ = nodes[n['hold_target']]
+            assert ht_['kind'] == 'hold', \
+                f'dispatch {n["id"]} hold_target must reference a hold node'
         if kind == 'hold':
             assert n.get('resume_targets') is not None, \
                 f'hold {n["id"]} missing resume_targets'
@@ -450,6 +487,10 @@ def graph(policy):
                 if acts_ and not b.get('goto'):
                     assert acts_[-1][0] == 'emit', \
                         f'route {n["id"]} branch has actions but no goto (non-emit dead-end)'
+                if not any(a_[0] == 'emit' for a_ in acts_):
+                    g_ = b.get('goto')
+                    assert g_, f'route {n["id"]} non-emit branch missing goto'
+                    assert g_ in nodes, f'route {n["id"]} goto {g_!r} dangling'
                 # (F10-1) emit is terminal: nothing after, no goto
                 emits_ = [i for i, a in enumerate(acts_) if a[0] == 'emit']
                 for i_ in emits_:

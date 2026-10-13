@@ -1906,10 +1906,50 @@ def contract_checks(doc):
                     assert acts[-1][0] == "emit", \
                         f"route {n['id']} branch has actions but no goto " \
                         "(non-emit dead-end)"
+                # (F16-1) EVERY non-emit branch carries a valid goto
+                if not any(a[0] == "emit" for a in acts):
+                    g = br.get("goto")
+                    assert g, \
+                        f"route {n['id']} non-emit branch missing goto"
+                    assert g in {x["id"] for x in doc["nodes"]}, \
+                        f"route {n['id']} branch goto {g!r} dangling"
                 for i, a in enumerate(acts):
                     if a[0] == "revert":
                         assert not any(x[0] == "emit" for x in acts[i+1:]), \
                             f"route {n['id']} revert-then-emit (§2.3)"
+    # (F16-2) cross-node revert→emit: after a revert action, the
+    # goto chain must not reach any emit (load-time §2.3 rule)
+    _node_ids = {x["id"]: x for x in doc["nodes"]}
+    def _reaches_emit(start, seen=None):
+        if seen is None:
+            seen = set()
+        if start in seen or start not in _node_ids:
+            return False
+        seen.add(start)
+        nd = _node_ids[start]
+        if nd["kind"] == "emit":
+            return True
+        if nd["kind"] == "route":
+            for br_ in nd.get("branches", []):
+                if _reaches_emit(br_.get("goto"), seen):
+                    return True
+                for a_ in _parse_actions_top(br_.get("do")):
+                    if a_[0] == "emit" and not br_.get("goto"):
+                        return True
+        if nd["kind"] in ("dispatch", "redrive") and nd.get("on_done"):
+            return _reaches_emit(nd["on_done"], seen)
+        # hold = human checkpoint; resuming from it implies
+        # re-verification, so a revert path THROUGH a hold is legal
+        return False
+    for n in doc["nodes"]:
+        if n["kind"] == "route":
+            for br in n.get("branches", []):
+                for i, a in enumerate(_parse_actions_top(br.get("do"))):
+                    if a[0] == "revert":
+                        nxt = br.get("goto")
+                        assert not _reaches_emit(nxt), \
+                            f"route {n['id']} revert path reaches emit " \
+                            "(revert invalidates evidence — §2.3)"
     # (F15-3) redrive schema: on_done mandatory, base in {origin,latest}
     for n in doc["nodes"]:
         if n["kind"] == "redrive":
