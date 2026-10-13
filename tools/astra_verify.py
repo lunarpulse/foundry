@@ -282,9 +282,13 @@ def graph(policy):
     declared = set()
     for oe_ in policy.get('output', {}).get('on_error', []) or []:
         assert oe_.get('state') in NS, f'on_error state {oe_.get("state")!r} not normative'
-        assert oe_.get('policy') in NP, f'on_error policy {oe_.get("policy")!r} not in {NP}'
-        assert oe_['policy'] == SP[oe_['state']], \
-            f'on_error {oe_["state"]} must be {SP[oe_["state"]]!r}, got {oe_["policy"]!r} (§2.5)'
+        # (F7-4) per-state ALLOWED sets — pack owns the choice
+        SP_ALLOWED = {'ok': {'accept-stage'},
+                      'dispatch_error': {'discard-stage', 'fail-run'},
+                      'parse_error': {'discard-finding', 'fail-run'},
+                      'timeout': {'hold', 'fail-run'}}
+        assert oe_.get('policy') in SP_ALLOWED[oe_['state']], \
+            f'on_error {oe_["state"]} policy {oe_.get("policy")!r} not in {SP_ALLOWED[oe_["state"]]} (§2.5)'
         declared.add(oe_['state'])
     assert NS <= declared, f'on_error missing: {NS - declared}'
     # (F6-1) verify<=1 per pack; stage IDs unique across BOTH node
@@ -298,8 +302,15 @@ def graph(policy):
                 nverify += 1
                 assert st_.get('after'), \
                     f'verify stage {st_["id"]} must declare after dependencies'
+                lens_ids_ = [s['id'] for s in n_.get('stages', [])
+                             if s.get('role') == 'lens']
+                miss_ = set(lens_ids_) - set(st_['after'])
+                assert not miss_, \
+                    f'verify stage {st_["id"]} must run after ALL lens stages; missing: {sorted(miss_)}'
     for ps_ in policy.get('pack_stages', []) or []:
         sid_list.append(ps_.get('id'))
+        if ps_.get('role') == 'verify':
+            nverify += 1
     assert nverify <= 1, f'pack declares {nverify} verify stages (max 1, §2.3)'
     dupes_ = {x for x in sid_list if sid_list.count(x) > 1}
     assert not dupes_, f'duplicate stage IDs: {sorted(dupes_)}'

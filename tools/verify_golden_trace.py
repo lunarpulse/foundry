@@ -128,7 +128,10 @@ def evaluate(expr, state):
             break
         val = "T" if atom(m.group(1), m.group(2), state) else "F"
         e = e[:m.start()] + val + e[m.end():]
-    e = e.replace("true", "T").replace("false", "F")
+    # (F7-3) token-boundary replacement: 'true'/'false' only as whole
+    # tokens — 'trueorfalse' must NOT be rewritten into 'TorF'
+    e = re.sub(r"\btrue\b", "T", e)
+    e = re.sub(r"\bfalse\b", "F", e)
     e = e.replace("T", " True ").replace("F", " False ")
     py = e.replace("&&", " and ").replace("||", " or ").replace("!", " not ")
     # (F2-4) FULL-CONSUMPTION: only True/False/and/or/not/parens/space
@@ -1756,20 +1759,19 @@ def contract_checks(doc):
     # closed policies {accept-stage, discard-stage, discard-finding, hold}
     NORM_STATES = {"dispatch_error", "parse_error", "timeout", "ok"}
     NORM_POLS = {"accept-stage", "discard-stage", "discard-finding", "hold"}
-    # (F6-2) §2.5 state→policy normative mapping (canonical)
-    STATE_POLICY = {"ok": "accept-stage",
-                    "dispatch_error": "discard-stage",
-                    "parse_error": "discard-finding",
-                    "timeout": "hold"}
+    # (F6-2/F7-4) §2.5 state→ALLOWED policy sets (per-state choice is
+    # pack-owned, not a frozen global mapping)
+    STATE_ALLOWED = {"ok": {"accept-stage"},
+                     "dispatch_error": {"discard-stage", "fail-run"},
+                     "parse_error": {"discard-finding", "fail-run"},
+                     "timeout": {"hold", "fail-run"}}
     declared_states = set()
     for oe in doc.get("output", {}).get("on_error", []) or []:
         assert oe.get("state") in NORM_STATES, \
             f"on_error state {oe.get('state')!r} not normative"
-        assert oe.get("policy") in NORM_POLS, \
-            f"on_error policy {oe.get('policy')!r} not in {NORM_POLS}"
-        assert oe["policy"] == STATE_POLICY[oe["state"]], \
-            f"on_error {oe['state']} must be {STATE_POLICY[oe['state']]!r}, " \
-            f"got {oe['policy']!r} (§2.5)"
+        allowed = STATE_ALLOWED[oe["state"]]
+        assert oe.get("policy") in allowed, \
+            f"on_error {oe['state']} policy {oe.get('policy')!r} not in {allowed} (§2.5)"
         declared_states.add(oe["state"])
     assert NORM_STATES <= declared_states, \
         f"on_error must declare all of {NORM_STATES}, missing: " \
@@ -1786,8 +1788,9 @@ def contract_checks(doc):
                 ls = st.get("lenses")
                 assert isinstance(ls, list) and len(ls) >= 1, \
                     f"stage {st['id']} must list at least one lens"
-    # (F6-1) verify stages <=1 per pack (§2.3); stage IDs unique pack-wide;
-    # verify-carrying dispatch stages declare their dependency chain
+    # (F6-1/F7-1) verify stages <=1 per pack counted across BOTH node
+    # stages and pack_stages; stage IDs unique pack-wide; verify
+    # stages declare their dependency chain
     all_stage_ids = []
     verify_count = 0
     for n in doc["nodes"]:
@@ -1798,6 +1801,17 @@ def contract_checks(doc):
                 after = st.get("after")
                 assert after, \
                     f"verify stage {st['id']} must declare after dependencies"
+                # (F7-2) pack contract: verify depends on ALL lens
+                # stages in its dispatch (full-finding verification)
+                lens_ids = [s["id"] for s in n.get("stages", [])
+                            if s.get("role") == "lens"]
+                missing = set(lens_ids) - set(after)
+                assert not missing, \
+                    f"verify stage {st['id']} must run after ALL lens " \
+                    f"stages; missing deps: {sorted(missing)}"
+    for ps in doc.get("pack_stages", []) or []:
+        if ps.get("role") == "verify":
+            verify_count += 1
     assert verify_count <= 1, \
         f"pack declares {verify_count} verify stages (max 1, §2.3)"
     # (F6-1c) pack_stages share the same ID namespace

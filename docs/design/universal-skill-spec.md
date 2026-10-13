@@ -1,7 +1,7 @@
 # Foundry Universal Skill Spec — 범용 실행 모델 (Universal Review Engine)
 
-- **버전**: v0.41 (2026-10-12) — 6차 최종 검증 반영.
-  verify≤1·stage ID 통합 네임스페이스·after 의존·상태별 정책 매핑·DSL 문법 동결 범위 고정.
+- **버전**: v0.42 (2026-10-12) — 7차 최종 검증 반영.
+  pack_stages verify 집계·verify→전 렌즈 의존(팩 계약)·상태별 허용 집합(팩 소유)·토큰 경계 치환.
 - **의도(소유자)**: Foundry는 어떤 방법론도 돌릴 수 있는 유니버설
   플랫폼. BMad는 스킬 데이터의 첫 고객. **Rust 도메인에 방법론
   코드가 박히는 순간이 실패.** 엔진 고정·확장 선언(procedural macro
@@ -396,9 +396,11 @@ review-run 소유의 범용 실행 회차(generation)로 정의한다.**
 
 ### 2.5 정규화 (r3-MAJOR-7)
 - 4분류(ok/parse_error/dispatch_error/timeout)별 정책표 — 팩이
-  **4 상태 전부 선언**(ok의 정상 수용 정책 accept-stage 포함,
-  r10-4; 엔진 기본값 없음, 미선언 시 로드 거부). 오류 정책은 팩
-  전체 [[output.on_error]]가 유일 소유(노드 필드 아님):
+  **4 상태 전부 선언**(r10-4; 엔진 기본값 없음, 미선언 시 로드 거부).
+  **상태별 허용 집합**(v0.42 — 팩이 선택, 전역 고정 아님):
+  ok={accept-stage} · dispatch_error={discard-stage, fail-run} ·
+  parse_error={discard-finding, fail-run} · timeout={hold, fail-run}.
+  오류 정책은 팩 전체 [[output.on_error]]가 유일 소유(노드 필드 아님):
 ```toml
 [[output.on_error]]        # 순서=우선순위
 state = "dispatch_error"   # ok | parse_error | dispatch_error | timeout
