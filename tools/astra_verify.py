@@ -365,23 +365,24 @@ def _tree_const_a(t):
     return None
 
 
-def _tree_or_weak_a(t):
+def _tree_or_weak_a(t, outer_cap=False):
     if not isinstance(t, tuple):
         return False
     if t[0] == 'or':
         kids = t[1]
-        if any(_tree_has_cl_a(k) for k in kids):
+        if not outer_cap and any(_tree_has_cl_a(k) for k in kids):
             for k in kids:
                 if _tree_has_cl_a(k):
                     continue
                 if _tree_const_a(k) is False:
                     continue
                 return True
-        return any(_tree_or_weak_a(k) for k in kids)
-    if t[0] in ('and', 'or'):
-        return any(_tree_or_weak_a(k) for k in t[1])
+        return any(_tree_or_weak_a(k, outer_cap) for k in kids)
+    if t[0] == 'and':
+        capped = outer_cap or any(_tree_has_cl_a(k) for k in t[1])
+        return any(_tree_or_weak_a(k, capped) for k in t[1])
     if t[0] == 'not':
-        return _tree_or_weak_a(t[1])
+        return _tree_or_weak_a(t[1], outer_cap)
     return False
 
 
@@ -720,6 +721,11 @@ def graph(policy):
             raise AssertionError(
                 f'automatic cycle {sorted(cnodes_)} has no counter bump '
                 'anywhere on it — unbounded self-loop (§2.2)')
+        # (F30-1) no route node = re-entry can never be counter-guarded
+        if not any(nodes[x_].get('kind') == 'route' for x_ in cnodes_):
+            raise AssertionError(
+                f'automatic cycle {sorted(cnodes_)} has no route node — '
+                're-entry can never be counter-guarded (§2.2)')
     # per-edge rules
     for (u19, w19, bi27_) in list(guard_ctrs.keys()):
         if scc_of19.get(u19) != scc_of19.get(w19) or u19 not in scc_of19:
@@ -729,17 +735,23 @@ def graph(policy):
         dst_n_ = nodes[w19]
         dst_br = [src_n_['branches'][bi27_]]
         node_b = dst_n_.get('bump') if dst_n_['kind'] == 'redrive' else None
-        if node_b == gc_:
-            for b_ in dst_br:
-                for a_ in actions(b_.get('do'), {'counters': {}, 'events': []}):
-                    if a_[0] == 'bump' and a_[1] == gc_:
-                        raise AssertionError(f'edge {u19}->{w19}: counter {gc_!r} bumped BOTH on branch and node — double increment (§2.3)')
-        else:
-            for b_ in dst_br:
-                has_ = any(a_[0] == 'bump' and a_[1] == gc_
-                           for a_ in actions(b_.get('do'), {'counters': {}, 'events': []}))
-                assert has_, (f'edge {u19}->{w19}: guarded cycle edge counter {gc_!r} '
-                              'not bumped on every branch (§2.2/§2.3)')
+        # (F30-2) direct-destination conflict for EVERY guard counter
+        _gc30_ = set()
+        for _k30_, _v30_ in guard_all_ctrs.items():
+            if _k30_[0] == u19 and _k30_[1] == w19:
+                _gc30_ |= _v30_
+        for gc30_ in _gc30_:
+            if node_b == gc30_:
+                for b_ in dst_br:
+                    for a_ in actions(b_.get('do'), {'counters': {}, 'events': []}):
+                        if a_[0] == 'bump' and a_[1] == gc30_:
+                            raise AssertionError(f'edge {u19}->{w19}: counter {gc30_!r} bumped BOTH on branch and node — double increment (§2.3)')
+            else:
+                for b_ in dst_br:
+                    has_ = any(a_[0] == 'bump' and a_[1] == gc30_
+                               for a_ in actions(b_.get('do'), {'counters': {}, 'events': []}))
+                    assert has_, (f'edge {u19}->{w19}: guarded cycle edge counter {gc30_!r} '
+                                  'not bumped on every branch (§2.2/§2.3)')
     # (F23) every ROUTE branch re-entering an automatic SCC carries
     # its OWN guard — per-branch, not per-edge
     for u19, ws19 in auto_adj.items():

@@ -1870,26 +1870,31 @@ def _tree_const_value(t):
     return None  # call / ident / num / list are non-constant
 
 
-def _tree_or_weakened(t):
-    """(F29-3) structure-aware: an OR is weakened only when some child
-    lacks count_lt, is not constant-false, AND a sibling carries the
-    cap (count_lt). Conjunction-joined caps are preserved."""
+def _tree_or_weakened(t, outer_cap=False):
+    """(F29-3/F30-3) structure-aware OR-weakening. An OR is weakened
+    only when some child lacks count_lt, is not constant-false, AND a
+    sibling carries the cap — AND the whole OR is not nested inside a
+    conjunction that itself enforces an outer cap (an outer count_lt
+    bounds the cycle regardless of which alternative is taken)."""
     if not isinstance(t, tuple):
         return False
     if t[0] == "or":
         kids = t[1]
-        if any(_tree_has_count_lt(k) for k in kids):
+        if not outer_cap and any(_tree_has_count_lt(k) for k in kids):
             for k in kids:
                 if _tree_has_count_lt(k):
                     continue
                 if _tree_const_value(k) is False:
                     continue  # dead alternative cannot bypass
                 return True
-        return any(_tree_or_weakened(k) for k in kids)
-    if t[0] in ("and", "or"):
-        return any(_tree_or_weakened(k) for k in t[1])
+        return any(_tree_or_weakened(k, outer_cap) for k in kids)
+    if t[0] == "and":
+        # an outer cap exists for children if any sibling subtree
+        # (including this node itself) carries a count_lt
+        capped = outer_cap or any(_tree_has_count_lt(k) for k in t[1])
+        return any(_tree_or_weakened(k, capped) for k in t[1])
     if t[0] == "not":
-        return _tree_or_weakened(t[1])
+        return _tree_or_weakened(t[1], outer_cap)
     return False
 
 def contract_checks(doc):
@@ -2308,6 +2313,14 @@ def contract_checks(doc):
                 raise AssertionError(
                     f"automatic cycle {sorted(_cnodes)} has no counter "
                     "bump anywhere on it — unbounded self-loop (§2.2)")
+            # (F30-1) a cycle with no ROUTE node can never be entry-
+            # guarded — only a route branch can carry count_lt caps
+            if not any(_node_ids[x].get("kind") == "route"
+                       for x in _cnodes):
+                raise AssertionError(
+                    f"automatic cycle {sorted(_cnodes)} has no route "
+                    "node — re-entry can never be counter-guarded "
+                    "(§2.2)")
         # (F22) PER-EDGE rule: every edge whose endpoints share an SCC
     # (i.e. the edge closes a cycle) must be counter-guarded with
     # path-exact bumps; the earlier whole-cycle heuristic conflated
@@ -2364,28 +2377,36 @@ def contract_checks(doc):
     for (u, w, _bidx27) in list(_guard_ctrs.keys()):
         if _scc_of.get(u) != _scc_of.get(w) or u not in _scc_of:
             continue  # not a cycle-closing edge
+        # (F30-2) direct-destination conflict for EVERY guard counter
+        # (previously only the first-extracted gc was checked)
+        _gc_all_30 = set()
+        for _k30, _v30 in _guard_all_ctrs.items():
+            if _k30[0] == u and _k30[1] == w:
+                _gc_all_30 |= _v30
         gc = _guard_ctrs[(u, w, _bidx27)]
         src_n = _node_ids[u]
         dst_n = _node_ids[w]
         _dst_branches = [br for br in src_n.get("branches", [])
                          if br.get("goto") == w]
         node_b = dst_n.get("bump") if dst_n["kind"] == "redrive" else None
-        if node_b == gc:
-            for br in _dst_branches:
-                for a in _parse_actions_top(br.get("do")):
-                    if a[0] == "bump" and a[1] == gc:
-                        raise AssertionError(
-                            f"edge {u}->{w}: counter {gc!r} bumped BOTH "
-                            "on branch and node — double increment (§2.3)")
-        else:
-            # every branch to w must bump gc on its own do
-            for br in _dst_branches:
-                _has = any(a[0] == "bump" and a[1] == gc
-                           for a in _parse_actions_top(br.get("do")))
-                assert _has, (
-                    f"edge {u}->{w}: guarded cycle edge's counter {gc!r} "
-                    "not bumped on every branch (no-do duplicate would "
-                    "loop unguarded — §2.2/§2.3)")
+        for gc30 in _gc_all_30:
+            if node_b == gc30:
+                for br in _dst_branches:
+                    for a in _parse_actions_top(br.get("do")):
+                        if a[0] == "bump" and a[1] == gc30:
+                            raise AssertionError(
+                                f"edge {u}->{w}: counter {gc30!r} bumped "
+                                "BOTH on branch and node — double "
+                                "increment (§2.3)")
+            else:
+                # every branch to w must bump gc30 on its own do
+                for br in _dst_branches:
+                    _has = any(a[0] == "bump" and a[1] == gc30
+                               for a in _parse_actions_top(br.get("do")))
+                    assert _has, (
+                        f"edge {u}->{w}: guarded cycle edge's counter "
+                        f"{gc30!r} not bumped on every branch (no-do "
+                        "duplicate would loop unguarded — §2.2/§2.3)")
     # (F23) every ROUTE branch into an automatic SCC must carry its
     # own count_lt guard (dispatch/redrive on_done edges carry no
     # condition — the cap lives on the route entry that re-selects
