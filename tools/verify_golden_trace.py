@@ -1877,6 +1877,47 @@ def contract_checks(doc):
                         assert a[1] in _declared_ctrs, \
                             f"branch bumps undeclared counter {a[1]!r} " \
                             f"(route {n['id']})"
+    # (F15-1) emit ACTIONS in branches: event must be the canonical
+    # pair and payload a declared output or 'summary'
+    _out_names = set()
+    import os as _os2
+    for _sf in os.listdir(PACK):
+        if _sf.startswith("schema-"):
+            _sd = tomllib.load(open(f"{PACK}/{_sf}", "rb"))
+            _out_names |= {o.get("name") for o in _sd.get("output", [])}
+    for n in doc["nodes"]:
+        if n["kind"] == "route":
+            for br in n.get("branches", []):
+                for a in _parse_actions_top(br.get("do")):
+                    if a[0] == "emit":
+                        assert a[1] in ("InspectionPassed",
+                                        "InspectionFailed"), \
+                            f"emit action event {a[1]!r} not canonical"
+                        if len(a) > 2:
+                            assert a[2] in _out_names or a[2] == "summary", \
+                                f"emit payload {a[2]!r} not a declared output"
+    # (F15-2) branch action ordering: revert/bump without goto is a
+    # dead-end; revert followed by emit in the same branch invalidates
+    for n in doc["nodes"]:
+        if n["kind"] == "route":
+            for br in n.get("branches", []):
+                acts = _parse_actions_top(br.get("do"))
+                if acts and not br.get("goto"):
+                    assert acts[-1][0] == "emit", \
+                        f"route {n['id']} branch has actions but no goto " \
+                        "(non-emit dead-end)"
+                for i, a in enumerate(acts):
+                    if a[0] == "revert":
+                        assert not any(x[0] == "emit" for x in acts[i+1:]), \
+                            f"route {n['id']} revert-then-emit (§2.3)"
+    # (F15-3) redrive schema: on_done mandatory, base in {origin,latest}
+    for n in doc["nodes"]:
+        if n["kind"] == "redrive":
+            assert n.get("on_done"), \
+                f"redrive {n['id']} missing on_done (§2.3)"
+            if "base" in n:
+                assert n["base"] in ("origin", "latest"), \
+                    f"redrive {n['id']} base {n['base']!r} invalid"
     # (F14-1) redrive bump targets must be DECLARED counters
     _declared_ctrs0 = set(doc.get("counters", {}).keys())
     for n in doc["nodes"]:

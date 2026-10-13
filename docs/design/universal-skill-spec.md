@@ -1,7 +1,7 @@
 # Foundry Universal Skill Spec — 범용 실행 모델 (Universal Review Engine)
 
-- **버전**: v0.49 (2026-10-12) — 14차 최종 검증 반영.
-  redrive bump 선언 카운터 검증·조건식 프로브 state에 선언 카운터 주입(오류 삼킴 제거)·emit branch goto 참조 안전화.
+- **버전**: v0.50 (2026-10-12) — 15차 최종 검증 반영.
+  emit 액션 이벤트·payload 검증·revert-then-emit/비emit dead-end 금지·redrive on_done·base enum·astra 프로브 선언 카운터 주입.
 - **의도(소유자)**: Foundry는 어떤 방법론도 돌릴 수 있는 유니버설
   플랫폼. BMad는 스킬 데이터의 첫 고객. **Rust 도메인에 방법론
   코드가 박히는 순간이 실패.** 엔진 고정·확장 선언(procedural macro

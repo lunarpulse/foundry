@@ -271,6 +271,11 @@ def graph(policy):
             # (F13-2) target mandatory — unused nodes included
             assert n.get('target'), \
                 f'redrive {n["id"]} missing target (§2.3)'
+            assert n.get('on_done'), \
+                f'redrive {n["id"]} missing on_done (§2.3)'
+            if 'base' in n:
+                assert n['base'] in ('origin', 'latest'), \
+                    f'redrive {n["id"]} base {n["base"]!r} invalid'
         if n['kind'] != 'hold' and 'timeout_s' in n:
             # (F13-1) timeout_s is a hold-only optional field
             raise AssertionError(
@@ -425,13 +430,26 @@ def graph(policy):
             assert 'on_done' not in n, f'route {n["id"]} must not declare on_done (§2.3)'
             assert n['branches'][-1]['when'].strip() == 'true', 'missing last true fallback'
             for b in n['branches']:
-                Expr(b['when'], state()).run()
+                # (F15-4) declared counters seeded so count_lt on a
+                # pack-declared counter cannot KeyError
+                _st = state()
+                _st['counters'].update({c: 0 for c in policy.get('counters', {})})
+                Expr(b['when'], _st).run()
                 acts_ = actions(b.get('do'), state())
                 # (F11-3) bump targets must be DECLARED — dead branches too
                 for a_ in acts_:
                     if a_[0] == 'bump':
                         assert a_[1] in policy.get('counters', {}), \
                             f'branch bumps undeclared counter {a_[1]!r} (route {n["id"]})'
+                    if a_[0] == 'emit':
+                        assert a_[1] in ('InspectionPassed', 'InspectionFailed'), \
+                            f'emit action event {a_[1]!r} not canonical (route {n["id"]})'
+                    if a_[0] == 'revert':
+                        assert not any(x[0] == 'emit' for x in acts_[acts_.index(a_)+1:]), \
+                            f'revert-then-emit (route {n["id"]}, §2.3)'
+                if acts_ and not b.get('goto'):
+                    assert acts_[-1][0] == 'emit', \
+                        f'route {n["id"]} branch has actions but no goto (non-emit dead-end)'
                 # (F10-1) emit is terminal: nothing after, no goto
                 emits_ = [i for i, a in enumerate(acts_) if a[0] == 'emit']
                 for i_ in emits_:
