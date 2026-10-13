@@ -87,7 +87,15 @@ class Expr:
                     literal = self.take()
                     if not literal.startswith('"'):
                         raise ValueError('expected string literal')
-                    values.append(tomllib.loads('v = ' + literal)['v'])
+                    # (F5-3) normative: TOML owns decoding — the DSL
+                    # compares the string CONTENT as-is. Strip quotes
+                    # without a second escape decode.
+                    inner = literal[1:-1]
+                    if '\\' in inner:
+                        raise ValueError(
+                            'escape sequences are TOML-owned; DSL '
+                            'literals arrive pre-decoded')
+                    values.append(inner)
                     if not self.peek(','):
                         break
                     self.take(',')
@@ -102,8 +110,12 @@ class Expr:
             value = self.state['counters'][counter] < int(bound)
         elif name == 'has_findings':
             group = self.take()
+            # (F5-3) §2.3: exactly the literal token 'any' — quoted
+            # strings and arbitrary group ids are syntax errors
+            if group != 'any':
+                raise ValueError(f'has_findings requires (any), got {group!r}')
             active = self.state['verdicts'] & self.state['active']
-            value = bool(active if group == 'any' else active & {group})
+            value = bool(active)
         elif name in ('budget_exhausted', 'timeout'):
             value = self.state[name]
         else:
@@ -258,9 +270,20 @@ def graph(policy):
             if 'role' in ps_:
                 assert ps_['role'] in ('lens', 'verify', 'replan'), \
                     f'pack_stage {ps_.get("id")} role {ps_["role"]!r} invalid'
-        # (F3-3) emit payload_from must reference a declared output
-        if n['kind'] == 'emit' and n.get('payload_from'):
-            pass  # checked after schemas load (below)
+            # (F5-2) registered stages list >=1 lens
+            pls_ = ps_.get('lenses')
+            assert isinstance(pls_, list) and len(pls_) >= 1, \
+                f'pack_stage {ps_.get("id")} must list at least one lens'
+    # (F5-1) §2.5 on_error completeness + closed policy set
+    NS = {'ok', 'dispatch_error', 'parse_error', 'timeout'}
+    NP = {'accept-stage', 'discard-stage', 'discard-finding', 'hold'}
+    declared = set()
+    for oe_ in policy.get('output', {}).get('on_error', []) or []:
+        assert oe_.get('state') in NS, f'on_error state {oe_.get("state")!r} not normative'
+        assert oe_.get('policy') in NP, f'on_error policy {oe_.get("policy")!r} not in {NP}'
+        declared.add(oe_['state'])
+    assert NS <= declared, f'on_error missing: {NS - declared}'
+    # (F3-3) emit payload_from validated after schemas load (main)
     # (F3-1/F4-1) top-level [hold] table is MANDATORY
     assert 'hold' in policy, 'pack must declare a top-level [hold] table'
     ht = policy['hold'].get('timeout_s')

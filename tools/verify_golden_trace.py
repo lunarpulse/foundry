@@ -98,9 +98,15 @@ def check_grammar(expr):
     two word-chars separated only by whitespace (no operator, paren,
     comma or quote between them) is a token-split error, because
     whitespace-stripping would manufacture a single token."""
-    if "'" in expr:
-        raise ValueError(f"single-quote literal not in grammar: {expr!r}")
+    # single quotes OUTSIDE string literals are grammar errors;
+    # an apostrophe INSIDE a double-quoted literal is legal content
     outside = re.sub(r'"[^"]*"', '""', expr)
+    if "'" in outside:
+        raise ValueError(f"single-quote literal not in grammar: {expr!r}")
+    # (F5-3) uppercase literals (T/F) are not in the grammar
+    outside = re.sub(r'"[^"]*"', '""', expr)
+    if re.search(r"\b[A-Z]\w*", outside):
+        raise ValueError(f"uppercase token not in grammar: {expr!r}")
     for m in re.finditer(r"([A-Za-z0-9_]+)(\s+)([A-Za-z0-9_]+)", outside):
         s, e = m.start(), m.end()
         seg = outside[s:e]
@@ -1745,6 +1751,26 @@ def contract_checks(doc):
         if "role" in ps:
             assert ps["role"] in ROLES, \
                 f"pack_stage {ps.get('id')} role {ps['role']!r} not in {ROLES}"
+    # (F5-1) §2.5 normalization completeness: on_error must cover the
+    # normative states {dispatch_error, parse_error, timeout} with
+    # closed policies {accept-stage, discard-stage, discard-finding, hold}
+    NORM_STATES = {"dispatch_error", "parse_error", "timeout", "ok"}
+    NORM_POLS = {"accept-stage", "discard-stage", "discard-finding", "hold"}
+    declared_states = set()
+    for oe in doc.get("output", {}).get("on_error", []) or []:
+        assert oe.get("state") in NORM_STATES, \
+            f"on_error state {oe.get('state')!r} not normative"
+        assert oe.get("policy") in NORM_POLS, \
+            f"on_error policy {oe.get('policy')!r} not in {NORM_POLS}"
+        declared_states.add(oe["state"])
+    assert NORM_STATES <= declared_states, \
+        f"on_error must declare all of {NORM_STATES}, missing: " \
+        f"{NORM_STATES - declared_states}"
+    # (F5-2) registered stages: lens minimum applies too
+    for ps in doc.get("pack_stages", []) or []:
+        ps_ls = ps.get("lenses")
+        assert isinstance(ps_ls, list) and len(ps_ls) >= 1, \
+            f"pack_stage {ps.get('id')} must list at least one lens"
     # (F4-2) every dispatch stage must list >=1 lens (§A.4)
     for n in doc["nodes"]:
         if n["kind"] == "dispatch":
