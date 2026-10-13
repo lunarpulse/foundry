@@ -31,6 +31,15 @@ POLICY = f"{PACK}/policy.toml"
 
 
 def load(path=POLICY):
+    """Load the canonical pack; the executed policy.toml MUST be a
+    manifest member (r30-2 execution binding)."""
+    import os as _os
+    man = _os.path.join(_os.path.dirname(path), "manifest.toml")
+    with open(man, "rb") as f:
+        mdoc = tomllib.load(f)
+    files_decl = mdoc.get("files", [])
+    assert "policy.toml" in files_decl, \
+        "FULL pack manifest must declare policy.toml (execution binding)"
     with open(path, "rb") as f:
         return tomllib.load(f)
 
@@ -644,57 +653,58 @@ def sweep_rejection_fixtures():
         return cycles
 
     def _enforced_guards(w):
-        """(r28-1) counters ENFORCED by this condition, decided
-        semantically at the CAP BOUNDARY: c enforces iff NO state
-        with c >= cap makes the condition true. Other factors probed
-        adversarially (verdicts empty/nonempty, findings F/T, other
-        counters at 0 / cap-1)."""
+        """(r30-1) c enforces iff NO reachable state with c >= its
+        SMALLEST cap makes the condition true. State space: counter
+        values at {0, cap-1, cap, cap+1} for EVERY counter cap in the
+        expression (multi-threshold preserved via list), clocks at
+        {F,T} x {F,T}, verdict subsets of the expression's own
+        any_in samples (plus empty and full), findings F/T. Bounded:
+        <=4^counters * 4 * 2^|samples| * 2 <= ~10k evaluations."""
         import re as _re
-        caps = {m.group(1): int(m.group(2)) for m in
-                _re.finditer(r"count_lt\s*[(]\s*([A-Za-z_]\w*)\s*,\s*(\d+)\s*[)]", w)}
-        # (r29-1) clock predicates anywhere; verdict samples from
-        # the expression's own any_in lists
-        clock_present = bool(_re.search(r"timeout\s*\(", w)
-                             or _re.search(r"budget_exhausted\s*\(", w))
-        vsamples = []
+        import itertools as _it
+        # ALL thresholds per counter (dict-overwrite bug fixed)
+        caps = {}
+        for m in _re.finditer(r"count_lt\s*[(]\s*([A-Za-z_]\w*)\s*,\s*(\d+)\s*[)]", w):
+            caps.setdefault(m.group(1), []).append(int(m.group(2)))
+        # verdict universe from any_in samples
+        uni = []
         for m in _re.finditer(r'any_in\s*\(\s*verdicts\s*,\s*\[(.*?)\]\s*\)', w):
-            vsamples += _re.findall(r'"([^"]+)"', m.group(1))
-        vlists = [[], ["patch"]]
-        if vsamples:
-            vlists += [sorted(set(vsamples)),
-                       sorted(set(vsamples)) + ["patch"]]
-        out = set()
-        for c, cap in caps.items():
-            enforced = True
-            for cval in (cap, cap + 1, cap + 10):
-                for others in ({k: 0 for k in caps},
-                               {k: max(v - 1, 0) for k, v in caps.items()}):
-                    for verdicts in vlists or [[]]:
+            uni += _re.findall(r'"([^"]+)"', m.group(1))
+        uni = sorted(set(uni))[:4]
+        verdict_sets = [()] + [tuple(c) for r in range(1, len(uni) + 1)
+                              for c in _it.combinations(uni, r)]
+        clocks = [(False, False), (True, False), (False, True), (True, True)]
+        def states_for(c):
+            vals_per = []
+            for k, ths in caps.items():
+                s = {0}
+                for t in ths:
+                    s |= {max(t - 1, 0), t, t + 1}
+                if k == c:
+                    s |= {min(ths), max(ths) + 1}
+                vals_per.append((k, sorted(s)))
+            base = list(_it.product(*[v for _, v in vals_per]))
+            for counters in base:
+                cmap = dict(zip([k for k, _ in vals_per], counters))
+                if cmap[c] < min(caps[c]):
+                    continue  # only states where c can be over cap
+                for verdicts in verdict_sets:
+                    for to, bo in clocks:
                         for findings in (False, True):
-                            st = {"counters": {**others, c: cval},
-                                  "verdicts": verdicts,
-                                  "findings": findings,
-                                  "reverted_base": None}
-                            ok = evaluate(w, st)
-                            # (r29-1) evaluation failure is NOT
-                            # evidence of enforcement — treat as True
-                            if ok is not False:
-                                enforced = False
-                                break
-                        if not enforced: break
-                    if not enforced: break
-                if not enforced: break
-            if clock_present and "|" in w:
-                # a clock predicate in an OR-adjacent position: probe
-                # by rewriting it to true — if that admits c>=cap,
-                # no enforcement
-                w2 = re.sub(r"(timeout|budget_exhausted)\s*\(\s*\)", "true", w)
-                if w2 != w:
-                    st = {"counters": {k: 0 for k in caps} | {c: cap + 1},
-                          "verdicts": [], "findings": False,
-                          "reverted_base": None}
-                    if evaluate(w2, st) is not False:
-                        enforced = False
+                            yield {"counters": cmap,
+                                   "verdicts": list(verdicts),
+                                   "findings": findings,
+                                   "timeout": to,
+                                   "budget_exhausted": bo,
+                                   "reverted_base": None}
+        out = set()
+        for c in caps:
+            enforced = True
+            for st in states_for(c):
+                ok = evaluate(w, st)
+                if ok is not False:
+                    enforced = False
+                    break
             if enforced:
                 out.add(c)
         return out
@@ -702,7 +712,7 @@ def sweep_rejection_fixtures():
     def _bumps_in(do):
         """Counter occurrence counts in an action sequence."""
         out = {}
-        for m in re.finditer(r"bump[(]([A-Za-z_]\w*)[)]", do or ""):
+        for m in re.finditer(r"bump\s*[(]\s*([A-Za-z_]\w*)\s*[)]", do or ""):
             out[m.group(1)] = out.get(m.group(1), 0) + 1
         return out
 

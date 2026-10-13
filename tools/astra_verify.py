@@ -119,18 +119,30 @@ def state(categories=(), fix=0, loops=0, active=None):
 
 
 def actions(text, s):
-    for action in filter(None, map(str.strip, text.split(';'))):
+    # (r30-3) full-normative parser: emit(2-arg, whitespace-tolerant),
+    # revert latest|origin, empty actions REJECTED; no do = no-op
+    if text is None:
+        return
+    parts = text.split(';')
+    if any(not p.strip() for p in parts):
+        raise ValueError('empty action in sequence: ' + repr(text))
+    for action in map(str.strip, parts):
         m = re.fullmatch(r'(bump|revert)\s*\(\s*([a-z_][a-z0-9_]*)\s*\)', action)
-        if not m:
-            raise ValueError('unsupported action: ' + action)
-        op, arg = m.groups()
-        if op == 'bump':
-            s['counters'][arg] += 1
-        elif arg == 'origin':
-            s['reverted'] = True
-        else:
-            raise ValueError('unsupported revert base')
-        s['events'].append(f'{op}({arg})')
+        if m:
+            op, arg = m.groups()
+            if op == 'bump':
+                s['counters'][arg] += 1
+            elif arg in ('origin', 'latest'):
+                s['reverted'] = True
+            else:
+                raise ValueError('unsupported revert base: ' + arg)
+            s['events'].append(f'{op}({arg})')
+            continue
+        m = re.fullmatch(r'emit\s*\(\s*([A-Za-z_]\w*)\s*,\s*([A-Za-z_]\w*)\s*\)', action)
+        if m:
+            s['events'].append(f'emit({m.group(1)}, {m.group(2)})')
+            continue
+        raise ValueError('unsupported action: ' + action)
 
 
 def decision(policy, s, start=None):
@@ -148,7 +160,7 @@ def decision(policy, s, start=None):
         elif kind == 'route':
             for branch in n['branches']:
                 if Expr(branch['when'], s).run():
-                    actions(branch.get('do', ''), s)
+                    actions(branch.get('do') or None, s)
                     cursor = branch['goto']
                     break
             else:
@@ -224,7 +236,7 @@ def graph(policy):
             assert n['branches'][-1]['when'].strip() == 'true', 'missing last true fallback'
             for b in n['branches']:
                 Expr(b['when'], state()).run()
-                actions(b.get('do', ''), state())
+                actions(b.get('do') or None, state())
                 refs.append(b['goto'])
         if kind == 'hold':
             refs.extend(n['resume_targets'])
