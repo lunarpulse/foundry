@@ -471,7 +471,48 @@ def _tree_cl_caps_a(t):
     return out_
 
 
-def _guard_enforces_caps_a(w):
+def _tree_str_samples_a(t):
+    """(F35-1) string-literal samples from parsed list nodes —
+    includes the EMPTY string the raw-text regex dropped."""
+    out_ = []
+    def rec_(x):
+        if not isinstance(x, tuple):
+            return
+        if x[0] == 'list':
+            for it_ in x[1]:
+                if isinstance(it_, str) and len(it_) >= 2 \
+                        and it_.startswith('"') and it_.endswith('"'):
+                    out_.append(it_[1:-1])
+            return
+        if x[0] == 'call':
+            for a_ in x[2]:
+                rec_(a_)
+        elif x[0] == 'not':
+            rec_(x[1])
+        elif x[0] in ('and', 'or'):
+            for c_ in x[1]:
+                rec_(c_)
+    rec_(t)
+    return out_
+
+
+def _pack_active_cats_a(policy, pack_dir):
+    """(F35-2) the pack's REAL active categories, from the verify
+    stage's output_schema — has_findings states must be explored
+    against these, never against the guard's own string samples."""
+    for n_ in policy['nodes']:
+        if n_.get('kind') == 'dispatch':
+            for st_ in n_.get('stages', []) or []:
+                if st_.get('role') == 'verify' and st_.get('output_schema'):
+                    d_ = tomllib.loads(
+                        (pack_dir / st_['output_schema']).read_text())
+                    for o_ in d_.get('output', []) or []:
+                        if o_.get('name') == 'verdicts':
+                            return set(o_.get('active_categories') or [])
+    return set()
+
+
+def _guard_enforces_caps_a(w, active_cats=()):
     """(F34-1) SEMANTIC cap enforcement — parity/structure checks are
     insufficient (De Morgan: !(!count_lt(c,n) && false) is parity-even
     yet always true). A counter enforces iff NO reachable state with
@@ -485,10 +526,14 @@ def _guard_enforces_caps_a(w):
     caps_ = {}
     for c_, b_ in _tree_cl_caps_a(t_):
         caps_.setdefault(c_, []).append(b_)
-    uni_ = sorted(set(re.findall(r'"([^"]+)"', w)))
-    if len(uni_) > 12:
+    # (F35-1) samples from AST list literals (empty string included);
+    # (F35-2) the pack's REAL active categories join the universe so
+    # every reachable has_findings state is explored — the guard's own
+    # string samples must NOT stand in for active categories
+    uni_ = sorted(set(_tree_str_samples_a(t_)) | set(active_cats))
+    if len(uni_) > 16:
         raise AssertionError(  # resource bound: fail, never trust
-            f'guard verdict universe {len(uni_)} > 12: {w!r}')
+            f'guard verdict universe {len(uni_)} > 16: {w!r}')
     vsets_ = [()]
     for r_ in range(1, len(uni_) + 1):
         vsets_ += list(_it2.combinations(uni_, r_))
@@ -511,7 +556,8 @@ def _guard_enforces_caps_a(w):
                 for to_ in (False, True):
                     for bo_ in (False, True):
                         st_ = {'verdicts': set(vs_), 'counters': cmap_,
-                               'active': set(uni_), 'budget_exhausted': bo_,
+                               'active': set(active_cats),
+                               'budget_exhausted': bo_,
                                'timeout': to_, 'reverted': False,
                                'events': []}
                         try:
@@ -532,17 +578,30 @@ def _guard_enforces_caps_a(w):
     return bad_
 
 
-def schema_output_uniqueness(pack_dir):
-    """(F34-2) output names unique and non-null from-columns unique
-    across ALL schema files — a pack STRUCTURE contract, independent
-    of routing vocabulary (the old '"defer"'-in-condition gate let
-    the canonical pack skip the check; 34th round, finding 2)."""
+def schema_output_uniqueness(pack_dir=None, files=None):
+    """(F34-2/F35-3) output names unique and non-null from-columns
+    unique across ALL schema-declaring files — independent of routing
+    vocabulary AND of the 'schema-' filename convention (a renamed
+    schema file with updated manifest/digest closures evaded the
+    prefix scan; 35th round, finding 3). Enumerates every *.toml in
+    the pack and checks any file declaring [[output]] arrays.
+    `files` = in-memory {name: text} override."""
+    if files is None:
+        assert pack_dir is not None
+        files = {}
+        for p_ in sorted(pack_dir.iterdir()):
+            if p_.name.endswith('.toml'):
+                files[p_.name] = p_.read_text()
     froms_ = []
     names_ = []
-    for f_ in sorted(p_.name for p_ in pack_dir.iterdir()
-                     if p_.name.startswith('schema-')):
-        d_ = tomllib.loads((pack_dir / f_).read_text())
-        for o_ in d_.get('output', []):
+    for f_ in sorted(files):
+        d_ = tomllib.loads(files[f_])
+        outs_ = d_.get('output', [])
+        if not isinstance(outs_, list):
+            continue  # policy [output] tables (on_error) are not
+            # schema output arrays — only [[output]] arrays declare
+            # named outputs
+        for o_ in outs_:
             froms_.append(o_.get('from'))
             names_.append(o_.get('name'))
     nn_ = [x for x in froms_ if x]
@@ -1081,7 +1140,10 @@ def graph(policy):
                     # (!(!count_lt(c,n) && false)) are parity-even yet
                     # always true. Every count_lt counter in a re-entry
                     # guard must enforce its smallest declared cap.
-                    bad34_ = _guard_enforces_caps_a(wb_)
+                    # (F35-2) explored against the pack's REAL active
+                    # categories so all has_findings states are seen.
+                    bad34_ = _guard_enforces_caps_a(
+                        wb_, _pack_active_cats_a(policy, PACK_DIR_))
                     if bad34_:
                         raise AssertionError(
                             f'route {u19} branch to {w19}: guard does not '
@@ -1601,32 +1663,77 @@ def main():
         raise AssertionError('OR-added bypass mutant NOT detected (34-1)')
     check('negative control OR-added bypass', negative_or_added_bypass)
 
-    # (34-2) schema from-column / output-name uniqueness mutants
+    # (34-2/35-3) schema from/name uniqueness — in-memory, vocabulary-
+    # AND filename-independent (renamed schema file with a smuggled
+    # duplicate must still be rejected)
     def negative_schema_dup():
-        import tempfile as tf_
-        import shutil as sh_
-        for mode_ in ('from', 'name'):
-            with tf_.TemporaryDirectory() as td_:
-                pk_ = Path(td_) / 'pack'
-                sh_.copytree(args.pack, pk_)
-                sp_ = pk_ / 'schema-triage.toml'
-                txt_ = sp_.read_text()
-                if mode_ == 'from':
-                    txt_ = txt_.replace('from = "triage_log_rows"',
-                                        'from = "entries_routed_defer"')
-                else:
-                    txt_ = txt_.replace('name = "carried_rows"',
-                                        'name = "deferred"')
-                sp_.write_text(txt_)
-                try:
-                    schema_output_uniqueness(pk_)
-                except AssertionError as e:
-                    assert 'duplicate' in str(e), f'wrong failure: {e}'
-                    continue
+        files_ = {p_.name: p_.read_text()
+                  for p_ in sorted(args.pack.iterdir())
+                  if p_.name.endswith('.toml')}
+        for mode_ in ('from', 'name', 'rename_from', 'rename_name'):
+            m_ = dict(files_)
+            txt_ = m_['schema-triage.toml']
+            if mode_ == 'from':
+                txt_ = txt_.replace('from = "triage_log_rows"',
+                                    'from = "entries_routed_defer"')
+            elif mode_ == 'name':
+                txt_ = txt_.replace('name = "carried_rows"',
+                                    'name = "deferred"')
+            else:
+                txt_ = txt_.replace(
+                    'name = "carried_rows"',
+                    'name = "deferred"' if mode_ == 'rename_name'
+                    else 'name = "carried_rows"').replace(
+                    'from = "triage_log_rows"',
+                    'from = "entries_routed_defer"'
+                    if mode_ == 'rename_from' else 'from = "triage_log_rows"')
+                del m_['schema-triage.toml']
+            m_['mapping.toml' if mode_.startswith('rename')
+               else 'schema-triage.toml'] = txt_
+            try:
+                schema_output_uniqueness(files=m_)
+            except AssertionError as e:
+                assert 'across schema outputs' in str(e), \
+                    f'wrong failure: {e}'
+                continue
             raise AssertionError(
-                f'{mode_}-duplicate schema mutant NOT detected (34-2)')
-        return 'from/name duplicates rejected'
+                f'{mode_} schema mutant NOT detected (34-2/35-3)')
+        return 'from/name/rename duplicates rejected'
     check('negative control schema from/name duplicate', negative_schema_dup)
+
+    # (35-1) empty-string verdict bypass must be REJECTED
+    def negative_empty_string_verdict():
+        mutant = copy.deepcopy(policy)
+        rt = next(n for n in mutant['nodes'] if n['id'] == 'route1')
+        for b_ in rt['branches']:
+            if b_.get('goto') == 'fixdie':
+                b_['when'] = ('(any_in(verdicts, ["patch"]) && '
+                              'count_lt(fix_rounds, 3)) || '
+                              '(any_in(verdicts, [""]) && '
+                              '!(!count_lt(fix_rounds, 3) && false))')
+        try:
+            graph(mutant)
+        except AssertionError as e:
+            return 'mutant rejected: ' + str(e)
+        raise AssertionError('empty-string verdict mutant NOT detected (35-1)')
+    check('negative control empty-string verdict', negative_empty_string_verdict)
+
+    # (35-2) findings-based cap bypass must be REJECTED — the state
+    # space must see the pack's REAL active categories
+    def negative_findings_bypass():
+        mutant = copy.deepcopy(policy)
+        rt = next(n for n in mutant['nodes'] if n['id'] == 'route1')
+        for b_ in rt['branches']:
+            if b_.get('goto') == 'fixdie':
+                b_['when'] = ('count_lt(fix_rounds, 3) '
+                              '|| !(!count_lt(fix_rounds, 3) '
+                              '&& !has_findings(any))')
+        try:
+            graph(mutant)
+        except AssertionError as e:
+            return 'mutant rejected: ' + str(e)
+        raise AssertionError('findings bypass mutant NOT detected (35-2)')
+    check('negative control findings-based cap bypass', negative_findings_bypass)
 
     print('SCOPE: declarative model; no live engine/subagent execution. Prompt compliance and actual session reuse are not proven.')
     print(f'RESULT: {"FAIL" if failures else "PASS"}; {len(failures)} failed checks')

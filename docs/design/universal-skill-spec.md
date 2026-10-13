@@ -1,6 +1,21 @@
 # Foundry Universal Skill Spec — 범용 실행 모델 (Universal Review Engine)
 
-- **버전**: v0.69 (2026-10-14) — 34차 최종 검증 반영.
+- **버전**: v0.70 (2026-10-14) — 35차 최종 검증 반영.
+  문자열 표본의 AST 리터럴 추출(상태공간 verdict 우주를 파서 트리의
+  리스트 리터럴에서 수집 — 빈 문자열 "" 포함. 원시 정규식 [^"]+가 ""
+  를 누락해 any_in(verdicts, [""]) De Morgan 대안이 상한 검사를 우회했
+  던 verifier gap 폐쇄)·findings 축의 실측화(독립 검증기 상태공간의
+  active를 가드 문자열 집합이 아닌 **팩 실제 active_categories**로 —
+  has_findings(any) 도달 상태 전부 탐색, verdict 우주에 active 범주
+  합집합)·스키마 검출의 파일명 관례 탈피(유일성 검사 대상을 `schema-`
+  접두 파일이 아닌 **전 *.toml 중 [[output]] 배열을 선언한 파일 전부**로
+  — 참조 폐쇠·digest를 갱신한 파일명 변경(mapping.toml)이 접두 스캔을
+  우회했던 gap 폐쇄. 회귀 핀의 자기예외 흡수 결함("duplicate" 부분문자
+  열이 NOT-detected 메시지에도 포함)도 정확 메시지 대조로 수정, 핀은
+  전부 임시파일 없는 인메모리 방식으로 전환 — 읽기 전용 샌드박스에서도
+  원본 실행 가능). 회귀 핀 +5(빈 문자열 verdict 거부·findings 기반
+  우회 거부·파일명 변경+from 중복 거부·파일명 변경+name 중복 거부·
+  핀 메시지 정밀화). 34차:
   상한 강제의 의미론 판정(가드의 count_lt 카운터는 '상한 도달 상태에서
   그 가드가 참이 되는 reachable 상태가 없을' 때 강제 — 유한 상태공간
   실측. De Morgan 형태 !(!count_lt(c,n) && false)는 짝수 패리티임에도

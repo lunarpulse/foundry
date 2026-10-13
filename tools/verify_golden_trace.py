@@ -897,32 +897,60 @@ def contract_negative_controls(doc):
         raise AssertionError("OR-added bypass mutant NOT detected (34-1)")
     except AssertionError as e:
         assert "enforce the declared cap" in str(e), f"wrong failure: {e}"
-    # (F34-2) schema from-column and output-name uniqueness —
-    # vocabulary-independent structure contract (mutated pack copy)
-    import tempfile as _tf34
-    import shutil as _sh34
-    import os as _os34
-    for _mode34 in ("from", "name"):
-        with _tf34.TemporaryDirectory() as _td34:
-            _pk34 = f"{_td34}/pack"
-            _sh34.copytree(PACK, _pk34)
-            _sp34 = f"{_pk34}/schema-triage.toml"
-            _txt34 = open(_sp34).read()
-            if _mode34 == "from":
-                _txt34 = _txt34.replace(
-                    'from = "triage_log_rows"',
-                    'from = "entries_routed_defer"')
-            else:
-                _txt34 = _txt34.replace(
-                    'name = "carried_rows"',
-                    'name = "deferred"')
-            open(_sp34, "w").write(_txt34)
-            try:
-                _schema_output_uniqueness(_pk34)
-                raise AssertionError(
-                    f"{_mode34}-duplicate schema mutant NOT detected (34-2)")
-            except AssertionError as e:
-                assert "duplicate" in str(e), f"wrong failure: {e}"
+    # (F34-2/F35-3) schema from-column and output-name uniqueness —
+    # vocabulary- AND filename-independent structure contract,
+    # tested in-memory (read-only sandbox safe)
+    import os as _os35
+    _files35 = {}
+    for _sf35 in sorted(_os35.listdir(PACK)):
+        if _sf35.endswith(".toml"):
+            _files35[_sf35] = open(f"{PACK}/{_sf35}",
+                                   encoding="utf-8").read()
+    for _mode35 in ("from", "name", "rename_from", "rename_name"):
+        _m35 = dict(_files35)
+        _txt35 = _m35["schema-triage.toml"]
+        if _mode35 == "from":
+            _txt35 = _txt35.replace('from = "triage_log_rows"',
+                                    'from = "entries_routed_defer"')
+        elif _mode35 == "name":
+            _txt35 = _txt35.replace('name = "carried_rows"',
+                                    'name = "deferred"')
+        else:
+            # renamed schema file (declared closure updated) with a
+            # duplicate smuggled in — the prefix scan missed this
+            _txt35 = _txt35.replace(
+                'name = "carried_rows"',
+                'name = "deferred"' if _mode35 == "rename_name"
+                else 'name = "carried_rows"').replace(
+                'from = "triage_log_rows"',
+                'from = "entries_routed_defer"'
+                if _mode35 == "rename_from" else 'from = "triage_log_rows"')
+            del _m35["schema-triage.toml"]
+        _m35["mapping.toml" if _mode35.startswith("rename")
+             else "schema-triage.toml"] = _txt35
+        try:
+            _schema_output_uniqueness(files=_m35)
+            raise AssertionError(
+                f"{_mode35} schema mutant NOT detected (34-2/35-3)")
+        except AssertionError as e:
+            assert "across schema outputs" in str(e), \
+                f"wrong failure: {e}"
+    # (F35-1) empty-string verdict bypass must be REJECTED — the
+    # interpreter accepts "" but the old regex universe dropped it
+    bad = copy.deepcopy(doc)
+    for n in bad["nodes"]:
+        if n["id"] == "route1":
+            for br in n.get("branches", []):
+                if br.get("goto") == "fixdie":
+                    br["when"] = ('(any_in(verdicts, ["patch"]) && '
+                                  'count_lt(fix_rounds, 3)) || '
+                                  '(any_in(verdicts, [""]) && '
+                                  '!(!count_lt(fix_rounds, 3) && false))')
+    try:
+        contract_checks(bad)
+        raise AssertionError("empty-string verdict mutant NOT detected (35-1)")
+    except AssertionError as e:
+        assert "enforce the declared cap" in str(e), f"wrong failure: {e}"
 
 
 def example_pack_identity():
@@ -2030,6 +2058,32 @@ def _tree_guard_parse(w):
         return None
 
 
+def _tree_string_samples(t):
+    """(F35-1) string-literal samples from the parsed tree's list
+    nodes — includes the EMPTY string, which the raw-text regex
+    r'"([^"]+)"' dropped while the interpreters accept it."""
+    out = []
+    def rec(x):
+        if not isinstance(x, tuple):
+            return
+        if x[0] == "list":
+            for it in x[1]:
+                if isinstance(it, str) and len(it) >= 2 \
+                        and it.startswith('"') and it.endswith('"'):
+                    out.append(it[1:-1])
+            return
+        if x[0] == "call":
+            for a in x[2]:
+                rec(a)
+        elif x[0] == "not":
+            rec(x[1])
+        elif x[0] in ("and", "or"):
+            for c in x[1]:
+                rec(c)
+    rec(t)
+    return out
+
+
 def _guard_enforces_caps(w):
     """(F34-1) SEMANTIC cap enforcement. Parity/structure checks are
     insufficient: De Morgan forms like !(!count_lt(c,n) && false) are
@@ -2046,7 +2100,7 @@ def _guard_enforces_caps(w):
     caps = {}
     for _c, _b in _tree_count_lt_caps(t):
         caps.setdefault(_c, []).append(_b)
-    uni = sorted(set(re.findall(r'"([^"]+)"', w)))
+    uni = sorted(set(_tree_string_samples(t)))
     if len(uni) > 12:
         raise AssertionError(  # resource bound: fail, never trust
             f"guard verdict universe {len(uni)} > 12: {w!r}")
@@ -2090,21 +2144,32 @@ def _guard_enforces_caps(w):
     return unenforced
 
 
-def _schema_output_uniqueness(pack_dir):
-    """(F34-2) output names unique and non-null from-columns unique
-    across ALL schema files — a pack STRUCTURE contract, enforced
-    independently of routing vocabulary (the old check only ran when
-    the literal 'defer' appeared in a route condition, so the
-    canonical pack — which expresses defer via !has_findings(any) —
-    skipped it entirely; 34th round, finding 2)."""
+def _schema_output_uniqueness(pack_dir=None, files=None):
+    """(F34-2/F35-3) output names unique and non-null from-columns
+    unique across ALL schema-declaring files — a pack STRUCTURE
+    contract, enforced independently of routing vocabulary AND of the
+    'schema-' filename convention (a renamed schema file with updated
+    manifest/digest closures evaded the prefix scan; 35th round,
+    finding 3). Enumerates every *.toml in the pack and checks any
+    file that declares [[output]] tables. `files` = in-memory
+    {name: text} override (read-only-sandbox regression pins)."""
+    if files is None:
+        files = {}
+        for sf in sorted(os.listdir(pack_dir)):
+            if sf.endswith(".toml"):
+                files[sf] = open(f"{pack_dir}/{sf}", encoding="utf-8").read()
     froms = []
     names = []
-    for sf in sorted(os.listdir(pack_dir)):
-        if sf.startswith("schema-"):
-            sd = tomllib.load(open(f"{pack_dir}/{sf}", "rb"))
-            for o in sd.get("output", []):
-                froms.append(o.get("from"))
-                names.append(o.get("name"))
+    for sf in sorted(files):
+        sd = tomllib.loads(files[sf])
+        outs = sd.get("output", [])
+        if not isinstance(outs, list):
+            continue  # policy [output] tables (on_error) are not
+            # schema output arrays — only [[output]] arrays declare
+            # named outputs
+        for o in outs:
+            froms.append(o.get("from"))
+            names.append(o.get("name"))
     non_null = [f for f in froms if f]
     dup_f = sorted({x for x in non_null if non_null.count(x) > 1})
     assert not dup_f, f"duplicate 'from' columns across schema outputs: {dup_f}"
