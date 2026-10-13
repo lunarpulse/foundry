@@ -10,6 +10,16 @@
   전 라우팅**이 팩 데이터로 표현되고, 팩 교체·라우팅 변경 시 **엔진
   diff 0**.
 
+## DSL 문자열 규범 (FINAL-4)
+- 문자열 리터럴은 **큰따옴표만**. 작은따옴표는 문법 오류(양 검증기 일관 거부).
+- 이스케이프(`\u0070atch` 등)는 **TOML 파싱이 소유** — DSL은 디코딩된 값만 비교.
+- 조건식은 완전 소비 파서가 처리: 괄호 안 `)` 포함 문자열(`"a)b"`)도 정상 토큰.
+- 검증 증거 게이트(§2.4): emit 노드·emit 액션 공통 적용, redrive(신산출물)·
+  revert는 증거 무효화. 게이트 거부 시 상류 dispatch hold_target으로 divert.
+- 현재 PASS는 **선언적 모델 검증** — 실제 세션 계승·원자성·fencing·엔진 diff 0의
+  실행 증명은 구현 단계(§4)의 인수 조건이다.
+
+
 ## 0. 측정된 기반 (불변 사실 — r2/r3 실측 확정)
 
 ### 0.1 InspectionFailed 실제 전이 (order.rs 283–294, MAX_ATTEMPTS=3)
@@ -115,15 +125,6 @@ kind = "redrive"     #    재디스패치 — 새 generation workdir(물리 격�
 #    지시(포트 불변, 전달 규약은 workdir 파일 소유 — M0 경로 단일
 #    진실원 패턴 승계)
 #  격리: generation별 workdir 분리(gen-N), 실행별 로그(attempt-N.log)
-
-## DSL 문자열 규범 (FINAL-4)
-- 문자열 리터럴은 **큰따옴표만**. 작은따옴표는 문법 오류(양 검증기 일관 거부).
-- 이스케이프(`\u0070atch` 등)는 **TOML 파싱이 소유** — DSL은 디코딩된 값만 비교.
-- 조건식은 완전 소비 파서가 처리: 괄호 안 `)` 포함 문자열(`"a)b"`)도 정상 토큰.
-- 검증 증거 게이트(§2.4): emit 노드·emit 액션 공통 적용, redrive(신산출물)·
-  revert는 증거 무효화. 게이트 거부 시 상류 dispatch hold_target으로 divert.
-- 현재 PASS는 **선언적 모델 검증** — 실제 세션 계승·원자성·fencing·엔진 diff 0의
-  실행 증명은 구현 단계(§4)의 인수 조건이다.
 
 #  실패: exit≠0/timeout → on_redrive_error(팩 정책: hold|fail-run)
 #  산출: 새 result_commit → 다음 검증의 artifact 결속 + 이전 증거
