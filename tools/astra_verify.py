@@ -153,6 +153,12 @@ def actions(text, s):
             continue
         m = re.fullmatch(r'emit\s*\(\s*([A-Za-z_]\w*)\s*,\s*([A-Za-z_]\w*)\s*\)', action)
         if m:
+            # (F29-4) emit payload must be a declared output — enforced
+            # when the state declares its output universe; the walker
+            # state (no 'outputs' key) is load-checked in graph()
+            if 'outputs' in s:
+                assert m.group(2) in s['outputs'], \
+                    f'emit({m.group(1)}, {m.group(2)}): payload not a declared output'
             s['events'].append(f'emit({m.group(1)}, {m.group(2)})')
             out.append(('emit', m.group(1)))
             continue
@@ -258,6 +264,140 @@ def _outs19(n):
 
 
 
+
+
+def _guard_tree_a(py):
+    import re as _re
+    toks = _re.findall(
+        r'!|&&|\|\||\(|\)|,|\[|\]|"[^"]*"|\d+\.\d+|\d+'
+        r'|[A-Za-z_][A-Za-z0-9_]*', py)
+    pos = [0]
+    def peek():
+        return toks[pos[0]] if pos[0] < len(toks) else None
+    def eat(t=None):
+        tk = toks[pos[0]] if pos[0] < len(toks) else None
+        if tk is None or (t is not None and tk != t):
+            raise ValueError(f'guard syntax: {py!r} at {tk!r}')
+        pos[0] += 1
+        return tk
+    def atom():
+        tk = peek()
+        if tk == '(':
+            eat('(')
+            v = orx()
+            eat(')')
+            return v
+        if tk == '[':
+            eat('[')
+            items = []
+            while peek() != ']':
+                items.append(eat())
+                if peek() == ',':
+                    eat(',')
+            eat(']')
+            return ('list', items)
+        if tk in ('true', 'false'):
+            eat()
+            return ('const', tk == 'true')
+        if tk and _re.fullmatch(r'\d+(\.\d+)?', tk):
+            return ('num', eat())
+        if tk and _re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', tk):
+            name = eat()
+            if peek() == '(':
+                eat('(')
+                args = []
+                while peek() != ')':
+                    args.append(atom())
+                    if peek() == ',':
+                        eat(',')
+                eat(')')
+                return ('call', name, args)
+            return ('ident', name)
+        raise ValueError(f'guard syntax: {py!r} at {tk!r}')
+    def unary():
+        if peek() == '!':
+            eat('!')
+            return ('not', unary())
+        return atom()
+    def andx():
+        v = unary()
+        while peek() == '&&':
+            eat('&&')
+            v = ('and', [v, unary()])
+        return v
+    def orx():
+        v = andx()
+        while peek() == '||':
+            eat('||')
+            v = ('or', [v, andx()])
+        return v
+    t = orx()
+    if pos[0] != len(toks):
+        raise ValueError(f'guard trailing syntax: {py!r}')
+    return t
+
+
+def _tree_has_cl_a(t):
+    if not isinstance(t, tuple):
+        return False
+    if t[0] == 'call' and t[1] == 'count_lt':
+        return True
+    if t[0] in ('and', 'or'):
+        return any(_tree_has_cl_a(c) for c in t[1])
+    if t[0] == 'not':
+        return _tree_has_cl_a(t[1])
+    return False
+
+
+def _tree_const_a(t):
+    if not isinstance(t, tuple):
+        return None
+    if t[0] == 'const':
+        return t[1]
+    if t[0] == 'not':
+        v = _tree_const_a(t[1])
+        return None if v is None else (not v)
+    if t[0] in ('and', 'or'):
+        vals = [_tree_const_a(c) for c in t[1]]
+        if any(v is None for v in vals):
+            return None
+        return all(vals) if t[0] == 'and' else any(vals)
+    return None
+
+
+def _tree_or_weak_a(t):
+    if not isinstance(t, tuple):
+        return False
+    if t[0] == 'or':
+        kids = t[1]
+        if any(_tree_has_cl_a(k) for k in kids):
+            for k in kids:
+                if _tree_has_cl_a(k):
+                    continue
+                if _tree_const_a(k) is False:
+                    continue
+                return True
+        return any(_tree_or_weak_a(k) for k in kids)
+    if t[0] in ('and', 'or'):
+        return any(_tree_or_weak_a(k) for k in t[1])
+    if t[0] == 'not':
+        return _tree_or_weak_a(t[1])
+    return False
+
+
+def _tree_neg_cl_a(t):
+    def rec(x, neg):
+        if not isinstance(x, tuple):
+            return False
+        if x[0] == 'call' and x[1] == 'count_lt':
+            return neg
+        if x[0] == 'not':
+            return rec(x[1], not neg)
+        if x[0] in ('and', 'or'):
+            return any(rec(c, neg) for c in x[1])
+        return False
+    return rec(t, False)
+
 def _reach_set19(adj, start, universe):
     seen_ = set()
     stk_ = [start]
@@ -270,6 +410,21 @@ def _reach_set19(adj, start, universe):
             if y_ not in seen_:
                 stk_.append(y_)
     return seen_
+
+PACK_DIR_ = Path('skills/bmad-review-full/v1')
+
+
+def _declared_outputs():
+    """(F29-4) output names from sibling schema files + 'summary'."""
+    names = {'summary'}
+    for sf_ in ('schema-triage.toml', 'schema-findings.toml',
+                'schema-defer.toml'):
+        p_ = PACK_DIR_ / sf_
+        if p_.exists():
+            names |= {o_.get('name') for o_ in
+                      tomllib.loads(p_.read_text()).get('output', [])}
+    return names
+
 
 def graph(policy):
     nodes = {n['id']: n for n in policy['nodes']}
@@ -286,6 +441,9 @@ def graph(policy):
         if n['kind'] == 'emit':
             assert n.get('payload_from'), \
                 f'emit {n["id"]} missing payload_from'
+            _pf29_ = n['payload_from']
+            assert _pf29_ in _declared_outputs(), \
+                f'emit {n["id"]} payload_from={_pf29_!r} not a declared output'
             # (F11-1/F12-1) closed event set — canonical pair ONLY
             # (output declarations do NOT extend the event namespace)
             ev_ = n.get('event')
@@ -382,6 +540,39 @@ def graph(policy):
                 miss_ = set(lens_ids_) - set(st_['after'])
                 assert not miss_, \
                     f'verify stage {st_["id"]} must run after ALL lens stages; missing: {sorted(miss_)}'
+    # (F29-4) after dependencies must reference DECLARED stage ids
+    all_sids_ = {s['id'] for n_ in nodes.values()
+                 for s in (n_.get('stages', []) or [])}
+    all_sids_ |= {p_.get('id') for p_ in (policy.get('pack_stages', []) or [])}
+    for n_ in nodes.values():
+        for st_ in n_.get('stages', []) or []:
+            _af_ = st_.get('after') or []
+            if isinstance(_af_, str):
+                _af_ = [_af_]
+            for d_ in _af_:
+                assert d_ in all_sids_, \
+                    f'stage {st_["id"]} after undeclared stage {d_!r}'
+    # (F29-4) stages sharing a session must be SERIALIZED: one must
+    # explicitly run after the other (parallel same-session forbidden)
+    for n_ in nodes.values():
+        sst_ = [st_ for st_ in n_.get('stages', []) or [] if st_.get('session')]
+        for i_ in range(len(sst_)):
+            for j_ in range(i_ + 1, len(sst_)):
+                a_, b_ = sst_[i_], sst_[j_]
+                if a_['session'] != b_['session']:
+                    continue
+                _aa_ = a_.get('after') or []
+                if isinstance(_aa_, str):
+                    _aa_ = [_aa_]
+                _ab_ = b_.get('after') or []
+                if isinstance(_ab_, str):
+                    _ab_ = [_ab_]
+                if b_['id'] in _aa_ or a_['id'] in _ab_:
+                    continue  # serialized in one direction
+                _m_ = ('session %r: %r and %r have no ordering — '
+                       'same session must be serial (§2.1)'
+                       % (a_['session'], a_['id'], b_['id']))
+                raise AssertionError(_m_)
     for ps_ in policy.get('pack_stages', []) or []:
         sid_list.append(ps_.get('id'))
         if ps_.get('role') == 'verify':
@@ -491,20 +682,44 @@ def graph(policy):
                 guard_ctrs[(n_['id'], g_, bi_)] = ctrs_in_w[0]
                 guard_all_ctrs[(n_['id'], g_, bi_)] = set(ctrs_in_w)
                 parts_ = _re19.split(r'\|\|', _re19.sub(r'"[^"]*"', '""', w_))
-                pure_or = any('count_lt' not in p.strip() for p in parts_ if p.strip())
+                # (F29-3) structure-aware OR-weakening
+                pure_or = _tree_or_weak_a(_guard_tree_a(w_))
                 dst_n_ = nodes.get(g_)
                 reenters_ = dst_n_ is not None and (
                     dst_n_['kind'] == 'redrive' or g_ == n_['id'])
-                neg_entry = False
-                if reenters_:
-                    for p in parts_:
-                        p = p.strip()
-                        if not p:
-                            continue
-                        if _re19.search(r'!\s*\(*\s*count_lt', p):
-                            neg_entry = True
+                neg_entry = reenters_ and _tree_neg_cl_a(_guard_tree_a(w_))
                 if pure_or or neg_entry:
                     raise AssertionError(f'guard on {n_["id"]}->{g_} is OR-weakened or negated entry: {w_!r} (§2.2)')
+    # (F29-4) route-branch do emit payloads must be declared outputs
+    _outs29_ = _declared_outputs()
+    for n_ in nodes.values():
+        for b_ in n_.get('branches', []) or []:
+            _do_ = b_.get('do') or ''
+            for _m29_ in re.finditer(
+                    r'emit\s*\(\s*\w+\s*,\s*(\w+)\s*\)', _do_):
+                assert _m29_.group(1) in _outs29_, \
+                    f'{n_["id"]} branch do emit payload ' \
+                    f'{_m29_.group(1)!r} not a declared output'
+    # (F29-2) every automatic cycle — including route-less redrive
+    # chains — must carry a counter bump somewhere on the cycle
+    for comp_ in sccs19:
+        cnodes_ = set(comp_)
+        is_auto_ = (len(cnodes_) > 1) or any(
+            x_ in auto_adj.get(x_, ()) for x_ in cnodes_)
+        if not is_auto_:
+            continue
+        has_bump_ = any(
+            nodes[x_].get('kind') == 'redrive' and nodes[x_].get('bump')
+            for x_ in cnodes_) or any(
+            nodes[x_].get('kind') == 'route'
+            and any(a_[0] == 'bump'
+                    for b_ in nodes[x_].get('branches', [])
+                    for a_ in actions(b_.get('do'), {'counters': {}, 'events': []}))
+            for x_ in cnodes_)
+        if not has_bump_:
+            raise AssertionError(
+                f'automatic cycle {sorted(cnodes_)} has no counter bump '
+                'anywhere on it — unbounded self-loop (§2.2)')
     # per-edge rules
     for (u19, w19, bi27_) in list(guard_ctrs.keys()):
         if scc_of19.get(u19) != scc_of19.get(w19) or u19 not in scc_of19:
@@ -594,28 +809,28 @@ def graph(policy):
                             b_here_ = any(
                                 a_[0] == 'bump' and a_[1] == gc_all
                                 for a_ in actions(_br27.get('do'), {'counters': {}, 'events': []}))
-                        b_node_ = (nodes[w19].get('kind') == 'redrive'
-                                   and nodes[w19].get('bump') == gc_all)
-                        reach_ = set()
-                        stack_ = [w19]
-                        while stack_:
-                            x_ = stack_.pop()
-                            if x_ in reach_:
-                                continue
-                            reach_.add(x_)
-                            if x_ == u19:
-                                continue
-                            for y_ in auto_adj.get(x_, ()):
-                                if y_ not in reach_:
-                                    stack_.append(y_)
-                        back_ = reach_ - {u19}
-                        b_comp_ = any(gc_all in bump_ctr.get(x_, set())
-                                      for x_ in back_)
-                        if not (b_here_ or b_node_ or b_comp_):
-                            raise AssertionError(
-                                f'route {u19} branch to {w19}: guard counter '
-                                f'{gc_all!r} never bumped along the cycle — '
-                                'OR-joined stale counter bypasses the cap (§2.2/§2.3)')
+                            b_node_ = (nodes[w19].get('kind') == 'redrive'
+                                       and nodes[w19].get('bump') == gc_all)
+                            reach_ = set()
+                            stack_ = [w19]
+                            while stack_:
+                                x_ = stack_.pop()
+                                if x_ in reach_:
+                                    continue
+                                reach_.add(x_)
+                                if x_ == u19:
+                                    continue
+                                for y_ in auto_adj.get(x_, ()):
+                                    if y_ not in reach_:
+                                        stack_.append(y_)
+                            back_ = reach_ - {u19}
+                            b_comp_ = any(gc_all in bump_ctr.get(x_, set())
+                                          for x_ in back_)
+                            if not (b_here_ or b_node_ or b_comp_):
+                                raise AssertionError(
+                                    f'route {u19} branch to {w19}: guard counter '
+                                    f'{gc_all!r} never bumped along the cycle — '
+                                    'OR-joined stale counter bypasses the cap (§2.2/§2.3)')
         # (F24-2) exactly-once: at most ONE redrive node per guard
         # counter inside an automatic SCC
         for u19, ws19 in auto_adj.items():
@@ -829,6 +1044,8 @@ def main():
             print(f'FAIL {label}: {e}')
 
     check('manifest closure + canonical digest', lambda: canonical(args.pack))
+    global PACK_DIR_
+    PACK_DIR_ = args.pack
     policy = tomllib.loads((args.pack / 'policy.toml').read_text())
     # (r17-4) follow the ACTUAL verify stage's output_schema reference
     # instead of hardcoding schema-triage.toml

@@ -1766,6 +1766,132 @@ def _reach_set(adj, start, universe):
                 stack.append(y)
     return seen
 
+
+
+def _guard_tree(py):
+    """Structural parse of a raw guard expression into a tree:
+    ("or", [..]), ("and", [..]), ("not", x), ("call", name, args),
+    ("const", bool), ("ident", s). Raises ValueError on bad syntax."""
+    toks = re.findall(
+        r'!|&&|\|\||\(|\)|,|\[|\]|"[^"]*"|\d+\.\d+|\d+'
+        r'|[A-Za-z_][A-Za-z0-9_]*', py)
+    pos = [0]
+    def peek():
+        return toks[pos[0]] if pos[0] < len(toks) else None
+    def eat(t=None):
+        tk = toks[pos[0]] if pos[0] < len(toks) else None
+        if tk is None or (t is not None and tk != t):
+            raise ValueError(f"guard syntax: {py!r} at {tk!r}")
+        pos[0] += 1
+        return tk
+    def atom():
+        tk = peek()
+        if tk == "(":
+            eat("(")
+            v = orx()
+            eat(")")
+            return v
+        if tk == "[":
+            eat("[")
+            items = []
+            while peek() != "]":
+                items.append(eat())
+                if peek() == ",":
+                    eat(",")
+            eat("]")
+            return ("list", items)
+        if tk in ("true", "false"):
+            eat()
+            return ("const", tk == "true")
+        if tk and re.fullmatch(r"\d+(\.\d+)?", tk):
+            return ("num", eat())
+        if tk and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", tk):
+            name = eat()
+            if peek() == "(":
+                eat("(")
+                args = []
+                while peek() != ")":
+                    args.append(atom())
+                    if peek() == ",":
+                        eat(",")
+                eat(")")
+                return ("call", name, args)
+            return ("ident", name)
+        raise ValueError(f"guard syntax: {py!r} at {tk!r}")
+    def unary():
+        if peek() == "!":
+            eat("!")
+            return ("not", unary())
+        return atom()
+    def andx():
+        v = unary()
+        while peek() == "&&":
+            eat("&&")
+            v = ("and", [v, unary()])
+        return v
+    def orx():
+        v = andx()
+        while peek() == "||":
+            eat("||")
+            v = ("or", [v, andx()])
+        return v
+    t = orx()
+    if pos[0] != len(toks):
+        raise ValueError(f"guard trailing syntax: {py!r}")
+    return t
+
+
+def _tree_has_count_lt(t):
+    if not isinstance(t, tuple):
+        return False
+    if t[0] == "call" and t[1] == "count_lt":
+        return True
+    if t[0] in ("and", "or"):
+        return any(_tree_has_count_lt(c) for c in t[1])
+    if t[0] == "not":
+        return _tree_has_count_lt(t[1])
+    return False
+
+
+def _tree_const_value(t):
+    """Return constant bool if the subtree is constant, else None."""
+    if not isinstance(t, tuple):
+        return None
+    if t[0] == "const":
+        return t[1]
+    if t[0] == "not":
+        v = _tree_const_value(t[1])
+        return None if v is None else (not v)
+    if t[0] in ("and", "or"):
+        vals = [_tree_const_value(c) for c in t[1]]
+        if any(v is None for v in vals):
+            return None
+        return all(vals) if t[0] == "and" else any(vals)
+    return None  # call / ident / num / list are non-constant
+
+
+def _tree_or_weakened(t):
+    """(F29-3) structure-aware: an OR is weakened only when some child
+    lacks count_lt, is not constant-false, AND a sibling carries the
+    cap (count_lt). Conjunction-joined caps are preserved."""
+    if not isinstance(t, tuple):
+        return False
+    if t[0] == "or":
+        kids = t[1]
+        if any(_tree_has_count_lt(k) for k in kids):
+            for k in kids:
+                if _tree_has_count_lt(k):
+                    continue
+                if _tree_const_value(k) is False:
+                    continue  # dead alternative cannot bypass
+                return True
+        return any(_tree_or_weakened(k) for k in kids)
+    if t[0] in ("and", "or"):
+        return any(_tree_or_weakened(k) for k in t[1])
+    if t[0] == "not":
+        return _tree_or_weakened(t[1])
+    return False
+
 def contract_checks(doc):
     """(r16-2) pack-contract regressions: pre_stage wiring and
     same-session ordering — the two mutants r15 slipped through."""
@@ -2140,10 +2266,11 @@ def contract_checks(doc):
                     _bi = n["branches"].index(br)
                     _guard_ctrs[(n["id"], g, _bi)] = _ctrs_in_w[0]
                     _guard_all_ctrs[(n["id"], g, _bi)] = set(_ctrs_in_w)
-                    _parts = re.split(r"\|\|", re.sub(r'"[^"]*"', '""', w))
-                    _pure_or = any(
-                        "count_lt" not in p.strip()
-                        for p in _parts if p.strip())
+                    # (F29-3) structure-aware OR-weakening: a cap
+                    # joined by && stays a cap; only an OR alternative
+                    # that is non-count_lt AND non-constant-false
+                    # weakens a sibling count_lt cap
+                    _pure_or = _tree_or_weakened(_guard_tree(w))
                     # negation governing count_lt — only a violation on
                     # edges that RE-ENTER a cycle; exit edges (hold/
                     # out-of-cycle targets) legitimately use !count_lt
@@ -2152,13 +2279,35 @@ def contract_checks(doc):
                     _reenters = _to_node is not None and (
                         _to_node["kind"] in ("redrive",)
                         or g == n["id"])
-                    _neg_entry = _reenters and any(
-                        re.search(r"!\s*\(*\s*count_lt", p)
-                        for p in _parts if p.strip())
+                    _gt = _guard_tree(w)
+                    _neg_entry = _reenters and _tree_neg_count_lt(_gt)
                     if _pure_or or _neg_entry:
                         raise AssertionError(
                             f"guard on {n['id']}->{g} is OR-weakened or "
                             f"negated entry: {w!r} (§2.2)")
+        # (F29-2) EVERY automatic cycle — including cycles with no
+        # route node at all (pure redrive chains) — must carry a
+        # counter bump somewhere on the cycle; a bump-less automatic
+        # SCC can only loop forever (§2.2)
+        for _sci, _comp in enumerate(_sccs):
+            _cnodes = set(_comp)
+            _is_auto_cycle = (len(_cnodes) > 1) or any(
+                x in _auto_adj.get(x, ()) for x in _cnodes)
+            if not _is_auto_cycle:
+                continue
+            _has_bump = any(
+                _node_ids[x].get("kind") == "redrive"
+                and _node_ids[x].get("bump")
+                for x in _cnodes) or any(
+                _node_ids[x].get("kind") == "route"
+                and any(a[0] == "bump"
+                        for br in _node_ids[x].get("branches", [])
+                        for a in _parse_actions_top(br.get("do")))
+                for x in _cnodes)
+            if not _has_bump:
+                raise AssertionError(
+                    f"automatic cycle {sorted(_cnodes)} has no counter "
+                    "bump anywhere on it — unbounded self-loop (§2.2)")
         # (F22) PER-EDGE rule: every edge whose endpoints share an SCC
     # (i.e. the edge closes a cycle) must be counter-guarded with
     # path-exact bumps; the earlier whole-cycle heuristic conflated
@@ -2197,17 +2346,17 @@ def contract_checks(doc):
                     _bi = n["branches"].index(br)
                     _guard_ctrs[(n["id"], g, _bi)] = _ctrs_in_w[0]
                     _guard_all_ctrs[(n["id"], g, _bi)] = set(_ctrs_in_w)
-                    _parts = re.split(r"\|\|", re.sub(r'"[^"]*"', '""', w))
-                    _pure_or = any(
-                        "count_lt" not in p.strip()
-                        for p in _parts if p.strip())
+                    # (F29-3) structure-aware OR-weakening: a cap
+                    # joined by && stays a cap; only an OR alternative
+                    # that is non-count_lt AND non-constant-false
+                    # weakens a sibling count_lt cap
+                    _pure_or = _tree_or_weakened(_guard_tree(w))
                     _to_node = _node_ids.get(g)
                     _reenters = _to_node is not None and (
                         _to_node["kind"] in ("redrive",)
                         or g == n["id"])
-                    _neg_entry = _reenters and any(
-                        re.search(r"!\s*\(*\s*count_lt", p)
-                        for p in _parts if p.strip())
+                    _gt = _guard_tree(w)
+                    _neg_entry = _reenters and _tree_neg_count_lt(_gt)
                     if _pure_or or _neg_entry:
                         raise AssertionError(
                             f"guard on {n['id']}->{g} is OR-weakened or "
@@ -2323,34 +2472,33 @@ def contract_checks(doc):
                             _b_here = any(
                                 a[0] == "bump" and a[1] == gc_all
                                 for a in _parse_actions_top(_br27.get("do")))
-                        _b_node = (_node_ids[w].get("kind") == "redrive"
-                                   and _node_ids[w].get("bump") == gc_all)
-                        # (F25-1a) bump credited only on nodes that
-                        # lie on a path from w BACK to u (the cycle the
-                        # guard actually closes) — route1's OTHER
-                        # branches don't run on this loop
-                        _reach = set()
-                        _stack = [w]
-                        while _stack:
-                            _x = _stack.pop()
-                            if _x in _reach:
-                                continue
-                            _reach.add(_x)
-                            if _x == u:
-                                continue
-                            for _y in _full_adj.get(_x, ()):
-                                if _y not in _reach:
-                                    _stack.append(_y)
-                        _back = _reach - {u}
-                        _b_comp = any(
-                            gc_all in _bump_ctr.get(x, set())
-                            for x in _back)
-                        if not (_b_here or _b_node or _b_comp):
-                            raise AssertionError(
-                                f"route {u} branch to {w}: guard counter "
-                                f"{gc_all!r} is never bumped along the "
-                                "cycle — an OR-joined stale counter "
-                                "bypasses the cap (§2.2/§2.3)")
+                            _b_node = (_node_ids[w].get("kind") == "redrive"
+                                       and _node_ids[w].get("bump") == gc_all)
+                            # (F25-1a) bump credited only on nodes
+                            # that lie on a path from w BACK to u (the
+                            # cycle the guard actually closes)
+                            _reach = set()
+                            _stack = [w]
+                            while _stack:
+                                _x = _stack.pop()
+                                if _x in _reach:
+                                    continue
+                                _reach.add(_x)
+                                if _x == u:
+                                    continue
+                                for _y in _full_adj.get(_x, ()):
+                                    if _y not in _reach:
+                                        _stack.append(_y)
+                            _back = _reach - {u}
+                            _b_comp = any(
+                                gc_all in _bump_ctr.get(x, set())
+                                for x in _back)
+                            if not (_b_here or _b_node or _b_comp):
+                                raise AssertionError(
+                                    f"route {u} branch to {w}: guard counter "
+                                    f"{gc_all!r} is never bumped along the "
+                                    "cycle — an OR-joined stale counter "
+                                    "bypasses the cap (§2.2/§2.3)")
         # (F27-2/F27-3) exactly-once for EVERY guard counter, judged
         # on CO-REACHABLE bump owners (same execution path) — mutually
         # exclusive alternate paths each bumping once are LEGAL
@@ -2678,6 +2826,21 @@ def contract_checks(doc):
                     if {"edge", "claims"} <= ids:
                         assert "claims" in reach("edge"), \
                             "trace session: claims must be ordered after edge"
+
+def _tree_neg_count_lt(t):
+    """True if a count_lt appears under an odd number of NOTs."""
+    def rec(x, neg):
+        if not isinstance(x, tuple):
+            return False
+        if x[0] == "call" and x[1] == "count_lt":
+            return neg
+        if x[0] == "not":
+            return rec(x[1], not neg)
+        if x[0] in ("and", "or"):
+            return any(rec(c, neg) for c in x[1])
+        return False
+    return rec(t, False)
+
 
 
 if __name__ == "__main__":
