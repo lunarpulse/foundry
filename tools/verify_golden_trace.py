@@ -1889,10 +1889,17 @@ def _tree_or_weakened(t, outer_cap=False):
                 return True
         return any(_tree_or_weakened(k, outer_cap) for k in kids)
     if t[0] == "and":
-        # an outer cap exists for children if any sibling subtree
-        # (including this node itself) carries a count_lt
-        capped = outer_cap or any(_tree_has_count_lt(k) for k in t[1])
-        return any(_tree_or_weakened(k, capped) for k in t[1])
+        # (F31-1) outer cap = count_lt in a SIBLING subtree (or higher
+        # context) — the OR's own nested count_lt must NOT count as
+        # its own outer cap: 'X && (count_lt(a,3) || true)' is still
+        # weakened because when X holds the cap never gates re-entry
+        for _i31, k in enumerate(t[1]):
+            capped31 = outer_cap or any(
+                _tree_has_count_lt(s) for _j31, s in enumerate(t[1])
+                if _j31 != _i31)
+            if _tree_or_weakened(k, capped31):
+                return True
+        return False
     if t[0] == "not":
         return _tree_or_weakened(t[1], outer_cap)
     return False
@@ -2399,14 +2406,32 @@ def contract_checks(doc):
                                 "BOTH on branch and node — double "
                                 "increment (§2.3)")
             else:
-                # every branch to w must bump gc30 on its own do
+                # (F31-2) the cap counter may be bumped on the entry
+                # branch do, the destination node, OR anywhere on the
+                # w->u return path — exactly once per traversal is the
+                # contract (§2.3), not 'on the entry branch itself'
+                _reach31 = set()
+                _stk31 = [w]
+                while _stk31:
+                    _x31 = _stk31.pop()
+                    if _x31 in _reach31:
+                        continue
+                    _reach31.add(_x31)
+                    if _x31 == u:
+                        continue
+                    for _y31 in _full_adj.get(_x31, ()):
+                        if _y31 not in _reach31:
+                            _stk31.append(_y31)
+                _path31 = any(
+                    gc30 in _bump_ctr.get(x, set())
+                    for x in _reach31 - {u})
                 for br in _dst_branches:
                     _has = any(a[0] == "bump" and a[1] == gc30
                                for a in _parse_actions_top(br.get("do")))
-                    assert _has, (
+                    assert _has or _path31, (
                         f"edge {u}->{w}: guarded cycle edge's counter "
-                        f"{gc30!r} not bumped on every branch (no-do "
-                        "duplicate would loop unguarded — §2.2/§2.3)")
+                        f"{gc30!r} not bumped on the entry branch or "
+                        "anywhere on the return path (§2.2/§2.3)")
     # (F23) every ROUTE branch into an automatic SCC must carry its
     # own count_lt guard (dispatch/redrive on_done edges carry no
     # condition — the cap lives on the route entry that re-selects

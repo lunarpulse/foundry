@@ -379,8 +379,14 @@ def _tree_or_weak_a(t, outer_cap=False):
                 return True
         return any(_tree_or_weak_a(k, outer_cap) for k in kids)
     if t[0] == 'and':
-        capped = outer_cap or any(_tree_has_cl_a(k) for k in t[1])
-        return any(_tree_or_weak_a(k, capped) for k in t[1])
+        # (F31-1) the OR's own nested count_lt is NOT its outer cap
+        for _i31_, k in enumerate(t[1]):
+            capped31_ = outer_cap or any(
+                _tree_has_cl_a(s) for _j31_, s in enumerate(t[1])
+                if _j31_ != _i31_)
+            if _tree_or_weak_a(k, capped31_):
+                return True
+        return False
     if t[0] == 'not':
         return _tree_or_weak_a(t[1], outer_cap)
     return False
@@ -568,8 +574,26 @@ def graph(policy):
                 _ab_ = b_.get('after') or []
                 if isinstance(_ab_, str):
                     _ab_ = [_ab_]
-                if b_['id'] in _aa_ or a_['id'] in _ab_:
-                    continue  # serialized in one direction
+                # (F31-3) transitive: reachability through the
+                # stage dependency graph serializes the session
+                _dep_ = {}
+                for _s31_ in n_.get('stages', []) or []:
+                    _da_ = _s31_.get('after') or []
+                    if isinstance(_da_, str):
+                        _da_ = [_da_]
+                    _dep_[_s31_['id']] = [d_ for d_ in _da_ if d_]
+                def _r31_(_sid_, _seen_=None):
+                    _seen_ = set(_seen_ or ())
+                    _stk_ = [_sid_]
+                    while _stk_:
+                        _x_ = _stk_.pop()
+                        if _x_ in _seen_:
+                            continue
+                        _seen_.add(_x_)
+                        _stk_.extend(_dep_.get(_x_, []))
+                    return _seen_
+                if b_['id'] in _r31_(a_['id']) or a_['id'] in _r31_(b_['id']):
+                    continue  # serialized (directly or transitively)
                 _m_ = ('session %r: %r and %r have no ordering — '
                        'same session must be serial (§2.1)'
                        % (a_['session'], a_['id'], b_['id']))
@@ -747,11 +771,27 @@ def graph(policy):
                         if a_[0] == 'bump' and a_[1] == gc30_:
                             raise AssertionError(f'edge {u19}->{w19}: counter {gc30_!r} bumped BOTH on branch and node — double increment (§2.3)')
             else:
+                # (F31-2) entry branch OR destination OR return path
+                reach31_ = set()
+                stk31_ = [w19]
+                while stk31_:
+                    x31_ = stk31_.pop()
+                    if x31_ in reach31_:
+                        continue
+                    reach31_.add(x31_)
+                    if x31_ == u19:
+                        continue
+                    for y31_ in auto_adj.get(x31_, ()):
+                        if y31_ not in reach31_:
+                            stk31_.append(y31_)
+                path31_ = any(gc30_ in bump_ctr.get(x31_, set())
+                              for x31_ in reach31_ - {u19})
                 for b_ in dst_br:
                     has_ = any(a_[0] == 'bump' and a_[1] == gc30_
                                for a_ in actions(b_.get('do'), {'counters': {}, 'events': []}))
-                    assert has_, (f'edge {u19}->{w19}: guarded cycle edge counter {gc30_!r} '
-                                  'not bumped on every branch (§2.2/§2.3)')
+                    assert has_ or path31_, (f'edge {u19}->{w19}: guarded cycle edge counter {gc30_!r} '
+                                             'not bumped on the entry branch or anywhere on the '
+                                             'return path (§2.2/§2.3)')
     # (F23) every ROUTE branch re-entering an automatic SCC carries
     # its OWN guard — per-branch, not per-edge
     for u19, ws19 in auto_adj.items():
