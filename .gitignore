@@ -3,3 +3,4 @@ target/
 *.db-wal
 .env
 .specs/
+__pycache__/

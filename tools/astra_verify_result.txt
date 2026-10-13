@@ -1,14 +1,14 @@
-PASS manifest closure + canonical digest: version=1.2.0, files=10+manifest, sha256=6cdfac4917b95629f17b3bcc24be8e3befdf3262b8c9abaa36ecf876287887b9
+PASS manifest closure + canonical digest: version=1.2.0, files=10+manifest, sha256=e925fd014d367c4c7f3d83fe92d03cd4bc4d3b7cbc1ecdf0d4e77320acab1db8
 PASS graph structure: 8 nodes, entry/references/fallback/resume/emit valid
 PASS independent expression interpreter: precedence, parentheses, functions, flags, malformed input
 PASS case 01 intent_gap fix=2 loops=4
-FAIL case 02 intent_gap fix=2 loops=5: actual=human/loopbacks=5, expected=human/loopbacks=6
+PASS case 02 intent_gap fix=2 loops=5
 PASS case 03 intent_gap fix=3 loops=4
-FAIL case 04 intent_gap fix=3 loops=5: actual=human/loopbacks=5, expected=human/loopbacks=6
+PASS case 04 intent_gap fix=3 loops=5
 PASS case 05 bad_plan fix=2 loops=4
-FAIL case 06 bad_plan fix=2 loops=5: actual=human/loopbacks=5, expected=human/loopbacks=6
+PASS case 06 bad_plan fix=2 loops=5
 PASS case 07 bad_plan fix=3 loops=4
-FAIL case 08 bad_plan fix=3 loops=5: actual=human/loopbacks=5, expected=human/loopbacks=6
+PASS case 08 bad_plan fix=3 loops=5
 PASS case 09 patch fix=2 loops=4
 PASS case 10 patch fix=2 loops=5
 PASS case 11 patch fix=3 loops=4
@@ -18,52 +18,52 @@ PASS case 14 defer fix=2 loops=5
 PASS case 15 defer fix=3 loops=4
 PASS case 16 defer fix=3 loops=5
 PASS case 17 intent_gap+bad_plan fix=2 loops=4
-FAIL case 18 intent_gap+bad_plan fix=2 loops=5: actual=human/loopbacks=5, expected=human/loopbacks=6
+PASS case 18 intent_gap+bad_plan fix=2 loops=5
 PASS case 19 intent_gap+bad_plan fix=3 loops=4
-FAIL case 20 intent_gap+bad_plan fix=3 loops=5: actual=human/loopbacks=5, expected=human/loopbacks=6
+PASS case 20 intent_gap+bad_plan fix=3 loops=5
 PASS case 21 intent_gap+patch fix=2 loops=4
-FAIL case 22 intent_gap+patch fix=2 loops=5: actual=human/loopbacks=5, expected=human/loopbacks=6
+PASS case 22 intent_gap+patch fix=2 loops=5
 PASS case 23 intent_gap+patch fix=3 loops=4
-FAIL case 24 intent_gap+patch fix=3 loops=5: actual=human/loopbacks=5, expected=human/loopbacks=6
+PASS case 24 intent_gap+patch fix=3 loops=5
 PASS case 25 intent_gap+defer fix=2 loops=4
-FAIL case 26 intent_gap+defer fix=2 loops=5: actual=human/loopbacks=5, expected=human/loopbacks=6
+PASS case 26 intent_gap+defer fix=2 loops=5
 PASS case 27 intent_gap+defer fix=3 loops=4
-FAIL case 28 intent_gap+defer fix=3 loops=5: actual=human/loopbacks=5, expected=human/loopbacks=6
+PASS case 28 intent_gap+defer fix=3 loops=5
 PASS case 29 bad_plan+patch fix=2 loops=4
-FAIL case 30 bad_plan+patch fix=2 loops=5: actual=human/loopbacks=5, expected=human/loopbacks=6
+PASS case 30 bad_plan+patch fix=2 loops=5
 PASS case 31 bad_plan+patch fix=3 loops=4
-FAIL case 32 bad_plan+patch fix=3 loops=5: actual=human/loopbacks=5, expected=human/loopbacks=6
+PASS case 32 bad_plan+patch fix=3 loops=5
 PASS case 33 bad_plan+defer fix=2 loops=4
-FAIL case 34 bad_plan+defer fix=2 loops=5: actual=human/loopbacks=5, expected=human/loopbacks=6
+PASS case 34 bad_plan+defer fix=2 loops=5
 PASS case 35 bad_plan+defer fix=3 loops=4
-FAIL case 36 bad_plan+defer fix=3 loops=5: actual=human/loopbacks=5, expected=human/loopbacks=6
+PASS case 36 bad_plan+defer fix=3 loops=5
 PASS case 37 patch+defer fix=2 loops=4
 PASS case 38 patch+defer fix=2 loops=5
 PASS case 39 patch+defer fix=3 loops=4
 PASS case 40 patch+defer fix=3 loops=5
 PASS case 41 intent_gap+bad_plan+patch fix=2 loops=4
-FAIL case 42 intent_gap+bad_plan+patch fix=2 loops=5: actual=human/loopbacks=5, expected=human/loopbacks=6
+PASS case 42 intent_gap+bad_plan+patch fix=2 loops=5
 PASS case 43 intent_gap+bad_plan+patch fix=3 loops=4
-FAIL case 44 intent_gap+bad_plan+patch fix=3 loops=5: actual=human/loopbacks=5, expected=human/loopbacks=6
+PASS case 44 intent_gap+bad_plan+patch fix=3 loops=5
 PASS case 45 intent_gap+bad_plan+defer fix=2 loops=4
-FAIL case 46 intent_gap+bad_plan+defer fix=2 loops=5: actual=human/loopbacks=5, expected=human/loopbacks=6
+PASS case 46 intent_gap+bad_plan+defer fix=2 loops=5
 PASS case 47 intent_gap+bad_plan+defer fix=3 loops=4
-FAIL case 48 intent_gap+bad_plan+defer fix=3 loops=5: actual=human/loopbacks=5, expected=human/loopbacks=6
+PASS case 48 intent_gap+bad_plan+defer fix=3 loops=5
 PASS case 49 intent_gap+patch+defer fix=2 loops=4
-FAIL case 50 intent_gap+patch+defer fix=2 loops=5: actual=human/loopbacks=5, expected=human/loopbacks=6
+PASS case 50 intent_gap+patch+defer fix=2 loops=5
 PASS case 51 intent_gap+patch+defer fix=3 loops=4
-FAIL case 52 intent_gap+patch+defer fix=3 loops=5: actual=human/loopbacks=5, expected=human/loopbacks=6
+PASS case 52 intent_gap+patch+defer fix=3 loops=5
 PASS case 53 bad_plan+patch+defer fix=2 loops=4
-FAIL case 54 bad_plan+patch+defer fix=2 loops=5: actual=human/loopbacks=5, expected=human/loopbacks=6
+PASS case 54 bad_plan+patch+defer fix=2 loops=5
 PASS case 55 bad_plan+patch+defer fix=3 loops=4
-FAIL case 56 bad_plan+patch+defer fix=3 loops=5: actual=human/loopbacks=5, expected=human/loopbacks=6
+PASS case 56 bad_plan+patch+defer fix=3 loops=5
 PASS case 57 intent_gap+bad_plan+patch+defer fix=2 loops=4
-FAIL case 58 intent_gap+bad_plan+patch+defer fix=2 loops=5: actual=human/loopbacks=5, expected=human/loopbacks=6
+PASS case 58 intent_gap+bad_plan+patch+defer fix=2 loops=5
 PASS case 59 intent_gap+bad_plan+patch+defer fix=3 loops=4
-FAIL case 60 intent_gap+bad_plan+patch+defer fix=3 loops=5: actual=human/loopbacks=5, expected=human/loopbacks=6
-MATRIX destinations=60/60; destination+counter=36/60
-TRACE bad_plan 1:replan(loops=1) -> 2:replan(loops=2) -> 3:replan(loops=3) -> 4:replan(loops=4) -> 5:replan(loops=5) -> 6:human(loops=5)
-FAIL repeated bad_plan sixth-entry state: sixth entry must persist increment to 6 before HALT; actual=5
+PASS case 60 intent_gap+bad_plan+patch+defer fix=3 loops=5
+MATRIX destinations=60/60; destination+counter=60/60
+TRACE bad_plan 1:replan(loops=1) -> 2:replan(loops=2) -> 3:replan(loops=3) -> 4:replan(loops=4) -> 5:replan(loops=5) -> 6:human(loops=6)
+PASS repeated bad_plan sixth-entry state
 PASS intent_gap pre-hold timing: enter:lenses -> enter:route1 -> bump(loopbacks) -> revert(origin) -> enter:human_gap
 PASS continuation + defer declarations: gap resume/full plan, bad_plan origin, patch continuation declarations, defer guard
 PASS empty set supplementary
@@ -72,4 +72,4 @@ PASS emergency timeout
 PASS negative control remove gap pre-hold actions: mutant rejected: hold entered before bump/revert
 PASS negative control dangling resume: mutant rejected: dangling node reference from human_gap
 SCOPE: declarative model; no live engine/subagent execution. Prompt compliance and actual session reuse are not proven.
-RESULT: FAIL; 25 failed checks
+RESULT: PASS; 0 failed checks
