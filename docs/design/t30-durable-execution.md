@@ -79,3 +79,12 @@ cargo test 전체 green + 생성/삭제 파일 리포트 정합 (부모 대조).
 - `foundry-pack → foundry-exec` 등 역방향 금지 (T29a r1 권고 계승).
 - BMad 고유 어휘(ID·verdict·상한 수치)는 팩 데이터 — 실행기 코드에
   분기 없음 (엔진 diff 0, T34 게이트 전제).
+
+## b1 리뷰 지연 항목 (b2/b4 계약 정합 필요 — 2026-10-14 gpt-6.1-sol 리뷰)
+- HoldCommand: 동일 run 재진입 식별자 부재 — b4 hold 세마포어 설계 시 판별
+  필수 (현재는 구별 불가).
+- IntentKey: activation·retry 변별 불가 — b2 실행기가 intent 재발행
+  시점 정의와 함께 키 확장 결정.
+- 미래 epoch 수용(fence)은 b1 명시 동작 — 활성 epoch 일치 조건과의
+  상충은 b5 fencing 이중 증명에서 재검.
+- 비환급 실행 횟수 예산(회수 불가 원칙)은 Budget과 별도 산정 필요.

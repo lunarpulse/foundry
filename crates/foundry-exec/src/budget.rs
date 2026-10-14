@@ -15,23 +15,29 @@ pub enum ReservationOutcome {
 }
 
 impl Budget {
+    // Subtract spend before adding balances so an overflowing sum cannot
+    // discard funds that would have fit after settlement.
+    fn available_nano(&self) -> u128 {
+        if self.settled_nano <= self.reserved_nano {
+            self.carried_nano.saturating_add(self.reserved_nano - self.settled_nano)
+        } else {
+            self.carried_nano.saturating_sub(self.settled_nano - self.reserved_nano)
+        }
+    }
+
     /// Carries all unspent value forward, including prior carried value.
     pub fn carry_over(&self) -> Budget {
-        let remaining_reserved = self.reserved_nano.saturating_sub(self.settled_nano);
         Budget {
             reserved_nano: 0,
             settled_nano: 0,
-            carried_nano: self.carried_nano.saturating_add(remaining_reserved),
+            carried_nano: self.available_nano(),
         }
     }
 }
 
 /// Reserves from carried plus currently reserved funds, less settled spend.
 pub fn reserve(budget: &Budget, nano: u128) -> ReservationOutcome {
-    let available = budget
-        .carried_nano
-        .saturating_add(budget.reserved_nano)
-        .saturating_sub(budget.settled_nano);
+    let available = budget.available_nano();
     if nano > available {
         ReservationOutcome::Exhausted
     } else {
