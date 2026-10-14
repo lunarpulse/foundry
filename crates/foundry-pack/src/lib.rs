@@ -1679,6 +1679,39 @@ fn eval(e: &Expr, x: &Env<'_>) -> bool {
     }
 }
 
+/// Evaluate an expression using the current in-memory counter values.
+pub fn eval_condition(expr: &Expr, counters: &BTreeMap<String, u64>) -> bool {
+    fn evaluate(expr: &Expr, counters: &BTreeMap<String, u64>) -> bool {
+        match expr {
+            Expr::And(left, right) => evaluate(left, counters) && evaluate(right, counters),
+            Expr::Or(left, right) => evaluate(left, counters) || evaluate(right, counters),
+            Expr::Not(inner) => !evaluate(inner, counters),
+            Expr::Call(name, args) if name == "count_lt" => {
+                let counter = args.first().and_then(|arg| arg_id(arg).ok());
+                let bound = args.get(1);
+                match (counter, bound) {
+                    (Some(counter), Some(Expr::Integer(bound))) => {
+                        counters.get(&counter).is_some_and(|value| value < bound)
+                    }
+                    _ => false,
+                }
+            }
+            _ => eval(
+                expr,
+                &Env {
+                    counter: "",
+                    value: 0,
+                    verdicts: &BTreeSet::new(),
+                    findings: false,
+                    timeout: false,
+                    budget: false,
+                },
+            ),
+        }
+    }
+    evaluate(expr, counters)
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::*;
