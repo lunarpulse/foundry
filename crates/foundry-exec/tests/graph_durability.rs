@@ -19,14 +19,22 @@ struct TestDir(PathBuf);
 impl TestDir {
     fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!("graph-durability-{}-{}",
+        let path = PathBuf::from("/tmp/b2c_review/test-data").join(format!("graph-durability-{}-{}",
             std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
         fs::create_dir_all(&path).unwrap();
         Self(path)
     }
 }
 impl Drop for TestDir {
-    fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+    fn drop(&mut self) {
+        use std::io::Write;
+        let mut inventory = fs::OpenOptions::new().create(true).append(true)
+            .open("/tmp/b2c_review/runtime-temporaries.txt").unwrap();
+        for entry in fs::read_dir(&self.0).unwrap() {
+            inventory.write_all(format!("{} (deleted)\n", entry.unwrap().path().display()).as_bytes()).unwrap();
+        }
+        fs::remove_dir_all(&self.0).unwrap();
+    }
 }
 
 fn read<T: DeserializeOwned + Default>(path: &Path) -> T {
@@ -38,6 +46,12 @@ fn read<T: DeserializeOwned + Default>(path: &Path) -> T {
 }
 fn write<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     let temporary = path.with_extension("pending");
+    {
+        use std::io::Write;
+        let mut inventory = std::fs::OpenOptions::new().create(true).append(true)
+            .open("/tmp/b2c_review/runtime-temporaries.txt").unwrap();
+        inventory.write_all(format!("{} (rename temporary)\n", temporary.display()).as_bytes()).unwrap();
+    }
     let bytes = serde_json::to_vec(value).map_err(|e| e.to_string())?;
     fs::write(&temporary, bytes).map_err(|e| e.to_string())?;
     File::open(&temporary).and_then(|f| f.sync_all()).map_err(|e| e.to_string())?;
@@ -64,8 +78,10 @@ impl CounterLog for DiskCounterLog {
 struct CrashAfterAppend(DiskCounterLog);
 impl CounterLog for CrashAfterAppend {
     fn append(&mut self, order: &str, run: u64, record: CounterRecord) -> Result<(), String> {
+        let bumped = matches!(record, CounterRecord::Bump { .. });
         self.0.append(order, run, record)?;
-        panic!("simulated process crash after durable counter append");
+        if bumped { panic!("simulated process crash after durable counter append"); }
+        Ok(())
     }
     fn load(&self, order: &str, run: u64) -> Vec<CounterRecord> {
         self.0.load(order, run)
@@ -258,8 +274,8 @@ fn counter_log_keeps_runs_isolated_across_driver_restarts() {
         assert_eq!(driver.counters()["turns"], 1);
     }
     let counter = DiskCounterLog(path);
-    assert_eq!(counter.load("durable-order", 1)[0], CounterRecord::Bump { node_id: "done".into(), counter: "turns".into(), value: 1 });
-    assert_eq!(counter.load("durable-order", 2)[0], CounterRecord::Bump { node_id: "done".into(), counter: "turns".into(), value: 1 });
+    assert_eq!(counter.load("durable-order", 1).into_iter().find(|r| matches!(r, CounterRecord::Bump { .. })).unwrap(), CounterRecord::Bump { node_id: "done".into(), counter: "turns".into(), value: 1 });
+    assert_eq!(counter.load("durable-order", 2).into_iter().find(|r| matches!(r, CounterRecord::Bump { .. })).unwrap(), CounterRecord::Bump { node_id: "done".into(), counter: "turns".into(), value: 1 });
     assert!(counter.load("durable-order", 3).is_empty());
 }
 
@@ -331,5 +347,28 @@ fn n_x_n_cycle_bumps_on_every_n_visit() {
     }
     assert_eq!(driver.counters()["turns"], 4);
     assert_eq!(counter.load("durable-order", 24).iter().filter(|r| matches!(r, CounterRecord::Bump { node_id, .. } if node_id == "done")).count(), 4);
+}
+
+#[test]
+fn b2c_disk_log_isolates_orders_with_the_same_run() {
+    let dir = TestDir::new(); let pack = route_pack(&dir);
+    let mut counter = DiskCounterLog(dir.0.join("orders.json"));
+    counter.append("other-order", 1, CounterRecord::Bump {
+        node_id: "done".into(), counter: "turns".into(), value: u64::MAX,
+    }).unwrap();
+    let mut intents = Intents::default(); let mut host = Host; let mut outcomes = Outcomes::default();
+    let mut sink = Sink; let mut emits = Emits;
+    {
+        let mut driver = GraphDriver::restore(&pack, &mut intents, &mut host, &mut outcomes,
+            &mut counter, &mut sink, &mut emits, OrderId("durable-order".into()), Attempt(1),
+            RunId(1), Generation(1), Epoch(0), "test", None);
+        assert_eq!(driver.counters()["turns"], 0);
+        assert!(matches!(driver.advance("done"), GraphStep::Advanced { .. }));
+        assert_eq!(driver.counters()["turns"], 1);
+    }
+    assert_eq!(counter.load("other-order", 1), vec![CounterRecord::Bump {
+        node_id: "done".into(), counter: "turns".into(), value: u64::MAX,
+    }]);
+    assert!(counter.load("durable-order", 2).is_empty());
 }
 

@@ -2,6 +2,9 @@ use crate::types::{Attempt, ExecutionIntent, ExecutionOutcome, OrderId, RunId};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CounterRecord {
+    /// Begins a visit before any effects. Host nodes retain the exact activation
+    /// until Completed is durable, including after outcome binding succeeds.
+    Started { node_id: String, activation: Option<u64> },
     /// A graph node bumped a counter (absolute value after the bump).
     Bump { node_id: String, counter: String, value: u64 },
     /// A node finished. `goto` is the next cursor, or `None` for graph completion.
@@ -10,9 +13,11 @@ pub enum CounterRecord {
 
 /// Durable write-ahead log for graph counter updates.
 pub trait CounterLog {
-    /// Appends an append-only fact. Implementations must fail-stop on failed/partial writes.
+    /// Appends an append-only fact. Ok means durable persistence. Implementations
+    /// must fail-stop on ambiguous/partial writes; Err must mean nothing appended.
     fn append(&mut self, order: &str, run: u64, record: CounterRecord) -> Result<(), String>;
-    /// Returns records in append order, or an empty vector when none are recorded.
+    /// Returns only this (order, run), in append order. Read failures must stop
+    /// execution; an empty vector means no records. Serialize writers per run.
     fn load(&self, order: &str, run: u64) -> Vec<CounterRecord>;
 }
 

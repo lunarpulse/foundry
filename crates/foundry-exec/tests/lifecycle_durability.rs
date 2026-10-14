@@ -18,7 +18,7 @@ struct TestDir(PathBuf);
 impl TestDir {
     fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = PathBuf::from("/tmp/b2b_review/test-data").join(format!(
+        let path = PathBuf::from("/tmp/b2c_review/test-data").join(format!(
             "durability-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed),
         ));
         fs::create_dir_all(&path).unwrap();
@@ -30,9 +30,9 @@ impl Drop for TestDir {
     fn drop(&mut self) {
         use std::io::Write;
         let mut inventory = fs::OpenOptions::new().create(true).append(true)
-            .open("/tmp/b2b_review/runtime-temporaries.txt").unwrap();
+            .open("/tmp/b2c_review/runtime-temporaries.txt").unwrap();
         for entry in fs::read_dir(&self.0).unwrap() {
-            writeln!(inventory, "{} (deleted)", entry.unwrap().path().display()).unwrap();
+            inventory.write_all(format!("{} (deleted)\n", entry.unwrap().path().display()).as_bytes()).unwrap();
         }
         fs::remove_dir_all(&self.0).unwrap();
     }
@@ -48,6 +48,12 @@ fn read<T: DeserializeOwned + Default>(path: &Path) -> T {
 
 fn write<T: Serialize>(path: &Path, value: &T) {
     let temporary = path.with_extension("pending");
+    {
+        use std::io::Write;
+        let mut inventory = std::fs::OpenOptions::new().create(true).append(true)
+            .open("/tmp/b2c_review/runtime-temporaries.txt").unwrap();
+        inventory.write_all(format!("{} (rename temporary)\n", temporary.display()).as_bytes()).unwrap();
+    }
     fs::write(&temporary, serde_json::to_vec(value).unwrap()).unwrap();
     File::open(&temporary).unwrap().sync_all().unwrap();
     fs::rename(&temporary, path).unwrap();

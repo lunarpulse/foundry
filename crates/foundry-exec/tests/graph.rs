@@ -71,11 +71,9 @@ impl OutcomeStore for Log {
             .or_insert_with(|| outcome.clone());
     }
     fn latest(&self, key: &Key) -> Option<ExecutionOutcome> {
-        self.intents
-            .iter()
-            .rev()
-            .find(|i| (i.order.clone(), i.attempt, i.run) == *key)
-            .and_then(|i| self.outcomes.get(&(key.clone(), i.activation)))
+        self.outcomes.values()
+            .filter(|outcome| &outcome.intent_key == key)
+            .max_by_key(|outcome| outcome.activation)
             .cloned()
     }
     fn get(&self, key: &Key, activation: u64) -> Option<ExecutionOutcome> {
@@ -558,7 +556,7 @@ impl ReviewDir {
     fn new() -> Self {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::path::Path::new("/tmp/b2b_review/test-data").join(format!(
+        let path = std::path::Path::new("/tmp/b2c_review/test-data").join(format!(
             "graph-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
         std::fs::create_dir_all(&path).unwrap();
         Self(path)
@@ -568,9 +566,9 @@ impl Drop for ReviewDir {
     fn drop(&mut self) {
         use std::io::Write;
         let mut inventory = std::fs::OpenOptions::new().create(true).append(true)
-            .open("/tmp/b2b_review/runtime-temporaries.txt").unwrap();
+            .open("/tmp/b2c_review/runtime-temporaries.txt").unwrap();
         for entry in std::fs::read_dir(&self.0).unwrap() {
-            writeln!(inventory, "{} (deleted)", entry.unwrap().path().display()).unwrap();
+            inventory.write_all(format!("{} (deleted)\n", entry.unwrap().path().display()).as_bytes()).unwrap();
         }
         std::fs::remove_dir_all(&self.0).unwrap();
     }
@@ -694,6 +692,12 @@ fn read_emit(path: &std::path::Path) -> EmitState {
 
 fn write_emit(path: &std::path::Path, state: &EmitState) {
     let pending = path.with_extension("pending");
+    {
+        use std::io::Write;
+        let mut inventory = std::fs::OpenOptions::new().create(true).append(true)
+            .open("/tmp/b2c_review/runtime-temporaries.txt").unwrap();
+        inventory.write_all(format!("{} (rename temporary)\n", pending.display()).as_bytes()).unwrap();
+    }
     std::fs::write(&pending, serde_json::to_vec(state).unwrap()).unwrap();
     std::fs::File::open(&pending).unwrap().sync_all().unwrap();
     std::fs::rename(&pending, path).unwrap();
@@ -879,4 +883,188 @@ fn review_graph_rejects_artifact_identity_from_another_run() {
         assert_eq!(rig.sink.publishes, 0);
         assert!(rig.emits.completed.is_empty());
     }
+}
+
+impl Rig {
+    fn restored<'a>(&'a mut self, pack: &'a foundry_pack::PackSnapshot)
+        -> GraphDriver<'a, Log, Host, Log, MemoryCounterLog, Sink, Log>
+    {
+        GraphDriver::restore(pack, &mut self.intents, &mut self.host, &mut self.outcomes,
+            &mut self.counters, &mut self.sink, &mut self.emits, OrderId("order-1".into()),
+            Attempt(1), RunId(2), Generation(3), Epoch(0), "fixture", Some(tuple()))
+    }
+}
+
+fn b2c_route(actions: &str, condition: &str) -> (ReviewDir, foundry_pack::PackSnapshot) {
+    changed_fixture(|policy| policy.replace(
+        "when = \"true\"\ndo = \"emit(InspectionPassed, summary)\"",
+        &format!("when = '{condition}'\ndo = '{actions}'{}\n\n[[nodes.branches]]\nwhen = 'true'",
+            if actions.contains("emit") { "" } else { "\ngoto = 'end_hold'" }),
+    ) + "\n[counters]\nturns = 0\nother = 0\n")
+}
+
+fn b2c_bump(rig: &mut Rig, value: u64) {
+    rig.counters.append("order-1", 2, CounterRecord::Bump {
+        node_id: "done".into(), counter: "turns".into(), value,
+    }).unwrap();
+}
+
+#[test]
+fn b2c_each_bump_action_is_recorded_and_replayed_in_order() {
+    let (_dir, pack) = b2c_route("bump(turns); bump(other); bump(turns)", "true");
+    for pending in 0..=3 {
+        let mut rig = Rig::default();
+        for (counter, value) in [("turns", 1), ("other", 1), ("turns", 2)].into_iter().take(pending) {
+            rig.counters.append("order-1", 2, CounterRecord::Bump {
+                node_id: "done".into(), counter: counter.into(), value,
+            }).unwrap();
+        }
+        {
+            let mut driver = rig.restored(&pack);
+            assert!(matches!(driver.advance("done"), GraphStep::Advanced { .. }));
+            assert_eq!(driver.counters()["turns"], 2, "pending={pending}");
+            assert_eq!(driver.counters()["other"], 1);
+        }
+        let bumps: Vec<_> = rig.counters.load("order-1", 2).into_iter().filter_map(|r| match r {
+            CounterRecord::Bump { counter, value, .. } => Some((counter, value)), _ => None,
+        }).collect();
+        assert_eq!(bumps, [("turns".into(), 1), ("other".into(), 1), ("turns".into(), 2)]);
+    }
+}
+
+#[test]
+fn b2c_pending_restore_selects_the_original_route_branch() {
+    let (_dir, pack) = b2c_route("bump(turns)", "count_lt(turns, 1)");
+    let mut rig = Rig::default();
+    b2c_bump(&mut rig, 1);
+    let mut driver = rig.restored(&pack);
+    assert_eq!(driver.counters()["turns"], 1);
+    assert!(matches!(driver.start(), GraphStep::Advanced { ref next, ref effects }
+        if next == "end_hold" && effects == &["bump:turns=1"]));
+}
+
+#[test]
+fn b2c_emit_recovery_preserves_original_branch_and_completion_order() {
+    let (_dir, pack) = b2c_route("bump(turns); emit(InspectionPassed, summary)", "count_lt(turns, 1)");
+    for point in [None, Some(foundry_exec::CrashPoint::W3), Some(foundry_exec::CrashPoint::W4)] {
+        let mut rig = Rig::promoted();
+        {
+            let mut driver = rig.driver(&pack);
+            if let Some(point) = point {
+                driver.arm_fault(point);
+                assert!(matches!(driver.advance("done"), GraphStep::Fault(_)));
+            } else {
+                assert!(matches!(driver.advance("done"), GraphStep::Emitted { .. }));
+            }
+        }
+        if point.is_some() {
+            assert!(matches!(rig.restored(&pack).start(), GraphStep::Emitted { .. }));
+        }
+        let records = rig.counters.load("order-1", 2);
+        let bumps: Vec<_> = records.iter().filter_map(|r| match r {
+            CounterRecord::Bump { counter, value, .. } => Some((counter.as_str(), *value)), _ => None,
+        }).collect();
+        assert_eq!(bumps, [("turns", 1)]);
+        assert!(matches!(records.last(), Some(CounterRecord::Completed { .. })));
+        assert_eq!(rig.sink.publishes, 1);
+    }
+}
+
+#[test]
+fn b2c_rejects_under_over_and_duplicate_pending_bumps_before_effects() {
+    let (_dir, pack) = b2c_route("bump(turns); emit(InspectionPassed, summary)", "true");
+    for values in [vec![0], vec![2], vec![1, 2]] {
+        let mut rig = Rig::promoted();
+        for value in &values { b2c_bump(&mut rig, *value); }
+        let before = rig.counters.load("order-1", 2);
+        assert!(matches!(rig.restored(&pack).start(), GraphStep::Fault(_)), "values={values:?}");
+        assert_eq!(rig.sink.publishes, 0);
+        assert_eq!(rig.counters.load("order-1", 2), before);
+    }
+}
+
+#[test]
+fn b2c_restore_never_reuses_a_completion_from_an_earlier_visit() {
+    let (_dir, pack) = b2c_route("bump(turns)", "true");
+    let mut rig = Rig::default();
+    // An older terminal visit followed by a newer visit returning to done.
+    rig.counters.append("order-1", 2, CounterRecord::Completed { node_id: "done".into(), goto: None }).unwrap();
+    rig.counters.append("order-1", 2, CounterRecord::Completed { node_id: "other".into(), goto: Some("done".into()) }).unwrap();
+    let key = (OrderId("order-1".into()), Attempt(1), RunId(2));
+    let intent = ExecutionIntent { order: key.0.clone(), attempt: key.1, run: key.2,
+        activation: 0, generation: Generation(3), epoch: Epoch(0), external_ref: "fixture".into(), recorded_at: Utc::now() };
+    rig.outcomes.intents.push(intent);
+    rig.outcomes.commit(&ExecutionOutcome { intent_key: key, activation: 0,
+        cursor: Some("other".into()), next_activation: None, receipts: vec![] });
+    assert!(matches!(rig.restored(&pack).start(), GraphStep::Advanced { ref next, .. } if next == "end_hold"));
+}
+
+struct B2cFailCompletion<'a> { log: &'a mut MemoryCounterLog, fail: bool }
+impl CounterLog for B2cFailCompletion<'_> {
+    fn append(&mut self, order: &str, run: u64, record: CounterRecord) -> Result<(), String> {
+        if self.fail && matches!(record, CounterRecord::Completed { .. }) {
+            self.fail = false;
+            return Err("crash before completion append".into());
+        }
+        self.log.append(order, run, record)
+    }
+    fn load(&self, order: &str, run: u64) -> Vec<CounterRecord> { self.log.load(order, run) }
+}
+
+#[test]
+fn b2c_bound_redrive_recovery_does_not_dispatch_another_activation() {
+    let pack = review_pack();
+    for restart in [false, true] {
+        let mut rig = Rig::default();
+        {
+            let mut counter = B2cFailCompletion { log: &mut rig.counters, fail: true };
+            let mut driver = GraphDriver::new(&pack, &mut rig.intents, &mut rig.host,
+                &mut rig.outcomes, &mut counter, &mut rig.sink, &mut rig.emits,
+                OrderId("order-1".into()), Attempt(1), RunId(2), Generation(3), Epoch(0), "fixture", Some(tuple()));
+            assert!(matches!(driver.advance("fixdie"), GraphStep::Fault(_)));
+            if !restart {
+                assert!(matches!(driver.advance("fixdie"), GraphStep::Advanced { .. }));
+            }
+        }
+        if restart { assert!(matches!(rig.restored(&pack).start(), GraphStep::Advanced { .. })); }
+        assert_eq!(rig.host.calls, 1, "restart={restart}");
+        assert_eq!(rig.intents.intents.len(), 1);
+    }
+}
+
+#[test]
+fn b2c_legacy_host_history_fails_closed_when_activation_is_ambiguous() {
+    let pack = review_pack();
+    for history in 0..3 {
+        let mut rig = Rig::default();
+        {
+            let mut driver = rig.driver(&pack);
+            assert!(matches!(driver.advance("fixdie"), GraphStep::Advanced { .. }));
+        }
+        // Strip visit markers to reproduce the original Bump/Completed format.
+        rig.counters.0.retain(|(_, _, record)| matches!(record, CounterRecord::Bump { .. }));
+        if history != 2 {
+            rig.counters.0.clear();
+            if history == 1 {
+                rig.counters.append("order-1", 2, CounterRecord::Completed {
+                    node_id: "route1".into(), goto: Some("lenses".into()),
+                }).unwrap();
+            }
+        }
+        let before = rig.counters.load("order-1", 2);
+        assert!(matches!(rig.restored(&pack).start(), GraphStep::Fault(ref error) if error.contains("ambiguous")));
+        assert_eq!(rig.host.calls, 1);
+        assert_eq!(rig.counters.load("order-1", 2), before);
+    }
+}
+
+#[test]
+fn b2c_outcome_fixture_latest_observes_committed_bindings() {
+    let mut log = Log::default();
+    let key = (OrderId("order-1".into()), Attempt(1), RunId(2));
+    let outcome = ExecutionOutcome { intent_key: key.clone(), activation: 7,
+        cursor: Some("done".into()), next_activation: None, receipts: vec![] };
+    log.commit(&outcome);
+    assert_eq!(OutcomeStore::latest(&log, &key), Some(outcome));
+    assert_eq!(OutcomeStore::latest(&log, &(OrderId("other".into()), Attempt(1), RunId(2))), None);
 }
