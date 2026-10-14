@@ -4,7 +4,7 @@ use chrono::Utc;
 use foundry_exec::{
     emit::{complete_after_w4, emit_once, EmitLog, EmitOutcome, EmitSink},
     graph::{GraphDriver, GraphStep},
-    ports::{DispatchHost, IntentLog, OutcomeStore},
+    ports::{CounterLog, CounterRecord, DispatchHost, IntentLog, OutcomeStore},
     types::{
         ArtifactLocation, ArtifactTuple, ArtifactTupleKey, Attempt, EmitReceipt, Epoch,
         ExecutionIntent, ExecutionOutcome, Generation, ImmutableCommit, OrderId, PromotionReceipt,
@@ -80,6 +80,20 @@ impl OutcomeStore for Log {
     }
     fn get(&self, key: &Key, activation: u64) -> Option<ExecutionOutcome> {
         self.outcomes.get(&(key.clone(), activation)).cloned()
+    }
+}
+
+#[derive(Default)]
+struct MemoryCounterLog(Vec<(String, u64, CounterRecord)>);
+
+impl CounterLog for MemoryCounterLog {
+    fn append(&mut self, order: &str, run: u64, record: CounterRecord) -> Result<(), String> {
+        self.0.push((order.into(), run, record));
+        Ok(())
+    }
+    fn load(&self, order: &str, run: u64) -> Vec<CounterRecord> {
+        self.0.iter().filter(|(o, r, _)| o == order && *r == run)
+            .map(|(_, _, record)| record.clone()).collect()
     }
 }
 
@@ -254,6 +268,7 @@ fn fixture_pack_dispatches_to_route_and_route_emits() {
     let pack = load_pack(root).expect("fixture-min loads");
     let mut intents = Log::default();
     let mut outcomes = Log::default();
+    let mut counters = MemoryCounterLog::default();
     let mut emit_log = Log::default();
     let artifact = tuple();
     promote(&mut emit_log, &artifact);
@@ -268,6 +283,7 @@ fn fixture_pack_dispatches_to_route_and_route_emits() {
         &mut intents,
         &mut host,
         &mut outcomes,
+        &mut counters,
         &mut sink,
         &mut emit_log,
         OrderId("order-1".into()),
@@ -288,6 +304,7 @@ fn graph_w3_and_w4_resume_without_republishing() {
     let pack = load_pack(root).expect("fixture-min loads");
     let mut intents = Log::default();
     let mut outcomes = Log::default();
+    let mut counters = MemoryCounterLog::default();
     let mut emit_log = Log::default();
     let artifact = tuple();
     promote(&mut emit_log, &artifact);
@@ -302,6 +319,7 @@ fn graph_w3_and_w4_resume_without_republishing() {
         &mut intents,
         &mut host,
         &mut outcomes,
+        &mut counters,
         &mut sink,
         &mut emit_log,
         OrderId("order-1".into()),
@@ -346,6 +364,7 @@ fn redrive_dispatches_next_activation_with_payload_context() {
         .unwrap();
     let mut intents = Log::default();
     let mut outcomes = Log::default();
+    let mut counters = MemoryCounterLog::default();
     let mut emit_log = Log::default();
     let mut sink = Sink::default();
     let mut host = Host::default();
@@ -354,6 +373,7 @@ fn redrive_dispatches_next_activation_with_payload_context() {
         &mut intents,
         &mut host,
         &mut outcomes,
+        &mut counters,
         &mut sink,
         &mut emit_log,
         OrderId("order-1".into()),
@@ -379,6 +399,7 @@ struct Rig {
     intents: Log,
     host: Host,
     outcomes: Log,
+    counters: MemoryCounterLog,
     sink: Sink,
     emits: Log,
 }
@@ -391,10 +412,10 @@ impl Rig {
     }
 
     fn driver<'a>(&'a mut self, pack: &'a foundry_pack::PackSnapshot)
-        -> GraphDriver<'a, Log, Host, Log, Sink, Log>
+        -> GraphDriver<'a, Log, Host, Log, MemoryCounterLog, Sink, Log>
     {
         GraphDriver::new(pack, &mut self.intents, &mut self.host, &mut self.outcomes,
-            &mut self.sink, &mut self.emits, OrderId("order-1".into()), Attempt(1),
+            &mut self.counters, &mut self.sink, &mut self.emits, OrderId("order-1".into()), Attempt(1),
             RunId(2), Generation(3), Epoch(0), "fixture", Some(tuple()))
     }
 }
@@ -752,9 +773,10 @@ fn review_w3_w4_reopen_both_stores_and_recover_via_receipts() {
             let mut sink = DiskSink(sink_path.clone());
             let mut intents = Log::default();
             let mut outcomes = Log::default();
+            let mut counters = MemoryCounterLog::default();
             let mut host = Host::default();
             let mut driver = GraphDriver::new(&pack, &mut intents, &mut host, &mut outcomes,
-                &mut sink, &mut log, OrderId("order-1".into()), Attempt(1), RunId(2),
+                &mut counters, &mut sink, &mut log, OrderId("order-1".into()), Attempt(1), RunId(2),
                 Generation(3), Epoch(0), "fixture", Some(tuple()));
             driver.arm_fault(point);
             assert!(matches!(driver.advance("done"), GraphStep::Fault(ref reason)
@@ -770,11 +792,12 @@ fn review_w3_w4_reopen_both_stores_and_recover_via_receipts() {
             let mut log = DiskEmitLog(log_path.clone());
             let mut intents = Log::default();
             let mut outcomes = Log::default();
+            let mut counters = MemoryCounterLog::default();
             let mut host = Host::default();
             if point == foundry_exec::CrashPoint::W4 {
                 let mut sink = NoSinkAccess;
                 let mut driver = GraphDriver::new(&pack, &mut intents, &mut host, &mut outcomes,
-                    &mut sink, &mut log, OrderId("order-1".into()), Attempt(1), RunId(2),
+                    &mut counters, &mut sink, &mut log, OrderId("order-1".into()), Attempt(1), RunId(2),
                     Generation(3), Epoch(0), "fixture", Some(tuple()));
                 let GraphStep::Emitted { receipt } = driver.advance("done") else { panic!("W4 must only complete") };
                 assert_eq!(receipt, before.emits[0]);
@@ -782,7 +805,7 @@ fn review_w3_w4_reopen_both_stores_and_recover_via_receipts() {
             } else {
                 let mut sink = DiskSink(sink_path.clone());
                 let mut driver = GraphDriver::new(&pack, &mut intents, &mut host, &mut outcomes,
-                    &mut sink, &mut log, OrderId("order-1".into()), Attempt(1), RunId(2),
+                    &mut counters, &mut sink, &mut log, OrderId("order-1".into()), Attempt(1), RunId(2),
                     Generation(3), Epoch(0), "fixture", Some(tuple()));
                 let GraphStep::Emitted { receipt } = driver.advance("done") else { panic!("W3 must emit promoted tuple") };
                 receipt
@@ -849,7 +872,7 @@ fn review_graph_rejects_artifact_identity_from_another_run() {
         promote(&mut rig.emits, &artifact);
         {
             let mut driver = GraphDriver::new(&pack, &mut rig.intents, &mut rig.host,
-                &mut rig.outcomes, &mut rig.sink, &mut rig.emits, OrderId("order-1".into()),
+                &mut rig.outcomes, &mut rig.counters, &mut rig.sink, &mut rig.emits, OrderId("order-1".into()),
                 Attempt(1), RunId(2), Generation(3), Epoch(0), "fixture", Some(artifact));
             assert!(matches!(driver.advance("pass"), GraphStep::Fault(ref reason) if reason.contains("does not belong")));
         }

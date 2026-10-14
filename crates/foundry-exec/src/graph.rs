@@ -3,12 +3,12 @@ use crate::{
     hold::{HoldCommand, HoldInstanceId, HoldOperation},
     inject::{CrashPoint, FaultInjector},
     lifecycle::{DispatchResult, Executor, LifecycleError, RunStep},
-    ports::{DispatchHost, IntentLog, OutcomeStore},
+    ports::{CounterLog, CounterRecord, DispatchHost, IntentLog, OutcomeStore},
     types::{ArtifactTuple, Attempt, Epoch, ExecutionIntent, Generation, OrderId, RunId},
 };
 use chrono::Utc;
 use foundry_pack::{Expr, PackSnapshot, eval_condition_checked, parse_expr};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GraphStep {
@@ -19,11 +19,12 @@ pub enum GraphStep {
     Fault(String),
 }
 
-pub struct GraphDriver<'a, L, H, S, ES, EL>
+pub struct GraphDriver<'a, L, H, S, C, ES, EL>
 where
     L: IntentLog,
     H: DispatchHost<Result = DispatchResult>,
     S: OutcomeStore,
+    C: CounterLog,
     ES: EmitSink,
     EL: EmitLog,
 {
@@ -31,6 +32,7 @@ where
     intents: &'a mut L,
     host: &'a mut H,
     outcomes: &'a mut S,
+    counter_log: &'a mut C,
     sink: &'a mut ES,
     emit_log: &'a mut EL,
     order: OrderId,
@@ -41,15 +43,18 @@ where
     external_ref: String,
     tuple: Option<ArtifactTuple>,
     activation: u64,
+    cursor: Option<String>,
+    completed: bool,
     counters: BTreeMap<String, u64>,
     faults: FaultInjector,
 }
 
-impl<'a, L, H, S, ES, EL> GraphDriver<'a, L, H, S, ES, EL>
+impl<'a, L, H, S, C, ES, EL> GraphDriver<'a, L, H, S, C, ES, EL>
 where
     L: IntentLog,
     H: DispatchHost<Result = DispatchResult>,
     S: OutcomeStore,
+    C: CounterLog,
     ES: EmitSink,
     EL: EmitLog,
 {
@@ -59,6 +64,7 @@ where
         intents: &'a mut L,
         host: &'a mut H,
         outcomes: &'a mut S,
+        counter_log: &'a mut C,
         sink: &'a mut ES,
         emit_log: &'a mut EL,
         order: OrderId,
@@ -84,6 +90,7 @@ where
             intents,
             host,
             outcomes,
+            counter_log,
             sink,
             emit_log,
             order,
@@ -94,9 +101,83 @@ where
             external_ref: external_ref.into(),
             tuple,
             activation,
+            cursor: None,
+            completed: false,
             counters: pack.counters().clone(),
             faults: FaultInjector::default(),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn restore(
+        pack: &'a PackSnapshot,
+        intents: &'a mut L,
+        host: &'a mut H,
+        outcomes: &'a mut S,
+        counter_log: &'a mut C,
+        sink: &'a mut ES,
+        emit_log: &'a mut EL,
+        order: OrderId,
+        attempt: Attempt,
+        run: RunId,
+        generation: Generation,
+        epoch: Epoch,
+        external_ref: impl Into<String>,
+        tuple: Option<ArtifactTuple>,
+    ) -> Self {
+        let mut driver = Self::new(pack, intents, host, outcomes, counter_log, sink, emit_log,
+            order.clone(), attempt, run, generation, epoch, external_ref, tuple);
+        let records = driver.counter_log.load(&order.0, run.0);
+        for record in &records {
+            if let CounterRecord::Bump { counter, value, .. } = record {
+                driver.counters.insert(counter.clone(), *value);
+            }
+        }
+        if let Some(outcome) = driver.outcomes.latest(&(order, attempt, run)) {
+            driver.cursor = outcome.cursor.or_else(|| outcome.next_activation.map(|next| next.node));
+            driver.activation = outcome.activation.saturating_add(1);
+        }
+        let mut cursor_is_next_from_log = false;
+        if let Some((bump_idx, pending_node)) = records.iter().enumerate().rev().find_map(|(idx, record)| match record {
+            CounterRecord::Bump { node_id, .. } => Some((idx, node_id.clone())),
+            CounterRecord::Completed { .. } => None,
+        }) {
+            let completed_idx = records.iter().rposition(|record| matches!(record,
+                CounterRecord::Completed { node_id, .. } if node_id == &pending_node));
+            if completed_idx.is_none_or(|idx| bump_idx > idx) {
+                driver.cursor = Some(pending_node);
+                driver.completed = false;
+                cursor_is_next_from_log = true;
+            }
+        }
+        if driver.cursor.is_none()
+            && let Some(CounterRecord::Completed { goto, .. }) = records.iter().rev().find(|record|
+                matches!(record, CounterRecord::Completed { .. }))
+        {
+            driver.cursor = goto.clone();
+            driver.completed = goto.is_none();
+            cursor_is_next_from_log = true;
+        }
+        let mut completion_chain = BTreeSet::new();
+        while !cursor_is_next_from_log && let Some(current) = driver.cursor.clone() {
+            if !completion_chain.insert(current.clone()) {
+                break;
+            }
+            let completion = records.iter().rev().find_map(|record| match record {
+                CounterRecord::Completed { node_id, goto } if node_id == &current => Some(goto.clone()),
+                _ => None,
+            });
+            match completion {
+                Some(Some(next)) if next != current => {
+                    let repeated = completion_chain.contains(&next);
+                    driver.cursor = Some(next);
+                    if repeated { break; }
+                }
+                Some(Some(_)) | None => break,
+                Some(None) => { driver.cursor = None; driver.completed = true; break; }
+            }
+        }
+        driver
     }
 
     pub fn counters(&self) -> &BTreeMap<String, u64> {
@@ -112,6 +193,12 @@ where
     }
 
     pub fn start(&mut self) -> GraphStep {
+        if self.completed {
+            return GraphStep::Completed;
+        }
+        if let Some(cursor) = self.cursor.clone() {
+            return self.advance(&cursor);
+        }
         let Some(entry) = self.pack.policy().get("entry").and_then(|v| v.as_str()) else {
             return GraphStep::Fault("pack entry is missing".into());
         };
@@ -205,16 +292,22 @@ where
                             let Some(value) = counters.get_mut(counter) else {
                                 return GraphStep::Fault(format!("unknown counter {counter}"));
                             };
-                            let Some(next) = value.checked_add(1) else {
-                                return GraphStep::Fault(format!("counter overflow: {counter}"));
-                            };
-                            *value = next;
+                            if let Err(error) = self.bump_with_log(&node.id, counter, value) {
+                                return GraphStep::Fault(error);
+                            }
+                            let next = *value;
                             effects.push(format!("bump:{counter}={next}"));
                         }
                         ("emit", [Expr::Ident(event), Expr::Ident(payload)]) => {
                             let result = self.emit_declared(event, payload);
                             if matches!(result, GraphStep::Emitted { .. }) {
                                 self.counters = counters;
+                            }
+                            if matches!(result, GraphStep::Emitted { .. }) {
+                                let goto = branch.get("goto").and_then(|v| v.as_str()).map(str::to_owned);
+                                if let Err(error) = self.append_completed(&node.id, goto) {
+                                    return GraphStep::Fault(error);
+                                }
                             }
                             return result;
                         }
@@ -226,9 +319,13 @@ where
                 }
             }
             self.counters = counters;
-            return match branch.get("goto").and_then(|v| v.as_str()) {
-                Some(next) => GraphStep::Advanced { next: next.into(), effects },
-                None => GraphStep::Completed,
+            let goto = branch.get("goto").and_then(|v| v.as_str()).map(str::to_owned);
+            if let Err(error) = self.append_completed(&node.id, goto.clone()) {
+                return GraphStep::Fault(error);
+            }
+            return match goto {
+                Some(next) => GraphStep::Advanced { next, effects },
+                None => { self.completed = true; GraphStep::Completed },
             };
         }
         GraphStep::Fault(format!("no route branch matched at {}", node.id))
@@ -246,10 +343,9 @@ where
             let Some(value) = counters.get_mut(counter) else {
                 return GraphStep::Fault(format!("unknown counter {counter}"));
             };
-            let Some(next) = value.checked_add(1) else {
-                return GraphStep::Fault(format!("counter overflow: {counter}"));
-            };
-            *value = next;
+            if let Err(error) = self.bump_with_log(&node.id, counter, value) {
+                return GraphStep::Fault(error);
+            }
         }
         let payload = node.value.get("payload").and_then(|v| v.as_str()).unwrap_or("");
         let intent = self.intent(activation, format!("redrive:{}:{payload}", node.id));
@@ -261,7 +357,10 @@ where
                 let next = outcome.cursor.or_else(|| {
                     node.value.get("on_done").and_then(|v| v.as_str()).map(str::to_owned)
                 });
-                next.map_or(GraphStep::Completed, |next| GraphStep::Advanced {
+                if let Err(error) = self.append_completed(&node.id, next.clone()) {
+                    return GraphStep::Fault(error);
+                }
+                next.map_or_else(|| { self.completed = true; GraphStep::Completed }, |next| GraphStep::Advanced {
                     next,
                     effects: vec![format!("redrive:{}", node.id)],
                 })
@@ -283,6 +382,45 @@ where
             return GraphStep::Fault("emit payload reference is missing".into());
         };
         self.emit_declared(event, payload)
+    }
+
+    fn bump_with_log(&mut self, node_id: &str, counter: &str, value: &mut u64) -> Result<(), String> {
+        let records = self.counter_log.load(&self.order.0, self.run.0);
+        let last_completed_idx = records.iter().rposition(|record| matches!(record,
+            CounterRecord::Completed { node_id: completed, .. } if completed == node_id));
+        let last_bump = records.iter().enumerate().filter_map(|(idx, record)| match record {
+            CounterRecord::Bump { node_id: bumped, counter: name, value } if bumped == node_id && name == counter => Some((idx, *value)),
+            _ => None,
+            }).next_back();
+        match last_bump {
+            Some((idx, persisted)) if last_completed_idx.is_none_or(|completed| idx > completed) => {
+                // Restore loads all bumps, including the pending one. Validate it
+                // against the preceding durable counter value, not the already-restored value.
+                let previous = records[..idx].iter().rev().find_map(|record| match record {
+                    CounterRecord::Bump { counter: name, value, .. } if name == counter => Some(*value),
+                    _ => None,
+                }).or_else(|| self.pack.counters().get(counter).copied()).unwrap_or(0);
+                let expected = previous.checked_add(1).ok_or_else(|| format!("counter overflow: {counter}"))?;
+                if persisted != expected {
+                    return Err(format!("counter log invariant violated for {node_id}/{counter}: expected {expected}, found {persisted}"));
+                }
+                *value = persisted;
+            }
+            _ => {
+                let next = value.checked_add(1).ok_or_else(|| format!("counter overflow: {counter}"))?;
+                self.counter_log.append(&self.order.0, self.run.0, CounterRecord::Bump {
+                    node_id: node_id.to_owned(), counter: counter.to_owned(), value: next,
+                }).map_err(|error| format!("counter log append failed: {error}"))?;
+                *value = next;
+            }
+        }
+        Ok(())
+    }
+
+    fn append_completed(&mut self, node_id: &str, goto: Option<String>) -> Result<(), String> {
+        self.counter_log.append(&self.order.0, self.run.0,
+            CounterRecord::Completed { node_id: node_id.to_owned(), goto })
+            .map_err(|error| format!("counter log append failed: {error}"))
     }
 
     fn emit_declared(&mut self, event: &str, payload: &str) -> GraphStep {

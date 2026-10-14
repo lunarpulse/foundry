@@ -15,7 +15,7 @@ pub use graph::{GraphDriver, GraphStep};
 pub use hold::{HoldCasOutcome, HoldCommand, HoldInstanceId, HoldOperation, cas_hold};
 pub use inject::{CrashPoint, FaultInjector};
 pub use lifecycle::{DispatchResult, Executor, LifecycleError, ResumeAction, RunStep};
-pub use ports::{DispatchHost, IntentLog, OutcomeStore};
+pub use ports::{CounterLog, CounterRecord, DispatchHost, IntentLog, OutcomeStore};
 pub use types::{
     ActivationRef, ArtifactLocation, ArtifactTuple, ArtifactTupleKey, Attempt, EmitReceipt, Epoch,
     ExecutionIntent, ExecutionOutcome, FenceVerdict, FencingToken, Generation, ImmutableCommit,

@@ -1,5 +1,21 @@
 use crate::types::{Attempt, ExecutionIntent, ExecutionOutcome, OrderId, RunId};
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum CounterRecord {
+    /// A graph node bumped a counter (absolute value after the bump).
+    Bump { node_id: String, counter: String, value: u64 },
+    /// A node finished. `goto` is the next cursor, or `None` for graph completion.
+    Completed { node_id: String, goto: Option<String> },
+}
+
+/// Durable write-ahead log for graph counter updates.
+pub trait CounterLog {
+    /// Appends an append-only fact. Implementations must fail-stop on failed/partial writes.
+    fn append(&mut self, order: &str, run: u64, record: CounterRecord) -> Result<(), String>;
+    /// Returns records in append order, or an empty vector when none are recorded.
+    fn load(&self, order: &str, run: u64) -> Vec<CounterRecord>;
+}
+
 /// Persistence boundary for execution intents. Implementations own all storage writes.
 /// A successful return must mean durable persistence; storage failures must stop
 /// execution (these infallible ports require fail-stop adapters). The owner must
