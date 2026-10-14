@@ -77,12 +77,17 @@ pub struct VerifiedSkill {
     declares_tools: Vec<String>,
     kind: SkillKind,
     content_hash: String,
+    /// **T29b**: 이 스킬이 로드된 검사 팩 스냅샷의 manifest digest.
+    /// None = 팩 외부 스킬(기존 경로). 디스패치 직전 변조 대조
+    /// (dsl::verify_pack_binding)의 영수증 성분.
+    review_pack_digest: Option<String>,
 }
 
 impl VerifiedSkill {
     pub fn id(&self) -> &str { &self.id }
     pub fn declares_tools(&self) -> &[String] { &self.declares_tools }
     pub fn kind(&self) -> SkillKind { self.kind }
+    pub fn review_pack_digest(&self) -> Option<&str> { self.review_pack_digest.as_deref() }
 }
 
 /// 로더 — G12 집행 지점. 콘텐츠 해시 계산 후 결속 digest와 대조.
@@ -109,7 +114,21 @@ pub fn load_skill(manifest: &SkillManifest, binding_digest: &str) -> Result<Veri
         declares_tools: manifest.declares_tools.clone(),
         kind: manifest.kind,
         content_hash: computed,
+        review_pack_digest: None,
     })
+}
+
+/// **T29b** — 팩 스냅샷 결속 로드: load_skill 검증 전부 + 팩 manifest
+/// digest 영수증 발급. 검사 팩 소속 스킬은 이 경로로만 로드해야
+/// 디스패치 직전 변조 대조(verify_pack_binding)의 증거가 성립한다.
+pub fn load_skill_with_review_pack(
+    manifest: &SkillManifest,
+    binding_digest: &str,
+    pack_digest: &str,
+) -> Result<VerifiedSkill, LoadError> {
+    let mut v = load_skill(manifest, binding_digest)?;
+    v.review_pack_digest = Some(pack_digest.to_string());
+    Ok(v)
 }
 
 /// 정적 lint 소견 (C-W2a — 경고일 뿐, 보안 경계 아님).
@@ -240,6 +259,7 @@ mod tests {
             routing: RoutingRules { rules: vec![], default_route: "w".into() },
             policy_digest: "p".into(),
             policy: None,
+            review_pack: None,
         }
     }
 
@@ -409,5 +429,33 @@ mod tests {
         let enf = SkillEnforcer { workflow_envelope: &envelope, verified: &verified, order_policy: &policy };
         // 교집합: envelope∩manifest = {git, cargo}, ∩policy = {cargo}
         assert_eq!(enf.effective_capability_set("die"), vec!["cargo".to_string()]);
+    }
+}
+
+/// **T29b 스냅샷 영수증 결속** — 팩 소속 스킬은 로드 시 팩 digest를
+/// 영수증으로 지니고, 일반 경로는 None (팩 외부 스킬).
+#[cfg(test)]
+mod t29b_receipt_tests {
+    use super::*;
+
+    fn manifest() -> SkillManifest {
+        SkillManifest {
+            id: "lens-a".into(),
+            interface_version: 1,
+            declares_tools: vec!["read".into()],
+            kind: SkillKind::Role,
+            digest: "sk-x".into(),
+        }
+    }
+
+    #[test]
+    fn receipt_binds_pack_digest() {
+        let m = manifest();
+        let dg = manifest_content_hash(&m);
+        let plain = load_skill(&m, &dg).unwrap();
+        assert_eq!(plain.review_pack_digest(), None);
+        let bound = load_skill_with_review_pack(&m, &dg, "pack-abc").unwrap();
+        assert_eq!(bound.review_pack_digest(), Some("pack-abc"));
+        assert!(load_skill_with_review_pack(&m, "wrong", "pack-abc").is_err());
     }
 }

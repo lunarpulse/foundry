@@ -145,6 +145,14 @@ fn interpret_error_to_diag(e: InterpretError) -> Diagnostic {
             "default_route_mismatch",
             format!("default_route '{got}' != workflow id '{expected}'"),
         ),
+        InterpretError::MissingReviewPack => (
+            "missing_review_pack",
+            "v4 document must bind a review pack digest".to_string(),
+        ),
+        InterpretError::PackTampered { bound, live } => (
+            "pack_tampered",
+            format!("bound pack digest {bound} != live digest {live} — pack changed since binding"),
+        ),
     };
     Diagnostic::err(code, detail)
 }
@@ -427,6 +435,7 @@ mod tests {
             },
             policy_digest: String::new(),
             policy: Some(PolicyDoc { schema_version: 1, approvals: vec![] }),
+            review_pack: None,
         }
     }
 

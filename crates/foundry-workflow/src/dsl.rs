@@ -39,6 +39,21 @@ pub struct WorkflowDoc {
     /// 커밋먼트). v1/v2 문서는 None (직렬화에서 제외 — 레거시 root 불변).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<PolicyDoc>,
+    /// **v4 (T29b)**: 결속 검사 팩 — `foundry-pack` 스냅샷의 manifest
+    /// digest로만 참조 (팩 내용이 워크플로 본문을 오염하지 않는다).
+    /// v1/v2/v3 문서는 None (직렬화 제외 — 레거시 root 불변). v4 문서는
+    /// 필수 (인터프리터가 부재 시 구조 오류 거부).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_pack: Option<ReviewPackRef>,
+}
+
+/// **ReviewPackRef (v4, T29b)** — 검사 팩 결속 참조.
+/// digest는 PackSnapshot의 canonical manifest digest (스펙 v0.71 §2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewPackRef {
+    /// 결속 팩 digest — Merkle 리프 6의 성분.
+    pub pack_digest: String,
 }
 
 /// **PolicyDoc (v3, T54)** — 승인 정책의 내용 스키마 (플랜 v6 C-W4a).
@@ -167,6 +182,8 @@ pub struct CompiledWorkflow {
     pub routing: RoutingRules,
     /// v3 문서의 내장 정책 (v1/v2는 None).
     pub policy: Option<PolicyDoc>,
+    /// v4 문서의 결속 검사 팩 digest (v1/v2/v3는 None).
+    pub review_pack: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -181,6 +198,10 @@ pub enum InterpretError {
     AdvisoryInRoleSlot { skill: String },
     /// default_route가 워크플로 id와 불일치 (C-W3 암묵 폴백 금지).
     DefaultRouteMismatch { expected: String, got: String },
+    /// v4 문서에 review_pack 결속이 없다 (구조 오류).
+    MissingReviewPack,
+    /// 디스패치 직전 재계산한 팩 digest가 결속값과 불일치 — 변조.
+    PackTampered { bound: String, live: String },
 }
 
 /// 정규 직렬화 — 구조체 필드 순서 + BTree 정렬로 결정적.
@@ -223,10 +244,23 @@ pub fn merkle_root(doc: &WorkflowDoc) -> String {
         _ => doc.policy_digest.clone(),
     };
     let l4 = leaf("policy", &policy_s);
+    // v4 (T29b): 리프 6 = 결속 검사 팩 digest. **리프 수 자체가
+    // schema_version으로 결정** — v1~v3는 5리프 그대로 (레거시 root
+    // 바이트 불변), v4만 6리프 (동일 pack_digest여도 버전이 다르면
+    // root가 다름 — 리프 0가 이미 버전을 덮음).
     let mut root = sha2::Sha256::new();
     root.update(b"foundry-workflow-merkle-v1");
     for l in [l0, l1, l2, l3, l4] {
         root.update(l);
+    }
+    if doc.schema_version >= 4 {
+        let pack_s = doc
+            .review_pack
+            .as_ref()
+            .map(|r| r.pack_digest.clone())
+            .unwrap_or_default();
+        let l5 = leaf("review_pack", &pack_s);
+        root.update(l5);
     }
     format!("wf-root-{:x}", root.finalize())
 }
@@ -270,6 +304,7 @@ pub mod interpreter_v1 {
         Ok(CompiledWorkflow {
             doc_digest: merkle_root(doc),
             policy: None,
+            review_pack: None,
             // astra MAJOR fix: the AUTHENTICATED encoding is carried —
             // the old code silently replaced it with frozen_v1(), so a
             // modified encoding whose digest matched the doc's claim
@@ -290,7 +325,7 @@ pub mod engine_registry {
 
     /// 현재 엔진이 구동 가능한 스키마 버전들 (T54 이후: v1+v2+v3).
     pub fn known_versions() -> Vec<u32> {
-        vec![1, 2, 3]
+        vec![1, 2, 3, 4]
     }
 
     /// 버전 디스패치 — 각 버전의 동결 인터프리터로.
@@ -326,6 +361,7 @@ pub mod engine_registry {
                     plan: doc.body.steps.clone(),
                     routing: doc.routing.clone(),
                     policy: None,
+                    review_pack: None,
                 })
             }
             // v3 (T54, 플랜 v6): v1 구조 검증 + 내장 정책 전달.
@@ -357,10 +393,61 @@ pub mod engine_registry {
                     plan: doc.body.steps.clone(),
                     routing: doc.routing.clone(),
                     policy: doc.policy.clone(),
+                    review_pack: None,
+                })
+            }
+            // v4 (T29b): v3 규칙 + 결속 검사 팩 필수·전달.
+            4 => {
+                if doc.body.encoding_digest != loaded_encoding.digest() {
+                    return Err(InterpretError::EncodingMismatch {
+                        doc: doc.body.encoding_digest.clone(),
+                        loaded: loaded_encoding.digest(),
+                    });
+                }
+                let pack_digest = doc
+                    .review_pack
+                    .as_ref()
+                    .map(|r| r.pack_digest.clone())
+                    .ok_or(InterpretError::MissingReviewPack)?;
+                for st in &doc.body.steps {
+                    if let Some(sk) = &st.skill {
+                        let r = doc.skills.iter().find(|s| &s.id == sk).ok_or_else(|| {
+                            InterpretError::UnknownSkillRef { step_event: st.event.clone(), skill: sk.clone() }
+                        })?;
+                        if r.kind == SkillKind::Advisory {
+                            return Err(InterpretError::AdvisoryInRoleSlot { skill: sk.clone() });
+                        }
+                    }
+                }
+                if doc.routing.default_route != doc.id {
+                    return Err(InterpretError::DefaultRouteMismatch { expected: doc.id.clone(), got: doc.routing.default_route.clone() });
+                }
+                Ok(CompiledWorkflow {
+                    doc_digest: merkle_root(doc),
+                    encoding: loaded_encoding.clone(),
+                    plan: doc.body.steps.clone(),
+                    routing: doc.routing.clone(),
+                    policy: doc.policy.clone(),
+                    review_pack: Some(pack_digest),
                 })
             }
             got => Err(InterpretError::UnknownSchemaVersion { got, known: known_versions() }),
         }
+    }
+}
+
+/// **디스패치 직전 변조 거부 (T29b)** — 결속 팩 digest를 현재 live
+/// 스냅샷의 재계산 digest와 대조. 로더는 스냅샷 적재 시점의 digest를,
+/// 이 함수는 디스패치 직전의 live digest를 받아 워크플로 결속값과
+/// 비교한다 — 사이에 팩 파일이 바뀌면 거부.
+pub fn verify_pack_binding(doc: &WorkflowDoc, live_pack_digest: &str) -> Result<(), InterpretError> {
+    match &doc.review_pack {
+        None => Err(InterpretError::MissingReviewPack),
+        Some(r) if r.pack_digest == live_pack_digest => Ok(()),
+        Some(r) => Err(InterpretError::PackTampered {
+            bound: r.pack_digest.clone(),
+            live: live_pack_digest.to_string(),
+        }),
     }
 }
 
@@ -391,6 +478,7 @@ mod tests {
             },
             policy_digest: "pol-001".into(),
             policy: None,
+            review_pack: None,
         }
     }
 
@@ -482,18 +570,147 @@ mod tests {
         // v1 직접 해석과도 일치
         let by_v1 = interpreter_v1::interpret(&doc, &enc).unwrap();
         assert_eq!(by_v2.doc_digest, by_v1.doc_digest);
-        // 미지 버전은 여전히 거부 — T54가 v3 인터프리터를 추가하면서
-        // 미지 프로브는 v4로 이동 (의도적·가시적 갱신).
+        // 미지 버전은 여전히 거부 — T29b가 v4 인터프리터를 추가하면서
+        // 미지 프로브는 v5로 이동 (의도적·가시적 갱신).
         let mut d = sample_doc();
-        d.schema_version = 4;
+        d.schema_version = 5;
         assert!(matches!(
             engine_registry::interpret(&d, &enc),
-            Err(InterpretError::UnknownSchemaVersion { got: 4, known }) if known == vec![1, 2, 3]
+            Err(InterpretError::UnknownSchemaVersion { got: 5, known }) if known == vec![1, 2, 3, 4]
         ));
         // v2 문서 root는 v1과 다르다 (schema_version 제5성분)
         let mut d = sample_doc();
         d.schema_version = 2;
         let by_v2doc = engine_registry::interpret(&d, &enc).unwrap();
         assert_ne!(by_v2doc.doc_digest, GOLDEN_V1_ROOT, "version identity must change the root");
+    }
+}
+
+/// **T29b v4 게이트 시험** — 리프 6 재현·v1/v3 골든 root 불변·
+/// 직전 변조 거부·advisory 배선 거부·팩 부재 거부.
+#[cfg(test)]
+mod t29b_tests {
+    use super::*;
+    use foundry_domain::workflow_encoding::EmbeddedWorkflow;
+
+    fn v4_doc() -> WorkflowDoc {
+        WorkflowDoc {
+            schema_version: 4,
+            id: "m8-review".into(),
+            body: WorkflowBody {
+                encoding_digest: EmbeddedWorkflow::frozen_v1().digest(),
+                steps: vec![StepSpec {
+                    id: "s1".into(),
+                    event: "Queued".into(),
+                    skill: Some("lens".into()),
+                }],
+            },
+            skills: vec![SkillRef { id: "lens".into(), digest: "sk-x".into(), kind: SkillKind::Role }],
+            routing: RoutingRules { rules: vec![], default_route: "m8-review".into() },
+            policy_digest: String::new(),
+            policy: None,
+            review_pack: Some(ReviewPackRef { pack_digest: "pack-abc".into() }),
+        }
+    }
+
+    /// 게이트 1a: v4 리프 6은 pack_digest를 덮는다 — 팩이 바뀌면 root 변화.
+    #[test]
+    fn v4_leaf_covers_review_pack() {
+        let d = v4_doc();
+        let r1 = merkle_root(&d);
+        let mut d2 = d.clone();
+        d2.review_pack = Some(ReviewPackRef { pack_digest: "pack-tampered".into() });
+        assert_ne!(r1, merkle_root(&d2), "review-pack leaf must be covered");
+    }
+
+    /// 게이트 1b: v1/v3 골든 root 불변 — 필드 추가·v4 코드 경로가
+    /// 레거시 root 바이트를 건드리지 않음 (변경 전 실측 핀).
+    #[test]
+    fn legacy_roots_unchanged() {
+        let d3 = WorkflowDoc {
+            schema_version: 3,
+            id: "m8-review".into(),
+            body: WorkflowBody {
+                encoding_digest: EmbeddedWorkflow::frozen_v1().digest(),
+                steps: vec![StepSpec { id: "s1".into(), event: "Queued".into(), skill: Some("lens".into()) }],
+            },
+            skills: vec![SkillRef { id: "lens".into(), digest: "sk-x".into(), kind: SkillKind::Role }],
+            routing: RoutingRules { rules: vec![], default_route: "m8-review".into() },
+            policy_digest: String::new(),
+            policy: Some(PolicyDoc {
+                schema_version: 1,
+                approvals: vec![PolicyApproval { node_ref: "s1".into(), level: PolicyLevel::Prepare }],
+            }),
+            review_pack: Some(ReviewPackRef { pack_digest: "pack-abc".into() }),
+        };
+        // v3 pin — 2026-10-14 변경 전 실측 (review_pack 주입에도 불변:
+        // 리프 6은 schema_version 4 미만에서는 root에 기여하지 않음).
+        assert_eq!(
+            merkle_root(&d3),
+            "wf-root-a4ca6a0ed2bb5aebc0053f4a427df33aa935caae9ab9ad775ff0514df291370c"
+        );
+        let mut d1 = d3;
+        d1.schema_version = 1;
+        d1.policy = None;
+        d1.policy_digest = "pol-001".into();
+        assert_eq!(
+            merkle_root(&d1),
+            "wf-root-021216ffc0463106ad94353bf3f91d60e9df23a5e897e2bf8f47a08ec39d800a"
+        );
+    }
+
+    /// 게이트 1c: 디스패치 직전 변조 거부 — 결속 digest ≠ live 재계산.
+    #[test]
+    fn pre_dispatch_tamper_rejected() {
+        let d = v4_doc();
+        assert!(verify_pack_binding(&d, "pack-abc").is_ok());
+        match verify_pack_binding(&d, "pack-changed") {
+            Err(InterpretError::PackTampered { bound, live }) => {
+                assert_eq!(bound, "pack-abc");
+                assert_eq!(live, "pack-changed");
+            }
+            other => panic!("expected PackTampered, got {other:?}"),
+        }
+        let mut bare = d;
+        bare.review_pack = None;
+        assert!(matches!(verify_pack_binding(&bare, "pack-abc"), Err(InterpretError::MissingReviewPack)));
+    }
+
+    /// 게이트 1d: v4 해석 — 팩 부재 거부·정상 문서는 팩 digest 전달.
+    #[test]
+    fn v4_interpreter_binds_pack() {
+        let enc = EmbeddedWorkflow::frozen_v1();
+        let mut d = v4_doc();
+        d.review_pack = None;
+        assert!(matches!(
+            engine_registry::interpret(&d, &enc),
+            Err(InterpretError::MissingReviewPack)
+        ));
+        let ok = engine_registry::interpret(&v4_doc(), &enc).unwrap();
+        assert_eq!(ok.review_pack.as_deref(), Some("pack-abc"));
+    }
+
+    /// 게이트 1e: advisory는 v4에서도 role 슬롯 배선 불가.
+    #[test]
+    fn v4_advisory_wiring_rejected() {
+        let enc = EmbeddedWorkflow::frozen_v1();
+        let mut d = v4_doc();
+        d.skills[0].kind = SkillKind::Advisory;
+        assert!(matches!(
+            engine_registry::interpret(&d, &enc),
+            Err(InterpretError::AdvisoryInRoleSlot { .. })
+        ));
+    }
+
+    /// 게이트 1f: v4 문서 직렬화는 review_pack 포함, v3는 제외
+    /// (레거시 canonical 바이트 불변).
+    #[test]
+    fn v4_serialization_contract() {
+        let s4 = canonical_json(&v4_doc());
+        assert!(s4.contains("review_pack"), "v4 must serialize the binding: {s4}");
+        let mut d3 = v4_doc();
+        d3.schema_version = 3;
+        d3.review_pack = None;
+        assert!(!canonical_json(&d3).contains("review_pack"));
     }
 }
