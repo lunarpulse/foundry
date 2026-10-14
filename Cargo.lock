@@ -431,6 +431,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "foundry-exec"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "foundry-domain",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "foundry-furnace"
 version = "0.1.0"
 dependencies = [

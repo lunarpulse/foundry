@@ -15,6 +15,7 @@ members = [
     "crates/foundry-gate",
     "crates/foundry-approval",
     "crates/foundry-pack",
+    "crates/foundry-exec",
     "crates/foundry",
 ]
 
