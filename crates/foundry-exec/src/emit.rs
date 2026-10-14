@@ -1,15 +1,29 @@
 use crate::types::{ArtifactTuple, ArtifactTupleKey, EmitReceipt, Epoch, PromotionReceipt};
 use chrono::Utc;
 
+/// The owner must serialize emits and epoch changes for an order, including
+/// across processes. Publication and its tuple-keyed receipt must be one durable
+/// transaction; reads/writes fail-stop on storage failure. `receipt_of` survives
+/// adapter recreation and never consumes a receipt. Concrete fencing is b5.
 pub trait EmitSink {
     fn publish(&mut self, t: &ArtifactTuple) -> EmitReceipt;
+    /// Graph declarations select the event and payload reference. An adapter
+    /// that only implements the legacy tuple helper must stop before any effect.
+    fn publish_named(&mut self, _: &ArtifactTuple, _: &str, _: &str) -> EmitReceipt {
+        panic!("emit adapter must implement declared event/payload publication")
+    }
     fn receipt_of(&self, key: &ArtifactTupleKey) -> Option<EmitReceipt>;
 }
 
-/// Durable records used to authorize promotion emits and resume W3/W4.
+/// Durable records used to authorize promotion emits and resume W3/W4. Reads
+/// must survive restart; successful writes mean durable persistence. Storage
+/// failures must stop execution. The owner serializes this log with the sink
+/// and epoch updates for the order, as required by the EmitSink contract.
 pub trait EmitLog {
     fn current_epoch(&self) -> Epoch;
     fn promotion_of(&self, key: &ArtifactTupleKey) -> Option<PromotionReceipt>;
+    /// Durable orchestration copy, read before touching the external sink at W4.
+    fn emit_of(&self, key: &ArtifactTupleKey) -> Option<EmitReceipt>;
     fn record_emit(&mut self, receipt: &EmitReceipt);
     fn mark_complete(&mut self, key: &ArtifactTupleKey);
     fn is_complete(&self, key: &ArtifactTupleKey) -> bool;
@@ -29,26 +43,57 @@ pub fn emit_once<S: EmitSink, L: EmitLog>(
     sink: &mut S,
     log: &mut L,
     tuple: &ArtifactTuple,
-    fence_epoch: Epoch,
+    presented_epoch: Epoch,
+) -> EmitOutcome {
+    emit_with(sink, log, tuple, presented_epoch, |sink, tuple| sink.publish(tuple))
+}
+
+pub(crate) fn emit_named<S: EmitSink, L: EmitLog>(
+    sink: &mut S,
+    log: &mut L,
+    tuple: &ArtifactTuple,
+    presented_epoch: Epoch,
+    event: &str,
+    payload: &str,
+) -> EmitOutcome {
+    emit_with(sink, log, tuple, presented_epoch, |sink, tuple| {
+        sink.publish_named(tuple, event, payload)
+    })
+}
+
+fn emit_with<S: EmitSink, L: EmitLog>(
+    sink: &mut S,
+    log: &mut L,
+    tuple: &ArtifactTuple,
+    presented_epoch: Epoch,
+    publish: impl FnOnce(&mut S, &ArtifactTuple) -> EmitReceipt,
 ) -> EmitOutcome {
     let key = tuple.key();
-    if let Some(receipt) = sink.receipt_of(&key) {
+    if let Some(receipt) = log.emit_of(&key) {
         return EmitOutcome::Existing(receipt);
+    }
+    if let Some(receipt) = sink.receipt_of(&key) {
+        // A crash can separate the atomic sink commit from this log copy.
+        log.record_emit(&receipt);
+        return EmitOutcome::Existing(receipt);
+    }
+    // Duplicate receipts take precedence over epoch and promotion checks.
+    // Future epochs retain b1 fence semantics; current-only fencing is a
+    // documented b5 contract decision, not silently changed by this helper.
+    if presented_epoch < log.current_epoch() {
+        return EmitOutcome::StaleRejected;
     }
     if log.promotion_of(&key).is_none() {
         return EmitOutcome::PromotionRequired;
     }
-    if fence_epoch < log.current_epoch() {
-        return EmitOutcome::StaleRejected;
-    }
-    let receipt = sink.publish(tuple);
+    let receipt = publish(sink, tuple);
     log.record_emit(&receipt);
     EmitOutcome::Published(receipt)
 }
 
 /// W4 recovery: the external emit is already committed, so persist completion only.
 pub fn complete_after_w4<L: EmitLog>(log: &mut L, key: &ArtifactTupleKey) -> bool {
-    if log.is_complete(key) {
+    if log.is_complete(key) || log.emit_of(key).is_none() {
         return false;
     }
     log.mark_complete(key);

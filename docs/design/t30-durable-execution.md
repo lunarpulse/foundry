@@ -94,3 +94,12 @@ cargo test 전체 green + 생성/삭제 파일 리포트 정합 (부모 대조).
   AwaitResult로 대기 (재dispatch 없음). host가 결과를 실제로 받았는지
   판별하려면 b3 접수 조정 프로토콜 (host 측 접수 영수증 또는
   조회 포트)이 필요 — b3에서 정의.
+
+## b2b 리뷰 미종결 blocker (b2c 설계 결정 필요 — 2026-10-14 gpt-6.1-sol 리뷰)
+- 드라이버 상태(카운터 맵·그래프 커서)가 메모리 전용 — 크래시 후
+  워크 위치 복원 불가. 결정 필요: (안1) OutcomeStore의
+  cursor/next_activation에서 재구성 (추가 상태 0) vs (안2)
+  GraphStateStore 포트 신설 (원자 기록, b3 저장소). bump 이력은
+  영수증 스트림에서 유도 가능한지가 안1 성립 조건.
+- 미래 epoch 허용(fence)과 current-only emit 문구의 정책 충돌 —
+  b5 fencing 이중 증명 시 통일.

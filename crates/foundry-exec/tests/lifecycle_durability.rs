@@ -18,7 +18,7 @@ struct TestDir(PathBuf);
 impl TestDir {
     fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = PathBuf::from("/tmp/b2a_review").join(format!(
+        let path = PathBuf::from("/tmp/b2b_review/test-data").join(format!(
             "durability-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed),
         ));
         fs::create_dir_all(&path).unwrap();
@@ -28,6 +28,12 @@ impl TestDir {
 
 impl Drop for TestDir {
     fn drop(&mut self) {
+        use std::io::Write;
+        let mut inventory = fs::OpenOptions::new().create(true).append(true)
+            .open("/tmp/b2b_review/runtime-temporaries.txt").unwrap();
+        for entry in fs::read_dir(&self.0).unwrap() {
+            writeln!(inventory, "{} (deleted)", entry.unwrap().path().display()).unwrap();
+        }
         fs::remove_dir_all(&self.0).unwrap();
     }
 }
