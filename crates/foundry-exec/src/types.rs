@@ -34,6 +34,7 @@ pub struct ExecutionIntent {
     pub order: OrderId,
     pub attempt: Attempt,
     pub run: RunId,
+    pub activation: u64,
     pub generation: Generation,
     pub epoch: Epoch,
     pub external_ref: String,
@@ -51,6 +52,7 @@ pub struct ActivationRef {
 #[serde(deny_unknown_fields)]
 pub struct ExecutionOutcome {
     pub intent_key: (OrderId, Attempt, RunId),
+    pub activation: u64,
     pub cursor: Option<String>,
     pub next_activation: Option<ActivationRef>,
     pub receipts: Vec<Receipt>,

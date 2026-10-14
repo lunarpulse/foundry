@@ -69,6 +69,7 @@ fn session_digest_distinguishes_absent_and_empty_restore_source() {
 fn receipt_wrapper_rejects_unknown_fields_inside_an_outcome() {
     let mut value = serde_json::to_value(ExecutionOutcome {
         intent_key: (OrderId("order-1".into()), Attempt(1), RunId(2)),
+        activation: 0,
         cursor: None,
         next_activation: None,
         receipts: vec![Receipt::Session(session_receipt(None))],

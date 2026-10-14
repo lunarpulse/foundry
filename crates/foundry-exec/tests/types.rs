@@ -118,6 +118,7 @@ fn serde_round_trips_execution_outcome_tuple_and_session_receipt() {
     let tuple = tuple();
     let outcome = ExecutionOutcome {
         intent_key: (OrderId("order-1".into()), Attempt(1), RunId(2)),
+        activation: 0,
         cursor: Some("cursor".into()),
         next_activation: Some(ActivationRef {
             node: "next".into(),
@@ -192,6 +193,7 @@ fn receipt_digests_have_separate_domains() {
 fn unknown_fields_are_rejected() {
     let outcome = ExecutionOutcome {
         intent_key: (OrderId("order-1".into()), Attempt(1), RunId(2)),
+        activation: 0,
         cursor: None,
         next_activation: None,
         receipts: vec![],
