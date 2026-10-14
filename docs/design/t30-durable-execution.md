@@ -88,3 +88,9 @@ cargo test 전체 green + 생성/삭제 파일 리포트 정합 (부모 대조).
 - 미래 epoch 수용(fence)은 b1 명시 동작 — 활성 epoch 일치 조건과의
   상충은 b5 fencing 이중 증명에서 재검.
 - 비환급 실행 횟수 예산(회수 불가 원칙)은 Budget과 별도 산정 필요.
+
+## b2a 리뷰 지연 항목 (b3 계약 정합 필요 — 2026-10-14 gpt-6.1-sol 리뷰)
+- mark_started 직후·host 결과 접수 전 종료 창: 현재 실행기는
+  AwaitResult로 대기 (재dispatch 없음). host가 결과를 실제로 받았는지
+  판별하려면 b3 접수 조정 프로토콜 (host 측 접수 영수증 또는
+  조회 포트)이 필요 — b3에서 정의.

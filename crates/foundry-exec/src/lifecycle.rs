@@ -2,6 +2,7 @@ use crate::inject::{CrashPoint, FaultInjector};
 use crate::ports::{DispatchHost, IntentLog, OutcomeStore};
 use crate::types::{ExecutionIntent, ExecutionOutcome, OrderId, Receipt};
 
+/// Run-level lookup key. Durable intent identity additionally includes activation.
 pub type IntentKey = (OrderId, crate::types::Attempt, crate::types::RunId);
 
 /// The output returned by a host dispatch and atomically bound as an outcome.
@@ -22,11 +23,20 @@ pub enum ResumeAction {
     NeedsFreshRun,
     ReDispatch,
     ReBind,
+    /// Dispatch was claimed, but its durable result is not available yet.
+    AwaitResult,
+    /// A fault interrupted recovery before the outcome was committed.
+    Interrupted(LifecycleError),
     AlreadyBound(ExecutionOutcome),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LifecycleError(pub CrashPoint);
+pub enum LifecycleError {
+    Crash(CrashPoint),
+    IntentConflict(u64),
+    ActivationPending(u64),
+    AwaitResult(u64),
+}
 
 /// Runs only through the storage and host ports; it never owns storage details.
 pub struct Executor<'a, L: IntentLog, H: DispatchHost<Result = DispatchResult>, S: OutcomeStore> {
@@ -60,44 +70,65 @@ where
         }
     }
 
-    /// Appends the intent before marking it started or calling the external host.
+    /// Records fresh work before dispatch. Retries of a recorded activation reuse
+    /// its binding or recover its result; new activations wait for the prior binding.
     pub fn run(&mut self, intent: ExecutionIntent) -> Result<RunStep, LifecycleError> {
         let key = (intent.order.clone(), intent.attempt, intent.run);
+        if let Some(recorded) = self.intents.get(&key, intent.activation) {
+            // A retry may have a new timestamp, but cannot change the work's identity.
+            if recorded.generation != intent.generation
+                || recorded.epoch != intent.epoch
+                || recorded.external_ref != intent.external_ref
+            {
+                return Err(LifecycleError::IntentConflict(intent.activation));
+            }
+            if let Some(outcome) = self.outcomes.get(&key, intent.activation) {
+                return Ok(RunStep::Bound(outcome));
+            }
+            if self.intents.is_started(&key, intent.activation) {
+                let Some(result) = self.host.recover_result(&recorded) else {
+                    return Err(LifecycleError::AwaitResult(intent.activation));
+                };
+                return self.bind_result(&recorded, result).map(RunStep::Bound);
+            }
+            return self.dispatch_recorded(&key, &recorded).map(RunStep::Bound);
+        }
+        let pending = self
+            .intents
+            .latest(&key)
+            .filter(|p| self.outcomes.get(&key, p.activation).is_none());
+        if let Some(previous) = pending {
+            return Err(LifecycleError::ActivationPending(previous.activation));
+        }
         self.intents.append(&intent);
-        self.faults.fire(CrashPoint::W1).map_err(LifecycleError)?;
-
-        self.intents.mark_started(&key, intent.activation);
-        let result = self.host.dispatch(&intent);
-        let outcome = outcome_from(&intent, result);
-        self.faults.fire(CrashPoint::W2).map_err(LifecycleError)?;
-
-        self.outcomes.commit(&outcome);
-        Ok(RunStep::Bound(outcome))
+        self.dispatch_recorded(&key, &intent).map(RunStep::Bound)
     }
 
     /// Resolves a previously recorded activation. W1 redispatches; W2 recovers
-    /// the host result and binds it without dispatching again.
+    /// the host result and binds it without dispatching again. Started work without
+    /// a durable result stays in AwaitResult, including ambiguous dispatch claims.
     pub fn resume(&mut self, key: &IntentKey) -> ResumeAction {
         let Some(intent) = self.intents.latest(key) else {
             return ResumeAction::NeedsFreshRun;
         };
-        if let Some(outcome) = self.outcomes.latest(key) {
+        if let Some(outcome) = self.outcomes.get(key, intent.activation) {
             return ResumeAction::AlreadyBound(outcome);
         }
 
         if !self.intents.is_started(key, intent.activation) {
-            self.intents.mark_started(key, intent.activation);
-            let result = self.host.dispatch(&intent);
-            let outcome = outcome_from(&intent, result);
-            self.outcomes.commit(&outcome);
-            return ResumeAction::ReDispatch;
+            return match self.dispatch_recorded(key, &intent) {
+                Ok(_) => ResumeAction::ReDispatch,
+                Err(error) => ResumeAction::Interrupted(error),
+            };
         }
 
         if let Some(result) = self.host.recover_result(&intent) {
-            let outcome = outcome_from(&intent, result);
-            self.outcomes.commit(&outcome);
+            return match self.bind_result(&intent, result) {
+                Ok(_) => ResumeAction::ReBind,
+                Err(error) => ResumeAction::Interrupted(error),
+            };
         }
-        ResumeAction::ReBind
+        ResumeAction::AwaitResult
     }
 
     pub fn dispatch_count(&self) -> u64 {
@@ -105,7 +136,8 @@ where
     }
 
     pub fn outcome(&self, key: &IntentKey) -> Option<ExecutionOutcome> {
-        self.outcomes.latest(key)
+        let intent = self.intents.latest(key)?;
+        self.outcomes.get(key, intent.activation)
     }
 
     pub fn latest_intent(&self, key: &IntentKey) -> Option<ExecutionIntent> {
@@ -114,6 +146,29 @@ where
 
     pub fn is_started(&self, key: &IntentKey, activation: u64) -> bool {
         self.intents.is_started(key, activation)
+    }
+
+    // Only called with an appended or recovered intent, never arbitrary host input.
+    fn dispatch_recorded(
+        &mut self,
+        key: &IntentKey,
+        intent: &ExecutionIntent,
+    ) -> Result<ExecutionOutcome, LifecycleError> {
+        self.faults.fire(CrashPoint::W1).map_err(LifecycleError::Crash)?;
+        self.intents.mark_started(key, intent.activation);
+        let result = self.host.dispatch(intent);
+        self.bind_result(intent, result)
+    }
+
+    fn bind_result(
+        &mut self,
+        intent: &ExecutionIntent,
+        result: DispatchResult,
+    ) -> Result<ExecutionOutcome, LifecycleError> {
+        let outcome = outcome_from(intent, result);
+        self.faults.fire(CrashPoint::W2).map_err(LifecycleError::Crash)?;
+        self.outcomes.commit(&outcome);
+        Ok(outcome)
     }
 }
 

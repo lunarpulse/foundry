@@ -36,6 +36,13 @@ impl IntentLog for MemoryIntentLog {
     fn is_started(&self, key: &Key, activation: u64) -> bool {
         self.started.contains(&(key.clone(), activation))
     }
+
+    fn get(&self, key: &Key, activation: u64) -> Option<ExecutionIntent> {
+        self.rows.iter().find(|intent| {
+            (intent.order.clone(), intent.attempt, intent.run) == *key
+                && intent.activation == activation
+        }).cloned()
+    }
 }
 
 #[derive(Default)]
@@ -78,17 +85,27 @@ impl DispatchHost for FakeHost {
 
 #[derive(Default)]
 struct MemoryOutcomeStore {
-    rows: HashMap<Key, ExecutionOutcome>,
+    rows: HashMap<(Key, u64), ExecutionOutcome>,
+    latest_activations: HashMap<Key, u64>,
 }
 
 impl OutcomeStore for MemoryOutcomeStore {
     fn commit(&mut self, outcome: &ExecutionOutcome) {
+        if self.rows.contains_key(&(outcome.intent_key.clone(), outcome.activation)) {
+            return;
+        }
+        self.latest_activations.insert(outcome.intent_key.clone(), outcome.activation);
         self.rows
-            .insert(outcome.intent_key.clone(), outcome.clone());
+            .entry((outcome.intent_key.clone(), outcome.activation))
+            .or_insert_with(|| outcome.clone());
     }
 
     fn latest(&self, key: &Key) -> Option<ExecutionOutcome> {
-        self.rows.get(key).cloned()
+        self.get(key, *self.latest_activations.get(key)?)
+    }
+
+    fn get(&self, key: &Key, activation: u64) -> Option<ExecutionOutcome> {
+        self.rows.get(&(key.clone(), activation)).cloned()
     }
 }
 
@@ -206,4 +223,161 @@ fn dispatch_is_reachable_only_after_the_intent_and_started_marker() {
     assert!(executor.latest_intent(&key()).is_some());
     assert!(executor.is_started(&key(), 8));
     assert_eq!(executor.dispatch_count(), 1);
+}
+
+#[test]
+fn review_w1_of_new_activation_does_not_return_the_previous_outcome() {
+    let mut intents = MemoryIntentLog::default();
+    let mut host = FakeHost::default();
+    let mut outcomes = MemoryOutcomeStore::default();
+    Executor::new(&mut intents, &mut host, &mut outcomes).run(intent(8)).unwrap();
+    let mut executor = Executor::with_faults(
+        &mut intents, &mut host, &mut outcomes, FaultInjector::armed_at(CrashPoint::W1),
+    );
+    assert!(executor.run(intent(9)).is_err());
+    assert_eq!(executor.resume(&key()), ResumeAction::ReDispatch);
+    assert_eq!(executor.outcome(&key()).unwrap().activation, 9);
+    assert_eq!(executor.dispatch_count(), 2);
+}
+
+#[test]
+fn review_w2_of_new_activation_recovers_its_own_result() {
+    let mut intents = MemoryIntentLog::default();
+    let mut host = FakeHost::default();
+    let mut outcomes = MemoryOutcomeStore::default();
+    Executor::new(&mut intents, &mut host, &mut outcomes).run(intent(8)).unwrap();
+    let mut executor = Executor::with_faults(
+        &mut intents, &mut host, &mut outcomes, FaultInjector::armed_at(CrashPoint::W2),
+    );
+    assert!(executor.run(intent(9)).is_err());
+    assert_eq!(executor.resume(&key()), ResumeAction::ReBind);
+    assert_eq!(executor.outcome(&key()).unwrap().activation, 9);
+    assert_eq!(executor.dispatch_count(), 2);
+}
+
+#[test]
+fn review_repeated_run_returns_the_original_outcome_without_dispatch() {
+    let mut intents = MemoryIntentLog::default();
+    let mut host = FakeHost::default();
+    let mut outcomes = MemoryOutcomeStore::default();
+    let mut executor = Executor::new(&mut intents, &mut host, &mut outcomes);
+    let expected = executor.run(intent(8)).unwrap();
+    assert_eq!(executor.run(intent(8)).unwrap(), expected);
+    assert_eq!(executor.dispatch_count(), 1);
+}
+
+#[test]
+fn review_unbound_activation_cannot_be_hidden_by_a_new_one() {
+    let mut intents = MemoryIntentLog::default();
+    let mut host = FakeHost::default();
+    let mut outcomes = MemoryOutcomeStore::default();
+    let mut executor = Executor::with_faults(
+        &mut intents, &mut host, &mut outcomes, FaultInjector::armed_at(CrashPoint::W2),
+    );
+    assert!(executor.run(intent(8)).is_err());
+    assert!(executor.run(intent(9)).is_err());
+    assert_eq!(executor.latest_intent(&key()).unwrap().activation, 8);
+    assert_eq!(executor.resume(&key()), ResumeAction::ReBind);
+    assert_eq!(executor.dispatch_count(), 1);
+}
+
+#[test]
+fn review_same_activation_cannot_change_external_execution_identity() {
+    let mut intents = MemoryIntentLog::default();
+    let mut host = FakeHost::default();
+    let mut outcomes = MemoryOutcomeStore::default();
+    let mut executor = Executor::new(&mut intents, &mut host, &mut outcomes);
+    executor.run(intent(8)).unwrap();
+    let mut conflicting = intent(8);
+    conflicting.external_ref = "another-external-execution".into();
+    assert!(executor.run(conflicting).is_err());
+    assert_eq!(executor.dispatch_count(), 1);
+}
+
+#[test]
+fn review_started_without_a_result_waits_and_never_dispatches() {
+    let mut intents = MemoryIntentLog::default();
+    let mut host = FakeHost::default();
+    let mut outcomes = MemoryOutcomeStore::default();
+    intents.append(&intent(8));
+    intents.mark_started(&key(), 8);
+    let mut executor = Executor::new(&mut intents, &mut host, &mut outcomes);
+    assert_eq!(executor.resume(&key()), ResumeAction::AwaitResult);
+    assert_eq!(executor.resume(&key()), ResumeAction::AwaitResult);
+    assert_eq!(executor.run(intent(8)), Err(foundry_exec::LifecycleError::AwaitResult(8)));
+    assert!(executor.outcome(&key()).is_none());
+    assert_eq!(executor.dispatch_count(), 0);
+    drop(executor);
+    host.recovered = Some((key(), 8, DispatchResult {
+        cursor: Some("completed-later".into()),
+        ..DispatchResult::default()
+    }));
+    let mut executor = Executor::new(&mut intents, &mut host, &mut outcomes);
+    assert_eq!(executor.resume(&key()), ResumeAction::ReBind);
+    assert_eq!(executor.outcome(&key()).unwrap().cursor.as_deref(), Some("completed-later"));
+    assert_eq!(executor.dispatch_count(), 0);
+}
+
+#[test]
+fn review_delayed_duplicate_returns_its_own_receipt_without_hiding_new_activation() {
+    let mut intents = MemoryIntentLog::default();
+    let mut host = FakeHost::default();
+    let mut outcomes = MemoryOutcomeStore::default();
+    let mut executor = Executor::new(&mut intents, &mut host, &mut outcomes);
+    let original = executor.run(intent(8)).unwrap();
+    executor.run(intent(2)).unwrap(); // IDs need not be monotonic.
+    assert_eq!(executor.run(intent(8)).unwrap(), original);
+    assert_eq!(executor.latest_intent(&key()).unwrap().activation, 2);
+    assert_eq!(executor.outcome(&key()).unwrap().activation, 2);
+    assert_eq!(executor.dispatch_count(), 2);
+    drop(executor);
+    assert_eq!(intents.rows.len(), 2);
+}
+
+#[test]
+fn review_run_retries_both_crash_windows_without_a_second_intent_or_dispatch() {
+    for point in [CrashPoint::W1, CrashPoint::W2] {
+        let mut intents = MemoryIntentLog::default();
+        let mut host = FakeHost::default();
+        let mut outcomes = MemoryOutcomeStore::default();
+        let mut executor = Executor::with_faults(
+            &mut intents, &mut host, &mut outcomes, FaultInjector::armed_at(point),
+        );
+        assert!(executor.run(intent(8)).is_err());
+        let mut retried = intent(8);
+        retried.recorded_at += chrono::Duration::seconds(1);
+        executor.run(retried).unwrap();
+        assert_eq!(executor.outcome(&key()).unwrap().activation, 8);
+        assert_eq!(executor.dispatch_count(), 1);
+        drop(executor);
+        assert_eq!(intents.rows.len(), 1);
+    }
+}
+
+#[test]
+fn review_resume_can_crash_at_w2_and_recover_without_redispatch() {
+    let mut intents = MemoryIntentLog::default();
+    let mut host = FakeHost::default();
+    let mut outcomes = MemoryOutcomeStore::default();
+    intents.append(&intent(8));
+    let mut executor = Executor::with_faults(
+        &mut intents, &mut host, &mut outcomes, FaultInjector::armed_at(CrashPoint::W2),
+    );
+    assert_eq!(executor.resume(&key()), ResumeAction::Interrupted(
+        foundry_exec::LifecycleError::Crash(CrashPoint::W2),
+    ));
+    assert!(executor.outcome(&key()).is_none());
+    assert_eq!(executor.resume(&key()), ResumeAction::ReBind);
+    assert_eq!(executor.dispatch_count(), 1);
+}
+
+#[test]
+fn review_no_intent_requires_a_fresh_run_without_external_effects() {
+    let mut intents = MemoryIntentLog::default();
+    let mut host = FakeHost::default();
+    let mut outcomes = MemoryOutcomeStore::default();
+    let mut executor = Executor::new(&mut intents, &mut host, &mut outcomes);
+    assert_eq!(executor.resume(&key()), ResumeAction::NeedsFreshRun);
+    assert_eq!(executor.dispatch_count(), 0);
+    assert!(executor.outcome(&key()).is_none());
 }
