@@ -95,18 +95,13 @@ impl Harness for CliHarness {
                 BaseSelection::Latest => "latest",
                 BaseSelection::Origin => "origin",
             };
-            let base_commit = match protocol.base {
-                BaseSelection::Latest => git_head(&workdir),
-                BaseSelection::Origin => {
-                    let commit = git_ref(&workdir.join("repo"), "origin/main");
-                    if commit.is_empty() {
-                        return Err(PortError::Permanent(format!(
-                            "die base origin/main not found in {}",
-                            workdir.join("repo").display()
-                        )));
-                    }
-                    commit
-                }
+            // Origin must be pinned before Die runs. Latest retains the legacy
+            // post-Die workdir HEAD lookup below.
+            let origin_base = match protocol.base {
+                BaseSelection::Latest => None,
+                BaseSelection::Origin => Some(git_repo_commit(
+                    &workdir.join("repo"), "refs/remotes/origin/main^{commit}",
+                )?),
             };
             let manifest = InputManifest {
                 order_id: order_id.clone(),
@@ -131,9 +126,9 @@ impl Harness for CliHarness {
             let mut cmd = Command::new(&binary);
             cmd.current_dir(&workdir)
                 .arg("--profile")
-                .arg(&profile)
+                .arg(&manifest.profile)
                 .arg("--task")
-                .arg(&dedup_key)
+                .arg(&manifest.task)
                 .env_clear()
                 .env("PATH", "/usr/bin:/bin:/usr/local/bin")
                 .env(
@@ -145,10 +140,10 @@ impl Harness for CliHarness {
                 .stdin(Stdio::null())
                 .stdout(Stdio::from(log_file))
                 .stderr(Stdio::from(log_err));
-            if protocol.fix_context {
+            if manifest.fix_context {
                 cmd.arg("--fix-context");
             }
-            cmd.arg("--base").arg(base_name);
+            cmd.arg("--base").arg(&manifest.base);
 
             let child = tokio::time::timeout(
                 std::time::Duration::from_secs(timeout_secs),
@@ -173,7 +168,10 @@ impl Harness for CliHarness {
             // HEAD may live one level down (measured 2026-10-07: git_head on
             // the bare workdir returned "" → empty digest → approval refused
             // 20/20). Refuse EARLY instead of binding an empty digest.
-            let result_commit = {
+            let base_commit = origin_base.unwrap_or_else(|| git_head(&workdir));
+            let result_commit = if protocol.base == BaseSelection::Origin {
+                git_repo_commit(&workdir.join("repo"), "HEAD^{commit}")?
+            } else {
                 let h = git_head(&workdir);
                 if h.is_empty() {
                     git_head(&workdir.join("repo"))
@@ -244,4 +242,43 @@ fn git_ref(dir: &Path, reference: &str) -> String {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default()
+}
+
+
+/// Unlike the legacy workdir lookup, Origin is bound to this exact clone.
+/// Do not inherit GIT_DIR/GIT_WORK_TREE (or Git config env) from the host.
+fn git_repo_commit(repo: &Path, reference: &str) -> PortResult<String> {
+    let run = |args: &[&str]| -> PortResult<Vec<u8>> {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()))
+            .output()
+            .map_err(|e| PortError::Permanent(format!("git {reference} in {}: {e}", repo.display())))?;
+        if !output.status.success() {
+            return Err(PortError::Permanent(format!(
+                "git {reference} failed in {}", repo.display()
+            )));
+        }
+        Ok(output.stdout)
+    };
+    // Git otherwise walks up into an unrelated parent repository when repo/
+    // exists but has not been cloned yet. Worktree .git files remain supported.
+    let prefix = run(&["rev-parse", "--show-prefix"])?;
+    if prefix != b"\n" && !prefix.is_empty() {
+        return Err(PortError::Permanent(format!(
+            "die repository is not rooted at {}", repo.display()
+        )));
+    }
+    let bytes = run(&["rev-parse", "--verify", reference])?;
+    let commit = std::str::from_utf8(&bytes).unwrap_or_default().trim();
+    // Accept surrounding whitespace, but never multiple revisions or a
+    // non-object response. Git supports both SHA-1 and SHA-256 repositories.
+    if !matches!(commit.len(), 40 | 64) || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(PortError::Permanent(format!(
+            "invalid git {reference} output in {}", repo.display()
+        )));
+    }
+    Ok(commit.to_string())
 }
