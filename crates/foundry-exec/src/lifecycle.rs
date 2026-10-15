@@ -141,6 +141,11 @@ where
         if let Some(outcome) = self.outcomes.get(key, intent.activation) {
             return ResumeAction::AlreadyBound(outcome);
         }
+        if let Some(ledger) = self.attempt_ledger
+            && let Err(error) = ledger.consume(&intent.order, intent.attempt)
+        {
+            return ResumeAction::Interrupted(LifecycleError::AttemptBudget(error));
+        }
 
         if !self.intents.is_started(key, intent.activation) {
             return match self.dispatch_recorded(key, &intent) {

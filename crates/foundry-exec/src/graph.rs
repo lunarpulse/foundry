@@ -173,7 +173,11 @@ where
                 CounterRecord::Started { node_id, activation } => {
                     driver.cursor = Some(node_id.clone());
                     driver.completed = false;
-                    pending_activation = *activation;
+                    // Original B4 logs placed hold entry in this field. Only
+                    // host visits can restore the host activation counter.
+                    pending_activation = if driver.pack.nodes().iter()
+                        .any(|node| &node.id == node_id && node.kind == "hold")
+                    { None } else { *activation };
                 }
                 CounterRecord::Bump { node_id, .. } => {
                     driver.cursor = Some(node_id.clone());
@@ -254,7 +258,7 @@ where
                     order: self.order.clone(), attempt: self.attempt, run: self.run,
                     hold_node: node.id.clone(), entry: self.hold_entry(&node.id),
                 },
-                op: HoldOperation::Info, human_resolution: None, evidence: "graph hold node".into(),
+                op: HoldOperation::Info, human_resolution: None, evidence: "graph hold node".into(), resume_to: None,
             });
         };
         let resume_to = node.value.get("resume_to").and_then(|value| value.as_str())
@@ -272,7 +276,9 @@ where
             Ok(visit) => visit,
             Err(error) => return GraphStep::Fault(error),
         };
-        if let Err(error) = self.start_visit(&node.id, &visit, Some(entry)) {
+        // The per-hold ordinal comes from Started/Completed visit history. It
+        // must not occupy the host activation slot used by restore().
+        if let Err(error) = self.start_visit(&node.id, &visit, None) {
             return GraphStep::Fault(error);
         }
         if let Err(error) = store.open(&instance, resume_to) {

@@ -99,6 +99,7 @@ fn hold_cas_applies_matching_instance_and_reports_conflict() {
         op: HoldOperation::Approve,
         human_resolution: Some("approved".into()),
         evidence: "evidence".into(),
+        resume_to: None,
     };
     assert_eq!(cas_hold(&expected, &matching), HoldCasOutcome::Applied);
     let stale = HoldCommand {

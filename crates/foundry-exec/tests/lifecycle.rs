@@ -165,6 +165,43 @@ fn executor_consumes_attempt_before_dispatch_and_keeps_it_after_success() {
     assert_eq!(ledger.consumed(&OrderId("order-1".into())).unwrap(), 1);
 }
 
+#[test]
+fn b4_resume_cannot_dispatch_an_unadmitted_attempt() {
+    let ledger = LimitedAttempts { max: 0, rows: Mutex::new(HashSet::new()) };
+    for started in [false, true] {
+        let mut intents = MemoryIntentLog::default(); let mut host = FakeHost::default();
+        let mut outcomes = MemoryOutcomeStore::default();
+        intents.append(&intent(0));
+        if started { intents.mark_started(&key(), 0); }
+        let mut executor = Executor::new(&mut intents, &mut host, &mut outcomes).with_attempt_ledger(&ledger);
+        assert_eq!(executor.resume(&key()), ResumeAction::Interrupted(foundry_exec::LifecycleError::AttemptBudget(
+            PortError::AttemptBudgetExhausted { max_attempts: 0 })));
+        assert_eq!(executor.dispatch_count(), 0);
+        assert!(executor.outcome(&key()).is_none());
+    }
+}
+
+#[test]
+fn b4_attempt_consumption_survives_w1_and_w2_restart() {
+    for point in [CrashPoint::W1, CrashPoint::W2] {
+        let ledger = LimitedAttempts { max: 1, rows: Mutex::new(HashSet::new()) };
+        let mut intents = MemoryIntentLog::default(); let mut host = FakeHost::default();
+        let mut outcomes = MemoryOutcomeStore::default();
+        {
+            let mut executor = Executor::with_faults(&mut intents, &mut host, &mut outcomes,
+                FaultInjector::armed_at(point)).with_attempt_ledger(&ledger);
+            assert!(executor.run(intent(0)).is_err());
+        }
+        assert_eq!(ledger.consumed(&key().0).unwrap(), 1);
+        let mut executor = Executor::new(&mut intents, &mut host, &mut outcomes).with_attempt_ledger(&ledger);
+        assert_eq!(executor.resume(&key()), if point == CrashPoint::W1 { ResumeAction::ReDispatch } else { ResumeAction::ReBind });
+        assert_eq!(executor.dispatch_count(), 1);
+        let mut fresh = intent(0); fresh.attempt = Attempt(2); fresh.run = RunId(3);
+        assert!(matches!(executor.run(fresh), Err(foundry_exec::LifecycleError::AttemptBudget(_))));
+        assert_eq!(ledger.consumed(&key().0).unwrap(), 1);
+    }
+}
+
 fn key() -> Key {
     (OrderId("order-1".into()), Attempt(1), RunId(2))
 }

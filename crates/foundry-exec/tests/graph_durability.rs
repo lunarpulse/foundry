@@ -2,15 +2,14 @@ use std::{
     fs::{self, File},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
-    sync::Mutex,
 };
 
 use foundry_exec::{
     graph::{GraphDriver, GraphStep},
     ports::{CounterLog, CounterRecord, DispatchHost, IntentLog, OutcomeStore},
     types::{Attempt, ExecutionIntent, ExecutionOutcome, Generation, OrderId, RunId},
-    hold::{apply_hold, HoldApplied, HoldCommand, HoldInstanceId, HoldState, HoldStatus},
-    ports::{HoldStore, PortError},
+    hold::{HoldApplied, HoldCommand, HoldStatus},
+    ports::HoldStore,
     DispatchResult, Epoch,
 };
 use foundry_pack::{load_pack, PackSnapshot};
@@ -159,31 +158,9 @@ fn hold_route_pack(dir: &TestDir) -> PackSnapshot {
     pack_with_policy(dir, policy)
 }
 
-#[derive(Default)]
-struct Holds(Mutex<std::collections::BTreeMap<String, HoldState>>);
-fn hold_key(instance: &HoldInstanceId) -> String {
-    format!("{}:{}:{}:{}:{}", instance.order.0, instance.attempt.0, instance.run.0, instance.hold_node, instance.entry)
-}
-impl HoldStore for Holds {
-    fn open(&self, instance: &HoldInstanceId, resume_to: &str) -> Result<bool, PortError> {
-        let mut states = self.0.lock().unwrap();
-        if states.contains_key(&hold_key(instance)) { return Ok(false); }
-        states.insert(hold_key(instance), HoldState { instance: instance.clone(), resume_to: resume_to.into(), status: HoldStatus::Waiting });
-        Ok(true)
-    }
-    fn apply(&self, cmd: &HoldCommand, expected: &HoldInstanceId) -> Result<HoldApplied, PortError> {
-        let mut states = self.0.lock().unwrap();
-        let key = hold_key(expected);
-        let state = states.get(&key).cloned().ok_or(PortError::MissingHold)?;
-        let applied = apply_hold(&state, cmd, expected)?;
-        if let HoldApplied::Amended { resume_to } = &applied { states.get_mut(&key).unwrap().resume_to = resume_to.clone(); }
-        else if !matches!(applied, HoldApplied::Info) { states.get_mut(&key).unwrap().status = HoldStatus::Resolved(applied.clone()); }
-        Ok(applied)
-    }
-    fn get(&self, instance: &HoldInstanceId) -> Result<Option<HoldState>, PortError> {
-        Ok(self.0.lock().unwrap().get(&hold_key(instance)).cloned())
-    }
-}
+#[path = "support/hold_store.rs"]
+mod hold_store;
+use hold_store::DiskHolds;
 
 fn pack_with_policy(dir: &TestDir, policy: String) -> PackSnapshot {
     use sha2::{Digest, Sha256};
@@ -378,7 +355,7 @@ fn completed_route_restores_to_next_node_without_rebumping() {
 #[test]
 fn durable_hold_waits_then_resumes_only_to_registered_destination_after_restart() {
     let dir = TestDir::new(); let pack = hold_route_pack(&dir); let counter_path = dir.0.join("hold-counters.json");
-    let holds = Holds::default();
+    let holds = DiskHolds::new(dir.0.join("holds.json"));
     let mut intents = Intents::default(); let mut host = Host; let mut outcomes = Outcomes::default();
     let mut sink = Sink; let mut emits = Emits;
     let hold_instance;
@@ -392,9 +369,21 @@ fn durable_hold_waits_then_resumes_only_to_registered_destination_after_restart(
     let waiting = holds.get(&hold_instance).unwrap().unwrap();
     assert_eq!(waiting.status, HoldStatus::Waiting);
     assert_eq!(waiting.resume_to, "after_hold");
+    drop(holds);
+    let holds = DiskHolds::new(dir.0.join("holds.json"));
+    {
+        let mut counter = DiskCounterLog(counter_path.clone());
+        let mut restored = GraphDriver::restore(&pack, &mut intents, &mut host, &mut outcomes,
+            &mut counter, &mut sink, &mut emits, OrderId("durable-order".into()), Attempt(1),
+            RunId(45), Generation(1), Epoch(0), "test", None).with_hold_store(&holds);
+        assert_eq!(restored.start(), GraphStep::HoldWaiting { instance: hold_instance.clone() });
+        assert_eq!(restored.start(), GraphStep::HoldWaiting { instance: hold_instance.clone() });
+    }
     let cmd = HoldCommand { instance: hold_instance.clone(), op: foundry_exec::HoldOperation::Approve,
-        human_resolution: Some("review-42".into()), evidence: "approved by reviewer".into() };
+        human_resolution: Some("review-42".into()), evidence: "approved by reviewer".into(), resume_to: None };
     assert_eq!(holds.apply(&cmd, &hold_instance).unwrap(), HoldApplied::Approved);
+    drop(holds);
+    let holds = DiskHolds::new(dir.0.join("holds.json"));
 
     let mut counter = DiskCounterLog(counter_path);
     let mut intents = Intents::default(); let mut host = Host; let mut outcomes = Outcomes::default();
@@ -409,6 +398,135 @@ fn durable_hold_waits_then_resumes_only_to_registered_destination_after_restart(
     assert_eq!(second.hold_node, hold_instance.hold_node);
     assert_eq!(second.entry, hold_instance.entry + 1);
     assert_eq!(holds.get(&second).unwrap().unwrap().status, HoldStatus::Waiting);
+    assert_eq!(holds.get(&hold_instance).unwrap().unwrap().status, HoldStatus::Resolved(HoldApplied::Approved));
+}
+
+#[test]
+fn b4_pending_hold_restart_preserves_host_activation() {
+    let dir = TestDir::new(); let pack = hold_route_pack(&dir);
+    let mut counters = DiskCounterLog(dir.0.join("activation-counters.json"));
+    let holds = DiskHolds::new(dir.0.join("holds.json"));
+    let mut intents = Intents::default(); let mut host = Host; let mut outcomes = Outcomes::default();
+    let mut sink = Sink; let mut emits = Emits;
+    let instance;
+    {
+        let mut driver = graph(&pack, &mut intents, &mut host, &mut outcomes, &mut counters, &mut sink, &mut emits, 46)
+            .with_hold_store(&holds);
+        assert!(matches!(driver.start(), GraphStep::Advanced { .. }));
+        assert_eq!(driver.activation(), 1);
+        let GraphStep::HoldWaiting { instance: id } = driver.advance("end_hold") else { panic!("must wait") };
+        instance = id;
+    }
+    let mut restored = GraphDriver::restore(&pack, &mut intents, &mut host, &mut outcomes,
+        &mut counters, &mut sink, &mut emits, OrderId("durable-order".into()), Attempt(1),
+        RunId(46), Generation(1), Epoch(0), "test", None).with_hold_store(&holds);
+    assert_eq!(restored.activation(), 1, "hold entry must not replace host activation");
+    assert_eq!(restored.start(), GraphStep::HoldWaiting { instance: instance.clone() });
+    holds.apply(&HoldCommand { instance: instance.clone(), op: foundry_exec::HoldOperation::Approve,
+        human_resolution: None, evidence: "review".into(), resume_to: None }, &instance).unwrap();
+    assert!(matches!(restored.start(), GraphStep::Advanced { .. }));
+    assert!(matches!(restored.advance("scan"), GraphStep::Advanced { .. }));
+    drop(restored);
+    assert_eq!(intents.0.iter().map(|intent| intent.activation).collect::<Vec<_>>(), [0, 1]);
+    assert_eq!(outcomes.0.len(), 2);
+}
+
+#[test]
+fn b4_amended_hold_resumes_from_durable_destination() {
+    let dir = TestDir::new(); let pack = hold_route_pack(&dir);
+    let path = dir.0.join("amended-counters.json");
+    let mut counters = DiskCounterLog(path.clone());
+    let holds = DiskHolds::new(dir.0.join("holds.json"));
+    let mut intents = Intents::default(); let mut host = Host; let mut outcomes = Outcomes::default();
+    let mut sink = Sink; let mut emits = Emits;
+    let instance = {
+        let mut driver = graph(&pack, &mut intents, &mut host, &mut outcomes, &mut counters, &mut sink, &mut emits, 47)
+            .with_hold_store(&holds);
+        let GraphStep::HoldWaiting { instance } = driver.advance("end_hold") else { panic!("must wait") };
+        instance
+    };
+    let mut cmd = HoldCommand { instance: instance.clone(), op: foundry_exec::HoldOperation::Amend,
+        evidence: "amendment review record".into(), human_resolution: Some("ignored-for-amend".into()),
+        resume_to: Some("scan".into()) };
+    assert_eq!(holds.apply(&cmd, &instance).unwrap(), HoldApplied::Amended { resume_to: "scan".into() });
+    cmd.op = foundry_exec::HoldOperation::Approve;
+    cmd.human_resolution = Some("approval-ticket".into()); cmd.resume_to = None;
+    holds.apply(&cmd, &instance).unwrap();
+    drop(holds); drop(counters);
+    let holds = DiskHolds::new(dir.0.join("holds.json"));
+    let mut counters = DiskCounterLog(path);
+    let mut restored = GraphDriver::restore(&pack, &mut intents, &mut host, &mut outcomes,
+        &mut counters, &mut sink, &mut emits, OrderId("durable-order".into()), Attempt(1),
+        RunId(47), Generation(1), Epoch(0), "test", None).with_hold_store(&holds);
+    assert!(matches!(restored.start(), GraphStep::Advanced { next, .. } if next == "scan"));
+    let resolution = holds.get(&instance).unwrap().unwrap().resolution.unwrap();
+    assert_eq!(resolution.human_resolution.as_deref(), Some("approval-ticket"));
+    assert_eq!(resolution.evidence, "amendment review record");
+}
+
+struct DeniedAttempts;
+impl foundry_exec::AttemptLedger for DeniedAttempts {
+    fn consume(&self, _: &OrderId, _: Attempt) -> Result<(), foundry_exec::PortError> {
+        Err(foundry_exec::PortError::AttemptBudgetExhausted { max_attempts: 0 })
+    }
+    fn consumed(&self, _: &OrderId) -> Result<u32, foundry_exec::PortError> { Ok(0) }
+}
+
+#[test]
+fn b4_graph_forwards_attempt_gate_to_dispatch_and_redrive() {
+    let pack = load_pack(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills/bmad-review-full/v1")).unwrap();
+    for cursor in ["lenses", "fixdie"] {
+        let dir = TestDir::new();
+        let mut counters = DiskCounterLog(dir.0.join("denied-counters.json"));
+        let mut intents = Intents::default(); let mut host = Host; let mut outcomes = Outcomes::default();
+        let mut sink = Sink; let mut emits = Emits;
+        let mut driver = graph(&pack, &mut intents, &mut host, &mut outcomes, &mut counters, &mut sink, &mut emits, 48)
+            .with_attempt_ledger(&DeniedAttempts);
+        assert!(matches!(driver.advance(cursor), GraphStep::Fault(error) if error.contains("AttemptBudgetExhausted")));
+        drop(driver);
+        assert!(intents.0.is_empty()); assert!(outcomes.0.is_empty());
+    }
+}
+
+struct CrashAfterHoldOpen(DiskHolds);
+impl HoldStore for CrashAfterHoldOpen {
+    fn open(&self, instance: &foundry_exec::HoldInstanceId, resume_to: &str) -> Result<bool, foundry_exec::PortError> {
+        self.0.open(instance, resume_to)?;
+        panic!("crash after durable hold open, before get");
+    }
+    fn apply(&self, cmd: &HoldCommand, expected: &foundry_exec::HoldInstanceId) -> Result<HoldApplied, foundry_exec::PortError> {
+        self.0.apply(cmd, expected)
+    }
+    fn get(&self, instance: &foundry_exec::HoldInstanceId) -> Result<Option<foundry_exec::HoldState>, foundry_exec::PortError> {
+        self.0.get(instance)
+    }
+}
+
+#[test]
+fn b4_crash_after_open_restores_same_hold_entry() {
+    let dir = TestDir::new(); let pack = hold_route_pack(&dir);
+    let path = dir.0.join("crash-counters.json"); let hold_path = dir.0.join("holds.json");
+    let mut intents = Intents::default(); let mut host = Host; let mut outcomes = Outcomes::default();
+    let mut sink = Sink; let mut emits = Emits;
+    let crash = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let holds = CrashAfterHoldOpen(DiskHolds::new(hold_path.clone()));
+        let mut counters = DiskCounterLog(path.clone());
+        let mut driver = graph(&pack, &mut intents, &mut host, &mut outcomes, &mut counters, &mut sink, &mut emits, 49)
+            .with_hold_store(&holds);
+        driver.advance("end_hold");
+    }));
+    assert!(crash.is_err());
+    let holds = DiskHolds::new(hold_path);
+    let mut counters = DiskCounterLog(path);
+    let mut restored = GraphDriver::restore(&pack, &mut intents, &mut host, &mut outcomes,
+        &mut counters, &mut sink, &mut emits, OrderId("durable-order".into()), Attempt(1),
+        RunId(49), Generation(1), Epoch(0), "test", None).with_hold_store(&holds);
+    let GraphStep::HoldWaiting { instance } = restored.start() else { panic!("must restore Waiting") };
+    assert_eq!(instance.entry, 0);
+    assert_eq!(restored.start(), GraphStep::HoldWaiting { instance });
+    drop(restored);
+    assert_eq!(counters.load("durable-order", 49).iter().filter(|record|
+        matches!(record, CounterRecord::Started { .. })).count(), 1);
 }
 
 #[test]

@@ -7,6 +7,7 @@ use crate::{
 pub enum PortError {
     HoldConflict(HoldCasOutcome),
     EvidenceRequired,
+    ResumeDestinationRequired,
     AlreadyResolved,
     MissingHold,
     AttemptBudgetExhausted { max_attempts: u32 },
@@ -20,12 +21,14 @@ pub enum PortError {
 /// and treats an identical resolved command as idempotent. A different second
 /// resolution fails. Amend changes only a Waiting row's resume destination;
 /// Info returns without changing state. Implementations should persist enough
-/// command identity to distinguish an exact retry from a different command
-/// that happens to produce the same `HoldApplied` value.
+/// command identity in `HoldState::resolution` to distinguish an exact retry
+/// from a different command that produces the same `HoldApplied` value.
+/// Amend takes its destination from `HoldCommand::resume_to`, never evidence.
 pub trait HoldStore: Send + Sync {
     /// Records a waiting hold; returns false when it already exists.
     fn open(&self, instance: &HoldInstanceId, resume_to: &str) -> Result<bool, PortError>;
     /// Applies one hold operation through the shared compare-and-swap boundary.
+    /// Check expected vs cmd.instance before lookup, including for missing rows.
     fn apply(&self, cmd: &HoldCommand, expected: &HoldInstanceId) -> Result<HoldApplied, PortError>;
     fn get(&self, instance: &HoldInstanceId) -> Result<Option<HoldState>, PortError>;
 }

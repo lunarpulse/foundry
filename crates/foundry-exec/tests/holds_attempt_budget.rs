@@ -1,71 +1,15 @@
 use std::{collections::BTreeMap, fs, path::PathBuf};
 
 use foundry_exec::{
-    AttemptBudget, HoldApplied, HoldCommand, HoldInstanceId, HoldOperation, HoldState, HoldStatus,
-    apply_hold,
+    AttemptBudget, HoldApplied, HoldCommand, HoldInstanceId, HoldOperation, HoldStatus,
     ports::{AttemptLedger, HoldStore, PortError},
     types::{Attempt, OrderId, RunId},
 };
 use serde::{Deserialize, Serialize};
 
-#[derive(Default, Serialize, Deserialize)]
-struct HoldDb {
-    states: BTreeMap<String, HoldState>,
-    commands: Vec<HoldCommand>,
-}
-
-fn key(instance: &HoldInstanceId) -> String {
-    format!("{}:{}:{}:{}:{}", instance.order.0, instance.attempt.0, instance.run.0, instance.hold_node, instance.entry)
-}
-
-struct DiskHolds(PathBuf);
-impl DiskHolds {
-    fn read(&self) -> HoldDb {
-        fs::read(&self.0).map(|bytes| serde_json::from_slice(&bytes).unwrap()).unwrap_or_default()
-    }
-    fn write(&self, db: &HoldDb) -> Result<(), PortError> {
-        fs::write(&self.0, serde_json::to_vec(db).map_err(|e| PortError::Store(e.to_string()))?)
-            .map_err(|e| PortError::Store(e.to_string()))
-    }
-}
-impl HoldStore for DiskHolds {
-    fn open(&self, instance: &HoldInstanceId, resume_to: &str) -> Result<bool, PortError> {
-        let mut db = self.read();
-        let k = key(instance);
-        if db.states.contains_key(&k) { return Ok(false); }
-        db.states.insert(k, HoldState { instance: instance.clone(), resume_to: resume_to.into(), status: HoldStatus::Waiting });
-        self.write(&db)?;
-        Ok(true)
-    }
-    fn apply(&self, cmd: &HoldCommand, expected: &HoldInstanceId) -> Result<HoldApplied, PortError> {
-        let mut db = self.read();
-        let k = key(expected);
-        let state = db.states.get(&k).cloned().ok_or(PortError::MissingHold)?;
-        let applied = apply_hold(&state, cmd, expected)?;
-        if cmd.op == HoldOperation::Info { return Ok(HoldApplied::Info); }
-        if matches!(state.status, HoldStatus::Resolved(_)) {
-            if db.commands.iter().rev().find(|last| key(&last.instance) == k).is_some_and(|last| last == cmd)
-                && let HoldStatus::Resolved(applied) = state.status
-            {
-                return Ok(applied);
-            }
-            return Err(PortError::AlreadyResolved);
-        }
-        if matches!(applied, HoldApplied::Amended { .. }) {
-            if let HoldApplied::Amended { resume_to } = &applied { db.states.get_mut(&k).unwrap().resume_to = resume_to.clone(); }
-        } else if !matches!(applied, HoldApplied::Info) {
-            db.states.get_mut(&k).unwrap().status = HoldStatus::Resolved(applied.clone());
-        }
-        let mut bound = cmd.clone();
-        if !matches!(cmd.op, HoldOperation::Approve | HoldOperation::Reject) { bound.human_resolution = None; }
-        db.commands.push(bound);
-        self.write(&db)?;
-        Ok(applied)
-    }
-    fn get(&self, instance: &HoldInstanceId) -> Result<Option<HoldState>, PortError> {
-        Ok(self.read().states.get(&key(instance)).cloned())
-    }
-}
+#[path = "support/hold_store.rs"]
+mod hold_store;
+use hold_store::DiskHolds;
 
 #[derive(Serialize, Deserialize, Default)]
 struct AttemptDb(BTreeMap<String, Vec<u64>>);
@@ -95,7 +39,10 @@ fn instance(entry: u64) -> HoldInstanceId {
     HoldInstanceId { order: OrderId("o".into()), attempt: Attempt(1), run: RunId(2), hold_node: "approval".into(), entry }
 }
 fn command(instance: &HoldInstanceId, op: HoldOperation, evidence: &str) -> HoldCommand {
-    HoldCommand { instance: instance.clone(), op, human_resolution: Some("ticket-17".into()), evidence: evidence.into() }
+    HoldCommand { instance: instance.clone(), op, human_resolution: Some("ticket-17".into()), evidence: evidence.into(), resume_to: None }
+}
+fn amend(instance: &HoldInstanceId, destination: &str) -> HoldCommand {
+    HoldCommand { resume_to: Some(destination.into()), ..command(instance, HoldOperation::Amend, "review amendment") }
 }
 fn temp_path(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!("foundry-{label}-{}-{}", std::process::id(), rand_suffix()))
@@ -107,7 +54,7 @@ fn hold_cas_transitions_evidence_reentry_info_and_human_resolution() {
     let id = instance(0);
     let other = instance(1);
     let path = temp_path("hold-cas");
-    let store = DiskHolds(path.clone());
+    let store = DiskHolds::new(path.clone());
     assert!(store.open(&id, "next").unwrap());
     assert!(!store.open(&id, "ignored").unwrap());
     assert!(store.open(&other, "next").unwrap());
@@ -116,16 +63,16 @@ fn hold_cas_transitions_evidence_reentry_info_and_human_resolution() {
     assert_eq!(store.apply(&command(&id, HoldOperation::Approve, " \n "), &id).unwrap_err(), PortError::EvidenceRequired);
     assert_eq!(store.apply(&command(&id, HoldOperation::Info, ""), &id).unwrap(), HoldApplied::Info);
     assert_eq!(store.get(&id).unwrap().unwrap().status, HoldStatus::Waiting);
-    assert_eq!(store.apply(&command(&id, HoldOperation::Amend, "changed"), &id).unwrap(), HoldApplied::Amended { resume_to: "changed".into() });
-    assert_eq!(store.apply(&command(&id, HoldOperation::Amend, "changed"), &id).unwrap(), HoldApplied::Amended { resume_to: "changed".into() });
+    assert_eq!(store.apply(&amend(&id, "changed"), &id).unwrap(), HoldApplied::Amended { resume_to: "changed".into() });
+    assert_eq!(store.apply(&amend(&id, "changed"), &id).unwrap(), HoldApplied::Amended { resume_to: "changed".into() });
     assert_eq!(store.get(&id).unwrap().unwrap().resume_to, "changed");
     let approved = command(&id, HoldOperation::Approve, "evidence");
     assert_eq!(store.apply(&approved, &id).unwrap(), HoldApplied::Approved);
     assert_eq!(store.apply(&approved, &id).unwrap(), HoldApplied::Approved);
     assert_eq!(store.apply(&command(&id, HoldOperation::Approve, "changed evidence"), &id).unwrap_err(), PortError::AlreadyResolved);
     assert_eq!(store.apply(&command(&id, HoldOperation::Reject, "other"), &id).unwrap_err(), PortError::AlreadyResolved);
-    assert_eq!(store.apply(&command(&id, HoldOperation::Amend, "later"), &id).unwrap_err(), PortError::AlreadyResolved);
-    let db = store.read();
+    assert_eq!(store.apply(&amend(&id, "later"), &id).unwrap_err(), PortError::AlreadyResolved);
+    let db = store.read().unwrap();
     assert!(db.commands.iter().any(|cmd| cmd.op == HoldOperation::Approve && cmd.human_resolution.as_deref() == Some("ticket-17")));
     drop(store);
     fs::remove_file(path).unwrap();
@@ -136,15 +83,15 @@ fn hold_waiting_and_resolution_survive_store_restart() {
     let path = temp_path("hold-restart");
     let id = instance(0);
     {
-        let store = DiskHolds(path.clone());
+        let store = DiskHolds::new(path.clone());
         store.open(&id, "resume-here").unwrap();
     }
     {
-        let store = DiskHolds(path.clone());
+        let store = DiskHolds::new(path.clone());
         assert_eq!(store.get(&id).unwrap().unwrap().status, HoldStatus::Waiting);
         store.apply(&command(&id, HoldOperation::Reject, "review record"), &id).unwrap();
     }
-    let store = DiskHolds(path.clone());
+    let store = DiskHolds::new(path.clone());
     let restored = store.get(&id).unwrap().unwrap();
     assert_eq!(restored.resume_to, "resume-here");
     assert_eq!(restored.status, HoldStatus::Resolved(HoldApplied::Rejected));
@@ -173,4 +120,69 @@ fn attempt_budget_is_non_refundable_idempotent_and_independent_of_nano_budget() 
     assert!(matches!(foundry_exec::budget::reserve(&foundry_exec::Budget { reserved_nano: 0, settled_nano: 0, carried_nano: 10 }, 1),
         foundry_exec::ReservationOutcome::Granted { remaining_nano: 9 }));
     fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn b4_all_operations_compare_instances_before_lookup_or_validation() {
+    let path = temp_path("all-hold-cas");
+    let store = DiskHolds::new(path.clone());
+    let id = instance(0); let missing = instance(1);
+    store.open(&id, "next").unwrap();
+    for op in [HoldOperation::Approve, HoldOperation::Reject, HoldOperation::Amend, HoldOperation::Info] {
+        let cmd = command(&id, op, "");
+        assert!(matches!(store.apply(&cmd, &missing), Err(PortError::HoldConflict(_))));
+        assert!(matches!(store.apply(&command(&missing, op, ""), &id), Err(PortError::HoldConflict(_))));
+    }
+    assert_eq!(store.get(&id).unwrap().unwrap().status, HoldStatus::Waiting);
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn b4_amend_destination_and_evidence_are_independently_persisted() {
+    let path = temp_path("amend-evidence"); let id = instance(0);
+    let store = DiskHolds::new(path.clone());
+    store.open(&id, "original").unwrap();
+    // Evidence that resembles a node name must never become the destination.
+    assert_eq!(store.apply(&command(&id, HoldOperation::Amend, "other-node"), &id),
+        Err(PortError::ResumeDestinationRequired));
+    let cmd = HoldCommand { evidence: " reviewer record\n".into(), resume_to: Some(" changed ".into()),
+        ..amend(&id, "unused") };
+    assert_eq!(store.apply(&cmd, &id).unwrap(), HoldApplied::Amended { resume_to: "changed".into() });
+    drop(store);
+    let store = DiskHolds::new(path.clone());
+    let state = store.get(&id).unwrap().unwrap();
+    assert_eq!(state.resume_to, "changed");
+    assert_eq!(state.status, HoldStatus::Waiting);
+    let db = store.read().unwrap();
+    assert_eq!(db.commands[0].evidence, " reviewer record\n");
+    assert_eq!(db.commands[0].human_resolution, None);
+    let count = db.commands.len();
+    store.apply(&command(&id, HoldOperation::Info, "info evidence"), &id).unwrap();
+    assert_eq!(store.read().unwrap().commands.len(), count);
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn b4_exact_resolution_identity_survives_restart_for_approve_and_reject() {
+    for op in [HoldOperation::Approve, HoldOperation::Reject] {
+        let path = temp_path("resolution-identity"); let id = instance(0);
+        let store = DiskHolds::new(path.clone()); store.open(&id, "next").unwrap();
+        assert_eq!(store.apply(&command(&id, op, " \n "), &id), Err(PortError::EvidenceRequired));
+        let cmd = command(&id, op, "verbatim evidence");
+        let applied = store.apply(&cmd, &id).unwrap(); drop(store);
+        let store = DiskHolds::new(path.clone());
+        let state = store.get(&id).unwrap().unwrap();
+        assert_eq!(state.resolution.as_ref(), Some(&cmd));
+        assert_eq!(store.apply(&cmd, &id).unwrap(), applied);
+        for changed in [HoldCommand { evidence: "changed".into(), ..cmd.clone() },
+            HoldCommand { human_resolution: None, ..cmd.clone() }]
+        {
+            assert_eq!(foundry_exec::apply_hold(&state, &changed, &id), Err(PortError::AlreadyResolved));
+            assert_eq!(store.apply(&changed, &id), Err(PortError::AlreadyResolved));
+        }
+        assert_eq!(store.apply(&amend(&id, "later"), &id), Err(PortError::AlreadyResolved));
+        assert_eq!(store.apply(&command(&id, HoldOperation::Info, ""), &id), Ok(HoldApplied::Info));
+        assert_eq!(store.get(&id).unwrap().unwrap(), state);
+        fs::remove_file(path).unwrap();
+    }
 }
