@@ -168,3 +168,54 @@ cargo test 전체 green + 생성/삭제 파일 리포트 정합 (부모 대조).
   `~/.foundry/tuples.db`다. 제품 review host는 T32 소유이며, 현재 Line 기본
   ReviewRunPort는 미주입 상태라 fail-closed다.
 - EpochGate의 실제 S4/S5/sibling 제품 배선은 T32 이후 범위다.
+
+## T32 — 그래프 정책 실행기와 제품 review host (독립 리뷰 반영)
+- `GraphEngine`은 팩의 선언 순서·카운터·hold/resume·오류 이송을 실행한다.
+  dispatch/redrive 진입 전에 budget/timeout을 차단하며, route 내 inline
+  emit도 독립 emit 노드와 동일한 verify 적격성 검사를 받는다. `run()`은
+  순수 정책 시뮬레이션이다. 외부 실행 증거는 host가 주입하는 staged 경계 소유다.
+- `PackReviewHost`의 라우팅 입력은 verify 출력만이다. 각 stage는 선행 완료가
+  내구 기록된 출력 경로만 `inputs`로 받으며, 독립 렌즈에 앞 렌즈의 로그를
+  fix-context로 전달하지 않는다. verify의 `inspected_commit`은 요청 result
+  commit과 일치해야 한다. 출력 원본·SHA-256·세션 영수증·팩 스냅샷을 보존한다.
+- stage별 `exec/<activation>-<stage-sequence>/0/` namespace를 사용한다.
+  수용된 동일 activation은 재실행하지 않으므로 retry는 0뿐이다. 향후 같은
+  activation의 재시도를 구현하면 retry도 새 namespace여야 한다. executor와
+  세션 복원은 해당 namespace 안에 쓰기를 한정하는 어댑터 계약을 따른다.
+  실제 프로세스 샌드박스/Die executor는 T33 소유이며 제품 기본값은 여전히
+  `UnavailableStageExecutor`다. 주문 ID는 경로에 직접 사용하지 않는다.
+- 정상 stage 오류는 barrier/팩 오류 정책으로 hold한다. 저널/스냅샷 등 host
+  오류는 `review_aborted`와 진단·카운터를 남긴다. 같은 수용 activation은
+  재디스패치하지 않는다. 중단된 run은 새 activation으로 새 run을 만들 수
+  있다. 모호한 크래시로 `running`인 run 교체는 더 높은 epoch만 허용한다.
+  held run은 새 activation으로 우회할 수 없다. 주문 최신 run의 카운터는
+  invalidated/aborted 상태도 포함하여 신규 run 생성 트랜잭션에서 승계한다.
+- **Line 경계**: 동결된 T31 Line은 모든 runner `Err`를 `InspectionFailed`로
+  해석한다. 제품 CLI/serve는 `InspectingReviewRun`으로 runner를 감싸 오류 시
+  fail-stop(panic)하여 이 분기로 돌아가지 않는다. 따라서 pack hold/fail-run이
+  도메인 시도를 소모하지 않고 Inspecting에 남는다. 정상 통과는 그대로 반환한다.
+  이는 정상적인 인간 대기 API가 아닌 임시 중단 경계이며, 해당 실행 task와
+  runner mutex는 중단/poison될 수 있다. hold-aware Line 결과 어댑터가 생기기
+  전까지 복구에는 저널 확인과 런타임 재시작이 필요하다. raw
+  `durable_review_run`의 `Err`는 Line에 직접 연결하지 않는다.
+- 외부 stage 시도는 실행/세션 복원 전에 주문 단위 비환급 횟수 예산을
+  SQLite에서 1씩 예약한다. 현재 host 운영 상한은 주문당 10,000회다.
+  새 run·도메인 attempt·세션 무효화가 이 누계를 초기화하지 않는다.
+- review DB의 epoch는 주문별 단조 증가한다. scoped EmitLog가 이를 읽고,
+  sink는 활성 run/activation/epoch·artifact 결속을 영수증 INSERT와 같은
+  트랜잭션에서 재확인한다. 기존 emit 영수증은 epoch 전진 후에도 재사용한다.
+  defer side record는 verify 입력으로 평가하고 pass emit 영수증과 함께 한 번만
+  기록한다. 이 DB 검사는 T31의 이후 범위인 제품 EpochGate 전체 배선을
+  대체하지 않는다. 현재 Line의 요청 epoch는 0이며 자동 크래시 재개 API는 없다.
+- **redrive 제한**: T31 `DurableReviewRun`의 고정 요청/결과는 원 result commit과
+  generation 0을 결속한다. T32 host에는 새 artifact를 전달하는 Die 경계가
+  없다. 따라서 redrive는 무실행 성공을 만들지 않고 `on_redrive_error`를 따른다
+  (canonical 팩은 hold). 실제 재계획/수정/새 generation 통과는 T33에서 T31
+  위의 artifact handoff 어댑터를 구현하기 전까지 제공하지 않는다. revert
+  hold 기록은 `requested_revert`와 `artifact_mutation_applied=false`로 구별한다.
+  인간 hold API/CAS도 이 host가 아직 제공하지 않는다.
+- 바이너리 provenance는 실행 경로·SHA-256·명시적 full source commit·pack
+  digest다. 빌드 시 `FOUNDRY_SOURCE_COMMIT` 또는 임베더의 명시적 값, 없으면
+  실행 환경의 같은 변수를 요구한다. 실행 cwd의 git HEAD는 사용하지 않으며,
+  출처 미설정은 외부 실행 수용 전에 실패한다. 옛 저널의 누락 증거를 추정하거나
+  마이그레이션하지 않는다.

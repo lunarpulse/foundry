@@ -19,7 +19,7 @@ pub mod privacy;
 pub mod read_guard;
 pub mod scope;
 use foundry_ledger::{LedgerRow, SqliteLedger};
-use foundry_line::{line::Line, PackReviewHost, UnavailableStageExecutor, durable_review_run};
+use foundry_line::{line::Line, PackReviewHost, UnavailableStageExecutor, InspectingReviewRun, durable_review_run};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -176,7 +176,7 @@ impl ServeState {
                 .map_err(|e| format!("review host: {e:?}"))?;
             let runner = durable_review_run(host, PackReviewHost::default_db_path(), tuples)
                 .map_err(|e| format!("review runner: {e}"))?;
-            line = line.with_review_run(runner);
+            line = line.with_review_run(InspectingReviewRun::new(runner));
         }
         let ident =
             identity::Identity::open(std::path::Path::new(&path.with_extension("identity.db")))
