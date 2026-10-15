@@ -23,13 +23,16 @@ pub struct StageOutput { pub verdict_category: Option<String>, pub findings: boo
 /// confine process, git-ref, and session writes to the supplied workdir.
 pub trait StageExecutor: Send {
     fn execute(&mut self, task: &StageTask) -> Result<StageOutput, String>;
+    fn ensure_available(&self) -> Result<(), String> { Ok(()) }
     fn restore_session(&mut self, _session_id: &str, _workdir: &Path) -> Result<(), String> {
         Err("session restoration is not implemented".into())
     }
 }
 /// Product wiring placeholder until the real LLM/Die adapter is supplied by T33.
 #[derive(Default)] pub struct UnavailableStageExecutor;
-impl StageExecutor for UnavailableStageExecutor { fn execute(&mut self, _task:&StageTask)->Result<StageOutput,String>{Err("review stage executor is not configured".into())} }
+impl StageExecutor for UnavailableStageExecutor { fn ensure_available(&self)->Result<(),String>{Err("review stage executor is not configured".into())} fn execute(&mut self, _task:&StageTask)->Result<StageOutput,String>{Err("review stage executor is not configured".into())} }
+
+type ActiveReviewRow = (String, i64, Option<String>, i64, String, String, Option<String>);
 
 pub struct PackReviewHost { pack_path: PathBuf, db_path: PathBuf, executor: Box<dyn StageExecutor>, conn: Connection, pack_digest: String, dispatches: u64, source_commit: Option<String> }
 impl PackReviewHost {
@@ -86,14 +89,17 @@ impl DispatchHost for PackReviewHost {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sqlerr).map_err(HostError::Persistence)?;
         let accepted: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM host_accept WHERE order_id=?1 AND attempt=?2 AND run_id=?3 AND activation=?4)", params![key.order,key.attempt as i64,key.run as i64,key.activation as i64], |r| r.get(0)).map_err(sqlerr).map_err(HostError::Persistence)?;
         if accepted { return Err(HostError::Persistence("accepted activation has no recoverable result; refusing redispatch".into())); }
-        let previous: Option<(String, i64, Option<String>)> = tx.query_row("SELECT r.status,a.epoch,r.result_json FROM review_runs r JOIN review_active a ON r.order_id=a.order_id AND r.run_id=a.journal_run WHERE r.order_id=?1", [&order], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional().map_err(sqlerr).map_err(HostError::Persistence)?;
-        let mut inherited_result=None;
-        if let Some((status, epoch, previous_result)) = previous {
-            if intent.epoch.0 < epoch as u64 || status == "held" || (status == "running" && intent.epoch.0 <= epoch as u64) {
+        let previous: Option<ActiveReviewRow> = tx.query_row("SELECT r.status,a.epoch,r.result_json,r.attempt,r.base_commit,r.result_commit,r.hold_json FROM review_runs r JOIN review_active a ON r.order_id=a.order_id AND r.run_id=a.journal_run WHERE r.order_id=?1", [&order], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))).optional().map_err(sqlerr).map_err(HostError::Persistence)?;
+        let mut inherited_result=None;let mut inherited_hold_json=None;
+        if let Some((status, epoch, previous_result, previous_attempt, previous_base, previous_commit, previous_hold_json)) = previous {
+            if intent.epoch.0 < epoch as u64 || matches!(status.as_str(), "held" | "resuming") || (status == "running" && intent.epoch.0 <= epoch as u64) {
                 return Err(HostError::Acceptance("stale, held, or still-running order cannot start this activation".into()));
             }
             if status == "running" { tx.execute("UPDATE review_runs SET status='invalidated' WHERE order_id=?1 AND status='running'", [&order]).map_err(sqlerr).map_err(HostError::Persistence)?; }
-            if status=="resolved" || status=="review_aborted" { inherited_result=previous_result; }
+            if (status=="resolved" || status=="review_aborted") && previous_attempt==attempt as i64 {
+                if previous_base!=base || previous_commit!=result { return Err(HostError::Acceptance("resolved review input binding mismatch".into())); }
+                inherited_result=previous_result;inherited_hold_json=previous_hold_json;
+            }
         }
         advance_epoch(&tx, &order, intent.epoch).map_err(HostError::Acceptance)?;
         let inherited = latest_counters(&tx, &order)?;
@@ -103,7 +109,16 @@ impl DispatchHost for PackReviewHost {
         tx.execute("INSERT INTO host_accept(order_id,attempt,run_id,activation) VALUES(?1,?2,?3,?4)", params![key.order,key.attempt as i64,key.run as i64,key.activation as i64]).map_err(sqlerr).map_err(HostError::Acceptance)?;
         if let Some(inherited)=inherited_result.as_ref() {
             let inherited_result:HostResult=serde_json::from_str(inherited).map_err(sqlerr).map_err(HostError::Persistence)?;
-            let status=if inherited_result.exit_code==0 {"passed"} else {"failed"};
+            let status=if inherited_result.held.is_some() {"held"} else if inherited_result.exit_code==0 {"passed"} else {"failed"};
+            if let Some(hold)=inherited_result.held.as_ref() {
+                let mut doc:serde_json::Value=serde_json::from_str(inherited_hold_json.as_deref().ok_or_else(||HostError::Persistence("inherited hold has no snapshot".into()))?).map_err(sqlerr).map_err(HostError::Persistence)?;
+                let source_run=doc["run_id"].as_str().ok_or_else(||HostError::Persistence("inherited hold has no run identity".into()))?.to_owned();
+                if doc.get("snapshot_run_id").is_none(){doc["snapshot_run_id"]=serde_json::json!(source_run);}
+                doc["intent"]=serde_json::to_value(intent).map_err(sqlerr).map_err(HostError::Persistence)?;
+                doc["run_id"]=serde_json::json!(run_id);
+                tx.execute("INSERT INTO review_stage_attempts(order_id,run_id,sequence,stage_id,status,output_json) SELECT order_id,?1,sequence,stage_id,status,output_json FROM review_stage_attempts WHERE order_id=?2 AND run_id=?3",params![run_id,order,source_run]).map_err(sqlerr).map_err(HostError::Persistence)?;
+                tx.execute("UPDATE review_runs SET hold_json=?1,hold_instance_id=?2,resume_targets=?3,deadline=?4 WHERE order_id=?5 AND attempt=?6 AND run_id=?7",params![doc.to_string(),hold.hold_instance_id,serde_json::to_string(&hold.resume_targets).map_err(sqlerr).map_err(HostError::Persistence)?,if hold.deadline_secs==0{0}else{chrono::Utc::now().timestamp().saturating_add(hold.deadline_secs as i64)},order,attempt as i64,run_id]).map_err(sqlerr).map_err(HostError::Persistence)?;
+            }
             tx.execute("UPDATE review_runs SET status=?1,result_json=?2 WHERE order_id=?3 AND attempt=?4 AND run_id=?5",params![status,inherited,order,attempt as i64,run_id]).map_err(sqlerr).map_err(HostError::Persistence)?;
             tx.execute("INSERT INTO host_results(order_id,attempt,run_id,activation,result_json) VALUES(?1,?2,?3,?4,?5)",params![key.order,key.attempt as i64,key.run as i64,key.activation as i64,inherited]).map_err(sqlerr).map_err(HostError::Persistence)?;
         }
@@ -146,43 +161,20 @@ impl DispatchHost for PackReviewHost {
                     stage_def.get("role").and_then(toml::Value::as_str).ok_or_else(||packerr("redrive pre_stage missing role"))?.to_owned()
                 };
                 let payload = node.value.get("payload").and_then(toml::Value::as_str).unwrap_or("findings");
-                let finding_rows: Vec<serde_json::Value> = {
-                    let mut q = self.conn.prepare("SELECT stage_id,output_json,run_id FROM review_stage_attempts WHERE order_id=?1 AND run_id=?2 AND status='complete' ORDER BY sequence") .map_err(packerr)?;
-                    q.query_map(params![order,run_id], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?))).map_err(packerr)?
-                        .filter_map(std::result::Result::ok).filter_map(|(stage_id,json)| {
-                            let value:serde_json::Value=serde_json::from_str(&json).ok()?;
-                            (value["role"]=="verify" && value["findings"]==true).then(||serde_json::json!({"stage_id":stage_id,"verdicts":value["verdicts"],"log_path":value["log_path"]}))
-                        }).collect()
-                };
-                let session_id=format!("{order}:{node_id}");
+                let session_id=redrive_session_key(&order,node_id);
                 let saved:Option<String>=self.conn.query_row("SELECT receipt_json FROM review_sessions WHERE order_id=?1 AND session_id=?2 ORDER BY rowid DESC LIMIT 1",params![order,session_id],|r|r.get(0)).optional().map_err(sqlerr).map_err(packerr)?;
                 let saved=saved.map(|s|serde_json::from_str::<SessionReceipt>(&s).map_err(packerr)).transpose()?;
-                let task_session=saved.as_ref().map(|r|r.session_id.clone()).unwrap_or_else(||format!("{order}:{node_id}:fresh:{run_id}"));
+                let task_session=saved.as_ref().map(|r|r.session_id.clone()).unwrap_or_else(||format!("{session_id}:fresh:{run_id}"));
                 let workdir=run_root.join("exec").join(format!("{}-{sequence}-{}-g{generation}",intent.activation,node_id)).join("0");
                 fs::create_dir_all(workdir.parent().unwrap()).map_err(packerr)?;fs::create_dir(&workdir).map_err(packerr)?;
                 let task_session=if let Some(saved)=saved.as_ref() {
-                    if self.executor.restore_session(&saved.session_id,&workdir).is_ok(){saved.session_id.clone()}else{format!("{order}:{node_id}:fresh:{run_id}")}
+                    if session_output_valid(saved) && self.executor.restore_session(&saved.session_id,&workdir).is_ok(){saved.session_id.clone()}else{self.conn.execute("UPDATE review_runs SET status='invalidated' WHERE order_id=?1 AND status IN ('passed','held','failed')",[&order]).map_err(packerr)?;format!("{session_id}:fresh:{run_id}")}
                 } else {task_session};
                 let mut inputs=BTreeMap::new();
-                let payload_rows = match payload {
-                    "findings" => finding_rows,
-                    name => {
-                        let mut q=self.conn.prepare("SELECT stage_id,output_json FROM review_stage_attempts WHERE order_id=?1 AND run_id=?2 AND status='complete' ORDER BY sequence").map_err(packerr)?;
-                        q.query_map(params![order,run_id],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?))).map_err(packerr)?
-                            .filter_map(std::result::Result::ok).filter_map(|(stage_id,json)| {
-                                let value:serde_json::Value=serde_json::from_str(&json).ok()?;
-                                let matched = match name {
-                                    "plan" => stage_id.contains("plan") || stage_id=="triage",
-                                    "plan_full" => stage_id.contains("plan") || stage_id=="triage",
-                                    _ => stage_id==name,
-                                };
-                                matched.then(||serde_json::json!({"stage_id":stage_id,"verdicts":value["verdicts"],"log_path":value["log_path"]}))
-                            }).collect()
-                    }
-                };
+                let payload_rows = redrive_payload(&self.conn,&order,&run_id,payload)?;
                 inputs.insert(payload.to_owned(),serde_json::to_string(&payload_rows).map_err(packerr)?);
                 let task=StageTask{stage_id:format!("{node_id}-g{generation}"),role:role.clone(),lens_bytes:Vec::new(),session_id:task_session.clone(),fix_context:Some(latest_commit.clone()),base_commit:latest_commit.clone(),artifact_commit:latest_commit.clone(),inputs,workdir};
-                charge_review_budget(&mut self.conn,&order)?;
+                charge_review_budget(&mut self.conn,&order,intent)?;
                 let out=self.executor.execute(&task).and_then(|out|accept_output(&task,out)).map_err(|e|foundry_pack::PackError{code:"E_EXEC_REDRIVE_ERROR",message:e})?;
                 let Some(commit)=out.produced_commit.clone().filter(|commit|!commit.is_empty()) else {return Err(foundry_pack::PackError{code:"E_EXEC_REDRIVE_ERROR",message:"fix stage did not produce a commit".into()});};
                 sequence+=1;
@@ -333,6 +325,9 @@ impl DispatchHost for PackReviewHost {
         }
         if let foundry_exec::ReviewHoldAction::Resume{target}=&action {
             if !hold.resume_targets.iter().any(|candidate|candidate==target){return Err(HostError::Worker("resume target is not allowed".into()));}
+            self.executor.ensure_available().map_err(HostError::Worker)?;
+            let resume_sequence=doc["resume_sequence"].as_u64().unwrap_or(0).checked_add(1).ok_or_else(||HostError::Persistence("resume sequence exhausted".into()))?;
+            doc["resume_sequence"]=serde_json::json!(resume_sequence);
             history.push(serde_json::json!({"actor":actor,"at":chrono::Utc::now().to_rfc3339(),"action":"resume","target":target}));
             doc["human_events"]=serde_json::Value::Array(history);
             tx.execute("UPDATE review_runs SET status='resuming',hold_json=?1 WHERE order_id=?2 AND attempt=?3 AND run_id=?4 AND status='held' AND hold_instance_id=?5",params![doc.to_string(),order,attempt,run_id,hold_id]).map_err(sqlerr).map_err(HostError::Persistence)?;
@@ -367,13 +362,20 @@ impl PackReviewHost {
         let intent:ExecutionIntent=serde_json::from_value(doc["intent"].clone()).map_err(sqlerr).map_err(HostError::Persistence)?;
         let base_commit=parse_external_ref(&intent.external_ref).map(|parts|parts.2).ok_or_else(||HostError::Persistence("held intent has invalid external_ref".into()))?;
         let mut state=foundry_pack::EngineState::import(doc["engine_state"].as_str().ok_or_else(||HostError::Persistence("held run has no engine snapshot".into()))?).map_err(HostError::Persistence)?;
-        let snap=load_pack(&self.pack_path).map_err(|e|HostError::Persistence(e.to_string()))?;
+        let run_root=self.db_path.with_extension("review-runs").join(format!("{:x}",Sha256::digest(run_id.as_bytes())));
+        let snapshot_run=doc["snapshot_run_id"].as_str().unwrap_or(run_id);
+        let snapshot_root=self.db_path.with_extension("review-runs").join(format!("{:x}",Sha256::digest(snapshot_run.as_bytes())));
+        let snap=load_pack(snapshot_root.join("pack-snapshot")).map_err(|e|HostError::Persistence(e.to_string()))?;
+        let expected_digest:String=self.conn.query_row("SELECT pack_digest FROM review_runs WHERE order_id=?1 AND attempt=?2 AND run_id=?3",params![order,attempt,run_id],|r|r.get(0)).map_err(sqlerr).map_err(HostError::Persistence)?;
+        if snap.digest()!=expected_digest || snap.digest()!=self.pack_digest { return Err(HostError::Persistence("held pack snapshot digest changed".into())); }
         let engine=GraphEngine::from_snapshot(&snap).map_err(|e|HostError::Persistence(e.to_string()))?;
-        let mut generations:Vec<foundry_exec::GenerationCommit>=serde_json::from_value(doc["generations"].clone()).unwrap_or_else(|_|vec![foundry_exec::GenerationCommit{generation:0,commit:intent.external_ref.rsplit_once("..").map(|(_,c)|c.to_owned()).unwrap_or_default(),fix_log_path:String::new()}]);
+        let mut generations:Vec<foundry_exec::GenerationCommit>=serde_json::from_value(doc["generations"].clone()).map_err(sqlerr).map_err(HostError::Persistence)?;
         let mut latest_commit=doc["latest_commit"].as_str().map(str::to_owned).unwrap_or_else(||generations.last().map(|g|g.commit.clone()).unwrap_or_default());
         let mut accepted_logs:Vec<String>=serde_json::from_value(doc["accepted_logs"].clone()).unwrap_or_default();
-        let mut sequence=doc["sequence"].as_u64().unwrap_or(0);
-        let run_root=self.db_path.with_extension("review-runs").join(format!("{:x}",Sha256::digest(run_id.as_bytes())));
+        let mut sequence:u64=self.conn.query_row("SELECT COALESCE(MAX(sequence),0) FROM review_stage_attempts WHERE order_id=?1 AND run_id=?2",params![order,run_id],|r|r.get(0)).map_err(sqlerr).map_err(HostError::Persistence)?;
+        let mut session_ids=BTreeSet::new();let mut fresh_sessions=BTreeMap::new();
+        let resume_sequence=doc["resume_sequence"].as_u64().ok_or_else(||HostError::Persistence("resume sequence missing".into()))?;
+        let execution_root=run_root.join("exec").join(format!("resume-{resume_sequence}"));
         let outcome=engine.resume_staged(&mut state,target,|node_id,redrive,input,counters|{
             self.conn.execute("UPDATE review_runs SET counters_json=?1 WHERE order_id=?2 AND run_id=?3",params![serde_json::to_string(counters).map_err(packerr)?,order,run_id]).map_err(packerr)?;
             if redrive {
@@ -385,21 +387,17 @@ impl PackReviewHost {
                 let generation=generations.len() as u64;
                 let payload=node.value.get("payload").and_then(toml::Value::as_str).unwrap_or("findings");
                 let mut inputs=BTreeMap::new();
-                let values:Vec<serde_json::Value>={
-                    let mut q=self.conn.prepare("SELECT stage_id,output_json FROM review_stage_attempts WHERE order_id=?1 AND run_id=?2 AND status='complete' ORDER BY sequence").map_err(packerr)?;
-                    q.query_map(params![order,run_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).map_err(packerr)?
-                        .filter_map(std::result::Result::ok).filter_map(|(stage_id,json)|{let v:serde_json::Value=serde_json::from_str(&json).ok()?;let matches=payload!="findings" || (v["role"]=="verify"&&v["findings"]==true);matches.then(||serde_json::json!({"stage_id":stage_id,"verdicts":v["verdicts"],"log_path":v["log_path"]}))}).collect()
-                };
+                let values=redrive_payload(&self.conn,order,run_id,payload)?;
                 inputs.insert(payload.to_owned(),serde_json::to_string(&values).map_err(packerr)?);
                 sequence+=1;
-                let workdir=run_root.join("exec").join(format!("{}-{node_id}-g{generation}",intent.activation)).join("0");
+                let workdir=execution_root.join(format!("{}-{node_id}-g{generation}",intent.activation)).join("0");
                 fs::create_dir_all(workdir.parent().unwrap()).map_err(packerr)?;fs::create_dir(&workdir).map_err(packerr)?;
-                let session_key=format!("{order}:{node_id}");
+                let session_key=redrive_session_key(order,node_id);
                 let saved:Option<String>=self.conn.query_row("SELECT receipt_json FROM review_sessions WHERE order_id=?1 AND session_id=?2 ORDER BY rowid DESC LIMIT 1",params![order,session_key],|r|r.get(0)).optional().map_err(sqlerr).map_err(packerr)?;
                 let saved=saved.map(|s|serde_json::from_str::<SessionReceipt>(&s).map_err(packerr)).transpose()?;
-                let task_session=if let Some(saved)=saved.as_ref(){if self.executor.restore_session(&saved.session_id,&workdir).is_ok(){saved.session_id.clone()}else{format!("{order}:{node_id}:fresh:{}",intent.run.0)}}else{format!("{order}:{node_id}:fresh:{}",intent.run.0)};
+                let task_session=if let Some(saved)=saved.as_ref(){if session_output_valid(saved) && self.executor.restore_session(&saved.session_id,&workdir).is_ok(){saved.session_id.clone()}else{self.conn.execute("UPDATE review_runs SET status='invalidated' WHERE order_id=?1 AND status IN ('passed','held','failed')",[order]).map_err(packerr)?;format!("{session_key}:fresh:{run_id}:resume-{resume_sequence}")}}else{format!("{session_key}:fresh:{run_id}:resume-{resume_sequence}")};
                 let task=StageTask{stage_id:format!("{node_id}-g{generation}"),role:role.clone(),lens_bytes:Vec::new(),session_id:task_session,fix_context:Some(latest_commit.clone()),base_commit:latest_commit.clone(),artifact_commit:latest_commit.clone(),inputs,workdir};
-                charge_review_budget(&mut self.conn,order)?;
+                charge_review_budget(&mut self.conn,order,&intent)?;
                 let out=self.executor.execute(&task).and_then(|o|accept_output(&task,o)).map_err(|e|foundry_pack::PackError{code:"E_EXEC_REDRIVE_ERROR",message:e})?;
                 let Some(commit)=out.produced_commit.clone().filter(|c|!c.is_empty()) else{return Err(foundry_pack::PackError{code:"E_EXEC_REDRIVE_ERROR",message:"redrive stage produced no commit".into()});};
                 self.conn.execute("INSERT INTO review_stage_attempts(order_id,run_id,sequence,stage_id,status,output_json) VALUES(?1,?2,?3,?4,'complete',?5)",params![order,run_id,sequence as i64,task.stage_id,serde_json::json!({"role":role,"log_path":out.log_path,"produced_commit":commit}).to_string()]).map_err(packerr)?;
@@ -416,27 +414,46 @@ impl PackReviewHost {
                 let inputs=match sealed_inputs(&stage,&done){Ok(v)=>v,Err(_)=>{verify_failed|=role=="verify";continue;}};
                 let lens_names=stage.get("lenses").and_then(toml::Value::as_array).ok_or_else(||packerr("stage missing lenses"))?;
                 let mut lens_bytes=Vec::new();for name in lens_names{let name=name.as_str().ok_or_else(||packerr("lens path not string"))?;lens_bytes.extend_from_slice(snap.files().get(name).ok_or_else(||packerr("lens absent from snapshot"))?);lens_bytes.push(b'\n');}
-                sequence+=1;let workdir=run_root.join("exec").join(format!("{}-{}-resume",intent.activation,sequence)).join("0");fs::create_dir_all(workdir.parent().unwrap()).map_err(packerr)?;fs::create_dir(&workdir).map_err(packerr)?;
-                let task=StageTask{stage_id:id.clone(),role:role.clone(),lens_bytes,session_id:format!("{order}:{}:fresh:{}",stage.get("session").and_then(toml::Value::as_str).unwrap_or(&id),intent.run.0),fix_context:None,base_commit:base_commit.clone(),artifact_commit:latest_commit.clone(),inputs,workdir};
-                charge_review_budget(&mut self.conn,order)?;
-                let output=match self.executor.execute(&task).and_then(|o|accept_output(&task,o)){Ok(o)=>o,Err(_)=>{verify_failed|=role=="verify";continue;}};
+                sequence+=1;let workdir=execution_root.join(format!("{}-{}",intent.activation,sequence)).join("0");fs::create_dir_all(workdir.parent().unwrap()).map_err(packerr)?;fs::create_dir(&workdir).map_err(packerr)?;
+                let session=stage.get("session").and_then(toml::Value::as_str).unwrap_or(&id);
+                let session_key=format!("{order}:{session}");
+                let saved:Option<String>=self.conn.query_row("SELECT receipt_json FROM review_sessions WHERE order_id=?1 AND session_id=?2 ORDER BY rowid DESC LIMIT 1",params![order,session_key],|r|r.get(0)).optional().map_err(packerr)?;
+                let saved=saved.map(|s|serde_json::from_str::<SessionReceipt>(&s).map_err(packerr)).transpose()?;
+                let mut task_session=fresh_sessions.get(&session_key).cloned().unwrap_or_else(||saved.as_ref().map(|s|s.session_id.clone()).unwrap_or_else(||session_key.clone()));
+                if session_ids.insert(session_key.clone()) && let Some(saved)=saved.as_ref()
+                    && (!session_output_valid(saved) || self.executor.restore_session(&saved.session_id,&workdir).is_err()) {
+                    self.conn.execute("UPDATE review_runs SET status='invalidated' WHERE order_id=?1 AND status IN ('passed','held','failed')",[order]).map_err(packerr)?;
+                    task_session=format!("{session_key}:fresh:{run_id}:resume-{resume_sequence}");fresh_sessions.insert(session_key.clone(),task_session.clone());
+                }
+                let task=StageTask{stage_id:id.clone(),role:role.clone(),lens_bytes,session_id:task_session,fix_context:None,base_commit:base_commit.clone(),artifact_commit:latest_commit.clone(),inputs,workdir};
+                charge_review_budget(&mut self.conn,order,&intent)?;
+                self.conn.execute("INSERT INTO review_stage_attempts(order_id,run_id,sequence,stage_id,status) VALUES(?1,?2,?3,?4,'accepted')",params![order,run_id,sequence,id]).map_err(packerr)?;
+                let output=match self.executor.execute(&task).and_then(|o|accept_output(&task,o)){Ok(o)=>o,Err(error)=>{
+                    self.conn.execute("UPDATE review_stage_attempts SET status='error',output_json=?1 WHERE order_id=?2 AND run_id=?3 AND sequence=?4",params![error,order,run_id,sequence]).map_err(packerr)?;
+                    verify_failed|=role=="verify";continue;
+                }};
                 let categories:Vec<String>=output.verdict_category.iter().chain(&output.verdict_categories).cloned().collect();
-                self.conn.execute("INSERT INTO review_stage_attempts(order_id,run_id,sequence,stage_id,status,output_json) VALUES(?1,?2,?3,?4,'complete',?5)",params![order,run_id,sequence as i64,id,serde_json::json!({"role":role,"log_path":output.log_path,"findings":output.findings,"verdicts":categories}).to_string()]).map_err(packerr)?;
+                let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(packerr)?;ensure_active(&tx,&intent).map_err(packerr)?;
+                tx.execute("UPDATE review_stage_attempts SET status='complete',output_json=?1 WHERE order_id=?2 AND run_id=?3 AND sequence=?4",params![serde_json::json!({"role":role,"log_path":output.log_path,"sha256":format!("{:x}",Sha256::digest(fs::read(&output.log_path).map_err(packerr)?)),"inspected_commit":output.inspected_commit,"findings":output.findings,"verdicts":categories}).to_string(),order,run_id,sequence]).map_err(packerr)?;
+                tx.execute("INSERT OR REPLACE INTO review_sessions(order_id,run_id,session_id,receipt_json) VALUES(?1,?2,?3,?4)",params![order,run_id,session_key,serde_json::to_string(&SessionReceipt{session_id:task.session_id,output:output.log_path.clone(),sha256:format!("{:x}",Sha256::digest(fs::read(&output.log_path).map_err(packerr)?))}).map_err(packerr)?]).map_err(packerr)?;tx.commit().map_err(packerr)?;
                 valid+=1;done.insert(id,output.log_path.clone());accepted_logs.push(output.log_path);
-                if role=="verify"{findings|=output.findings;verdicts.extend(categories);}
+                if role=="verify"{findings|=output.findings || categories.iter().any(|v|matches!(v.as_str(),"patch"|"intent_gap"|"bad_plan"));verdicts.extend(categories);}
             }
-            if valid==0{return Err(packerr("no valid stage output"));}
-            if verify_failed{return Err(packerr("verify output invalid"));}
+            if valid==0{return Err(foundry_pack::PackError{code:"E_EXEC_ALL_ERROR",message:"no valid stage output".into()});}
+            if verify_failed{return Err(foundry_pack::PackError{code:"E_EXEC_VERIFY_INVALID",message:"verify output invalid".into()});}
             Ok(RunInput{verdicts,has_findings:findings,budget_exhausted:input.budget_exhausted,timeout:input.timeout})
         }).map_err(|e|HostError::Worker(e.to_string()))?;
         let passed=outcome.terminal&&outcome.actions.iter().any(|a|matches!(a,EngineAction::Emit{event,..}if event=="InspectionPassed"));
-        let hold=outcome.hold.as_ref().map(|entry|{let targets=snap.nodes().iter().find(|n|n.id==entry.node_id).and_then(|n|n.value.get("resume_targets")).and_then(toml::Value::as_array).into_iter().flatten().filter_map(toml::Value::as_str).map(str::to_owned).collect();foundry_exec::host::HoldState{hold_instance_id:new_hold_id(),reason:entry.node_id.clone(),resume_targets:targets,deadline_secs:0}});
+        let hold=outcome.hold.as_ref().map(|entry|{let targets=snap.nodes().iter().find(|n|n.id==entry.node_id).and_then(|n|n.value.get("resume_targets")).and_then(toml::Value::as_array).into_iter().flatten().filter_map(toml::Value::as_str).map(str::to_owned).collect();foundry_exec::host::HoldState{hold_instance_id:new_hold_id(),reason:entry.node_id.clone(),resume_targets:targets,deadline_secs:snap.policy().get("hold").and_then(|v|v.get("timeout_s")).and_then(toml::Value::as_integer).unwrap_or(0).max(0) as u64}});
         let mut result:HostResult=serde_json::from_str(&self.conn.query_row::<String,_,_>("SELECT result_json FROM review_runs WHERE order_id=?1 AND attempt=?2 AND run_id=?3",params![order,attempt,run_id],|r|r.get(0)).map_err(sqlerr).map_err(HostError::Persistence)?).map_err(sqlerr).map_err(HostError::Persistence)?;
         result.result_commit=latest_commit;result.generations=generations;result.log_path=accepted_logs.last().cloned().unwrap_or(result.log_path);result.exit_code=if passed{0}else{1};result.held=hold.clone();
         doc["engine_state"]=serde_json::Value::String(state.export());doc["generations"]=serde_json::to_value(&result.generations).map_err(sqlerr).map_err(HostError::Persistence)?;doc["latest_commit"]=serde_json::Value::String(result.result_commit.clone());doc["accepted_logs"]=serde_json::to_value(accepted_logs).map_err(sqlerr).map_err(HostError::Persistence)?;doc["sequence"]=serde_json::json!(sequence);
         if let (Some(hold),Some(entry))=(hold.as_ref(),outcome.hold.as_ref()){doc["hold"]=serde_json::to_value(hold).map_err(sqlerr).map_err(HostError::Persistence)?;doc["entry"]=serde_json::to_value(entry).map_err(sqlerr).map_err(HostError::Persistence)?;}
-        let status=if hold.is_some(){"held"}else{"resolved"};let result_json=serde_json::to_string(&result).map_err(sqlerr).map_err(HostError::Persistence)?;
+        // The consumed hold is resolved; the runner transfers a newly raised hold
+        // to its next run without publishing a tuple.
+        let status="resolved";let result_json=serde_json::to_string(&result).map_err(sqlerr).map_err(HostError::Persistence)?;
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sqlerr).map_err(HostError::Persistence)?;
+        ensure_active(&tx,&intent).map_err(HostError::Persistence)?;
         let resume_targets=hold.as_ref().map(|h|serde_json::to_string(&h.resume_targets).unwrap_or_else(|_|"[]".into()));
         let deadline=hold.as_ref().map(|h|if h.deadline_secs==0{0}else{chrono::Utc::now().timestamp().saturating_add(h.deadline_secs as i64)});
         tx.execute("UPDATE review_runs SET status=?1,counters_json=?2,hold_json=?3,hold_instance_id=?4,resume_targets=?5,deadline=?6,result_json=?7 WHERE order_id=?8 AND attempt=?9 AND run_id=?10",params![status,serde_json::to_string(&state.counters).map_err(sqlerr).map_err(HostError::Persistence)?,doc.to_string(),hold.as_ref().map(|h|h.hold_instance_id.clone()),resume_targets,deadline,result_json,order,attempt,run_id]).map_err(sqlerr).map_err(HostError::Persistence)?;
@@ -461,6 +478,28 @@ impl PackReviewHost {
 
 #[derive(serde::Serialize,serde::Deserialize)]
 struct SessionReceipt { session_id:String, output:String, sha256:String }
+
+
+fn redrive_session_key(order:&str,node:&str)->String {
+    format!("{order}:{}",if node=="fixdie" {"die"} else {node})
+}
+fn session_output_valid(saved:&SessionReceipt)->bool {
+    fs::read(&saved.output).is_ok_and(|bytes|format!("{:x}",Sha256::digest(bytes))==saved.sha256)
+}
+// Select only the latest completed occurrence of each requested artifact.
+fn redrive_payload(conn:&Connection,order:&str,run:&str,payload:&str)->foundry_pack::Result<Vec<serde_json::Value>> {
+    let mut query=conn.prepare("SELECT stage_id,status,output_json FROM review_stage_attempts WHERE order_id=?1 AND run_id=?2 ORDER BY sequence DESC").map_err(packerr)?;
+    let rows=query.query_map(params![order,run],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<String>>(2)?))).map_err(packerr)?;
+    let mut seen=BTreeSet::new();let mut values=Vec::new();
+    for row in rows {
+        let (stage,status,json)=row.map_err(packerr)?;
+        if !seen.insert(stage.clone()) || status!="complete" { continue; }
+        let value:serde_json::Value=serde_json::from_str(&json.ok_or_else(||packerr("complete stage lacks output"))?).map_err(packerr)?;
+        let matches=if payload=="findings" { value["role"]=="verify" && value["findings"]==true } else {stage==payload};
+        if matches {values.push(serde_json::json!({"stage_id":stage,"verdicts":value["verdicts"],"log_path":value["log_path"]}));}
+    }
+    values.reverse();Ok(values)
+}
 
 fn sealed_inputs(stage:&toml::Value,done:&BTreeMap<String,String>)->foundry_pack::Result<BTreeMap<String,String>>{
     let deps=match stage.get("after") {
@@ -630,8 +669,9 @@ fn parse_external_ref(s:&str)->Option<(String,u64,String,String)>{
 }
 fn host_key(i:&ExecutionIntent)->HostKey{HostKey{order:i.order.0.clone(),attempt:i.attempt.0,run:i.run.0,activation:i.activation}}
 fn new_hold_id()->String{use std::io::Read;let mut bytes=[0u8;16];std::fs::File::open("/dev/urandom").and_then(|mut f|f.read_exact(&mut bytes)).expect("OS random source");bytes[6]=(bytes[6]&0x0f)|0x40;bytes[8]=(bytes[8]&0x3f)|0x80;format!("{:02x?}",bytes).replace(['[',']',',',' '],"")}
-fn charge_review_budget(conn:&mut Connection,order:&str)->foundry_pack::Result<()>{
+fn charge_review_budget(conn:&mut Connection,order:&str,intent:&ExecutionIntent)->foundry_pack::Result<()>{
     let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(packerr)?;
+    ensure_active(&tx,intent).map_err(packerr)?;
     tx.execute("INSERT OR IGNORE INTO review_budget(order_id,used) VALUES(?1,0)",[order]).map_err(packerr)?;
     if tx.execute("UPDATE review_budget SET used=used+1 WHERE order_id=?1 AND used<10000",[order]).map_err(packerr)?==0 {
         return Err(foundry_pack::PackError{code:"E_EXEC_BUDGET",message:"order execution budget exhausted".into()});

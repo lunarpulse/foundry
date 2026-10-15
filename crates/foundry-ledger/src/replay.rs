@@ -202,6 +202,7 @@ pub(crate) fn decode_event(repr: &str, intent: &str, ctx_attempt: u32) -> Option
             reason: intent.to_string(),
         },
         "InspectionPassed" => OrderEvent::InspectionPassed,
+        "ReviewHeld" => OrderEvent::ReviewHeld { reason: intent.to_string() },
         "InspectionFailed" => OrderEvent::InspectionFailed {
             reason: intent.to_string(),
         },

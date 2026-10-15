@@ -392,6 +392,21 @@ where
         }
     }
 
+    /// Restores a verified ledger order using the durable review run as its artifact source.
+    /// Review holds have no promoted tuple until human resolution completes.
+    pub async fn restore_review_hold(&self, mut order:Order)->Result<(),LineError> {
+        let invalid=|message:&str|LineError::Port(order.id.clone(),foundry_domain::ports::PortError::Permanent(message.into()));
+        if order.state()!=OrderState::FurnaceHold {return Err(invalid("order is not waiting on review"));}
+        let latest={let port=self.review_run.lock().unwrap();
+            port.as_ref().ok_or_else(||invalid("review runner unavailable"))?.latest_run(&order.id,order.attempt() as u64)
+                .map_err(|e|invalid(&format!("latest review run: {e:?}")))?
+        }.ok_or_else(||invalid("review run not found"))?;
+        if !matches!(latest.status.as_str(),"held"|"resolved"|"review_aborted") || latest.result_commit.is_empty() {return Err(invalid("review hold is not recoverable"));}
+        order.artifact_digest=Some(latest.result_commit);
+        self.orders.lock().await.entry(order.id.clone()).or_insert(order);
+        Ok(())
+    }
+
     /// Re-enters a resolved review hold through a new durable host run.
     pub async fn resume_review(&self, order_id: &str) -> Result<OrderState, LineError> {
         let order=self.get(order_id).await.ok_or_else(||LineError::UnknownOrder(order_id.to_owned()))?;

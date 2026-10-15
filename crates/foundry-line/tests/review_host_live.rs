@@ -30,6 +30,12 @@ struct Policy; impl foundry_domain::ports::Policy for Policy{fn authorize(&self,
 impl foundry_domain::ports::Ledger for Events{fn append(&mut self,_:&str,e:&foundry_domain::OrderEvent,_:foundry_domain::OrderState,_:foundry_domain::OrderState,_:&foundry_domain::ActorId,_:chrono::DateTime<chrono::Utc>)->foundry_domain::ports::PortResult<()>{self.0.lock().unwrap().push(e.clone());Ok(())}}
 struct Publisher; impl foundry_domain::ports::Publisher for Publisher{async fn publish(&self,_:&foundry_domain::Order,_:&str,_:&str)->foundry_domain::ports::PortResult<foundry_domain::ports::PublishOutcome>{Ok(foundry_domain::ports::PublishOutcome::Confirmed{pr_url:"test".into()})}}
 
+fn recover_new_hold(host:&mut PackReviewHost,order:&str) {
+    let latest=host.latest_run(order,1).unwrap().unwrap();
+    let mut next=intent(order,latest.run+1);next.run=RunId(latest.run+1);next.epoch=Epoch(latest.run+1);
+    assert!(host.try_dispatch(&next).unwrap().held.is_some());
+}
+
 #[test]
 fn real_pack_passes_through_durable_review_and_promotes_tuple(){let db=Db::new();let trace=Arc::new(Mutex::new(Trace::default()));passed_outputs(&trace);let fail=Arc::new(AtomicBool::new(false));let h=host(&db,trace,fail);let tuples=Arc::new(SqliteTupleStore::open(&db.0).unwrap()) as Arc<dyn TupleStore>;let mut run=durable_review_run(h,&db.0,tuples.clone()).unwrap();let e=run.run(ReviewRunRequest{order:OrderId("pass".into()),attempt:Attempt(1),run:RunId(7),base_commit:"base".into(),result_commit:"result".into(),artifact_digest:"result".into(),epoch:Epoch(1),activation:1}).unwrap();assert!(matches!(e,foundry_exec::ReviewRunOutcome::Completed(e) if e.verdict==foundry_exec::ReviewVerdict::Passed));assert!(tuples.latest_promoted(&OrderId("pass".into()),Attempt(1)).unwrap().is_some());}
 
@@ -149,11 +155,13 @@ fn human_resume_replan_full_executes_policy_role_and_revalidates_new_head(){
     trace.lock().unwrap().outputs.push_back(replan);
     for i in 4..8{trace.lock().unwrap().outputs.push_back(output(None,false,i));}
     let mut h=host(&db,trace.clone(),Arc::new(AtomicBool::new(false)));
+    connection(&db).execute("INSERT INTO review_stage_attempts(order_id,run_id,sequence,stage_id,status,output_json) SELECT order_id,run_id,0,'plan_full','complete',?1 FROM review_runs WHERE order_id='replan-resume'",[serde_json::json!({"log_path":"plan-full.log","verdicts":[]}).to_string()]).unwrap();
     h.resume("replan-resume",&hold_id,"replan_full","human").unwrap();
     let task=trace.lock().unwrap().tasks.iter().find(|task|task.stage_id=="replan_full-g1").unwrap().clone();
     assert_eq!(task.role,"replan");assert_eq!(task.fix_context.as_deref(),Some("result"));
     assert_eq!(task.base_commit,"result");assert_eq!(task.artifact_commit,"result");
-    assert!(task.inputs.get("plan_full").is_some_and(|v|!v.is_empty()));
+    let payload:serde_json::Value=serde_json::from_str(task.inputs.get("plan_full").unwrap()).unwrap();
+    assert_eq!(payload,serde_json::json!([{"stage_id":"plan_full","verdicts":[],"log_path":"plan-full.log"}]));
     let latest=h.latest_run("replan-resume",1).unwrap().unwrap();
     assert_eq!(latest.status,"resolved");assert_eq!(latest.result_commit,"result");
     let result_json:String=connection(&db).query_row("SELECT result_json FROM host_results WHERE order_id='replan-resume'",[],|row|row.get(0)).unwrap();
@@ -199,6 +207,7 @@ fn resumed_hold_survives_host_restart_then_second_resolution_publishes_final_gen
     trace.lock().unwrap().outputs.push_back(output(Some("intent_gap"),true,7));
     let mut h=host(&db,trace.clone(),Arc::new(AtomicBool::new(false)));
     h.resume("repeat-hold",&first.hold_instance_id,"replan_full","reviewer").unwrap();
+    recover_new_hold(&mut h,"repeat-hold");
     let second=h.latest_run("repeat-hold",1).unwrap().unwrap();
     let second_hold:foundry_exec::host::HoldState=serde_json::from_value(serde_json::from_str::<serde_json::Value>(second.hold_json.as_deref().unwrap()).unwrap()["hold"].clone()).unwrap();
     assert_ne!(second_hold.hold_instance_id,first.hold_instance_id);
@@ -217,7 +226,7 @@ fn resumed_hold_survives_host_restart_then_second_resolution_publishes_final_gen
 
     let tuples=Arc::new(SqliteTupleStore::open(&db.0).unwrap());let tuple_port=tuples.clone() as Arc<dyn TupleStore>;
     let mut runner=durable_review_run(h,&db.0,tuple_port).unwrap();
-    let outcome=runner.run(ReviewRunRequest{order:OrderId("repeat-hold".into()),attempt:Attempt(1),run:RunId(resolved.run+1),base_commit:resolved.base_commit,result_commit:"result".into(),artifact_digest:"commit-C".into(),epoch:Epoch(2),activation:2}).unwrap();
+    let outcome=runner.run(ReviewRunRequest{order:OrderId("repeat-hold".into()),attempt:Attempt(1),run:RunId(resolved.run+1),base_commit:resolved.base_commit,result_commit:"result".into(),artifact_digest:"commit-C".into(),epoch:Epoch(resolved.run+1),activation:resolved.run+1}).unwrap();
     assert!(matches!(outcome,foundry_exec::ReviewRunOutcome::Completed(_)));
     let tuple=tuples.latest_promoted(&OrderId("repeat-hold".into()),Attempt(1)).unwrap().unwrap();
     assert_eq!(tuple.run.0,resolved.run+1);
@@ -495,4 +504,170 @@ async fn product_bridge_records_review_held_without_consuming_a_domain_attempt()
     assert!(!events.iter().any(|e|matches!(e,foundry_domain::OrderEvent::InspectionPassed|foundry_domain::OrderEvent::InspectionFailed{..})));
     assert_eq!(status(&db),"held");
     assert!(tuples.latest_promoted(&OrderId("line-hold".into()),Attempt(1)).unwrap().is_none());
+}
+
+#[test]
+fn unavailable_resume_preserves_the_original_hold_and_returns_an_error() {
+    let db=Db::new();let trace=Arc::new(Mutex::new(Trace::default()));
+    for i in 0..3 { trace.lock().unwrap().outputs.push_back(output(None,false,i)); }
+    trace.lock().unwrap().outputs.push_back(output(Some("intent_gap"),true,3));
+    let mut h=host(&db,trace,Arc::new(AtomicBool::new(false)));
+    let hold=h.try_dispatch(&intent("unavailable",1)).unwrap().held.unwrap();drop(h);
+    let pack=Path::new(env!("CARGO_MANIFEST_DIR")).join(PACK);
+    let mut h=PackReviewHost::new(pack,foundry_line::UnavailableStageExecutor,&db.0).unwrap();
+    assert!(h.resume("unavailable",&hold.hold_instance_id,"replan_full","human").is_err());
+    let latest=h.latest_run("unavailable",1).unwrap().unwrap();
+    assert_eq!(latest.status,"held");assert_eq!(latest.hold_instance_id.as_deref(),Some(hold.hold_instance_id.as_str()));
+}
+
+#[test]
+fn resuming_run_cannot_be_bypassed_by_another_activation() {
+    let db=Db::new();let trace=Arc::new(Mutex::new(Trace::default()));passed_outputs(&trace);
+    let mut h=host(&db,trace.clone(),Arc::new(AtomicBool::new(false)));
+    h.try_dispatch(&intent("resume-fence",1)).unwrap();
+    connection(&db).execute("UPDATE review_runs SET status='resuming'",[]).unwrap();
+    let before=trace.lock().unwrap().tasks.len();let mut next=intent("resume-fence",2);next.run=RunId(8);next.epoch=Epoch(2);
+    assert!(h.try_dispatch(&next).is_err());assert_eq!(trace.lock().unwrap().tasks.len(),before);
+}
+
+#[test]
+fn resolved_review_is_not_inherited_by_a_different_attempt() {
+    let db=Db::new();let trace=Arc::new(Mutex::new(Trace::default()));
+    for i in 0..3 { trace.lock().unwrap().outputs.push_back(output(None,false,i)); }
+    trace.lock().unwrap().outputs.push_back(output(Some("intent_gap"),true,3));
+    let mut h=host(&db,trace.clone(),Arc::new(AtomicBool::new(false)));
+    let hold=h.try_dispatch(&intent("attempt-fence",1)).unwrap().held.unwrap();
+    h.commit_pass("attempt-fence",&hold.hold_instance_id,"human").unwrap();
+    let before=trace.lock().unwrap().tasks.len();passed_outputs(&trace);
+    let mut next=intent("attempt-fence",2);next.attempt=Attempt(2);next.run=RunId(8);next.epoch=Epoch(2);next.external_ref="review:attempt-fence:2:base..result".into();
+    h.try_dispatch(&next).unwrap();assert!(trace.lock().unwrap().tasks.len()>before,"new attempts require their own review");
+}
+
+#[test]
+fn resumed_invalid_verify_enters_a_new_barrier_hold() {
+    let db=Db::new();let trace=Arc::new(Mutex::new(Trace::default()));
+    for i in 0..3 { trace.lock().unwrap().outputs.push_back(output(None,false,i)); }
+    trace.lock().unwrap().outputs.push_back(output(Some("intent_gap"),true,3));
+    let mut h=host(&db,trace.clone(),Arc::new(AtomicBool::new(false)));
+    let hold=h.try_dispatch(&intent("invalid-resume",1)).unwrap().held.unwrap();
+    trace.lock().unwrap().outputs.push_back(StageOutput{produced_commit:Some("commit-B".into()),..StageOutput::default()});
+    trace.lock().unwrap().wrong_commit=true;
+    h.resume("invalid-resume",&hold.hold_instance_id,"replan_full","human").unwrap();
+    recover_new_hold(&mut h,"invalid-resume");
+    let latest=h.latest_run("invalid-resume",1).unwrap().unwrap();assert_eq!(latest.status,"held");
+    assert_ne!(latest.hold_instance_id.as_deref(),Some(hold.hold_instance_id.as_str()));
+    let doc:serde_json::Value=serde_json::from_str(latest.hold_json.as_deref().unwrap()).unwrap();
+    assert_eq!(doc["latest_commit"],"commit-B");
+}
+
+#[test]
+fn redrive_sessions_use_the_die_key_and_validate_saved_output_before_restore() {
+    let db=Db::new();let trace=Arc::new(Mutex::new(Trace::default()));
+    for i in 0..4 { trace.lock().unwrap().outputs.push_back(output(Some("patch"),true,i)); }
+    trace.lock().unwrap().outputs.push_back(StageOutput{produced_commit:Some("commit-B".into()),..StageOutput::default()});
+    for i in 4..7 { trace.lock().unwrap().outputs.push_back(output(None,false,i)); }
+    trace.lock().unwrap().outputs.push_back(output(Some("patch"),true,7));
+    let mut h=host(&db,trace.clone(),Arc::new(AtomicBool::new(false)));
+    let result=h.try_dispatch(&intent("session-key",1)).unwrap();assert!(result.held.is_some());
+    let json:String=connection(&db).query_row("SELECT receipt_json FROM review_sessions WHERE session_id='session-key:die'",[],|r|r.get(0)).unwrap();
+    let receipt:serde_json::Value=serde_json::from_str(&json).unwrap();
+    std::fs::write(receipt["output"].as_str().unwrap(),"tampered").unwrap();
+    trace.lock().unwrap().restores.clear();
+    // Exercise the same implementation session via a human fix resume.
+    trace.lock().unwrap().outputs.push_back(StageOutput{produced_commit:Some("commit-C".into()),..StageOutput::default()});passed_outputs(&trace);
+    h.resume("session-key",&result.held.unwrap().hold_instance_id,"fixdie","human").unwrap();
+    assert!(!trace.lock().unwrap().restores.iter().any(|id|id==receipt["session_id"].as_str().unwrap()));
+}
+
+#[test]
+fn resume_rejects_a_changed_durable_pack_snapshot_before_execution() {
+    let db=Db::new();let trace=Arc::new(Mutex::new(Trace::default()));
+    for i in 0..3 {trace.lock().unwrap().outputs.push_back(output(None,false,i));}
+    trace.lock().unwrap().outputs.push_back(output(Some("intent_gap"),true,3));
+    let mut h=host(&db,trace.clone(),Arc::new(AtomicBool::new(false)));
+    let hold=h.try_dispatch(&intent("snapshot-resume",1)).unwrap().held.unwrap();drop(h);
+    let root=trace.lock().unwrap().tasks[0].workdir.ancestors().nth(3).unwrap().to_owned();
+    use std::io::Write;
+    std::fs::OpenOptions::new().append(true).open(root.join("pack-snapshot/policy.toml")).unwrap().write_all(b"\n# changed snapshot\n").unwrap();
+    let before=trace.lock().unwrap().tasks.len();
+    let mut h=host(&db,trace.clone(),Arc::new(AtomicBool::new(false)));
+    assert!(h.resume("snapshot-resume",&hold.hold_instance_id,"replan_full","human").is_err());
+    assert_eq!(trace.lock().unwrap().tasks.len(),before);
+    assert_eq!(h.latest_run("snapshot-resume",1).unwrap().unwrap().hold_instance_id.as_deref(),Some(hold.hold_instance_id.as_str()));
+}
+
+#[test]
+fn repeated_fix_failure_then_success_uses_new_execution_directories() {
+    let db=Db::new();let trace=Arc::new(Mutex::new(Trace::default()));
+    for i in 0..4 {trace.lock().unwrap().outputs.push_back(output(Some("patch"),true,i));}
+    let mut h=host(&db,trace.clone(),Arc::new(AtomicBool::new(false)));
+    let first=h.try_dispatch(&intent("retry-resume",1)).unwrap().held.unwrap();
+    h.resume("retry-resume",&first.hold_instance_id,"fixdie","human").unwrap();
+    recover_new_hold(&mut h,"retry-resume");
+    let second=h.latest_run("retry-resume",1).unwrap().unwrap().hold_instance_id.unwrap();
+    trace.lock().unwrap().outputs.push_back(StageOutput{produced_commit:Some("fixed".into()),..StageOutput::default()});passed_outputs(&trace);
+    h.resume("retry-resume",&second,"fixdie","human").unwrap();
+    assert_eq!(h.latest_run("retry-resume",1).unwrap().unwrap().status,"resolved");
+    let tasks=trace.lock().unwrap();let dirs:std::collections::BTreeSet<_>=tasks.tasks.iter().map(|t|&t.workdir).collect();
+    assert_eq!(dirs.len(),tasks.tasks.len());
+}
+
+#[tokio::test]
+async fn line_restarts_between_repeated_holds_and_publishes_the_third_run() {
+    let db=Db::new();let trace=Arc::new(Mutex::new(Trace::default()));
+    for i in 0..3 {trace.lock().unwrap().outputs.push_back(output(None,false,i));}
+    trace.lock().unwrap().outputs.push_back(output(Some("intent_gap"),true,3));
+    let tuples=Arc::new(SqliteTupleStore::open(&db.0).unwrap());
+    let events=Arc::new(tokio::sync::Mutex::new(Events::default()));
+    let make_line=||{
+        let h=host(&db,trace.clone(),Arc::new(AtomicBool::new(false)));
+        foundry_line::Line::new(Arc::new(Gate),Arc::new(foundry_harness_cli::fake::FakeHarness::default()),events.clone(),Arc::new(Publisher),Arc::new(Policy))
+            .with_review_run(durable_review_run(h,&db.0,tuples.clone()).unwrap()).with_tuple_store(tuples.clone())
+    };
+    let line=make_line();line.submit(foundry_domain::Order::new("line-repeat".into(),foundry_domain::ExternalRef::cron("test","x"),chrono::Utc::now())).await;
+    assert_eq!(line.drive("line-repeat").await.unwrap(),foundry_domain::OrderState::FurnaceHold);
+    let order=line.get("line-repeat").await.unwrap();drop(line);
+    let line=make_line();line.restore_review_hold(order).await.unwrap();
+    let first:String=connection(&db).query_row("SELECT hold_instance_id FROM review_runs ORDER BY rowid DESC LIMIT 1",[],|r|r.get(0)).unwrap();
+    let event_count=events.lock().await.0.lock().unwrap().len();
+    trace.lock().unwrap().outputs.push_back(StageOutput{produced_commit:Some("commit-B".into()),..Default::default()});
+    for i in 4..7 {trace.lock().unwrap().outputs.push_back(output(None,false,i));}
+    trace.lock().unwrap().outputs.push_back(output(Some("intent_gap"),true,7));
+    line.resolve_review_hold("line-repeat",&first,foundry_exec::ReviewHoldAction::Resume{target:"replan_full".into()},"human").await.unwrap();
+    assert_eq!(events.lock().await.0.lock().unwrap().len(),event_count,"repeated hold adds no domain event");
+    let (run,second):(String,String)=connection(&db).query_row("SELECT run_id,hold_instance_id FROM review_runs WHERE status='held'",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+    assert!(run.starts_with("line-repeat:1:2:"));assert_ne!(first,second);
+    let order=line.get("line-repeat").await.unwrap();drop(line);
+    let line=make_line();line.restore_review_hold(order).await.unwrap();
+    trace.lock().unwrap().outputs.push_back(StageOutput{produced_commit:Some("commit-C".into()),..Default::default()});passed_outputs(&trace);
+    line.resolve_review_hold("line-repeat",&second,foundry_exec::ReviewHoldAction::Resume{target:"replan_full".into()},"human").await.unwrap();
+    let tuple=tuples.latest_promoted(&OrderId("line-repeat".into()),Attempt(1)).unwrap().unwrap();
+    assert_eq!(tuple.run,RunId(3));assert_eq!(tuple.immutable_commit.0,"commit-C");assert_eq!(tuple.generations.len(),3);
+    let actor=foundry_domain::ActorId{kind:foundry_domain::ActorKind::Human,source:"test".into(),id:"human".into()};
+    let token=foundry_domain::ports::ApprovalToken{order_id:"line-repeat".into(),intent:"approve".into(),artifact_digest:"commit-C".into(),actor:actor.clone(),granted_at:chrono::Utc::now()};
+    assert_eq!(line.approve("line-repeat",&token,"approve",&actor).await.unwrap(),foundry_domain::OrderState::Publishing);
+}
+
+#[tokio::test]
+async fn resumed_commit_fail_at_max_attempts_is_terminal() {
+    use foundry_domain::{OrderEvent as E,OrderState};
+    let db=Db::new();let trace=Arc::new(Mutex::new(Trace::default()));
+    for i in 0..3 {trace.lock().unwrap().outputs.push_back(output(None,false,i));}
+    trace.lock().unwrap().outputs.push_back(output(Some("intent_gap"),true,3));
+    let mut order=foundry_domain::Order::new("max-review".into(),foundry_domain::ExternalRef::cron("test","x"),chrono::Utc::now());
+    order.transition(E::Queued,1).unwrap();
+    for attempt in 1..foundry_domain::order::MAX_ATTEMPTS {
+        order.transition(E::DieStarted,attempt).unwrap();order.transition(E::DieFailed{attempt,reason:"retry".into()},attempt).unwrap();
+    }
+    let attempt=foundry_domain::order::MAX_ATTEMPTS;
+    order.transition(E::DieStarted,attempt).unwrap();order.transition(E::DieSucceeded{attempt},attempt).unwrap();order.transition(E::ReviewHeld{reason:"gap".into()},attempt).unwrap();
+    let mut h=host(&db,trace,Arc::new(AtomicBool::new(false)));let mut request=intent("max-review",1);
+    request.attempt=Attempt(attempt as u64);request.external_ref=format!("review:max-review:{attempt}:base..result");
+    let hold=h.try_dispatch(&request).unwrap().held.unwrap();
+    let tuples=Arc::new(SqliteTupleStore::open(&db.0).unwrap());
+    let line=foundry_line::Line::new(Arc::new(Gate),Arc::new(foundry_harness_cli::fake::FakeHarness::default()),Arc::new(tokio::sync::Mutex::new(Events::default())),Arc::new(Publisher),Arc::new(Policy))
+        .with_review_run(durable_review_run(h,&db.0,tuples.clone()).unwrap()).with_tuple_store(tuples.clone());
+    line.restore_review_hold(order).await.unwrap();
+    assert_eq!(line.resolve_review_hold("max-review",&hold.hold_instance_id,foundry_exec::ReviewHoldAction::CommitFail,"human").await.unwrap(),OrderState::Failed);
+    assert!(tuples.latest_promoted(&OrderId("max-review".into()),Attempt(attempt as u64)).unwrap().is_none());
 }
