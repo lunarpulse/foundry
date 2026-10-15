@@ -87,6 +87,7 @@ fn hold_instance(run: u64) -> HoldInstanceId {
         attempt: Attempt(1),
         run: RunId(run),
         hold_node: "approval".into(),
+        entry: 0,
     }
 }
 

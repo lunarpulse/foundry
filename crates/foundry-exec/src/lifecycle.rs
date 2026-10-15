@@ -1,5 +1,5 @@
 use crate::inject::{CrashPoint, FaultInjector};
-use crate::ports::{DispatchHost, IntentLog, OutcomeStore};
+use crate::ports::{AttemptLedger, DispatchHost, IntentLog, OutcomeStore, PortError};
 use crate::types::{ExecutionIntent, ExecutionOutcome, OrderId, Receipt};
 
 /// Run-level lookup key. Durable intent identity additionally includes activation.
@@ -37,6 +37,7 @@ pub enum LifecycleError {
     IntentConflict(u64),
     ActivationPending(u64),
     AwaitResult(u64),
+    AttemptBudget(PortError),
 }
 
 /// Runs only through the storage and host ports; it never owns storage details.
@@ -45,6 +46,7 @@ pub struct Executor<'a, L: IntentLog, H: DispatchHost<Result = DispatchResult>, 
     host: &'a mut H,
     outcomes: &'a mut S,
     faults: FaultInjector,
+    attempt_ledger: Option<&'a dyn AttemptLedger>,
 }
 
 impl<'a, L, H, S> Executor<'a, L, H, S>
@@ -68,12 +70,21 @@ where
             host,
             outcomes,
             faults,
+            attempt_ledger: None,
         }
+    }
+
+    pub fn with_attempt_ledger(mut self, ledger: &'a dyn AttemptLedger) -> Self {
+        self.attempt_ledger = Some(ledger);
+        self
     }
 
     /// Records fresh work before dispatch. Retries of a recorded activation reuse
     /// its binding or recover its result; new activations wait for the prior binding.
     pub fn run(&mut self, intent: ExecutionIntent) -> Result<RunStep, LifecycleError> {
+        if let Some(ledger) = self.attempt_ledger {
+            ledger.consume(&intent.order, intent.attempt).map_err(LifecycleError::AttemptBudget)?;
+        }
         let key = (intent.order.clone(), intent.attempt, intent.run);
         if let Some(recorded) = self.intents.get(&key, intent.activation) {
             // A retry may have a new timestamp, but cannot change the work's identity.
@@ -106,6 +117,17 @@ where
         }
         self.intents.append(&intent);
         self.dispatch_recorded(&key, &intent).map(RunStep::Bound)
+    }
+
+    /// Consumes the order's attempt before any execution work. Ledger
+    /// implementations make repeated calls for the same `(order, attempt)` idempotent.
+    pub fn run_with_attempt_ledger(
+        &mut self,
+        intent: ExecutionIntent,
+        ledger: &dyn AttemptLedger,
+    ) -> Result<RunStep, LifecycleError> {
+        ledger.consume(&intent.order, intent.attempt).map_err(LifecycleError::AttemptBudget)?;
+        self.run(intent)
     }
 
     /// Resolves a previously recorded activation. W1 redispatches; W2 recovers

@@ -1,3 +1,8 @@
+// Drops of executor/host adapters below are intentional: they terminate &mut
+// borrow chains so the underlying worker/ledger can be re-read. Types are
+// non-Drop by design, hence the targeted allow.
+#![allow(clippy::drop_non_drop)]
+
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};

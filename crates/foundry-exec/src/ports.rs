@@ -1,4 +1,42 @@
-use crate::types::{Attempt, ExecutionIntent, ExecutionOutcome, OrderId, RunId};
+use crate::{
+    hold::{HoldApplied, HoldCasOutcome, HoldCommand, HoldInstanceId, HoldState},
+    types::{Attempt, ExecutionIntent, ExecutionOutcome, OrderId, RunId},
+};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PortError {
+    HoldConflict(HoldCasOutcome),
+    EvidenceRequired,
+    AlreadyResolved,
+    MissingHold,
+    AttemptBudgetExhausted { max_attempts: u32 },
+    Store(String),
+}
+
+/// Durable human hold state. Implementations serialize operations per instance.
+/// `apply` must atomically compare the full instance id, bind command evidence,
+/// and persist the transition. It rejects blank approve/reject evidence after
+/// trimming, preserves `human_resolution` verbatim for approve/reject only,
+/// and treats an identical resolved command as idempotent. A different second
+/// resolution fails. Amend changes only a Waiting row's resume destination;
+/// Info returns without changing state. Implementations should persist enough
+/// command identity to distinguish an exact retry from a different command
+/// that happens to produce the same `HoldApplied` value.
+pub trait HoldStore: Send + Sync {
+    /// Records a waiting hold; returns false when it already exists.
+    fn open(&self, instance: &HoldInstanceId, resume_to: &str) -> Result<bool, PortError>;
+    /// Applies one hold operation through the shared compare-and-swap boundary.
+    fn apply(&self, cmd: &HoldCommand, expected: &HoldInstanceId) -> Result<HoldApplied, PortError>;
+    fn get(&self, instance: &HoldInstanceId) -> Result<Option<HoldState>, PortError>;
+}
+
+/// One-time consumption ledger for non-refundable execution attempts.
+/// Implementations enforce their configured `AttemptBudget`, count unique
+/// `(order, attempt)` pairs, and never remove a consumed pair.
+pub trait AttemptLedger: Send + Sync {
+    fn consume(&self, order: &OrderId, attempt: Attempt) -> Result<(), PortError>;
+    fn consumed(&self, order: &OrderId) -> Result<u32, PortError>;
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CounterRecord {

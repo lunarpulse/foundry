@@ -1,3 +1,8 @@
+// Drops of executor/host adapters below are intentional: they terminate &mut
+// borrow chains so the underlying worker/ledger can be re-read. Types are
+// non-Drop by design, hence the targeted allow.
+#![allow(clippy::drop_non_drop)]
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::Utc;
@@ -612,9 +617,8 @@ fn changed_fixture_with_outputs(
     for (name, bytes) in files {
         std::fs::write(dir.0.join(name), bytes).unwrap();
     }
-    std::fs::write(dir.0.join("manifest.toml"), format!("{digest_line}\n{}",
-        std::fs::read_to_string(dir.0.join("manifest.toml")).unwrap(),
-        digest_line = format!("digest = \"{digest}\""))).unwrap();
+    std::fs::write(dir.0.join("manifest.toml"), format!("digest = \"{digest}\"\n{}",
+        std::fs::read_to_string(dir.0.join("manifest.toml")).unwrap())).unwrap();
     let pack = load_pack(&dir.0).unwrap();
     (dir, pack)
 }
@@ -816,8 +820,8 @@ fn review_w3_w4_reopen_both_stores_and_recover_via_receipts() {
             }
         };
         assert_eq!(read_emit(&sink_path).publishes, 1);
-        assert_eq!(read_emit(&sink_path).emits, [receipt.clone()]);
-        assert_eq!(read_emit(&log_path).emits, [receipt.clone()]);
+        assert_eq!(read_emit(&sink_path).emits, vec![receipt.clone()]);
+        assert_eq!(read_emit(&log_path).emits, vec![receipt.clone()]);
         assert_eq!(read_emit(&log_path).completed, [tuple().key()]);
         let mut log = DiskEmitLog(log_path.clone());
         assert!(!complete_after_w4(&mut log, &tuple().key()));

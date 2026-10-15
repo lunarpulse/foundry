@@ -3,7 +3,7 @@ use crate::{
     hold::{HoldCommand, HoldInstanceId, HoldOperation},
     inject::{CrashPoint, FaultInjector},
     lifecycle::{DispatchResult, Executor, LifecycleError, RunStep},
-    ports::{CounterLog, CounterRecord, DispatchHost, IntentLog, OutcomeStore},
+    ports::{AttemptLedger, CounterLog, CounterRecord, DispatchHost, HoldStore, IntentLog, OutcomeStore},
     types::{ArtifactTuple, Attempt, Epoch, ExecutionIntent, Generation, OrderId, RunId},
 };
 use chrono::Utc;
@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, VecDeque};
 pub enum GraphStep {
     Advanced { next: String, effects: Vec<String> },
     HoldRequired(HoldCommand),
+    HoldWaiting { instance: HoldInstanceId },
     Emitted { receipt: crate::types::EmitReceipt },
     Completed,
     Fault(String),
@@ -48,6 +49,8 @@ where
     counters: BTreeMap<String, u64>,
     faults: FaultInjector,
     recovery_error: Option<String>,
+    hold_store: Option<&'a dyn HoldStore>,
+    attempt_ledger: Option<&'a dyn AttemptLedger>,
 }
 
 struct Visit {
@@ -114,7 +117,20 @@ where
             counters: pack.counters().clone(),
             faults: FaultInjector::default(),
             recovery_error: None,
+            hold_store: None,
+            attempt_ledger: None,
         }
+    }
+
+    /// Enables durable hold handling while retaining the legacy constructor API.
+    pub fn with_hold_store(mut self, hold_store: &'a dyn HoldStore) -> Self {
+        self.hold_store = Some(hold_store);
+        self
+    }
+
+    pub fn with_attempt_ledger(mut self, attempt_ledger: &'a dyn AttemptLedger) -> Self {
+        self.attempt_ledger = Some(attempt_ledger);
+        self
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -224,21 +240,75 @@ where
         match node.kind.as_str() {
             "dispatch" => self.dispatch_node(&node),
             "route" => self.route_node(&node),
-            "hold" => GraphStep::HoldRequired(HoldCommand {
-                instance: HoldInstanceId {
-                    order: self.order.clone(),
-                    attempt: self.attempt,
-                    run: self.run,
-                    hold_node: node.id,
-                },
-                op: HoldOperation::Info,
-                human_resolution: None,
-                evidence: "graph hold node".into(),
-            }),
+            "hold" => self.hold_node(&node),
             "redrive" => self.redrive_node(&node),
             "emit" => self.emit_node(&node),
             kind => GraphStep::Fault(format!("unsupported node kind {kind}")),
         }
+    }
+
+    fn hold_node(&mut self, node: &foundry_pack::Node) -> GraphStep {
+        let Some(store) = self.hold_store else {
+            return GraphStep::HoldRequired(HoldCommand {
+                instance: HoldInstanceId {
+                    order: self.order.clone(), attempt: self.attempt, run: self.run,
+                    hold_node: node.id.clone(), entry: self.hold_entry(&node.id),
+                },
+                op: HoldOperation::Info, human_resolution: None, evidence: "graph hold node".into(),
+            });
+        };
+        let resume_to = node.value.get("resume_to").and_then(|value| value.as_str())
+            .or_else(|| node.value.get("resume_targets").and_then(|value| value.as_array())
+                .and_then(|targets| targets.first()).and_then(|target| target.as_str()));
+        let Some(resume_to) = resume_to else {
+            return GraphStep::Fault(format!("hold node {} has no declared resume destination", node.id));
+        };
+        let entry = self.hold_entry(&node.id);
+        let instance = HoldInstanceId {
+            order: self.order.clone(), attempt: self.attempt, run: self.run,
+            hold_node: node.id.clone(), entry,
+        };
+        let visit = match self.prepare_visit(&node.id) {
+            Ok(visit) => visit,
+            Err(error) => return GraphStep::Fault(error),
+        };
+        if let Err(error) = self.start_visit(&node.id, &visit, Some(entry)) {
+            return GraphStep::Fault(error);
+        }
+        if let Err(error) = store.open(&instance, resume_to) {
+            return GraphStep::Fault(format!("hold store open failed: {error:?}"));
+        }
+        let state = match store.get(&instance) {
+            Ok(Some(state)) => state,
+            Ok(None) => return GraphStep::Fault("hold store lost opened instance".into()),
+            Err(error) => return GraphStep::Fault(format!("hold store read failed: {error:?}")),
+        };
+        match state.status {
+            crate::hold::HoldStatus::Waiting => GraphStep::HoldWaiting { instance },
+            crate::hold::HoldStatus::Resolved(_) => {
+                if let Err(error) = self.append_completed(&node.id, Some(state.resume_to.clone())) {
+                    return GraphStep::Fault(error);
+                }
+                GraphStep::Advanced { next: state.resume_to, effects: vec![format!("hold:{}", node.id)] }
+            }
+        }
+    }
+
+    fn hold_entry(&self, node_id: &str) -> u64 {
+        let records = self.counter_log.load(&self.order.0, self.run.0);
+        let mut entries = 0u64;
+        let mut active = false;
+        for record in records {
+            match record {
+                CounterRecord::Started { node_id: started, .. } if started == node_id => {
+                    entries = entries.saturating_add(1);
+                    active = true;
+                }
+                CounterRecord::Completed { node_id: completed, .. } if completed == node_id => active = false,
+                _ => {}
+            }
+        }
+        if active { entries.saturating_sub(1) } else { entries }
     }
 
     fn dispatch_node(&mut self, node: &foundry_pack::Node) -> GraphStep {
@@ -255,6 +325,7 @@ where
         }
         let intent = self.intent(activation, self.external_ref.clone());
         let mut executor = Executor::with_faults(self.intents, self.host, self.outcomes, self.faults);
+        if let Some(ledger) = self.attempt_ledger { executor = executor.with_attempt_ledger(ledger); }
         match executor.run(intent) {
             Ok(RunStep::Bound(outcome)) => {
                 let next = outcome.cursor.or_else(|| outcome.next_activation.map(|next| next.node))
@@ -379,6 +450,7 @@ where
         let payload = node.value.get("payload").and_then(|v| v.as_str()).unwrap_or("");
         let intent = self.intent(activation, format!("redrive:{}:{payload}", node.id));
         let mut executor = Executor::with_faults(self.intents, self.host, self.outcomes, self.faults);
+        if let Some(ledger) = self.attempt_ledger { executor = executor.with_attempt_ledger(ledger); }
         match executor.run(intent) {
             Ok(RunStep::Bound(outcome)) => {
                 let next = outcome.cursor.or_else(|| outcome.next_activation.map(|next| next.node))

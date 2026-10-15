@@ -1,9 +1,13 @@
-use std::collections::{HashMap, HashSet};
+// Drops of executor below are intentional: they terminate &mut borrow chains
+// so the underlying stores can be re-read. Types are non-Drop by design.
+#![allow(clippy::drop_non_drop)]
+
+use std::{collections::{HashMap, HashSet}, sync::Mutex};
 
 use chrono::{TimeZone, Utc};
 use foundry_exec::inject::{CrashPoint, FaultInjector};
 use foundry_exec::lifecycle::{DispatchResult, Executor, ResumeAction, RunStep};
-use foundry_exec::ports::{DispatchHost, IntentLog, OutcomeStore};
+use foundry_exec::ports::{AttemptLedger, DispatchHost, IntentLog, OutcomeStore, PortError};
 use foundry_exec::types::{
     Attempt, Epoch, ExecutionIntent, ExecutionOutcome, Generation, OrderId, RunId,
 };
@@ -126,6 +130,39 @@ fn intent(activation: u64) -> ExecutionIntent {
         external_ref: "external-1".into(),
         recorded_at: Utc.with_ymd_and_hms(2026, 10, 15, 0, 0, 0).unwrap(),
     }
+}
+
+struct LimitedAttempts { max: u32, rows: Mutex<HashSet<(OrderId, Attempt)>> }
+impl AttemptLedger for LimitedAttempts {
+    fn consume(&self, order: &OrderId, attempt: Attempt) -> Result<(), PortError> {
+        let mut rows = self.rows.lock().unwrap();
+        if rows.contains(&(order.clone(), attempt)) { return Ok(()); }
+        if rows.iter().filter(|(seen, _)| seen == order).count() >= self.max as usize {
+            return Err(PortError::AttemptBudgetExhausted { max_attempts: self.max });
+        }
+        rows.insert((order.clone(), attempt));
+        Ok(())
+    }
+    fn consumed(&self, order: &OrderId) -> Result<u32, PortError> {
+        Ok(self.rows.lock().unwrap().iter().filter(|(seen, _)| seen == order).count() as u32)
+    }
+}
+
+#[test]
+fn executor_consumes_attempt_before_dispatch_and_keeps_it_after_success() {
+    let ledger = LimitedAttempts { max: 1, rows: Mutex::new(HashSet::new()) };
+    let mut intents = MemoryIntentLog::default(); let mut host = FakeHost::default();
+    let mut outcomes = MemoryOutcomeStore::default();
+    let mut executor = Executor::new(&mut intents, &mut host, &mut outcomes).with_attempt_ledger(&ledger);
+    assert!(matches!(executor.run(intent(0)), Ok(RunStep::Bound(_))));
+    assert_eq!(ledger.consumed(&OrderId("order-1".into())).unwrap(), 1);
+    let mut next_attempt = intent(1);
+    next_attempt.attempt = Attempt(2);
+    next_attempt.run = RunId(3);
+    assert_eq!(executor.run(next_attempt).unwrap_err(), foundry_exec::lifecycle::LifecycleError::AttemptBudget(
+        PortError::AttemptBudgetExhausted { max_attempts: 1 }));
+    assert_eq!(executor.dispatch_count(), 1);
+    assert_eq!(ledger.consumed(&OrderId("order-1".into())).unwrap(), 1);
 }
 
 fn key() -> Key {

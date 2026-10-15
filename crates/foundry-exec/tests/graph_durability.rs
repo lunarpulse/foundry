@@ -2,12 +2,15 @@ use std::{
     fs::{self, File},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
+    sync::Mutex,
 };
 
 use foundry_exec::{
     graph::{GraphDriver, GraphStep},
     ports::{CounterLog, CounterRecord, DispatchHost, IntentLog, OutcomeStore},
     types::{Attempt, ExecutionIntent, ExecutionOutcome, Generation, OrderId, RunId},
+    hold::{apply_hold, HoldApplied, HoldCommand, HoldInstanceId, HoldState, HoldStatus},
+    ports::{HoldStore, PortError},
     DispatchResult, Epoch,
 };
 use foundry_pack::{load_pack, PackSnapshot};
@@ -146,6 +149,42 @@ fn route_pack(dir: &TestDir) -> PackSnapshot {
     pack_with_policy(dir, policy)
 }
 
+fn hold_route_pack(dir: &TestDir) -> PackSnapshot {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills/fixture-min/v1");
+    let policy = fs::read_to_string(source.join("policy.toml")).unwrap()
+        .replace("when = \"true\"\ndo = \"emit(InspectionPassed, summary)\"",
+            "when = \"true\"\ndo = \"bump(turns)\"\ngoto = \"end_hold\"")
+        .replace("resume_targets = []", "resume_targets = [\"after_hold\"]")
+        + "\n[counters]\nturns = 0\n\n[[nodes]]\nid = \"after_hold\"\nkind = \"emit\"\nevent = \"InspectionPassed\"\npayload_from = \"summary\"\n";
+    pack_with_policy(dir, policy)
+}
+
+#[derive(Default)]
+struct Holds(Mutex<std::collections::BTreeMap<String, HoldState>>);
+fn hold_key(instance: &HoldInstanceId) -> String {
+    format!("{}:{}:{}:{}:{}", instance.order.0, instance.attempt.0, instance.run.0, instance.hold_node, instance.entry)
+}
+impl HoldStore for Holds {
+    fn open(&self, instance: &HoldInstanceId, resume_to: &str) -> Result<bool, PortError> {
+        let mut states = self.0.lock().unwrap();
+        if states.contains_key(&hold_key(instance)) { return Ok(false); }
+        states.insert(hold_key(instance), HoldState { instance: instance.clone(), resume_to: resume_to.into(), status: HoldStatus::Waiting });
+        Ok(true)
+    }
+    fn apply(&self, cmd: &HoldCommand, expected: &HoldInstanceId) -> Result<HoldApplied, PortError> {
+        let mut states = self.0.lock().unwrap();
+        let key = hold_key(expected);
+        let state = states.get(&key).cloned().ok_or(PortError::MissingHold)?;
+        let applied = apply_hold(&state, cmd, expected)?;
+        if let HoldApplied::Amended { resume_to } = &applied { states.get_mut(&key).unwrap().resume_to = resume_to.clone(); }
+        else if !matches!(applied, HoldApplied::Info) { states.get_mut(&key).unwrap().status = HoldStatus::Resolved(applied.clone()); }
+        Ok(applied)
+    }
+    fn get(&self, instance: &HoldInstanceId) -> Result<Option<HoldState>, PortError> {
+        Ok(self.0.lock().unwrap().get(&hold_key(instance)).cloned())
+    }
+}
+
 fn pack_with_policy(dir: &TestDir, policy: String) -> PackSnapshot {
     use sha2::{Digest, Sha256};
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills/fixture-min/v1");
@@ -173,6 +212,7 @@ fn pack_with_policy(dir: &TestDir, policy: String) -> PackSnapshot {
     load_pack(&dir.0).unwrap()
 }
 
+#[allow(clippy::too_many_arguments)] // test helper wiring the graph driver rig
 fn graph<'a>(
     pack: &'a PackSnapshot, intents: &'a mut Intents, host: &'a mut Host,
     outcomes: &'a mut Outcomes, counters: &'a mut DiskCounterLog, sink: &'a mut Sink,
@@ -333,6 +373,42 @@ fn completed_route_restores_to_next_node_without_rebumping() {
     assert!(matches!(restored.start(), GraphStep::HoldRequired(_)));
     assert_eq!(restored.counters()["turns"], 1);
     assert_eq!(counter.load("durable-order", 23).iter().filter(|r| matches!(r, CounterRecord::Bump { .. })).count(), 1);
+}
+
+#[test]
+fn durable_hold_waits_then_resumes_only_to_registered_destination_after_restart() {
+    let dir = TestDir::new(); let pack = hold_route_pack(&dir); let counter_path = dir.0.join("hold-counters.json");
+    let holds = Holds::default();
+    let mut intents = Intents::default(); let mut host = Host; let mut outcomes = Outcomes::default();
+    let mut sink = Sink; let mut emits = Emits;
+    let hold_instance;
+    {
+        let mut counter = DiskCounterLog(counter_path.clone());
+        let mut driver = graph(&pack, &mut intents, &mut host, &mut outcomes, &mut counter, &mut sink, &mut emits, 45)
+            .with_hold_store(&holds);
+        let GraphStep::HoldWaiting { instance } = driver.advance("end_hold") else { panic!("hold must wait") };
+        hold_instance = instance;
+    }
+    let waiting = holds.get(&hold_instance).unwrap().unwrap();
+    assert_eq!(waiting.status, HoldStatus::Waiting);
+    assert_eq!(waiting.resume_to, "after_hold");
+    let cmd = HoldCommand { instance: hold_instance.clone(), op: foundry_exec::HoldOperation::Approve,
+        human_resolution: Some("review-42".into()), evidence: "approved by reviewer".into() };
+    assert_eq!(holds.apply(&cmd, &hold_instance).unwrap(), HoldApplied::Approved);
+
+    let mut counter = DiskCounterLog(counter_path);
+    let mut intents = Intents::default(); let mut host = Host; let mut outcomes = Outcomes::default();
+    let mut sink = Sink; let mut emits = Emits;
+    let mut restored = GraphDriver::restore(&pack, &mut intents, &mut host, &mut outcomes, &mut counter,
+        &mut sink, &mut emits, OrderId("durable-order".into()), Attempt(1), RunId(45), Generation(1), Epoch(0), "test", None)
+        .with_hold_store(&holds);
+    assert!(matches!(restored.start(), GraphStep::Advanced { next, .. } if next == "after_hold"));
+    // A second visit to the same hold node in the same run has a separate durable identity.
+    assert!(matches!(restored.advance("done"), GraphStep::Advanced { next, .. } if next == "end_hold"));
+    let GraphStep::HoldWaiting { instance: second } = restored.advance("end_hold") else { panic!("second hold must wait") };
+    assert_eq!(second.hold_node, hold_instance.hold_node);
+    assert_eq!(second.entry, hold_instance.entry + 1);
+    assert_eq!(holds.get(&second).unwrap().unwrap().status, HoldStatus::Waiting);
 }
 
 #[test]
