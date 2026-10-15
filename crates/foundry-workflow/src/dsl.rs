@@ -555,7 +555,8 @@ mod tests {
         let enc = EmbeddedWorkflow::frozen_v1();
         let doc = sample_doc();
         // 동결된 골든 리터럴 (실측 기록 — 코드 재계산 아님)
-        const GOLDEN_V1_ROOT: &str = "wf-root-98ac4ebfbc09873beee244a05dab30ddacbe532532a0702baf5e79cd6e659a74";
+        // T33 ADDENDUM 24/29/31: intentional pin update after embedded edge additions.
+        const GOLDEN_V1_ROOT: &str = "wf-root-58023c9e74af689335440e3b3069b6d8bf3a18ec446ff581b6dce8a4df488afb";
         const GOLDEN_PLAN_LEN: usize = 3;
         const GOLDEN_FIRST_STEP_EVENT: &str = "Queued";
         const GOLDEN_DEFAULT_ROUTE: &str = "order-pipeline";
@@ -643,11 +644,12 @@ mod t29b_tests {
             }),
             review_pack: Some(ReviewPackRef { pack_digest: "pack-abc".into() }),
         };
-        // v3 pin — 2026-10-14 변경 전 실측 (review_pack 주입에도 불변:
+        // v3 pin — T33 ADDENDUM 24/29/31 내장 엣지 추가로 인한 의도적 갱신
+        // (review_pack 주입에도 불변:
         // 리프 6은 schema_version 4 미만에서는 root에 기여하지 않음).
         assert_eq!(
             merkle_root(&d3),
-            "wf-root-a4ca6a0ed2bb5aebc0053f4a427df33aa935caae9ab9ad775ff0514df291370c"
+            "wf-root-cf0ef4a3e8df3d00f8f36c1a6cb9be3421eda12cc28e2a7525230826e37541ea"
         );
         let mut d1 = d3;
         d1.schema_version = 1;
@@ -655,7 +657,8 @@ mod t29b_tests {
         d1.policy_digest = "pol-001".into();
         assert_eq!(
             merkle_root(&d1),
-            "wf-root-021216ffc0463106ad94353bf3f91d60e9df23a5e897e2bf8f47a08ec39d800a"
+            // T33 ADDENDUM 24/29/31 내장 엣지 추가로 인한 의도적 갱신.
+            "wf-root-08f12ea36c2f31fb9333dc5ff0a7f68e3cf591780a8c0a79e66103168900447b"
         );
     }
 
