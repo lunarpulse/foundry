@@ -1,4 +1,6 @@
 //! Methodology-neutral loader and validator for Foundry review packs.
+mod executor;
+pub use executor::{EngineAction, EngineState, GraphEngine, HoldEntry, RunInput, StepOutcome};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{

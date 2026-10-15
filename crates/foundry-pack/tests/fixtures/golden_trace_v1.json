@@ -1,0 +1,584 @@
+{
+ "bad_plan_iterated": {
+  "destinations": [
+   "lenses",
+   "replan",
+   "lenses",
+   "replan",
+   "lenses",
+   "replan",
+   "lenses",
+   "replan",
+   "lenses",
+   "replan",
+   "lenses",
+   "hold:human"
+  ],
+  "final_counters": {
+   "fix_rounds": 0,
+   "loopbacks": 6
+  }
+ },
+ "first_decision_60": [
+  {
+   "expected_first": "fixdie",
+   "fix_rounds": 2,
+   "loopbacks": 4,
+   "verdicts": [
+    "patch"
+   ]
+  },
+  {
+   "expected_first": "fixdie",
+   "fix_rounds": 2,
+   "loopbacks": 5,
+   "verdicts": [
+    "patch"
+   ]
+  },
+  {
+   "expected_first": "human",
+   "fix_rounds": 3,
+   "loopbacks": 4,
+   "verdicts": [
+    "patch"
+   ]
+  },
+  {
+   "expected_first": "human",
+   "fix_rounds": 3,
+   "loopbacks": 5,
+   "verdicts": [
+    "patch"
+   ]
+  },
+  {
+   "expected_first": "human_gap",
+   "fix_rounds": 2,
+   "loopbacks": 4,
+   "verdicts": [
+    "intent_gap"
+   ]
+  },
+  {
+   "expected_first": "human",
+   "fix_rounds": 2,
+   "loopbacks": 5,
+   "verdicts": [
+    "intent_gap"
+   ]
+  },
+  {
+   "expected_first": "human_gap",
+   "fix_rounds": 3,
+   "loopbacks": 4,
+   "verdicts": [
+    "intent_gap"
+   ]
+  },
+  {
+   "expected_first": "human",
+   "fix_rounds": 3,
+   "loopbacks": 5,
+   "verdicts": [
+    "intent_gap"
+   ]
+  },
+  {
+   "expected_first": "replan",
+   "fix_rounds": 2,
+   "loopbacks": 4,
+   "verdicts": [
+    "bad_plan"
+   ]
+  },
+  {
+   "expected_first": "human",
+   "fix_rounds": 2,
+   "loopbacks": 5,
+   "verdicts": [
+    "bad_plan"
+   ]
+  },
+  {
+   "expected_first": "replan",
+   "fix_rounds": 3,
+   "loopbacks": 4,
+   "verdicts": [
+    "bad_plan"
+   ]
+  },
+  {
+   "expected_first": "human",
+   "fix_rounds": 3,
+   "loopbacks": 5,
+   "verdicts": [
+    "bad_plan"
+   ]
+  },
+  {
+   "expected_first": "pass",
+   "fix_rounds": 2,
+   "loopbacks": 4,
+   "verdicts": [
+    "defer"
+   ]
+  },
+  {
+   "expected_first": "pass",
+   "fix_rounds": 2,
+   "loopbacks": 5,
+   "verdicts": [
+    "defer"
+   ]
+  },
+  {
+   "expected_first": "pass",
+   "fix_rounds": 3,
+   "loopbacks": 4,
+   "verdicts": [
+    "defer"
+   ]
+  },
+  {
+   "expected_first": "pass",
+   "fix_rounds": 3,
+   "loopbacks": 5,
+   "verdicts": [
+    "defer"
+   ]
+  },
+  {
+   "expected_first": "human_gap",
+   "fix_rounds": 2,
+   "loopbacks": 4,
+   "verdicts": [
+    "patch",
+    "intent_gap"
+   ]
+  },
+  {
+   "expected_first": "human",
+   "fix_rounds": 2,
+   "loopbacks": 5,
+   "verdicts": [
+    "patch",
+    "intent_gap"
+   ]
+  },
+  {
+   "expected_first": "human_gap",
+   "fix_rounds": 3,
+   "loopbacks": 4,
+   "verdicts": [
+    "patch",
+    "intent_gap"
+   ]
+  },
+  {
+   "expected_first": "human",
+   "fix_rounds": 3,
+   "loopbacks": 5,
+   "verdicts": [
+    "patch",
+    "intent_gap"
+   ]
+  },
+  {
+   "expected_first": "replan",
+   "fix_rounds": 2,
+   "loopbacks": 4,
+   "verdicts": [
+    "patch",
+    "bad_plan"
+   ]
+  },
+  {
+   "expected_first": "human",
+   "fix_rounds": 2,
+   "loopbacks": 5,
+   "verdicts": [
+    "patch",
+    "bad_plan"
+   ]
+  },
+  {
+   "expected_first": "replan",
+   "fix_rounds": 3,
+   "loopbacks": 4,
+   "verdicts": [
+    "patch",
+    "bad_plan"
+   ]
+  },
+  {
+   "expected_first": "human",
+   "fix_rounds": 3,
+   "loopbacks": 5,
+   "verdicts": [
+    "patch",
+    "bad_plan"
+   ]
+  },
+  {
+   "expected_first": "fixdie",
+   "fix_rounds": 2,
+   "loopbacks": 4,
+   "verdicts": [
+    "patch",
+    "defer"
+   ]
+  },
+  {
+   "expected_first": "fixdie",
+   "fix_rounds": 2,
+   "loopbacks": 5,
+   "verdicts": [
+    "patch",
+    "defer"
+   ]
+  },
+  {
+   "expected_first": "human",
+   "fix_rounds": 3,
+   "loopbacks": 4,
+   "verdicts": [
+    "patch",
+    "defer"
+   ]
+  },
+  {
+   "expected_first": "human",
+   "fix_rounds": 3,
+   "loopbacks": 5,
+   "verdicts": [
+    "patch",
+    "defer"
+   ]
+  },
+  {
+   "expected_first": "human_gap",
+   "fix_rounds": 2,
+   "loopbacks": 4,
+   "verdicts": [
+    "intent_gap",
+    "bad_plan"
+   ]
+  },
+  {
+   "expected_first": "human",
+   "fix_rounds": 2,
+   "loopbacks": 5,
+   "verdicts": [
+    "intent_gap",
+    "bad_plan"
+   ]
+  },
+  {
+   "expected_first": "human_gap",
+   "fix_rounds": 3,
+   "loopbacks": 4,
+   "verdicts": [
+    "intent_gap",
+    "bad_plan"
+   ]
+  },
+  {
+   "expected_first": "human",
+   "fix_rounds": 3,
+   "loopbacks": 5,
+   "verdicts": [
+    "intent_gap",
+    "bad_plan"
+   ]
+  },
+  {
+   "expected_first": "human_gap",
+   "fix_rounds": 2,
+   "loopbacks": 4,
+   "verdicts": [
+    "intent_gap",
+    "defer"
+   ]
+  },
+  {
+   "expected_first": "human",
+   "fix_rounds": 2,
+   "loopbacks": 5,
+   "verdicts": [
+    "intent_gap",
+    "defer"
+   ]
+  },
+  {
+   "expected_first": "human_gap",
+   "fix_rounds": 3,
+   "loopbacks": 4,
+   "verdicts": [
+    "intent_gap",
+    "defer"
+   ]
+  },
+  {
+   "expected_first": "human",
+   "fix_rounds": 3,
+   "loopbacks": 5,
+   "verdicts": [
+    "intent_gap",
+    "defer"
+   ]
+  },
+  {
+   "expected_first": "replan",
+   "fix_rounds": 2,
+   "loopbacks": 4,
+   "verdicts": [
+    "bad_plan",
+    "defer"
+   ]
+  },
+  {
+   "expected_first": "human",
+   "fix_rounds": 2,
+   "loopbacks": 5,
+   "verdicts": [
+    "bad_plan",
+    "defer"
+   ]
+  },
+  {
+   "expected_first": "replan",
+   "fix_rounds": 3,
+   "loopbacks": 4,
+   "verdicts": [
+    "bad_plan",
+    "defer"
+   ]
+  },
+  {
+   "expected_first": "human",
+   "fix_rounds": 3,
+   "loopbacks": 5,
+   "verdicts": [
+    "bad_plan",
+    "defer"
+   ]
+  },
+  {
+   "expected_first": "human_gap",
+   "fix_rounds": 2,
+   "loopbacks": 4,
+   "verdicts": [
+    "patch",
+    "intent_gap",
+    "bad_plan"
+   ]
+  },
+  {
+   "expected_first": "human",
+   "fix_rounds": 2,
+   "loopbacks": 5,
+   "verdicts": [
+    "patch",
+    "intent_gap",
+    "bad_plan"
+   ]
+  },
+  {
+   "expected_first": "human_gap",
+   "fix_rounds": 3,
+   "loopbacks": 4,
+   "verdicts": [
+    "patch",
+    "intent_gap",
+    "bad_plan"
+   ]
+  },
+  {
+   "expected_first": "human",
+   "fix_rounds": 3,
+   "loopbacks": 5,
+   "verdicts": [
+    "patch",
+    "intent_gap",
+    "bad_plan"
+   ]
+  },
+  {
+   "expected_first": "human_gap",
+   "fix_rounds": 2,
+   "loopbacks": 4,
+   "verdicts": [
+    "patch",
+    "intent_gap",
+    "defer"
+   ]
+  },
+  {
+   "expected_first": "human",
+   "fix_rounds": 2,
+   "loopbacks": 5,
+   "verdicts": [
+    "patch",
+    "intent_gap",
+    "defer"
+   ]
+  },
+  {
+   "expected_first": "human_gap",
+   "fix_rounds": 3,
+   "loopbacks": 4,
+   "verdicts": [
+    "patch",
+    "intent_gap",
+    "defer"
+   ]
+  },
+  {
+   "expected_first": "human",
+   "fix_rounds": 3,
+   "loopbacks": 5,
+   "verdicts": [
+    "patch",
+    "intent_gap",
+    "defer"
+   ]
+  },
+  {
+   "expected_first": "replan",
+   "fix_rounds": 2,
+   "loopbacks": 4,
+   "verdicts": [
+    "patch",
+    "bad_plan",
+    "defer"
+   ]
+  },
+  {
+   "expected_first": "human",
+   "fix_rounds": 2,
+   "loopbacks": 5,
+   "verdicts": [
+    "patch",
+    "bad_plan",
+    "defer"
+   ]
+  },
+  {
+   "expected_first": "replan",
+   "fix_rounds": 3,
+   "loopbacks": 4,
+   "verdicts": [
+    "patch",
+    "bad_plan",
+    "defer"
+   ]
+  },
+  {
+   "expected_first": "human",
+   "fix_rounds": 3,
+   "loopbacks": 5,
+   "verdicts": [
+    "patch",
+    "bad_plan",
+    "defer"
+   ]
+  },
+  {
+   "expected_first": "human_gap",
+   "fix_rounds": 2,
+   "loopbacks": 4,
+   "verdicts": [
+    "intent_gap",
+    "bad_plan",
+    "defer"
+   ]
+  },
+  {
+   "expected_first": "human",
+   "fix_rounds": 2,
+   "loopbacks": 5,
+   "verdicts": [
+    "intent_gap",
+    "bad_plan",
+    "defer"
+   ]
+  },
+  {
+   "expected_first": "human_gap",
+   "fix_rounds": 3,
+   "loopbacks": 4,
+   "verdicts": [
+    "intent_gap",
+    "bad_plan",
+    "defer"
+   ]
+  },
+  {
+   "expected_first": "human",
+   "fix_rounds": 3,
+   "loopbacks": 5,
+   "verdicts": [
+    "intent_gap",
+    "bad_plan",
+    "defer"
+   ]
+  },
+  {
+   "expected_first": "human_gap",
+   "fix_rounds": 2,
+   "loopbacks": 4,
+   "verdicts": [
+    "patch",
+    "intent_gap",
+    "bad_plan",
+    "defer"
+   ]
+  },
+  {
+   "expected_first": "human",
+   "fix_rounds": 2,
+   "loopbacks": 5,
+   "verdicts": [
+    "patch",
+    "intent_gap",
+    "bad_plan",
+    "defer"
+   ]
+  },
+  {
+   "expected_first": "human_gap",
+   "fix_rounds": 3,
+   "loopbacks": 4,
+   "verdicts": [
+    "patch",
+    "intent_gap",
+    "bad_plan",
+    "defer"
+   ]
+  },
+  {
+   "expected_first": "human",
+   "fix_rounds": 3,
+   "loopbacks": 5,
+   "verdicts": [
+    "patch",
+    "intent_gap",
+    "bad_plan",
+    "defer"
+   ]
+  }
+ ],
+ "intent_gap_iterated": {
+  "destinations": [
+   "lenses",
+   "hold:human_gap"
+  ],
+  "hold_entry_counters": {
+   "fix_rounds": 0,
+   "loopbacks": 1
+  },
+  "reverted_base": "origin"
+ },
+ "pack_digest_expected": "e925fd014d367c4c7f3d83fe92d03cd4bc4d3b7cbc1ecdf0d4e77320acab1db8"
+}
