@@ -92,6 +92,15 @@ where
     L: EmitLog + Send,
 {
     fn run(&mut self, req: ReviewRunRequest) -> Result<ReviewEvidence, ReviewRunError> {
+        if let Some(tuple) = self.tuples.latest_promoted(&req.order, req.attempt)
+            .map_err(ReviewRunError::Tuple)?
+            .filter(|tuple| tuple.immutable_commit.0 == req.artifact_digest)
+        {
+            let key = tuple.key();
+            if let Some(receipt) = self.log.emit_of(&key) {
+                return Ok(ReviewEvidence { emit_receipt: receipt, tuple_key: key, verdict: ReviewVerdict::Passed });
+            }
+        }
         let intent = ExecutionIntent {
             order: req.order.clone(), attempt: req.attempt, run: req.run,
             activation: req.activation, generation: Generation(0), epoch: req.epoch,

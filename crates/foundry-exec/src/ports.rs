@@ -70,6 +70,9 @@ pub trait TupleStore: Send + Sync {
     fn record(&self, tuple: &ArtifactTuple) -> Result<Recorded, PortError>;
     /// Greatest (run, generation) in this order/attempt, or proven absence.
     fn latest(&self, order: &OrderId, attempt: Attempt) -> Result<Option<ArtifactTuple>, PortError>;
+    /// Greatest tuple whose emit receipt has been durably promoted (S6).
+    /// Record-only tuples are never eligible for consumption.
+    fn latest_promoted(&self, order: &OrderId, attempt: Attempt) -> Result<Option<ArtifactTuple>, PortError>;
     /// Requires a recorded tuple and a matching receipt from the emit owner.
     /// Missing tuple or mismatched key returns MissingEmitReceipt. Exact receipt
     /// retries are idempotent; a different receipt is Permanent, without writes.

@@ -52,15 +52,6 @@ pub async fn approve(
     Path(id): Path<String>,
     body: Option<Json<ApproveBody>>,
 ) -> impl IntoResponse {
-    let tuple_path = std::env::var("FOUNDRY_TUPLES").unwrap_or_else(|_| "~/.foundry/tuples.db".into());
-    let tuple_path = if let Some(rest) = tuple_path.strip_prefix("~/") {
-        std::env::var("HOME").map(std::path::PathBuf::from).unwrap_or_default().join(rest)
-    } else { tuple_path.into() };
-    let tuples = match SqliteTupleStore::open(&tuple_path) {
-        Ok(store) => Arc::new(store),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"tuple store unavailable","detail":format!("{e:?}")}))).into_response(),
-    };
-    st.line.set_tuple_store(tuples.clone());
     let intent = match body {
         Some(Json(b)) if !b.intent.trim().is_empty() => b.intent,
         _ => {
@@ -103,6 +94,19 @@ pub async fn approve(
                 .into_response();
         }
     }
+
+    let tuple_path = std::env::var("FOUNDRY_TUPLES").unwrap_or_else(|_| "~/.foundry/tuples.db".into());
+    let tuple_path = if let Some(rest) = tuple_path.strip_prefix("~/") {
+        match std::env::var_os("HOME") {
+            Some(home) => std::path::PathBuf::from(home).join(rest),
+            None => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"tuple store home unavailable"}))).into_response(),
+        }
+    } else { tuple_path.into() };
+    let tuples = match SqliteTupleStore::open(&tuple_path) {
+        Ok(store) => Arc::new(store),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"tuple store unavailable","detail":format!("{e:?}")}))).into_response(),
+    };
+    st.line.set_tuple_store(tuples.clone());
 
     // rehydrate if needed (defect #7 recovery)
     if st.line.get(&id).await.is_none() {

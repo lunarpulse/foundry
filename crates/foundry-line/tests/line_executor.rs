@@ -131,6 +131,10 @@ impl TupleStore for MemTuples {
         Ok(self.0.lock().unwrap().iter().filter(|(t, _)| &t.order == order && t.attempt == attempt)
             .max_by_key(|(t, _)| (t.run, t.generation)).map(|(t, _)| t.clone()))
     }
+    fn latest_promoted(&self, order: &OrderId, attempt: Attempt) -> Result<Option<ArtifactTuple>, ExecError> {
+        Ok(self.0.lock().unwrap().iter().filter(|(t, receipt)| &t.order == order && t.attempt == attempt && receipt.is_some())
+            .max_by_key(|(t, _)| (t.run, t.generation)).map(|(t, _)| t.clone()))
+    }
     fn promote(&self, key: &ArtifactTupleKey, receipt: &EmitReceipt) -> Result<(), ExecError> {
         let mut rows = self.0.lock().unwrap();
         let (_, slot) = rows.iter_mut().find(|(t, _)| t.key() == *key).ok_or(ExecError::MissingEmitReceipt)?;
@@ -436,4 +440,80 @@ async fn t19_real_diff_still_reaches_hold() {
     line.acquire_lease("watch").await.unwrap();
     let end = line.drive("o-ok1").await.unwrap();
     assert_eq!(end, OrderState::FurnaceHold);
+}
+
+
+#[tokio::test]
+async fn completed_die_reuses_latest_matching_tuple_without_a_runner() {
+    let tuples = Arc::new(MemTuples::default());
+    let tuple = ArtifactTuple {
+        order: OrderId("review-existing".into()), attempt: Attempt(1),
+        run: foundry_exec::RunId(7), generation: Generation(0),
+        immutable_commit: ImmutableCommit("die-1".into()),
+        artifact_location: ArtifactLocation("existing-review.log".into()),
+    };
+    tuples.record(&tuple).unwrap();
+    tuples.promote(&tuple.key(), &EmitReceipt { key: tuple.key(), event: "publish".into(), at: chrono::Utc::now() }).unwrap();
+    let line = mk_unreviewed_line().with_tuple_store(tuples);
+    line.submit(order("review-existing")).await;
+    assert_eq!(line.drive("review-existing").await.unwrap(), OrderState::FurnaceHold);
+    assert_eq!(line.ledger.lock().await.rows.lock().unwrap().iter()
+        .filter(|(_, ev, _, _)| matches!(ev, OrderEvent::InspectionPassed)).count(), 1);
+    assert_eq!(line.drive("review-existing").await.unwrap(), OrderState::FurnaceHold);
+}
+
+#[tokio::test]
+async fn latest_mismatch_blocks_reentry_approval_and_publish() {
+    let tuples = Arc::new(MemTuples::default());
+    for (run, digest) in [(1, "digest"), (2, "other")] {
+        tuples.record(&ArtifactTuple {
+            order: OrderId("latest-mismatch".into()), attempt: Attempt(1),
+            run: foundry_exec::RunId(run), generation: Generation(0),
+            immutable_commit: ImmutableCommit(digest.into()), artifact_location: ArtifactLocation("review.log".into()),
+        }).unwrap();
+    }
+    let line = mk_unreviewed_line().with_tuple_store(tuples);
+    let mut o = order("latest-mismatch");
+    o.artifact_digest = Some("digest".into());
+    line.submit(o).await;
+    for ev in [OrderEvent::Queued, OrderEvent::DieStarted, OrderEvent::DieSucceeded { attempt: 1 }] {
+        line.commit_for_test("latest-mismatch", &ev, OrderState::Received, OrderState::Inspecting, &sys()).await.unwrap();
+    }
+    assert_eq!(line.drive("latest-mismatch").await.unwrap(), OrderState::Inspecting);
+    line.commit_for_test("latest-mismatch", &OrderEvent::InspectionPassed, OrderState::Inspecting, OrderState::FurnaceHold, &sys()).await.unwrap();
+    let token = ApprovalToken { order_id: "latest-mismatch".into(), intent: "go".into(), artifact_digest: "digest".into(), actor: actor(), granted_at: chrono::Utc::now() };
+    assert!(line.approve("latest-mismatch", &token, "go", &actor()).await.is_err());
+    line.commit_for_test("latest-mismatch", &OrderEvent::Approved { intent: "go".into(), artifact_digest: "digest".into() }, OrderState::FurnaceHold, OrderState::Publishing, &actor()).await.unwrap();
+    assert!(line.publish("latest-mismatch", &actor()).await.is_err());
+    assert!(line.publisher.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn noop_taxonomy_needs_no_review_runner_or_tuple_reader() {
+    let mut line = mk_unreviewed_line();
+    line.harness = Arc::new(FakeHarness::noop_success());
+    line.submit(order("noop-required-unreviewed")).await;
+    assert_eq!(line.drive("noop-required-unreviewed").await.unwrap(), OrderState::Failed);
+    assert!(!line.ledger.lock().await.rows.lock().unwrap().iter().any(|(_, ev, _, _)| matches!(ev, OrderEvent::InspectionPassed)));
+}
+
+#[tokio::test]
+async fn inspecting_reentry_reuses_matching_tuple_and_commits_once() {
+    let tuples = Arc::new(MemTuples::default());
+    let tuple = ArtifactTuple {
+        order: OrderId("review-resume".into()), attempt: Attempt(1), run: foundry_exec::RunId(9), generation: Generation(0),
+        immutable_commit: ImmutableCommit("digest".into()), artifact_location: ArtifactLocation("review.log".into()),
+    };
+    tuples.record(&tuple).unwrap();
+    tuples.promote(&tuple.key(), &EmitReceipt { key: tuple.key(), event: "publish".into(), at: chrono::Utc::now() }).unwrap();
+    let line = mk_unreviewed_line().with_tuple_store(tuples);
+    let mut o = order("review-resume");
+    o.artifact_digest = Some("digest".into());
+    line.submit(o).await;
+    for ev in [OrderEvent::Queued, OrderEvent::DieStarted, OrderEvent::DieSucceeded { attempt: 1 }] {
+        line.commit_for_test("review-resume", &ev, OrderState::Received, OrderState::Inspecting, &sys()).await.unwrap();
+    }
+    for _ in 0..2 { assert_eq!(line.drive("review-resume").await.unwrap(), OrderState::FurnaceHold); }
+    assert_eq!(line.ledger.lock().await.rows.lock().unwrap().iter().filter(|(_, ev, _, _)| matches!(ev, OrderEvent::InspectionPassed)).count(), 1);
+    assert!(line.harness.calls().is_empty());
 }

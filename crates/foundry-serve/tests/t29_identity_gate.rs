@@ -250,3 +250,26 @@ async fn legacy_actor_cannot_authenticate() {
     };
     assert!(ok, "legacy actor tokens never authenticate");
 }
+
+
+#[tokio::test(flavor = "multi_thread")]
+async fn identity_errors_precede_tuple_store_failure() {
+    let _tuple_env = APPROVAL_TUPLE_ENV.lock().await;
+    let store = approval_tuple_store("unavailable");
+    drop(store);
+    let valid_path = std::env::var_os("FOUNDRY_TUPLES").unwrap();
+    // A directory is deterministically not an openable SQLite database.
+    let invalid_path = PathBuf::from(&valid_path).parent().unwrap().to_path_buf();
+    unsafe { std::env::set_var("FOUNDRY_TUPLES", &invalid_path) };
+    let st = setup_with_users("unavailable").await;
+    let app = || Router::new().merge(foundry_serve::http::router(st.clone()));
+    assert_eq!(req(app(), None, "go").await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(req(app(), Some("invalid-session"), "go").await.0, StatusCode::UNAUTHORIZED);
+    let observer = login(&st, "obs").await;
+    assert_eq!(req(app(), Some(&observer), "go").await.0, StatusCode::FORBIDDEN);
+    let owner = login(&st, "root").await;
+    assert_eq!(req(app(), Some(&owner), "go").await.0, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(st.line.get("o-29").await.unwrap().state(), OrderState::FurnaceHold);
+    assert!(!st.ledger.read_all().unwrap().iter().any(|r| r.to_state == "publishing"));
+    unsafe { std::env::set_var("FOUNDRY_TUPLES", valid_path) };
+}

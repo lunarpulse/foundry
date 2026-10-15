@@ -23,25 +23,39 @@ use foundry_exec::{ArtifactLocation, ArtifactTuple, ArtifactTupleKey, Attempt as
 use std::sync::Mutex;
 
 #[derive(Default)]
-struct ReviewTuples(Mutex<Vec<ArtifactTuple>>);
+struct ReviewTuples(Mutex<(Vec<ArtifactTuple>, Vec<EmitReceipt>)>);
 impl TupleStore for ReviewTuples {
     fn record(&self, tuple: &ArtifactTuple) -> Result<Recorded, ExecPortError> {
-        self.0.lock().unwrap().push(tuple.clone()); Ok(Recorded)
+        self.0.lock().unwrap().0.push(tuple.clone()); Ok(Recorded)
     }
     fn latest(&self, order: &ExecOrderId, attempt: ExecAttempt) -> Result<Option<ArtifactTuple>, ExecPortError> {
-        Ok(self.0.lock().unwrap().iter().filter(|t| &t.order == order && t.attempt == attempt)
+        Ok(self.0.lock().unwrap().0.iter().filter(|t| &t.order == order && t.attempt == attempt)
             .max_by_key(|t| (t.run, t.generation)).cloned())
     }
-    fn promote(&self, _: &ArtifactTupleKey, _: &EmitReceipt) -> Result<(), ExecPortError> { Ok(()) }
+    fn latest_promoted(&self, order: &ExecOrderId, attempt: ExecAttempt) -> Result<Option<ArtifactTuple>, ExecPortError> {
+        let rows = self.0.lock().unwrap();
+        Ok(rows.0.iter().filter(|t| &t.order == order && t.attempt == attempt
+            && rows.1.iter().any(|r| r.key == t.key()))
+            .max_by_key(|t| (t.run, t.generation)).cloned())
+    }
+    fn promote(&self, key: &ArtifactTupleKey, receipt: &EmitReceipt) -> Result<(), ExecPortError> {
+        let mut rows = self.0.lock().unwrap();
+        if receipt.key != *key || !rows.0.iter().any(|t| t.key() == *key) { return Err(ExecPortError::MissingEmitReceipt); }
+        rows.1.push(receipt.clone());
+        Ok(())
+    }
 }
 
 fn review_tuples(order: &str, digest: &str) -> std::sync::Arc<ReviewTuples> {
     let store = std::sync::Arc::new(ReviewTuples::default());
-    store.record(&ArtifactTuple {
+    let tuple = ArtifactTuple {
         order: ExecOrderId(order.into()), attempt: ExecAttempt(1), run: foundry_exec::RunId(1),
         generation: Generation(0), immutable_commit: ImmutableCommit(digest.into()),
         artifact_location: ArtifactLocation("review.log".into()),
-    }).unwrap();
+    };
+    store.record(&tuple).unwrap();
+    let receipt = EmitReceipt { key: tuple.key(), event: "publish".into(), at: chrono::Utc::now() };
+    store.promote(&tuple.key(), &receipt).unwrap();
     store
 }
 

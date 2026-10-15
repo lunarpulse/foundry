@@ -272,7 +272,7 @@ impl StreamRuntime {
         if digest.is_empty() { return Err("review evidence unavailable: empty artifact digest".into()); }
         let guard = self.tuple_store.lock().unwrap();
         let store = guard.as_ref().ok_or("review evidence unavailable: tuple reader not configured")?;
-        let tuple = store.latest(&ExecOrderId(order_id.into()), ExecAttempt(attempt as u64))
+        let tuple = store.latest_promoted(&ExecOrderId(order_id.into()), ExecAttempt(attempt as u64))
             .map_err(|e| format!("review tuple read failed: {e:?}"))?;
         if tuple.is_some_and(|tuple| tuple.immutable_commit.0 == digest) { Ok(()) }
         else { Err("review evidence unavailable: matching tuple missing".into()) }
@@ -727,7 +727,7 @@ impl StreamRuntime {
         let has_tuple = {
             let guard = self.tuple_store.lock().unwrap();
             let store = guard.as_ref().ok_or("review evidence unavailable: tuple reader not configured")?;
-            store.latest(&ExecOrderId(order_id.into()), ExecAttempt(att as u64))
+            store.latest_promoted(&ExecOrderId(order_id.into()), ExecAttempt(att as u64))
                 .map_err(|er| format!("review tuple read failed: {er:?}"))?
                 .is_some_and(|tuple| tuple.immutable_commit.0 == die.result_commit)
         };
@@ -1196,18 +1196,72 @@ mod tests {
         o
     }
 
+    #[test]
+    fn finish_die_segment_requires_latest_bound_evidence() {
+        struct NoReview;
+        impl ReviewRunPort for NoReview {
+            fn run(&mut self, _: ReviewRunRequest) -> Result<foundry_exec::ReviewEvidence, foundry_exec::ReviewRunError> {
+                panic!("matching tuple must bypass review dispatch");
+            }
+        }
+        for mode in ["unconfigured", "empty", "mismatch", "wrong-attempt", "existing"] {
+            let d = tmpdir(&format!("review-finish-{mode}"));
+            let orch = OrchestrationLog::open(&d.join("orch.db")).unwrap();
+            orch.declare_plan("review-plan", vec![("review-order".into(), vec![])], vec![("review-order".into(), "review-stream".into())]).unwrap();
+            let rt = StreamRuntime::new(orch);
+            rt.add_stream(Stream::new_with_root("review-stream", &d, "bmad-quickloop").unwrap()).unwrap();
+            rt.bind_approval_ledger(foundry_approval::ApprovalLedger::open(&d.join("approval.db")).unwrap()).unwrap();
+            rt.dispatch("review-order", mkorder("review-order")).unwrap();
+            assert_eq!(rt.start_die_segment("review-stream", "review-order", "review-exec").unwrap(), OrderState::Working);
+            if mode != "unconfigured" {
+                let tuples = foundry_exec::SqliteTupleStore::open(d.join("tuples.db")).unwrap();
+                if mode != "empty" {
+                    let tuple = foundry_exec::ArtifactTuple {
+                        order: ExecOrderId("review-order".into()),
+                        attempt: ExecAttempt(if mode == "wrong-attempt" { 2 } else { 1 }),
+                        run: RunId(7), generation: foundry_exec::Generation(0),
+                        immutable_commit: foundry_exec::ImmutableCommit(if mode == "mismatch" { "other" } else { "result" }.into()),
+                        artifact_location: foundry_exec::ArtifactLocation("review.log".into()),
+                    };
+                    tuples.record(&tuple).unwrap();
+                    if mode == "existing" {
+                        tuples.promote(&tuple.key(), &foundry_exec::EmitReceipt { key: tuple.key(), event: "publish".into(), at: chrono::Utc::now() }).unwrap();
+                    }
+                }
+                rt.set_tuple_store(Arc::new(tuples));
+            }
+            if mode == "existing" { rt.set_review_run(NoReview); }
+            let output = foundry_domain::ports::DieOutput {
+                attempt: 1, base_commit: "base".into(), result_commit: "result".into(), log_path: "die.log".into(), exit_code: 0,
+            };
+            let result = rt.finish_die_segment("review-stream", "review-order", "review-exec", &output);
+            let rows = rt.stream("review-stream").unwrap().journal_rows().unwrap();
+            let passes = rows.iter().filter(|r| r.event == "InspectionPassed").count();
+            if mode == "existing" {
+                assert_eq!(result.unwrap(), OrderState::FurnaceHold);
+                assert_eq!(passes, 1);
+            } else {
+                assert!(result.is_err(), "{mode}");
+                assert_eq!(passes, 0, "{mode}");
+                assert_eq!(rt.stream("review-stream").unwrap().engine_if_unfenced().unwrap().order("review-order").unwrap().state(), OrderState::Working);
+            }
+        }
+    }
+
     mod publish {
     use super::*;
 
     fn tuples(path: &Path, order: &str, digest: &str) -> Arc<foundry_exec::SqliteTupleStore> {
         use foundry_exec::TupleStore as _;
         let store = Arc::new(foundry_exec::SqliteTupleStore::open(path).unwrap());
-        store.record(&foundry_exec::ArtifactTuple {
+        let tuple = foundry_exec::ArtifactTuple {
             order: ExecOrderId(order.into()), attempt: ExecAttempt(2), run: RunId(1),
             generation: foundry_exec::Generation(0),
             immutable_commit: foundry_exec::ImmutableCommit(digest.into()),
             artifact_location: foundry_exec::ArtifactLocation("review.log".into()),
-        }).unwrap();
+        };
+        store.record(&tuple).unwrap();
+        store.promote(&tuple.key(), &foundry_exec::EmitReceipt { key: tuple.key(), event: "publish".into(), at: chrono::Utc::now() }).unwrap();
         store
     }
 
@@ -1277,11 +1331,15 @@ mod tests {
     ) {
         let tuple_path = ap_db.with_file_name(format!("{oid}-tuples.db"));
         let tuple_store = foundry_exec::SqliteTupleStore::open(&tuple_path).unwrap();
-        foundry_exec::TupleStore::record(&tuple_store, &foundry_exec::ArtifactTuple {
+        let tuple = foundry_exec::ArtifactTuple {
             order: ExecOrderId(oid.into()), attempt: ExecAttempt(1), run: RunId(1),
             generation: foundry_exec::Generation(0),
             immutable_commit: foundry_exec::ImmutableCommit(format!("dig-{oid}")),
             artifact_location: foundry_exec::ArtifactLocation("review.log".into()),
+        };
+        foundry_exec::TupleStore::record(&tuple_store, &tuple).unwrap();
+        foundry_exec::TupleStore::promote(&tuple_store, &tuple.key(), &foundry_exec::EmitReceipt {
+            key: tuple.key(), event: "publish".into(), at: chrono::Utc::now(),
         }).unwrap();
         rt.set_tuple_store(Arc::new(tuple_store));
         let mut ap = foundry_approval::ApprovalLedger::open(ap_db).unwrap();

@@ -127,15 +127,18 @@ cargo test 전체 green + 생성/삭제 파일 리포트 정합 (부모 대조).
   튜플 기록 이전, W5는 튜플 기록·승격 이후·소비 이전이다. 기존 orchestration
   영수증 경로도 record/promote를 재수행한 뒤 완료하며 외부 sink 조회·발행은
   하지 않는다. 따라서 emit 성공 후 튜플 저장 실패도 재시작으로 보완한다.
-- **S6 경계**: TupleStore 소비는 latest(order, attempt)의 튜플만 이용한다.
+- **S6 경계**: TupleStore는 원본 순서 조회 `latest(order, attempt)`와 소비 자격
+  조회 `latest_promoted(order, attempt)`를 분리한다. 소비자는 record와 emit 영수증
+  promote가 모두 끝난 튜플만 받으며, record-only 튜플은 소비할 수 없다.
   저장소 파일 경로나 스캔 메서드는 없고, latest는 (run, generation) 최댓값을
   반환한다. 튜플의 artifact_location은 계약 데이터이며 저장소 파일 경로와
   구별한다. 경로 스캔 폴백 API와 영수증 없는 promote는 compile-fail 시험으로
   거부를 확인한다. promote는 emit 영수증의 S6 결속이며 실제 S5 ref 쓰기와 다르다.
 - **내구성 증거의 범위 (T31 갱신)**: `foundry-exec::SqliteTupleStore`는
   `BEGIN IMMEDIATE` 트랜잭션과 `synchronous=FULL`로 record/promote를 저장하고,
-  SQLite 파일 잠금에 다중 프로세스 직렬화를 맡긴다. latest는 읽기 트랜잭션에서
-  `(run, generation)` 최댓값을 반환한다. 참조 파일 어댑터 테스트는 기존 크래시
+  SQLite 파일 잠금에 다중 프로세스 직렬화를 맡긴다. latest와 latest_promoted는
+  읽기 트랜잭션에서 각각 전체 튜플과 승격된 튜플 중 `(run, generation)` 최댓값을
+  반환한다. 참조 파일 어댑터 테스트는 기존 크래시
   창 계약 확인용으로 유지한다.
 - **epoch 규칙과 포트**: epoch < active 최초 결과·이벤트 제출과 쓰기를
   거부하고 epoch >= active를 수용한다. 기존 emit 영수증은 epoch와 무관하게
@@ -158,7 +161,7 @@ cargo test 전체 green + 생성/삭제 파일 리포트 정합 (부모 대조).
 - Line의 일반 완료는 no-op taxonomy를 유지하며, 변경 산출물의
   `InspectionPassed`는 ReviewRunPort의 통과 증거와 latest tuple/digest 결속을
   확인한 뒤 기록한다. Inspecting 재진입은 일치 tuple이 없으면 Inspecting에 머문다.
-- Line 승인·publish 및 rehydrate는 latest `(order, attempt)` 튜플의
+- Line 재진입·승인·publish 및 rehydrate는 latest_promoted `(order, attempt)` 튜플의
   `immutable_commit == artifact_digest`를 요구한다. orch의 리뷰 통과 재생도
   동일 확인을 하며 리더 미주입 시 거부한다. 구 저널에 대한 마이그레이션은 없다.
 - 제품 튜플 저장은 SQLite로 제공한다. 기본 경로는 `FOUNDRY_TUPLES` 또는

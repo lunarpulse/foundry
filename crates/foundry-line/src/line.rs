@@ -115,7 +115,7 @@ where
         let Some(store) = store_guard.as_ref() else { return Ok(false); };
         let digest = order.artifact_digest.as_deref().unwrap_or_default();
         if digest.is_empty() { return Ok(false); }
-        store.latest(&OrderId(order.id.clone()), Attempt(order.attempt() as u64))
+        store.latest_promoted(&OrderId(order.id.clone()), Attempt(order.attempt() as u64))
             .map(|tuple| tuple.is_some_and(|tuple| tuple.immutable_commit.0 == digest))
             .map_err(|e| LineError::Port(order.id.clone(), foundry_domain::ports::PortError::Permanent(format!("tuple store: {e:?}"))))
     }
@@ -259,6 +259,8 @@ where
                                     o.artifact_digest = Some(die_out.result_commit.clone());
                                 }
                             }
+                            let current = self.get(order_id).await
+                                .ok_or_else(|| LineError::UnknownOrder(order_id.to_string()))?;
                             // Preserve the no-op taxonomy, but require durable
                             // review evidence before the passing transition.
                             let noop = die_out.result_commit.is_empty()
@@ -285,6 +287,9 @@ where
                                     }
                                     _ => {}
                                 }
+                            } else if self.has_review_tuple(&current)? {
+                                // Reuse durable evidence before invoking the review host.
+                                self.commit(order_id, OrderEvent::InspectionPassed, attempt, &actor).await?;
                             } else {
                                 let request = ReviewRunRequest {
                                     order: OrderId(order_id.to_string()), attempt: Attempt(attempt as u64),

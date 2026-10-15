@@ -45,13 +45,6 @@ pub async fn approve(
     Path(id): Path<String>,
     body: Option<Json<ApproveBody>>,
 ) -> impl IntoResponse {
-    let tuple_path = std::env::var("FOUNDRY_TUPLES").unwrap_or_else(|_| "~/.foundry/tuples.db".into());
-    let tuple_path = expand_tilde(&tuple_path);
-    let tuples = match SqliteTupleStore::open(&tuple_path) {
-        Ok(store) => Arc::new(store),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"tuple store unavailable","detail":format!("{e:?}")}))).into_response(),
-    };
-    st.line.set_tuple_store(tuples.clone());
     let intent = match body {
         Some(Json(b)) if !b.intent.trim().is_empty() => b.intent,
         _ => {
@@ -65,6 +58,14 @@ pub async fn approve(
                 .into_response();
         }
     };
+
+    let tuple_path = std::env::var("FOUNDRY_TUPLES").unwrap_or_else(|_| "~/.foundry/tuples.db".into());
+    let tuple_path = expand_tilde(&tuple_path);
+    let tuples = match SqliteTupleStore::open(&tuple_path) {
+        Ok(store) => Arc::new(store),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"tuple store unavailable","detail":format!("{e:?}")}))).into_response(),
+    };
+    st.line.set_tuple_store(tuples.clone());
 
     // Rehydrate the in-memory line if the order lives only in the
     // journal (watch restarted / serve restarted).

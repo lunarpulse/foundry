@@ -72,6 +72,26 @@ impl TupleStore for SqliteTupleStore {
         Ok(tuple)
     }
 
+    fn latest_promoted(&self, order: &OrderId, attempt: Attempt) -> Result<Option<ArtifactTuple>, PortError> {
+        let mut conn = self.connection.lock().map_err(|e| store_error(e.to_string()))?;
+        let tx = conn.transaction().map_err(store_error)?;
+        let tuple = tx.query_row(
+            "SELECT t.run_id, t.generation, t.immutable_commit, t.artifact_location
+             FROM artifact_tuples t JOIN tuple_promotions p
+               ON p.order_id=t.order_id AND p.attempt=t.attempt AND p.run_id=t.run_id AND p.generation=t.generation
+             WHERE t.order_id=?1 AND t.attempt=?2 ORDER BY t.run_id DESC, t.generation DESC LIMIT 1",
+            params![order.0, attempt.0],
+            |row| Ok(ArtifactTuple {
+                order: order.clone(), attempt, run: crate::types::RunId(row.get(0)?),
+                generation: crate::types::Generation(row.get(1)?),
+                immutable_commit: crate::types::ImmutableCommit(row.get(2)?),
+                artifact_location: crate::types::ArtifactLocation(row.get(3)?),
+            }),
+        ).optional().map_err(store_error)?;
+        tx.commit().map_err(store_error)?;
+        Ok(tuple)
+    }
+
     fn promote(&self, key: &ArtifactTupleKey, receipt: &EmitReceipt) -> Result<(), PortError> {
         let mut conn = self.connection.lock().map_err(|e| store_error(e.to_string()))?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(store_error)?;

@@ -68,6 +68,11 @@ impl Db {
         self.tuples.iter().filter(|t| &t.order == order && t.attempt == attempt)
             .max_by_key(|t| (t.run, t.generation)).cloned()
     }
+    fn latest_promoted(&self, order: &OrderId, attempt: Attempt) -> Option<ArtifactTuple> {
+        self.tuples.iter().filter(|t| &t.order == order && t.attempt == attempt
+            && self.promotions.iter().any(|r| r.key == t.key()))
+            .max_by_key(|t| (t.run, t.generation)).cloned()
+    }
     fn promote(&mut self, key: &ArtifactTupleKey, receipt: &EmitReceipt) -> Result<(), PortError> {
         if &receipt.key != key || !self.tuples.iter().any(|tuple| &tuple.key() == key) {
             return Err(PortError::MissingEmitReceipt);
@@ -87,6 +92,9 @@ impl TupleStore for MemoryTuples {
     fn record(&self, tuple: &ArtifactTuple) -> Result<Recorded, PortError> { self.0.lock().unwrap().record(tuple) }
     fn latest(&self, order: &OrderId, attempt: Attempt) -> Result<Option<ArtifactTuple>, PortError> {
         Ok(self.0.lock().unwrap().latest(order, attempt))
+    }
+    fn latest_promoted(&self, order: &OrderId, attempt: Attempt) -> Result<Option<ArtifactTuple>, PortError> {
+        Ok(self.0.lock().unwrap().latest_promoted(order, attempt))
     }
     fn promote(&self, key: &ArtifactTupleKey, receipt: &EmitReceipt) -> Result<(), PortError> {
         self.0.lock().unwrap().promote(key, receipt)
@@ -117,6 +125,10 @@ impl TupleStore for DiskTuples {
     fn latest(&self, order: &OrderId, attempt: Attempt) -> Result<Option<ArtifactTuple>, PortError> {
         let _owner = self.owner.lock().unwrap();
         Ok(read::<Db>(&self.path)?.latest(order, attempt))
+    }
+    fn latest_promoted(&self, order: &OrderId, attempt: Attempt) -> Result<Option<ArtifactTuple>, PortError> {
+        let _owner = self.owner.lock().unwrap();
+        Ok(read::<Db>(&self.path)?.latest_promoted(order, attempt))
     }
     fn promote(&self, key: &ArtifactTupleKey, receipt: &EmitReceipt) -> Result<(), PortError> {
         let _owner = self.owner.lock().unwrap();
