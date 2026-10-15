@@ -87,7 +87,10 @@ where
             }
             if self.intents.is_started(&key, intent.activation) {
                 let Some(result) = self.host.recover_result(&recorded) else {
-                    return Err(LifecycleError::AwaitResult(intent.activation));
+                    if self.host.accepted(&recorded) {
+                        return Err(LifecycleError::AwaitResult(intent.activation));
+                    }
+                    return self.dispatch_recorded(&key, &recorded).map(RunStep::Bound);
                 };
                 return self.bind_result(&recorded, result).map(RunStep::Bound);
             }
@@ -106,7 +109,7 @@ where
 
     /// Resolves a previously recorded activation. W1 redispatches; W2 recovers
     /// the host result and binds it without dispatching again. Started work without
-    /// a durable result stays in AwaitResult, including ambiguous dispatch claims.
+    /// a durable result waits only when the host has a durable acceptance receipt.
     pub fn resume(&mut self, key: &IntentKey) -> ResumeAction {
         let Some(intent) = self.intents.latest(key) else {
             return ResumeAction::NeedsFreshRun;
@@ -128,7 +131,14 @@ where
                 Err(error) => ResumeAction::Interrupted(error),
             };
         }
-        ResumeAction::AwaitResult
+        if self.host.accepted(&intent) {
+            ResumeAction::AwaitResult
+        } else {
+            match self.dispatch_recorded(key, &intent) {
+                Ok(_) => ResumeAction::ReDispatch,
+                Err(error) => ResumeAction::Interrupted(error),
+            }
+        }
     }
 
     pub fn dispatch_count(&self) -> u64 {

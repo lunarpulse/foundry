@@ -5,7 +5,6 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-foundry-domain = { path = "../foundry-domain" }
 foundry-pack = { path = "../foundry-pack" }
 serde.workspace = true
 serde_json.workspace = true

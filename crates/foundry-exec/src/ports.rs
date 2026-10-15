@@ -49,6 +49,12 @@ pub trait DispatchHost {
     fn dispatch(&mut self, intent: &ExecutionIntent) -> Self::Result;
     fn dispatch_count(&self) -> u64;
 
+    /// Whether the host durably recorded receipt of this exact activation.
+    /// Legacy hosts without receipt support report false.
+    fn accepted(&self, _intent: &ExecutionIntent) -> bool {
+        false
+    }
+
     /// Reads a durably saved result after restart, without starting external work
     /// or consuming the receipt. `None` means no result is available yet, never
     /// permission to redispatch. Read failures must stop execution, not return None.

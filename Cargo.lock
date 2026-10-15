@@ -435,7 +435,6 @@ name = "foundry-exec"
 version = "0.1.0"
 dependencies = [
  "chrono",
- "foundry-domain",
  "foundry-pack",
  "serde",
  "serde_json",

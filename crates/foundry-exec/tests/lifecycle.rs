@@ -49,6 +49,7 @@ impl IntentLog for MemoryIntentLog {
 struct FakeHost {
     calls: u64,
     recovered: Option<(Key, u64, DispatchResult)>,
+    accepted: bool,
 }
 
 impl DispatchHost for FakeHost {
@@ -56,6 +57,7 @@ impl DispatchHost for FakeHost {
 
     fn dispatch(&mut self, intent: &ExecutionIntent) -> Self::Result {
         self.calls += 1;
+        self.accepted = true;
         let result = DispatchResult {
             cursor: Some(format!("cursor-{}", self.calls)),
             ..DispatchResult::default()
@@ -70,6 +72,10 @@ impl DispatchHost for FakeHost {
 
     fn dispatch_count(&self) -> u64 {
         self.calls
+    }
+
+    fn accepted(&self, _intent: &ExecutionIntent) -> bool {
+        self.accepted
     }
 
     fn recover_result(&mut self, intent: &ExecutionIntent) -> Option<Self::Result> {
@@ -301,6 +307,7 @@ fn review_started_without_a_result_waits_and_never_dispatches() {
     let mut outcomes = MemoryOutcomeStore::default();
     intents.append(&intent(8));
     intents.mark_started(&key(), 8);
+    host.accepted = true;
     let mut executor = Executor::new(&mut intents, &mut host, &mut outcomes);
     assert_eq!(executor.resume(&key()), ResumeAction::AwaitResult);
     assert_eq!(executor.resume(&key()), ResumeAction::AwaitResult);
