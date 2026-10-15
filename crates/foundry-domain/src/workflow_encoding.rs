@@ -190,7 +190,7 @@ impl EmbeddedWorkflow {
         use sha2::Digest as _;
         let mut h = sha2::Sha256::new();
         h.update(b"foundry-embedded-workflow-v1");
-        h.update(&(self.schema_version as u64).to_be_bytes());
+        h.update((self.schema_version as u64).to_be_bytes());
         for e in &self.edges {
             for part in [
                 format!("{:?}", e.event),
@@ -201,7 +201,7 @@ impl EmbeddedWorkflow {
                     EdgeTarget::BackEdge { token, to } => format!("B:{token}>{to:?}"),
                 },
             ] {
-                h.update(&(part.len() as u64).to_be_bytes());
+                h.update((part.len() as u64).to_be_bytes());
                 h.update(part.as_bytes());
             }
         }

@@ -121,8 +121,8 @@ impl CastingRun {
     ) -> Result<(), String> {
         use CastingState::*;
         let ok = match (&self.state, &next) {
-            (Draft, Running { .. }) | (Draft, Rejected { .. }) => true,
-            (Running { .. }, Judged { .. }) | (Running { .. }, Rejected { .. }) => true,
+            (Draft, Running) | (Draft, Rejected { .. }) => true,
+            (Running, Judged { .. }) | (Running, Rejected { .. }) => true,
             (
                 Judged {
                     verdict: Verdict::Promote,
@@ -146,11 +146,11 @@ impl CastingRun {
         if let Judged {
             verdict: Verdict::Inconclusive,
         } = &self.state
+            && matches!(next, Promoted)
         {
-            if matches!(next, Promoted) {
-                return Err("inconclusive runs are not promotable".into());
-            }
+            return Err("inconclusive runs are not promotable".into());
         }
+
         self.state = next;
         Ok(())
     }
