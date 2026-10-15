@@ -18,6 +18,10 @@ use foundry_exec::{
 };
 use foundry_pack::load_pack;
 
+#[path = "support/tuple_store.rs"]
+mod tuple_store;
+use tuple_store::MemoryTuples;
+
 type Key = (OrderId, Attempt, RunId);
 
 struct Log {
@@ -274,6 +278,7 @@ fn fixture_pack_dispatches_to_route_and_route_emits() {
     let mut counters = MemoryCounterLog::default();
     let mut emit_log = Log::default();
     let artifact = tuple();
+    let tuples = MemoryTuples::default();
     promote(&mut emit_log, &artifact);
     let mut sink = Sink::default();
     let mut host = Host {
@@ -296,7 +301,7 @@ fn fixture_pack_dispatches_to_route_and_route_emits() {
         Epoch(0),
         "fixture",
         Some(artifact),
-    );
+    ).with_tuple_store(&tuples);
     assert!(matches!(driver.start(), GraphStep::Advanced { ref next, .. } if next == "done"));
     assert!(matches!(driver.advance("done"), GraphStep::Emitted { .. }));
 }
@@ -310,6 +315,7 @@ fn graph_w3_and_w4_resume_without_republishing() {
     let mut counters = MemoryCounterLog::default();
     let mut emit_log = Log::default();
     let artifact = tuple();
+    let tuples = MemoryTuples::default();
     promote(&mut emit_log, &artifact);
     let mut sink = Sink::default();
     let mut host = Host {
@@ -332,7 +338,7 @@ fn graph_w3_and_w4_resume_without_republishing() {
         Epoch(0),
         "fixture",
         Some(artifact.clone()),
-    );
+    ).with_tuple_store(&tuples);
     driver.arm_fault(foundry_exec::CrashPoint::W3);
     assert!(matches!(driver.start(), GraphStep::Advanced { .. }));
     assert!(matches!(driver.advance("done"), GraphStep::Fault(_)));
@@ -405,6 +411,7 @@ struct Rig {
     counters: MemoryCounterLog,
     sink: Sink,
     emits: Log,
+    tuples: MemoryTuples,
 }
 
 impl Rig {
@@ -419,7 +426,7 @@ impl Rig {
     {
         GraphDriver::new(pack, &mut self.intents, &mut self.host, &mut self.outcomes,
             &mut self.counters, &mut self.sink, &mut self.emits, OrderId("order-1".into()), Attempt(1),
-            RunId(2), Generation(3), Epoch(0), "fixture", Some(tuple()))
+            RunId(2), Generation(3), Epoch(0), "fixture", Some(tuple())).with_tuple_store(&self.tuples)
     }
 }
 
@@ -535,7 +542,7 @@ fn review_completion_requires_emit_and_stale_rejection_precedes_missing_promotio
     assert_eq!(emit_once(&mut rig.sink, &mut rig.emits, &artifact, Epoch(1)), EmitOutcome::StaleRejected);
     assert_eq!(emit_once(&mut rig.sink, &mut rig.emits, &artifact, Epoch(2)), EmitOutcome::PromotionRequired);
     promote(&mut rig.emits, &artifact);
-    // Preserve b1's explicitly tested future-epoch fence until b5 resolves it.
+    // B5 accepts current and future epochs for first publication.
     assert!(matches!(emit_once(&mut rig.sink, &mut rig.emits, &artifact, Epoch(3)), EmitOutcome::Published(_)));
     assert_eq!(rig.sink.publishes, 1);
 }
@@ -772,6 +779,7 @@ fn review_w3_w4_reopen_both_stores_and_recover_via_receipts() {
         let dir = ReviewDir::new();
         let log_path = dir.0.join("promotion-emit.json");
         let sink_path = dir.0.join("external.json");
+        let tuples = MemoryTuples::default();
         write_emit(&log_path, &EmitState {
             promotions: vec![PromotionReceipt { tuple: tuple().key(), promoted_at: Utc::now() }],
             ..Default::default()
@@ -785,7 +793,7 @@ fn review_w3_w4_reopen_both_stores_and_recover_via_receipts() {
             let mut host = Host::default();
             let mut driver = GraphDriver::new(&pack, &mut intents, &mut host, &mut outcomes,
                 &mut counters, &mut sink, &mut log, OrderId("order-1".into()), Attempt(1), RunId(2),
-                Generation(3), Epoch(0), "fixture", Some(tuple()));
+                Generation(3), Epoch(0), "fixture", Some(tuple())).with_tuple_store(&tuples);
             driver.arm_fault(point);
             assert!(matches!(driver.advance("done"), GraphStep::Fault(ref reason)
                 if reason.contains(&format!("{point:?}"))));
@@ -806,7 +814,7 @@ fn review_w3_w4_reopen_both_stores_and_recover_via_receipts() {
                 let mut sink = NoSinkAccess;
                 let mut driver = GraphDriver::new(&pack, &mut intents, &mut host, &mut outcomes,
                     &mut counters, &mut sink, &mut log, OrderId("order-1".into()), Attempt(1), RunId(2),
-                    Generation(3), Epoch(0), "fixture", Some(tuple()));
+                    Generation(3), Epoch(0), "fixture", Some(tuple())).with_tuple_store(&tuples);
                 let GraphStep::Emitted { receipt } = driver.advance("done") else { panic!("W4 must only complete") };
                 assert_eq!(receipt, before.emits[0]);
                 receipt
@@ -814,7 +822,7 @@ fn review_w3_w4_reopen_both_stores_and_recover_via_receipts() {
                 let mut sink = DiskSink(sink_path.clone());
                 let mut driver = GraphDriver::new(&pack, &mut intents, &mut host, &mut outcomes,
                     &mut counters, &mut sink, &mut log, OrderId("order-1".into()), Attempt(1), RunId(2),
-                    Generation(3), Epoch(0), "fixture", Some(tuple()));
+                    Generation(3), Epoch(0), "fixture", Some(tuple())).with_tuple_store(&tuples);
                 let GraphStep::Emitted { receipt } = driver.advance("done") else { panic!("W3 must emit promoted tuple") };
                 receipt
             }
@@ -895,7 +903,7 @@ impl Rig {
     {
         GraphDriver::restore(pack, &mut self.intents, &mut self.host, &mut self.outcomes,
             &mut self.counters, &mut self.sink, &mut self.emits, OrderId("order-1".into()),
-            Attempt(1), RunId(2), Generation(3), Epoch(0), "fixture", Some(tuple()))
+            Attempt(1), RunId(2), Generation(3), Epoch(0), "fixture", Some(tuple())).with_tuple_store(&self.tuples)
     }
 }
 

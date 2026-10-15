@@ -1,6 +1,6 @@
 use crate::{
     hold::{HoldApplied, HoldCasOutcome, HoldCommand, HoldInstanceId, HoldState},
-    types::{ArtifactTuple, ArtifactTupleKey, Attempt, EmitReceipt, ExecutionIntent, ExecutionOutcome, OrderId, RunId},
+    types::{ArtifactTuple, ArtifactTupleKey, Attempt, EmitReceipt, Epoch, ExecutionIntent, ExecutionOutcome, OrderId, RunId},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,6 +14,7 @@ pub enum PortError {
     Store(String),
     Permanent(String),
     MissingEmitReceipt,
+    StaleEpoch { active: Epoch, presented: Epoch },
 }
 
 /// Durable human hold state. Implementations serialize operations per instance.
@@ -36,9 +37,10 @@ pub trait HoldStore: Send + Sync {
 }
 
 /// One-time consumption ledger for non-refundable execution attempts.
-/// Implementations enforce their configured `AttemptBudget`, count unique
-/// unique `(order, attempt, run)` triples, enforce the configured maximum per
-/// `(order, attempt)` scope as specified by the adapter, and never remove a row.
+/// Count unique `(order, attempt, run)` triples, with a maximum per
+/// `(order, attempt)` pair. Exact retries succeed even when that pair is full.
+/// No refund or removal operation is permitted. `consumed` sums all pairs for
+/// the order; adapters serialize admission and persist it before returning Ok.
 pub trait AttemptLedger: Send + Sync {
     fn consume(&self, order: &OrderId, attempt: Attempt, run: RunId) -> Result<(), PortError>;
     fn consumed(&self, order: &OrderId) -> Result<u32, PortError>;
@@ -47,12 +49,49 @@ pub trait AttemptLedger: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Recorded;
 
-/// Durable tuple storage boundary. Adapters atomically persist complete tuples;
-/// consumers receive tuples through this port and never inspect storage paths.
+/// Durable tuple storage boundary. Serialize read/modify/write across all
+/// handles/processes. Ok means durable atomic persistence of complete tuples
+/// (file adapters sync the temporary, rename it, then sync the directory).
+/// Interrupted writes expose the old or new complete state, never a partial row.
+/// Only NotFound means absence; corruption and read failures return Store.
+/// Consumers receive tuples through this port, never storage paths or scans.
+///
+/// ```compile_fail
+/// use foundry_exec::TupleStore;
+/// fn scan(store: &dyn TupleStore) { store.scan_path("artifacts"); }
+/// ```
+/// ```compile_fail
+/// use foundry_exec::{ArtifactTupleKey, TupleStore};
+/// fn no_receipt(store: &dyn TupleStore, key: &ArtifactTupleKey) { store.promote(key); }
+/// ```
 pub trait TupleStore: Send + Sync {
+    /// An identical key/value is idempotent. Any changed field under the same
+    /// key returns Permanent and leaves the stored tuple unchanged.
     fn record(&self, tuple: &ArtifactTuple) -> Result<Recorded, PortError>;
+    /// Greatest (run, generation) in this order/attempt, or proven absence.
     fn latest(&self, order: &OrderId, attempt: Attempt) -> Result<Option<ArtifactTuple>, PortError>;
+    /// Requires a recorded tuple and a matching receipt from the emit owner.
+    /// Missing tuple or mismatched key returns MissingEmitReceipt. Exact receipt
+    /// retries are idempotent; a different receipt is Permanent, without writes.
+    /// This records S6 promotion authorization after emit, not S5 ref mutation.
     fn promote(&self, key: &ArtifactTupleKey, receipt: &EmitReceipt) -> Result<(), PortError>;
+}
+
+/// Order-scoped fencing boundary for storage owners. The adapter serializes
+/// epoch admission AND the entire write callback across handles/processes.
+/// Reject presented < active with StaleEpoch without invoking the callback.
+/// Otherwise durably set active = max(active, presented) BEFORE the callback;
+/// never roll it back, including on write failure. Do not release the ownership
+/// lock until the callback returns. A check followed by an unguarded write is
+/// insufficient. Actual sibling/ref/session owners must route every write here.
+/// Receipt-only retries bypass this gate because they do not repeat an effect.
+pub trait EpochGate: Send + Sync {
+    fn with_epoch(
+        &self,
+        order: &OrderId,
+        presented: Epoch,
+        write: &mut dyn FnMut() -> Result<(), PortError>,
+    ) -> Result<(), PortError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

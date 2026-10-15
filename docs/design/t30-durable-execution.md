@@ -81,28 +81,32 @@ cargo test 전체 green + 생성/삭제 파일 리포트 정합 (부모 대조).
   분기 없음 (엔진 diff 0, T34 게이트 전제).
 
 ## b1 리뷰 지연 항목 (b2/b4 계약 정합 필요 — 2026-10-14 gpt-6.1-sol 리뷰)
-- HoldCommand: 동일 run 재진입 식별자 부재 — b4 hold 세마포어 설계 시 판별
-  필수 (현재는 구별 불가).
-- IntentKey: activation·retry 변별 불가 — b2 실행기가 intent 재발행
-  시점 정의와 함께 키 확장 결정.
-- epoch·fencing 충돌은 b5에서 종결: epoch < active 제출 거부 및 쓰기
-  격리, epoch >= active 수용. 아래 b5 결정 참조.
-- 비환급 실행 횟수 예산(회수 불가 원칙)은 Budget과 별도 산정 필요.
+- HoldCommand 재진입 식별은 b4에서 종결: HoldInstanceId의 run·hold_node·entry와
+  영속 Started/Completed 방문 이력으로 같은 run의 재진입을 구별한다.
+- IntentKey 변별은 b2에서 종결: run 조회 키와 별도로 activation을 보존하고,
+  IntentLog::get과 OutcomeStore::get이 활성화별 재시도를 식별한다.
+- epoch 정책 충돌은 b5에서 종결: epoch < active 최초 제출 거부,
+  epoch >= active 수용, 기존 emit 영수증 재사용. 쓰기 격리의 실제 어댑터
+  통합은 미종결이며 아래 b5 결정의 검증 경계를 따른다.
+- 비환급 실행 횟수는 b4/b5의 AttemptLedger로 Budget과 별도 산정한다.
+  b5 edit-spec에 따라 (order, attempt, run) 멱등 키, (order, attempt)당
+  max를 적용하고 consumed(order)는 모든 pair의 합계다. I5의 nano 예산은
+  계속 주문 단위이며 실행 횟수의 pair당 상한과 구별한다.
 
 ## b2a 리뷰 지연 항목 (b3 계약 정합 필요 — 2026-10-14 gpt-6.1-sol 리뷰)
-- mark_started 직후·host 결과 접수 전 종료 창: 현재 실행기는
-  AwaitResult로 대기 (재dispatch 없음). host가 결과를 실제로 받았는지
-  판별하려면 b3 접수 조정 프로토콜 (host 측 접수 영수증 또는
-  조회 포트)이 필요 — b3에서 정의.
+- mark_started 직후·host 결과 접수 전 종료 창: 접수 증거가 불명인 경우
+  AwaitResult로 대기한다. host가 결과를 실제로 받았는지 판별하는 b3 HostLedger::is_accepted/load와 DispatchHost::accepted/
+  recover_result가 구현되었다. 접수 부재가 증명된 경우만 재dispatch하고,
+  접수됐으나 결과가 없거나 legacy 호스트이면 AwaitResult로 대기한다.
+  이 항목은 접수 조정에 한해 종결이며 물리 세션 fencing의 증명은 아니다.
 
-## b2b 리뷰 미종결 blocker (b2c 설계 결정 필요 — 2026-10-14 gpt-6.1-sol 리뷰)
-- 드라이버 상태(카운터 맵·그래프 커서)가 메모리 전용 — 크래시 후
-  워크 위치 복원 불가. 결정 필요: (안1) OutcomeStore의
-  cursor/next_activation에서 재구성 (추가 상태 0) vs (안2)
-  GraphStateStore 포트 신설 (원자 기록, b3 저장소). bump 이력은
-  영수증 스트림에서 유도 가능한지가 안1 성립 조건.
-- epoch·fencing 충돌은 b5에서 종결: epoch < active 제출 거부 및 쓰기
-  격리, epoch >= active 수용. 아래 b5 결정 참조.
+## b2b 리뷰 지연 항목 및 종결 현황 (2026-10-14 gpt-6.1-sol 리뷰)
+- 드라이버 상태 복원은 b2c에서 종결: CounterLog의 Started(activation 포함)/
+  Bump/Completed를 append 순서로 재생하고, OutcomeStore의 continuation과
+  결합하여 GraphDriver::restore가 카운터·커서·미완료 방문을 복원한다.
+  메모리 전용 상태라는 기존 blocker는 현재 구현에 해당하지 않는다.
+- epoch 정책 충돌은 b5에서 종결했으나 실제 sibling/ref/session 어댑터의
+  쓰기 격리는 미종결이다. 아래 b5 결정 참조.
 
 ## b2c 리뷰 지연 항목 (2026-10-15)
 - E_DAG_CYCLE: 순환 거부는 팩 스펙 소유다. 로더가 E_DAG_CYCLE로
@@ -110,15 +114,40 @@ cargo test 전체 green + 생성/삭제 파일 리포트 정합 (부모 대조).
   없다. 방문별 기록은 드라이버 직접 구성 시험으로 검증한다.
 - activation 없는 구형 카운터 로그는 자동 복원 대신 Fault 중단
   (b2c-2 계약 이전 로그는 미지원 — 자동 마이그레이션을 하지 않기로
-  결정했으며 명시적 결정 전까지 Fault 중단을 유지한다).
+  결정했다. activation 이력을 모호하게 만드는 구형 host 방문 복구는
+  Fault 중단을 유지하며 모든 구형 route-only 로그를 무조건 거부하지는 않는다).
 
 ## b5 통합 결정 — 튜플·epoch·fencing
-- TupleStore 포트가 ArtifactTuple만 읽고 쓴다. 소비자는 저장 경로에
-  접근하지 않는다. emit 성공 뒤 튜플을 기록하며 W5는 기록 후 소비 전이다.
-- 정책은 epoch < active 결과·이벤트 제출 거부 및 sibling 산출물, git refs,
-  세션 저장소 쓰기 격리다. epoch >= active는 수용하고 active epoch는
-  단조 증가해야 한다. 지연 emit은 영수증 없는 구 epoch 최초 emit만 거부하고,
-  동일 key의 기존 영수증은 멱등 반환한다. foundry-exec에서는 stale emit
-  거부와 기존 영수증 재사용을 구현한다. sibling/ref/session 쓰기 경계와
-  active epoch 갱신 포트가 이 크레이트에 없으므로 각각의 쓰기 격리 시험 및
-  단조 증가 강제는 해당 어댑터 소유이며 후속 통합 검증이 필요하다.
+- **I7 필수 연결**: GraphDriver의 emit 노드와 route emit action은
+  with_tuple_store 연결이 없으면 외부 발행 전에 Fault한다. 비emit 그래프는
+  기존 생성자를 사용할 수 있다. emit 성공은 record와 promote(emit 영수증
+  동반)가 모두 성공한 뒤에만 완료한다. record의 동일 key·동일 값은 멱등,
+  immutable_commit/artifact_location 불일치는 Permanent로 거부한다.
+- **W3/W4/W5 복구**: W3는 승격 영수증 이후·emit 이전, W4는 emit 커밋 이후·
+  튜플 기록 이전, W5는 튜플 기록·승격 이후·소비 이전이다. 기존 orchestration
+  영수증 경로도 record/promote를 재수행한 뒤 완료하며 외부 sink 조회·발행은
+  하지 않는다. 따라서 emit 성공 후 튜플 저장 실패도 재시작으로 보완한다.
+- **S6 경계**: TupleStore 소비는 latest(order, attempt)의 튜플만 이용한다.
+  저장소 파일 경로나 스캔 메서드는 없고, latest는 (run, generation) 최댓값을
+  반환한다. 튜플의 artifact_location은 계약 데이터이며 저장소 파일 경로와
+  구별한다. 경로 스캔 폴백 API와 영수증 없는 promote는 compile-fail 시험으로
+  거부를 확인한다. promote는 emit 영수증의 S6 결속이며 실제 S5 ref 쓰기와 다르다.
+- **내구성 증거의 범위**: TupleStore는 포트이고 제품용 파일/DB 구현은 이
+  크레이트에 없다. tests/support/tuple_store.rs의 참조 어댑터는 임시 파일
+  sync_all → rename → 부모 디렉터리 sync_all, 동일 프로세스 핸들 직렬화,
+  오류/손상 시 Store 반환을 검증한다. 부분 임시 쓰기·rename 전후 실패 및
+  실제 GraphDriver W5 이후 포트 전부 재생성 시험이 있다. 이 증거는 프로세스
+  재시작 수준이며 전원 장애나 다중 프로세스 저장소 잠금의 실측을 뜻하지 않는다.
+- **epoch 규칙과 포트**: epoch < active 최초 결과·이벤트 제출과 쓰기를
+  거부하고 epoch >= active를 수용한다. 기존 emit 영수증은 epoch와 무관하게
+  멱등 반환한다. EpochGate::with_epoch는 주문 소유권 잠금 안에서 stale을
+  거부하고, active=max(active,presented)를 효과보다 먼저 영속화하며 callback
+  종료까지 잠금을 유지하도록 계약한다. 실패한 callback도 epoch를 낮추지 않는다.
+  포트 참조 어댑터로 sibling/ref 모델/session 파일 쓰기 격리를 각각 독립 시험하고,
+  재시작·쓰기 실패 후 단조 증가도 검증한다. 단순 check 후 잠금 밖 쓰기는 금지다.
+- **미종결 경계**: 실제 S4 세션·S5 git refs·sibling 쓰기 소유자가 이 포트를
+  호출하는 제품 경로는 이 배치 범위 밖이다. 위 3종 시험은 참조 어댑터 계약
+  증거이며 실제 git CAS·호스트 세션 물리 격리의 통합 증거가 아니다. EmitLog의
+  active epoch 갱신 및 Executor의 host 결과 제출도 실제 소유자의 fencing과
+  직렬화가 필요하다. b5에서 epoch 정책 결정은 종결했지만 이 제품 통합까지
+  완료했다고 주장하지 않는다. 외부 어댑터의 격리·단조 증가 통합 검증은 남는다.

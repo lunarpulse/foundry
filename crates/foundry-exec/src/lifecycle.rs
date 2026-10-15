@@ -120,7 +120,7 @@ where
     }
 
     /// Consumes the order's attempt before any execution work. Ledger
-    /// implementations make repeated calls for the same `(order, attempt)` idempotent.
+    /// implementations make repeated calls for the same `(order, attempt, run)` idempotent.
     pub fn run_with_attempt_ledger(
         &mut self,
         intent: ExecutionIntent,

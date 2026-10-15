@@ -137,7 +137,7 @@ impl AttemptLedger for LimitedAttempts {
     fn consume(&self, order: &OrderId, attempt: Attempt, run: RunId) -> Result<(), PortError> {
         let mut rows = self.rows.lock().unwrap();
         if rows.contains(&(order.clone(), attempt, run)) { return Ok(()); }
-        if rows.iter().filter(|(seen, _, _)| seen == order).count() >= self.max as usize {
+        if rows.iter().filter(|(seen, seen_attempt, _)| seen == order && *seen_attempt == attempt).count() >= self.max as usize {
             return Err(PortError::AttemptBudgetExhausted { max_attempts: self.max });
         }
         rows.insert((order.clone(), attempt, run));
@@ -157,7 +157,7 @@ fn executor_consumes_attempt_before_dispatch_and_keeps_it_after_success() {
     assert!(matches!(executor.run(intent(0)), Ok(RunStep::Bound(_))));
     assert_eq!(ledger.consumed(&OrderId("order-1".into())).unwrap(), 1);
     let mut next_attempt = intent(1);
-    next_attempt.attempt = Attempt(2);
+    next_attempt.attempt = Attempt(1);
     next_attempt.run = RunId(3);
     assert_eq!(executor.run(next_attempt).unwrap_err(), foundry_exec::lifecycle::LifecycleError::AttemptBudget(
         PortError::AttemptBudgetExhausted { max_attempts: 1 }));
@@ -196,7 +196,7 @@ fn b4_attempt_consumption_survives_w1_and_w2_restart() {
         let mut executor = Executor::new(&mut intents, &mut host, &mut outcomes).with_attempt_ledger(&ledger);
         assert_eq!(executor.resume(&key()), if point == CrashPoint::W1 { ResumeAction::ReDispatch } else { ResumeAction::ReBind });
         assert_eq!(executor.dispatch_count(), 1);
-        let mut fresh = intent(0); fresh.attempt = Attempt(2); fresh.run = RunId(3);
+        let mut fresh = intent(0); fresh.run = RunId(3);
         assert!(matches!(executor.run(fresh), Err(foundry_exec::LifecycleError::AttemptBudget(_))));
         assert_eq!(ledger.consumed(&key().0).unwrap(), 1);
     }
@@ -487,4 +487,26 @@ fn b3a_legacy_host_without_receipts_waits_on_run_and_resume() {
     assert_eq!(executor.resume(&key()), ResumeAction::AwaitResult);
     assert_eq!(executor.dispatch_count(), 1);
     assert!(executor.outcome(&key()).is_none());
+}
+
+#[test]
+fn r7_executor_retries_and_activations_share_a_run_but_run_99_cannot_bypass_exhaustion() {
+    let ledger = LimitedAttempts { max: 2, rows: Mutex::new(HashSet::new()) };
+    let mut intents = MemoryIntentLog::default(); let mut host = FakeHost::default();
+    let mut outcomes = MemoryOutcomeStore::default();
+    let mut executor = Executor::new(&mut intents, &mut host, &mut outcomes).with_attempt_ledger(&ledger);
+    executor.run(intent(0)).unwrap();
+    executor.run(intent(0)).unwrap();
+    executor.run(intent(1)).unwrap();
+    assert_eq!(ledger.consumed(&key().0).unwrap(), 1);
+    let mut fresh = intent(0); fresh.run = RunId(3);
+    executor.run(fresh.clone()).unwrap();
+    executor.run(fresh.clone()).unwrap();
+    assert!(matches!(executor.resume(&(fresh.order.clone(), fresh.attempt, fresh.run)), ResumeAction::AlreadyBound(_)));
+    assert_eq!(ledger.consumed(&key().0).unwrap(), 2);
+    fresh.run = RunId(99);
+    assert_eq!(executor.run(fresh), Err(foundry_exec::LifecycleError::AttemptBudget(
+        PortError::AttemptBudgetExhausted { max_attempts: 2 })));
+    assert_eq!(executor.dispatch_count(), 3);
+    assert_eq!(ledger.consumed(&key().0).unwrap(), 2);
 }

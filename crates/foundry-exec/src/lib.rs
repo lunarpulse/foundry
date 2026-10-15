@@ -19,7 +19,7 @@ pub use attempt_budget::AttemptBudget;
 pub use hold::{HoldApplied, HoldCasOutcome, HoldCommand, HoldInstanceId, HoldOperation, HoldState, HoldStatus, apply_hold, cas_hold};
 pub use inject::{CrashPoint, FaultInjector};
 pub use lifecycle::{DispatchResult, Executor, LifecycleError, ResumeAction, RunStep};
-pub use ports::{AttemptLedger, CounterLog, CounterRecord, DispatchHost, HoldStore, IntentLog, OutcomeStore, PortError, Recorded, TupleStore};
+pub use ports::{AttemptLedger, CounterLog, CounterRecord, DispatchHost, EpochGate, HoldStore, IntentLog, OutcomeStore, PortError, Recorded, TupleStore};
 pub use types::{
     ActivationRef, ArtifactLocation, ArtifactTuple, ArtifactTupleKey, Attempt, EmitReceipt, Epoch,
     ExecutionIntent, ExecutionOutcome, FenceVerdict, FencingToken, Generation, ImmutableCommit,

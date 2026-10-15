@@ -24,7 +24,7 @@ impl AttemptLedger for DiskAttempts {
         let mut db = self.read();
         let attempts = db.0.entry(order.0.clone()).or_default();
         if attempts.contains(&(attempt.0, run.0)) { return Ok(()); }
-        if attempts.len() >= self.budget.max_attempts as usize {
+        if attempts.iter().filter(|(seen, _)| *seen == attempt.0).count() >= self.budget.max_attempts as usize {
             return Err(PortError::AttemptBudgetExhausted { max_attempts: self.budget.max_attempts });
         }
         attempts.push((attempt.0, run.0));
@@ -117,6 +117,13 @@ fn r7_attempt_budget_counts_unique_runs_and_rejects_new_run_after_exhaustion() {
         assert_eq!(ledger.consumed(&order).unwrap(), 2);
         assert_eq!(ledger.consume(&order, Attempt(1), RunId(99)).unwrap_err(), PortError::AttemptBudgetExhausted { max_attempts: 2 });
         assert_eq!(ledger.consumed(&order).unwrap(), 2);
+        // Exhaustion cannot block an exact retry, and the pair is the budget scope.
+        ledger.consume(&order, Attempt(1), RunId(2)).unwrap();
+        ledger.consume(&order, Attempt(2), RunId(99)).unwrap();
+        assert_eq!(ledger.consumed(&order).unwrap(), 3);
+        let other = OrderId("other".into());
+        ledger.consume(&other, Attempt(1), RunId(99)).unwrap();
+        assert_eq!(ledger.consumed(&other).unwrap(), 1);
     }
     assert!(matches!(foundry_exec::budget::reserve(&foundry_exec::Budget { reserved_nano: 0, settled_nano: 0, carried_nano: 10 }, 1),
         foundry_exec::ReservationOutcome::Granted { remaining_nano: 9 }));

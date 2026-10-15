@@ -135,7 +135,8 @@ where
         self
     }
 
-    /// Enables durable tuple recording after a successful emit.
+    /// Required for emit nodes and route emit actions. Missing storage faults
+    /// before publication; every receipt retry repairs tuple persistence first.
     pub fn with_tuple_store(mut self, tuple_store: &'a dyn TupleStore) -> Self {
         self.tuple_store = Some(tuple_store);
         self
@@ -607,48 +608,47 @@ where
         {
             return GraphStep::Fault("artifact tuple does not belong to this graph run".into());
         }
+        let Some(store) = self.tuple_store else {
+            return GraphStep::Fault("emit requires a durable tuple store".into());
+        };
         let key = tuple.key();
-        // W4 recovery touches orchestration only. It must not replay W3 or ask
-        // the external sink to republish a committed tuple, even at an old epoch.
-        if let Some(receipt) = self.emit_log.emit_of(&key) {
-            complete_after_w4(self.emit_log, &key);
-            return GraphStep::Emitted { receipt };
-        }
-        let existing = self.sink.receipt_of(&key).is_some();
-        if !existing && self.epoch >= self.emit_log.current_epoch()
-            && self.emit_log.promotion_of(&key).is_some()
-            && let Err(point) = self.faults.fire(CrashPoint::W3)
-        {
-            return GraphStep::Fault(format!("injected crash: {point:?}"));
-        }
-        match emit_named(self.sink, self.emit_log, tuple, self.epoch, event, payload) {
+        // W4 recovery must not touch the external sink, even at an old epoch.
+        // It must still repair a tuple write interrupted after the emit commit.
+        let outcome = if let Some(receipt) = self.emit_log.emit_of(&key) {
+            EmitOutcome::Existing(receipt)
+        } else {
+            let existing = self.sink.receipt_of(&key).is_some();
+            if !existing && self.epoch >= self.emit_log.current_epoch()
+                && self.emit_log.promotion_of(&key).is_some()
+                && let Err(point) = self.faults.fire(CrashPoint::W3)
+            {
+                return GraphStep::Fault(format!("injected crash: {point:?}"));
+            }
+            emit_named(self.sink, self.emit_log, tuple, self.epoch, event, payload)
+        };
+        let receipt = match outcome {
             EmitOutcome::Published(receipt) => {
-                if let Some(store) = self.tuple_store {
-                    if let Err(error) = store.record(tuple) {
-                        return GraphStep::Fault(format!("tuple record failed: {error:?}"));
-                    }
-                    if let Err(point) = self.faults.fire(CrashPoint::W5) {
-                        return GraphStep::Fault(format!("injected crash: {point:?}"));
-                    }
-                }
+                // The emit is committed, but tuple persistence may still fail.
                 if let Err(point) = self.faults.fire(CrashPoint::W4) {
                     return GraphStep::Fault(format!("injected crash: {point:?}"));
                 }
-                complete_after_w4(self.emit_log, &key);
-                GraphStep::Emitted { receipt }
+                receipt
             }
-            EmitOutcome::Existing(receipt) => {
-                if let Some(store) = self.tuple_store
-                    && let Err(error) = store.record(tuple)
-                {
-                    return GraphStep::Fault(format!("tuple record failed: {error:?}"));
-                }
-                complete_after_w4(self.emit_log, &key);
-                GraphStep::Emitted { receipt }
-            }
-            EmitOutcome::StaleRejected => GraphStep::Fault("stale emit rejected".into()),
-            EmitOutcome::PromotionRequired => GraphStep::Fault("emit has no promotion receipt".into()),
+            EmitOutcome::Existing(receipt) => receipt,
+            EmitOutcome::StaleRejected => return GraphStep::Fault("stale emit rejected".into()),
+            EmitOutcome::PromotionRequired => return GraphStep::Fault("emit has no promotion receipt".into()),
+        };
+        if let Err(error) = store.record(tuple) {
+            return GraphStep::Fault(format!("tuple record failed: {error:?}"));
         }
+        if let Err(error) = store.promote(&key, &receipt) {
+            return GraphStep::Fault(format!("tuple promotion failed: {error:?}"));
+        }
+        if let Err(point) = self.faults.fire(CrashPoint::W5) {
+            return GraphStep::Fault(format!("injected crash: {point:?}"));
+        }
+        complete_after_w4(self.emit_log, &key);
+        GraphStep::Emitted { receipt }
     }
 
     fn intent(&self, activation: u64, external_ref: String) -> ExecutionIntent {
