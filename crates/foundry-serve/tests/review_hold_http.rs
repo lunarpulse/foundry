@@ -22,6 +22,38 @@ async fn all_review_hold_routes_require_an_authenticated_session() {
     let _=std::fs::remove_file(&db);
 }
 
+#[tokio::test]
+async fn review_hold_routes_enforce_approver_observer_and_disabled_session_matrix() {
+    use foundry_serve::identity::Role;
+    let unique=SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let db=std::env::temp_dir().join(format!("review-role-{unique}.db"));
+    let state=ServeState::new(&db).unwrap();
+    let (approver,observer,inactive)={
+        let mut identity=state.identity.lock().await;
+        identity.bootstrap_owner("owner","pw",&FastHasher).unwrap();
+        let owner=identity.login("owner","pw",&FastHasher,300).unwrap();
+        let actor=identity.resolve_session(&owner).unwrap();
+        identity.create_user(&actor,"approver","pw",Role::Approver,&FastHasher).unwrap();
+        identity.create_user(&actor,"observer","pw",Role::Observer,&FastHasher).unwrap();
+        let approver=identity.login("approver","pw",&FastHasher,300).unwrap();
+        let observer=identity.login("observer","pw",&FastHasher,300).unwrap();
+        identity.create_user(&actor,"inactive","pw",Role::Approver,&FastHasher).unwrap();
+        let inactive=identity.login("inactive","pw",&FastHasher,300).unwrap();
+        let inactive_user=identity.resolve_session(&inactive).unwrap();
+        identity.set_disabled(&actor,&inactive_user.username,true).unwrap();
+        (approver,observer,inactive)
+    };
+    let app=Router::new().merge(foundry_serve::http::router(Arc::new(state)));
+    let request=|token:&str|Request::builder().method("POST").uri("/api/orders/missing/review/hold/missing/commit-pass")
+        .header("authorization",format!("Bearer {token}")).header("content-type","application/json").body(Body::from("{}")).unwrap();
+    assert_eq!(app.clone().oneshot(request(&observer)).await.unwrap().status(),StatusCode::FORBIDDEN);
+    assert_eq!(app.clone().oneshot(request(&inactive)).await.unwrap().status(),StatusCode::UNAUTHORIZED);
+    // The active Approver crosses the authorization boundary; the expected
+    // 500 is the downstream missing-order fixture, not an authorization denial.
+    assert_eq!(app.oneshot(request(&approver)).await.unwrap().status(),StatusCode::INTERNAL_SERVER_ERROR);
+    let _=std::fs::remove_file(db);
+}
+
 struct FastHasher;
 impl foundry_serve::identity::PasswordHasher for FastHasher {
     fn hash(&self,p:&str)->String {format!("test${p}")}
@@ -44,7 +76,7 @@ async fn cold_serve_resolves_holds_and_unavailable_resume_returns_500_without_co
         let unique=SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let root=std::env::temp_dir().join(format!("review-cold-{unique}"));std::fs::create_dir_all(&root).unwrap();
         let mut st=ServeState::new(root.join("ledger.db")).unwrap();
-        let token={let mut identity=st.identity.lock().await;identity.bootstrap_owner("reviewer","pw",&FastHasher).unwrap();identity.login("reviewer","pw",&FastHasher,300).unwrap()};
+        let (token,approver_token)={let mut identity=st.identity.lock().await;identity.bootstrap_owner("reviewer","pw",&FastHasher).unwrap();let owner_token=identity.login("reviewer","pw",&FastHasher,300).unwrap();let owner=identity.resolve_session(&owner_token).unwrap();identity.create_user(&owner,"approver","pw",foundry_serve::identity::Role::Approver,&FastHasher).unwrap();let approver_token=identity.login("approver","pw",&FastHasher,300).unwrap();(owner_token,approver_token)};
         let pack=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills/bmad-review-full/v1");
         let host_db=root.join("host.db");
         let mut host=foundry_line::PackReviewHost::new(&pack,GapExecutor,&host_db).unwrap().with_source_commit("67aa6c2bbea68ddec015cd8a3ec6fc7d26f837b0").unwrap();
@@ -63,7 +95,8 @@ async fn cold_serve_resolves_holds_and_unavailable_resume_returns_500_without_co
         let runner=foundry_line::durable_review_run(host,&host_db,tuples.clone()).unwrap();
         st.line=Arc::new(foundry_line::Line::new(st.line.gate.clone(),st.line.harness.clone(),st.line.ledger.clone(),st.line.publisher.clone(),st.line.policy.clone()).with_review_run(runner).with_tuple_store(tuples.clone()));
         let st=Arc::new(st);let app=foundry_serve::http::router(st.clone());
-        let request=||Request::builder().method("POST").uri(format!("/api/orders/cold-review/review/hold/{}/{suffix}",hold.hold_instance_id)).header("authorization",format!("Bearer {token}")).header("content-type","application/json").body(Body::from(r#"{"target":"replan_full"}"#)).unwrap();
+        let bearer=if suffix=="commit-pass"{&approver_token}else{&token};
+        let request=||Request::builder().method("POST").uri(format!("/api/orders/cold-review/review/hold/{}/{suffix}",hold.hold_instance_id)).header("authorization",format!("Bearer {bearer}")).header("content-type","application/json").body(Body::from(r#"{"target":"replan_full"}"#)).unwrap();
         let response=app.clone().oneshot(request()).await.unwrap();
         assert_eq!(response.status(),if suffix=="resume"{StatusCode::INTERNAL_SERVER_ERROR}else{StatusCode::OK},"{suffix}");
         let order=st.line.get("cold-review").await.unwrap();

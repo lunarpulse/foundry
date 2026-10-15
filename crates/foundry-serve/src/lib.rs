@@ -20,7 +20,7 @@ pub mod privacy;
 pub mod read_guard;
 pub mod scope;
 use foundry_ledger::{LedgerRow, SqliteLedger};
-use foundry_line::{line::Line, PackReviewHost, UnavailableStageExecutor, InspectingReviewRun, durable_review_run};
+use foundry_line::{line::Line, DieStageExecutor, PackReviewHost, UnavailableStageExecutor, InspectingReviewRun, durable_review_run};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -171,9 +171,20 @@ impl ServeState {
                 foundry_exec::SqliteTupleStore::open(&tuple_path).map_err(|e| format!("tuple store: {e:?}"))?
             );
             line.set_tuple_store(tuples.clone());
-            let host = PackReviewHost::new(&pack, UnavailableStageExecutor, PackReviewHost::default_db_path())
+            let host_db = PackReviewHost::default_db_path();
+            let executor: Box<dyn foundry_line::StageExecutor> = match (std::env::var("FOUNDRY_DIE_BINARY"), std::env::var("FOUNDRY_REPO_PATH")) {
+                (Ok(binary), Ok(repo)) => {
+                    let profile = std::env::var("FOUNDRY_DIE_PROFILE").unwrap_or_else(|_| "coding".into());
+                    let timeout_secs = std::env::var("FOUNDRY_DIE_TIMEOUT").ok().and_then(|v| v.parse().ok()).unwrap_or(600);
+                    let default_sessions = host_db.parent().unwrap_or(std::path::Path::new(".")).join("sessions");
+                    let session_root = std::env::var("FOUNDRY_SESSION_ROOT").map(PathBuf::from).unwrap_or(default_sessions);
+                    Box::new(DieStageExecutor::new(PathBuf::from(binary), profile, timeout_secs, PathBuf::from(repo), session_root))
+                }
+                _ => Box::new(UnavailableStageExecutor),
+            };
+            let host = PackReviewHost::new(&pack, executor, &host_db)
                 .map_err(|e| format!("review host: {e:?}"))?;
-            let runner = durable_review_run(host, PackReviewHost::default_db_path(), tuples)
+            let runner = durable_review_run(host, &host_db, tuples)
                 .map_err(|e| format!("review runner: {e}"))?;
             line = line.with_review_run(InspectingReviewRun::new(runner));
         }
@@ -317,7 +328,7 @@ mod tests {
         let db = std::env::temp_dir().join(format!("serve-t-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&db);
         let mut led = SqliteLedger::open(&db).unwrap();
-        let o = mk_order("o-1");
+        let _o = mk_order("o-1");
         let actor = foundry_domain::ActorId {
             kind: foundry_domain::ActorKind::Agent,
             source: "t".into(),

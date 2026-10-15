@@ -451,13 +451,13 @@ async fn origin_isolated_child() {
 
 #[tokio::test]
 async fn manifest_and_argv_agree_for_every_protocol_switch_combination() {
-    for base in [BaseSelection::Latest, BaseSelection::Origin] {
+    for base in [BaseSelection::Latest, BaseSelection::Origin, BaseSelection::Commit("a".repeat(40))] {
         for fix_context in [false, true] {
             let dir = temp_dir("protocol-parity");
             seed_repo(&dir.join("repo"), true);
             let binary = executable_script(&dir, "#!/bin/sh\nprintf '%s\\0' \"$@\" > argv.bin\ncp input-manifest.json consumed.json\n");
             let protocol = DieProtocol {
-                base, fix_context, context: vec!["src/a path.rs".into(), "README.md".into()],
+                base: base.clone(), fix_context, context: vec!["src/a path.rs".into(), "README.md".into()],
             };
             let test_order = order();
             let h = CliHarness::new(binary, "coding profile ; '$()'", 30).with_protocol(protocol.clone());
@@ -471,7 +471,8 @@ async fn manifest_and_argv_agree_for_every_protocol_switch_combination() {
             assert_eq!(manifest.profile, h.profile);
             assert_eq!(manifest.context, protocol.context);
             assert_eq!(manifest.fix_context, fix_context);
-            assert_eq!(manifest.base, if base == BaseSelection::Latest { "latest" } else { "origin" });
+            let expected_base=match &base { BaseSelection::Latest=>"latest",BaseSelection::Origin=>"origin",BaseSelection::Commit(commit)=>commit.as_str() };
+            assert_eq!(manifest.base, expected_base);
             let raw_args = std::fs::read(dir.join("argv.bin")).unwrap();
             assert_eq!(raw_args.last(), Some(&0));
             let actual: Vec<&[u8]> = raw_args[..raw_args.len() - 1].split(|b| *b == 0).collect();

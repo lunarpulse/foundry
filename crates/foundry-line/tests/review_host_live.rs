@@ -521,6 +521,31 @@ fn unavailable_resume_preserves_the_original_hold_and_returns_an_error() {
 }
 
 #[test]
+fn independent_host_connections_allow_exactly_one_hold_cas_winner() {
+    let db=Db::new();let trace=Arc::new(Mutex::new(Trace::default()));
+    for i in 0..3 { trace.lock().unwrap().outputs.push_back(output(None,false,i)); }
+    trace.lock().unwrap().outputs.push_back(output(Some("intent_gap"),true,3));
+    let mut initial=host(&db,trace,Arc::new(AtomicBool::new(false)));
+    let hold=initial.try_dispatch(&intent("cas",1)).unwrap().held.unwrap();drop(initial);
+    let pack=Path::new(env!("CARGO_MANIFEST_DIR")).join(PACK);
+    let a=PackReviewHost::new(&pack,foundry_line::UnavailableStageExecutor,&db.0).unwrap();
+    let b=PackReviewHost::new(&pack,foundry_line::UnavailableStageExecutor,&db.0).unwrap();
+    let barrier=Arc::new(std::sync::Barrier::new(3));
+    let run=|mut host:PackReviewHost,action,barrier:Arc<std::sync::Barrier>,id:String|std::thread::spawn(move||{
+        barrier.wait();
+        host.resolve_hold("cas",&id,action,"reviewer")
+    });
+    let first=run(a,foundry_exec::ReviewHoldAction::CommitPass,barrier.clone(),hold.hold_instance_id.clone());
+    let second=run(b,foundry_exec::ReviewHoldAction::CommitFail,barrier.clone(),hold.hold_instance_id.clone());
+    barrier.wait();
+    let outcomes=[first.join().unwrap(),second.join().unwrap()];
+    assert_eq!(outcomes.iter().filter(|result|result.is_ok()).count(),1);
+    let conn=connection(&db);
+    let status:String=conn.query_row("SELECT status FROM review_runs WHERE order_id='cas'",[],|r|r.get(0)).unwrap();
+    assert!(matches!(status.as_str(),"resolved"|"review_aborted"));
+}
+
+#[test]
 fn resuming_run_cannot_be_bypassed_by_another_activation() {
     let db=Db::new();let trace=Arc::new(Mutex::new(Trace::default()));passed_outputs(&trace);
     let mut h=host(&db,trace.clone(),Arc::new(AtomicBool::new(false)));

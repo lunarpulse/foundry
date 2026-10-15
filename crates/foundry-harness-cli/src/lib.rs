@@ -13,11 +13,12 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::process::Command;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum BaseSelection {
     #[default]
     Latest,
     Origin,
+    Commit(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -91,17 +92,19 @@ impl Harness for CliHarness {
                 )));
             }
 
-            let base_name = match protocol.base {
+            let base_name = match &protocol.base {
                 BaseSelection::Latest => "latest",
                 BaseSelection::Origin => "origin",
+                BaseSelection::Commit(commit) => commit.as_str(),
             };
             // Origin must be pinned before Die runs. Latest retains the legacy
             // post-Die workdir HEAD lookup below.
-            let origin_base = match protocol.base {
+            let origin_base = match &protocol.base {
                 BaseSelection::Latest => None,
                 BaseSelection::Origin => Some(git_repo_commit(
                     &workdir.join("repo"), "refs/remotes/origin/main^{commit}",
                 )?),
+                BaseSelection::Commit(_) => None,
             };
             let manifest = InputManifest {
                 order_id: order_id.clone(),

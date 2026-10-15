@@ -28,6 +28,11 @@ pub trait StageExecutor: Send {
         Err("session restoration is not implemented".into())
     }
 }
+impl<T: StageExecutor + ?Sized> StageExecutor for Box<T> {
+    fn execute(&mut self, task: &StageTask) -> Result<StageOutput, String> { (**self).execute(task) }
+    fn ensure_available(&self) -> Result<(), String> { (**self).ensure_available() }
+    fn restore_session(&mut self, session_id: &str, workdir: &Path) -> Result<(), String> { (**self).restore_session(session_id, workdir) }
+}
 /// Product wiring placeholder until the real LLM/Die adapter is supplied by T33.
 #[derive(Default)] pub struct UnavailableStageExecutor;
 impl StageExecutor for UnavailableStageExecutor { fn ensure_available(&self)->Result<(),String>{Err("review stage executor is not configured".into())} fn execute(&mut self, _task:&StageTask)->Result<StageOutput,String>{Err("review stage executor is not configured".into())} }
@@ -41,6 +46,10 @@ impl PackReviewHost {
         let snap = load_pack(pack_path.as_ref()).map_err(|e| HostError::Persistence(e.to_string()))?;
         if snap.digest() != REVIEW_PACK_DIGEST { return Err(HostError::Persistence(format!("unexpected review pack digest: {}", snap.digest()))); }
         let conn = open_db(db_path.as_ref()).map_err(HostError::Persistence)?;
+        // A process restart cannot distinguish a crashed continuation from a
+        // live one, so startup fences every durable resuming claim back to
+        // held. The hold remains consumable through the existing CAS path.
+        conn.execute("UPDATE review_runs SET status='held' WHERE status='resuming'", []).map_err(sqlerr).map_err(HostError::Persistence)?;
         Ok(Self { pack_path: pack_path.as_ref().to_path_buf(), db_path: fs::canonicalize(db_path.as_ref()).map_err(sqlerr).map_err(HostError::Persistence)?, executor: Box::new(executor), conn, pack_digest: snap.digest().to_owned(), dispatches: 0, source_commit: option_env!("FOUNDRY_SOURCE_COMMIT").map(str::to_owned).or_else(||std::env::var("FOUNDRY_SOURCE_COMMIT").ok()) })
     }
     pub fn with_source_commit(mut self, commit: impl Into<String>) -> Result<Self, HostError> {
@@ -81,6 +90,11 @@ impl DispatchHost for PackReviewHost {
         validate_intent(intent).map_err(HostError::Worker)?;
         self.check_binding(intent)?;
         if let Some(r) = self.load_result(&key)? { return Ok(r); }
+        let resolved_attempt: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM review_runs WHERE order_id=?1 AND attempt=?2 AND status IN ('resolved','review_aborted'))",
+            params![order, attempt as i64], |row| row.get(0),
+        ).map_err(sqlerr).map_err(HostError::Persistence)?;
+        if !resolved_attempt { self.executor.ensure_available().map_err(HostError::Worker)?; }
         let snap = load_pack(&self.pack_path).map_err(|e| HostError::Persistence(e.to_string()))?;
         if snap.digest() != self.pack_digest { return Err(HostError::Persistence("review pack digest changed".into())); }
         let digest = snap.digest().to_owned();
@@ -178,7 +192,7 @@ impl DispatchHost for PackReviewHost {
                 let out=self.executor.execute(&task).and_then(|out|accept_output(&task,out)).map_err(|e|foundry_pack::PackError{code:"E_EXEC_REDRIVE_ERROR",message:e})?;
                 let Some(commit)=out.produced_commit.clone().filter(|commit|!commit.is_empty()) else {return Err(foundry_pack::PackError{code:"E_EXEC_REDRIVE_ERROR",message:"fix stage did not produce a commit".into()});};
                 sequence+=1;
-                self.conn.execute("INSERT INTO review_stage_attempts(order_id,run_id,sequence,stage_id,status,output_json) VALUES(?1,?2,?3,?4,'complete',?5)",params![order,run_id,sequence as i64,task.stage_id,serde_json::json!({"role":role,"log_path":out.log_path,"produced_commit":commit}).to_string()]).map_err(sqlerr).map_err(packerr)?;
+                self.conn.execute("INSERT INTO review_stage_attempts(order_id,run_id,sequence,stage_id,status,output_json) VALUES(?1,?2,?3,?4,'complete',?5)",params![order,run_id,sequence as i64,task.stage_id,serde_json::json!({"role":role,"log_path":out.log_path,"produced_commit":commit,"input_manifest":manifest_evidence(&task)}).to_string()]).map_err(sqlerr).map_err(packerr)?;
                 self.conn.execute("INSERT OR REPLACE INTO review_sessions(order_id,run_id,session_id,receipt_json) VALUES(?1,?2,?3,?4)",params![order,run_id,session_id,serde_json::to_string(&SessionReceipt{session_id:task.session_id,output:out.log_path.clone(),sha256:format!("{:x}",Sha256::digest(fs::read(&out.log_path).map_err(packerr)?))}).map_err(packerr)?]).map_err(sqlerr).map_err(packerr)?;
                 accepted_logs.push(out.log_path.clone());
                 generations.push(foundry_exec::GenerationCommit{generation,commit:commit.clone(),fix_log_path:out.log_path});
@@ -244,7 +258,7 @@ impl DispatchHost for PackReviewHost {
                 let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(packerr)?;
                 ensure_active(&tx,intent).map_err(packerr)?;
                 let is_defer=role=="verify" && out.verdict_category.iter().chain(&out.verdict_categories).any(|v|v=="defer");
-                tx.execute("UPDATE review_stage_attempts SET status='complete',output_json=?1 WHERE order_id=?2 AND run_id=?3 AND sequence=?4",params![serde_json::json!({"log_path":out.log_path,"sha256":format!("{:x}",Sha256::digest(fs::read(&out.log_path).map_err(packerr)?)),"deferred":is_defer,"role":role,"inspected_commit":out.inspected_commit,"findings":out.findings,"verdicts":out.verdict_category.iter().chain(&out.verdict_categories).collect::<Vec<_>>()}).to_string(),order,run_id,sequence as i64]).map_err(packerr)?;
+                tx.execute("UPDATE review_stage_attempts SET status='complete',output_json=?1 WHERE order_id=?2 AND run_id=?3 AND sequence=?4",params![serde_json::json!({"log_path":out.log_path,"sha256":format!("{:x}",Sha256::digest(fs::read(&out.log_path).map_err(packerr)?)),"deferred":is_defer,"role":role,"inspected_commit":out.inspected_commit,"findings":out.findings,"verdicts":out.verdict_category.iter().chain(&out.verdict_categories).collect::<Vec<_>>(),"input_manifest":manifest_evidence(&task)}).to_string(),order,run_id,sequence as i64]).map_err(packerr)?;
                 tx.execute("INSERT OR REPLACE INTO review_sessions(order_id,run_id,session_id,receipt_json) VALUES(?1,?2,?3,?4)",params![order,run_id,session_id,serde_json::to_string(&SessionReceipt{session_id:task.session_id,output:out.log_path.clone(),sha256:format!("{:x}",Sha256::digest(fs::read(&out.log_path).map_err(packerr)?))}).map_err(packerr)?]).map_err(packerr)?;
                 tx.commit().map_err(packerr)?;
                 valid += 1;
@@ -278,6 +292,7 @@ impl DispatchHost for PackReviewHost {
         });
         let exit_code=if passed {0} else {1};
         let log_path=accepted_logs.last().cloned().unwrap_or_else(||format!("{}#{}", self.pack_path.display(),run_id));
+        validate_tuple_seal(generations.last().map(|generation|generation.commit.as_str()).unwrap_or(&latest_commit),&latest_commit).map_err(HostError::Worker)?;
         let host=HostResult{base_commit:base,result_commit:latest_commit.clone(),log_path,exit_code,generations:generations.clone(),held:hold_state.clone()};
         let held_json=hold_state.as_ref().zip(outcome.hold.as_ref()).map(|(hold,entry)|serde_json::json!({
             "hold":hold,"entry":entry,"engine_state":state.export(),"intent":intent,"run_id":run_id,
@@ -400,7 +415,7 @@ impl PackReviewHost {
                 charge_review_budget(&mut self.conn,order,&intent)?;
                 let out=self.executor.execute(&task).and_then(|o|accept_output(&task,o)).map_err(|e|foundry_pack::PackError{code:"E_EXEC_REDRIVE_ERROR",message:e})?;
                 let Some(commit)=out.produced_commit.clone().filter(|c|!c.is_empty()) else{return Err(foundry_pack::PackError{code:"E_EXEC_REDRIVE_ERROR",message:"redrive stage produced no commit".into()});};
-                self.conn.execute("INSERT INTO review_stage_attempts(order_id,run_id,sequence,stage_id,status,output_json) VALUES(?1,?2,?3,?4,'complete',?5)",params![order,run_id,sequence as i64,task.stage_id,serde_json::json!({"role":role,"log_path":out.log_path,"produced_commit":commit}).to_string()]).map_err(packerr)?;
+                self.conn.execute("INSERT INTO review_stage_attempts(order_id,run_id,sequence,stage_id,status,output_json) VALUES(?1,?2,?3,?4,'complete',?5)",params![order,run_id,sequence as i64,task.stage_id,serde_json::json!({"role":role,"log_path":out.log_path,"produced_commit":commit,"input_manifest":manifest_evidence(&task)}).to_string()]).map_err(packerr)?;
                 self.conn.execute("INSERT OR REPLACE INTO review_sessions(order_id,run_id,session_id,receipt_json) VALUES(?1,?2,?3,?4)",params![order,run_id,session_key,serde_json::to_string(&SessionReceipt{session_id:task.session_id,output:out.log_path.clone(),sha256:format!("{:x}",Sha256::digest(fs::read(&out.log_path).map_err(packerr)?))}).map_err(packerr)?]).map_err(packerr)?;
                 accepted_logs.push(out.log_path.clone());generations.push(foundry_exec::GenerationCommit{generation,commit:commit.clone(),fix_log_path:out.log_path});latest_commit=commit;
                 return Ok(input.clone());
@@ -434,7 +449,7 @@ impl PackReviewHost {
                 }};
                 let categories:Vec<String>=output.verdict_category.iter().chain(&output.verdict_categories).cloned().collect();
                 let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(packerr)?;ensure_active(&tx,&intent).map_err(packerr)?;
-                tx.execute("UPDATE review_stage_attempts SET status='complete',output_json=?1 WHERE order_id=?2 AND run_id=?3 AND sequence=?4",params![serde_json::json!({"role":role,"log_path":output.log_path,"sha256":format!("{:x}",Sha256::digest(fs::read(&output.log_path).map_err(packerr)?)),"inspected_commit":output.inspected_commit,"findings":output.findings,"verdicts":categories}).to_string(),order,run_id,sequence]).map_err(packerr)?;
+                tx.execute("UPDATE review_stage_attempts SET status='complete',output_json=?1 WHERE order_id=?2 AND run_id=?3 AND sequence=?4",params![serde_json::json!({"role":role,"log_path":output.log_path,"sha256":format!("{:x}",Sha256::digest(fs::read(&output.log_path).map_err(packerr)?)),"inspected_commit":output.inspected_commit,"findings":output.findings,"verdicts":categories,"input_manifest":manifest_evidence(&task)}).to_string(),order,run_id,sequence]).map_err(packerr)?;
                 tx.execute("INSERT OR REPLACE INTO review_sessions(order_id,run_id,session_id,receipt_json) VALUES(?1,?2,?3,?4)",params![order,run_id,session_key,serde_json::to_string(&SessionReceipt{session_id:task.session_id,output:output.log_path.clone(),sha256:format!("{:x}",Sha256::digest(fs::read(&output.log_path).map_err(packerr)?))}).map_err(packerr)?]).map_err(packerr)?;tx.commit().map_err(packerr)?;
                 valid+=1;done.insert(id,output.log_path.clone());accepted_logs.push(output.log_path);
                 if role=="verify"{findings|=output.findings || categories.iter().any(|v|matches!(v.as_str(),"patch"|"intent_gap"|"bad_plan"));verdicts.extend(categories);}
@@ -485,6 +500,13 @@ fn redrive_session_key(order:&str,node:&str)->String {
 }
 fn session_output_valid(saved:&SessionReceipt)->bool {
     fs::read(&saved.output).is_ok_and(|bytes|format!("{:x}",Sha256::digest(bytes))==saved.sha256)
+}
+fn manifest_evidence(task:&StageTask)->Option<serde_json::Value>{
+    fs::read(task.workdir.join("input-manifest.json")).ok().and_then(|bytes|serde_json::from_slice(&bytes).ok())
+}
+fn validate_tuple_seal(immutable_commit:&str,final_head:&str)->Result<(),String>{
+    if immutable_commit!=final_head {return Err("tuple immutable_commit does not match the final generation head (BindingMismatch)".into());}
+    Ok(())
 }
 // Select only the latest completed occurrence of each requested artifact.
 fn redrive_payload(conn:&Connection,order:&str,run:&str,payload:&str)->foundry_pack::Result<Vec<serde_json::Value>> {
@@ -717,6 +739,23 @@ mod tests {
     fn provenance_requires_explicit_build_identity(){
         assert!(provenance(REVIEW_PACK_DIGEST,None).unwrap_err().contains("FOUNDRY_SOURCE_COMMIT"));
         assert!(provenance(REVIEW_PACK_DIGEST,Some("HEAD")).is_err());
+    }
+    #[test]
+    fn startup_recovers_durable_resuming_run_to_held() {
+        let db=std::env::temp_dir().join(format!("review-resuming-{}.db",std::process::id()));
+        let pack=Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills/bmad-review-full/v1");
+        let conn=open_db(&db).unwrap();
+        conn.execute("INSERT INTO review_runs(order_id,attempt,run_id,base_commit,result_commit,pack_digest,status,counters_json,created_at) VALUES('order',1,'order:1:1:1','base','result',?1,'resuming','{}',0)",[REVIEW_PACK_DIGEST]).unwrap();
+        drop(conn);
+        let host=PackReviewHost::new(pack,UnavailableStageExecutor,&db).unwrap();
+        let status:String=host.conn.query_row("SELECT status FROM review_runs WHERE order_id='order'",[],|r|r.get(0)).unwrap();
+        assert_eq!(status,"held");
+        drop(host);let _=fs::remove_file(db);
+    }
+    #[test]
+    fn tuple_seal_refuses_immutable_commit_different_from_final_head(){
+        assert!(validate_tuple_seal("sealed-commit","final-head").unwrap_err().contains("BindingMismatch"));
+        assert!(validate_tuple_seal("final-head","final-head").is_ok());
     }
 }
 

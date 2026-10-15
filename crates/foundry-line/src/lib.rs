@@ -4,11 +4,13 @@
 //! Dies (#3); audit appends share the SQLite transaction with the state
 //! write (#5); operation_id idempotency guards publishing (#2).
 pub mod error;
+pub mod die_executor;
 pub mod line;
 pub mod rehydrate;
 pub mod review_host;
 
 pub use error::LineError;
+pub use die_executor::DieStageExecutor;
 pub use line::{Line, LineConfig, backoff_delay};
 pub use review_host::{InspectingReviewRun, BinaryProvenance, PackReviewHost, StageExecutor, StageOutput, StageTask, SqliteReviewLog, SqliteReviewSink, SqliteIntentLog, UnavailableStageExecutor, durable_review_run};
 
