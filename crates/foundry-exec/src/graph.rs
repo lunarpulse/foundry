@@ -3,7 +3,7 @@ use crate::{
     hold::{HoldCommand, HoldInstanceId, HoldOperation},
     inject::{CrashPoint, FaultInjector},
     lifecycle::{DispatchResult, Executor, LifecycleError, RunStep},
-    ports::{AttemptLedger, CounterLog, CounterRecord, DispatchHost, HoldStore, IntentLog, OutcomeStore},
+    ports::{AttemptLedger, CounterLog, CounterRecord, DispatchHost, HoldStore, IntentLog, OutcomeStore, TupleStore},
     types::{ArtifactTuple, Attempt, Epoch, ExecutionIntent, Generation, OrderId, RunId},
 };
 use chrono::Utc;
@@ -51,6 +51,7 @@ where
     recovery_error: Option<String>,
     hold_store: Option<&'a dyn HoldStore>,
     attempt_ledger: Option<&'a dyn AttemptLedger>,
+    tuple_store: Option<&'a dyn TupleStore>,
 }
 
 struct Visit {
@@ -119,6 +120,7 @@ where
             recovery_error: None,
             hold_store: None,
             attempt_ledger: None,
+            tuple_store: None,
         }
     }
 
@@ -130,6 +132,12 @@ where
 
     pub fn with_attempt_ledger(mut self, attempt_ledger: &'a dyn AttemptLedger) -> Self {
         self.attempt_ledger = Some(attempt_ledger);
+        self
+    }
+
+    /// Enables durable tuple recording after a successful emit.
+    pub fn with_tuple_store(mut self, tuple_store: &'a dyn TupleStore) -> Self {
+        self.tuple_store = Some(tuple_store);
         self
     }
 
@@ -615,6 +623,14 @@ where
         }
         match emit_named(self.sink, self.emit_log, tuple, self.epoch, event, payload) {
             EmitOutcome::Published(receipt) => {
+                if let Some(store) = self.tuple_store {
+                    if let Err(error) = store.record(tuple) {
+                        return GraphStep::Fault(format!("tuple record failed: {error:?}"));
+                    }
+                    if let Err(point) = self.faults.fire(CrashPoint::W5) {
+                        return GraphStep::Fault(format!("injected crash: {point:?}"));
+                    }
+                }
                 if let Err(point) = self.faults.fire(CrashPoint::W4) {
                     return GraphStep::Fault(format!("injected crash: {point:?}"));
                 }
@@ -622,6 +638,11 @@ where
                 GraphStep::Emitted { receipt }
             }
             EmitOutcome::Existing(receipt) => {
+                if let Some(store) = self.tuple_store
+                    && let Err(error) = store.record(tuple)
+                {
+                    return GraphStep::Fault(format!("tuple record failed: {error:?}"));
+                }
                 complete_after_w4(self.emit_log, &key);
                 GraphStep::Emitted { receipt }
             }

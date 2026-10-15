@@ -12,7 +12,7 @@ mod hold_store;
 use hold_store::DiskHolds;
 
 #[derive(Serialize, Deserialize, Default)]
-struct AttemptDb(BTreeMap<String, Vec<u64>>);
+struct AttemptDb(BTreeMap<String, Vec<(u64, u64)>>);
 struct DiskAttempts { path: PathBuf, budget: AttemptBudget }
 impl DiskAttempts {
     fn read(&self) -> AttemptDb {
@@ -20,14 +20,14 @@ impl DiskAttempts {
     }
 }
 impl AttemptLedger for DiskAttempts {
-    fn consume(&self, order: &OrderId, attempt: Attempt) -> Result<(), PortError> {
+    fn consume(&self, order: &OrderId, attempt: Attempt, run: RunId) -> Result<(), PortError> {
         let mut db = self.read();
         let attempts = db.0.entry(order.0.clone()).or_default();
-        if attempts.contains(&attempt.0) { return Ok(()); }
+        if attempts.contains(&(attempt.0, run.0)) { return Ok(()); }
         if attempts.len() >= self.budget.max_attempts as usize {
             return Err(PortError::AttemptBudgetExhausted { max_attempts: self.budget.max_attempts });
         }
-        attempts.push(attempt.0);
+        attempts.push((attempt.0, run.0));
         fs::write(&self.path, serde_json::to_vec(&db).unwrap()).map_err(|e| PortError::Store(e.to_string()))
     }
     fn consumed(&self, order: &OrderId) -> Result<u32, PortError> {
@@ -100,21 +100,22 @@ fn hold_waiting_and_resolution_survive_store_restart() {
 }
 
 #[test]
-fn attempt_budget_is_non_refundable_idempotent_and_independent_of_nano_budget() {
+fn r7_attempt_budget_counts_unique_runs_and_rejects_new_run_after_exhaustion() {
     let path = temp_path("attempts");
     let order = OrderId("o".into());
     let budget = AttemptBudget { max_attempts: 2 };
     {
         let ledger = DiskAttempts { path: path.clone(), budget };
-        ledger.consume(&order, Attempt(1)).unwrap();
-        ledger.consume(&order, Attempt(1)).unwrap();
+        ledger.consume(&order, Attempt(1), RunId(2)).unwrap();
+        ledger.consume(&order, Attempt(1), RunId(2)).unwrap();
         assert_eq!(ledger.consumed(&order).unwrap(), 1);
     }
     {
         let ledger = DiskAttempts { path: path.clone(), budget };
-        ledger.consume(&order, Attempt(2)).unwrap();
+        // Same (order, attempt) with a new run consumes the remaining slot.
+        ledger.consume(&order, Attempt(1), RunId(3)).unwrap();
         assert_eq!(ledger.consumed(&order).unwrap(), 2);
-        assert_eq!(ledger.consume(&order, Attempt(3)).unwrap_err(), PortError::AttemptBudgetExhausted { max_attempts: 2 });
+        assert_eq!(ledger.consume(&order, Attempt(1), RunId(99)).unwrap_err(), PortError::AttemptBudgetExhausted { max_attempts: 2 });
         assert_eq!(ledger.consumed(&order).unwrap(), 2);
     }
     assert!(matches!(foundry_exec::budget::reserve(&foundry_exec::Budget { reserved_nano: 0, settled_nano: 0, carried_nano: 10 }, 1),

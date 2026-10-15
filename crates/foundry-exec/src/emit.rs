@@ -18,7 +18,8 @@ pub trait EmitSink {
 /// Durable records used to authorize promotion emits and resume W3/W4. Reads
 /// must survive restart; successful writes mean durable persistence. Storage
 /// failures must stop execution. The owner serializes this log with the sink
-/// and epoch updates for the order, as required by the EmitSink contract.
+/// and epoch updates for the order. Epoch changes must be monotonic; consumers
+/// reject stale first-time emits while preserving exact receipt retries.
 pub trait EmitLog {
     fn current_epoch(&self) -> Epoch;
     fn promotion_of(&self, key: &ArtifactTupleKey) -> Option<PromotionReceipt>;
@@ -77,9 +78,8 @@ fn emit_with<S: EmitSink, L: EmitLog>(
         log.record_emit(&receipt);
         return EmitOutcome::Existing(receipt);
     }
-    // Duplicate receipts take precedence over epoch and promotion checks.
-    // Future epochs retain b1 fence semantics; current-only fencing is a
-    // documented b5 contract decision, not silently changed by this helper.
+    // Duplicate receipts take precedence over epoch checks, but first emits
+    // require a current or newer fencing token.
     if presented_epoch < log.current_epoch() {
         return EmitOutcome::StaleRejected;
     }

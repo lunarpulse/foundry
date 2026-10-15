@@ -466,7 +466,7 @@ fn b4_amended_hold_resumes_from_durable_destination() {
 
 struct DeniedAttempts;
 impl foundry_exec::AttemptLedger for DeniedAttempts {
-    fn consume(&self, _: &OrderId, _: Attempt) -> Result<(), foundry_exec::PortError> {
+    fn consume(&self, _: &OrderId, _: Attempt, _: RunId) -> Result<(), foundry_exec::PortError> {
         Err(foundry_exec::PortError::AttemptBudgetExhausted { max_attempts: 0 })
     }
     fn consumed(&self, _: &OrderId) -> Result<u32, foundry_exec::PortError> { Ok(0) }

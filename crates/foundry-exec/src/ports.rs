@@ -1,6 +1,6 @@
 use crate::{
     hold::{HoldApplied, HoldCasOutcome, HoldCommand, HoldInstanceId, HoldState},
-    types::{Attempt, ExecutionIntent, ExecutionOutcome, OrderId, RunId},
+    types::{ArtifactTuple, ArtifactTupleKey, Attempt, EmitReceipt, ExecutionIntent, ExecutionOutcome, OrderId, RunId},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12,6 +12,8 @@ pub enum PortError {
     MissingHold,
     AttemptBudgetExhausted { max_attempts: u32 },
     Store(String),
+    Permanent(String),
+    MissingEmitReceipt,
 }
 
 /// Durable human hold state. Implementations serialize operations per instance.
@@ -35,10 +37,22 @@ pub trait HoldStore: Send + Sync {
 
 /// One-time consumption ledger for non-refundable execution attempts.
 /// Implementations enforce their configured `AttemptBudget`, count unique
-/// `(order, attempt)` pairs, and never remove a consumed pair.
+/// unique `(order, attempt, run)` triples, enforce the configured maximum per
+/// `(order, attempt)` scope as specified by the adapter, and never remove a row.
 pub trait AttemptLedger: Send + Sync {
-    fn consume(&self, order: &OrderId, attempt: Attempt) -> Result<(), PortError>;
+    fn consume(&self, order: &OrderId, attempt: Attempt, run: RunId) -> Result<(), PortError>;
     fn consumed(&self, order: &OrderId) -> Result<u32, PortError>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Recorded;
+
+/// Durable tuple storage boundary. Adapters atomically persist complete tuples;
+/// consumers receive tuples through this port and never inspect storage paths.
+pub trait TupleStore: Send + Sync {
+    fn record(&self, tuple: &ArtifactTuple) -> Result<Recorded, PortError>;
+    fn latest(&self, order: &OrderId, attempt: Attempt) -> Result<Option<ArtifactTuple>, PortError>;
+    fn promote(&self, key: &ArtifactTupleKey, receipt: &EmitReceipt) -> Result<(), PortError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

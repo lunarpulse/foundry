@@ -4,6 +4,8 @@ pub enum CrashPoint {
     W2,
     W3,
     W4,
+    /// Tuple was durably recorded; a downstream consumer has not read it yet.
+    W5,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -85,8 +85,8 @@ cargo test 전체 green + 생성/삭제 파일 리포트 정합 (부모 대조).
   필수 (현재는 구별 불가).
 - IntentKey: activation·retry 변별 불가 — b2 실행기가 intent 재발행
   시점 정의와 함께 키 확장 결정.
-- 미래 epoch 수용(fence)은 b1 명시 동작 — 활성 epoch 일치 조건과의
-  상충은 b5 fencing 이중 증명에서 재검.
+- epoch·fencing 충돌은 b5에서 종결: epoch < active 제출 거부 및 쓰기
+  격리, epoch >= active 수용. 아래 b5 결정 참조.
 - 비환급 실행 횟수 예산(회수 불가 원칙)은 Budget과 별도 산정 필요.
 
 ## b2a 리뷰 지연 항목 (b3 계약 정합 필요 — 2026-10-14 gpt-6.1-sol 리뷰)
@@ -101,13 +101,24 @@ cargo test 전체 green + 생성/삭제 파일 리포트 정합 (부모 대조).
   cursor/next_activation에서 재구성 (추가 상태 0) vs (안2)
   GraphStateStore 포트 신설 (원자 기록, b3 저장소). bump 이력은
   영수증 스트림에서 유도 가능한지가 안1 성립 조건.
-- 미래 epoch 허용(fence)과 current-only emit 문구의 정책 충돌 —
-  b5 fencing 이중 증명 시 통일.
+- epoch·fencing 충돌은 b5에서 종결: epoch < active 제출 거부 및 쓰기
+  격리, epoch >= active 수용. 아래 b5 결정 참조.
 
 ## b2c 리뷰 지연 항목 (2026-10-15)
-- 실제 순환 그래프 팩의 통합 복원 시험 — 팩 로더가 E_DAG_CYCLE로
-  순환을 거부해 foundry-exec 단위에서 구성 불가. 드라이버 직접
-  구성 시험으로 방문별 기록은 검증됨. 순환 허용 여부는 팩 스펙
-  소유 사안 — b5/W5 이중 증명 시 팩 스펙 입장 정리 필요.
+- E_DAG_CYCLE: 순환 거부는 팩 스펙 소유다. 로더가 E_DAG_CYCLE로
+  순환을 거부하는 것을 정규 입장으로 확정하며 엔진 내 순환 지원 계획은
+  없다. 방문별 기록은 드라이버 직접 구성 시험으로 검증한다.
 - activation 없는 구형 카운터 로그는 자동 복원 대신 Fault 중단
-  (b2c-2 계약 이전 로그는 미지원 — 마이그레이션 필요 시 명시적 결정).
+  (b2c-2 계약 이전 로그는 미지원 — 자동 마이그레이션을 하지 않기로
+  결정했으며 명시적 결정 전까지 Fault 중단을 유지한다).
+
+## b5 통합 결정 — 튜플·epoch·fencing
+- TupleStore 포트가 ArtifactTuple만 읽고 쓴다. 소비자는 저장 경로에
+  접근하지 않는다. emit 성공 뒤 튜플을 기록하며 W5는 기록 후 소비 전이다.
+- 정책은 epoch < active 결과·이벤트 제출 거부 및 sibling 산출물, git refs,
+  세션 저장소 쓰기 격리다. epoch >= active는 수용하고 active epoch는
+  단조 증가해야 한다. 지연 emit은 영수증 없는 구 epoch 최초 emit만 거부하고,
+  동일 key의 기존 영수증은 멱등 반환한다. foundry-exec에서는 stale emit
+  거부와 기존 영수증 재사용을 구현한다. sibling/ref/session 쓰기 경계와
+  active epoch 갱신 포트가 이 크레이트에 없으므로 각각의 쓰기 격리 시험 및
+  단조 증가 강제는 해당 어댑터 소유이며 후속 통합 검증이 필요하다.

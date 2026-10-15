@@ -83,7 +83,7 @@ where
     /// its binding or recover its result; new activations wait for the prior binding.
     pub fn run(&mut self, intent: ExecutionIntent) -> Result<RunStep, LifecycleError> {
         if let Some(ledger) = self.attempt_ledger {
-            ledger.consume(&intent.order, intent.attempt).map_err(LifecycleError::AttemptBudget)?;
+            ledger.consume(&intent.order, intent.attempt, intent.run).map_err(LifecycleError::AttemptBudget)?;
         }
         let key = (intent.order.clone(), intent.attempt, intent.run);
         if let Some(recorded) = self.intents.get(&key, intent.activation) {
@@ -126,7 +126,7 @@ where
         intent: ExecutionIntent,
         ledger: &dyn AttemptLedger,
     ) -> Result<RunStep, LifecycleError> {
-        ledger.consume(&intent.order, intent.attempt).map_err(LifecycleError::AttemptBudget)?;
+        ledger.consume(&intent.order, intent.attempt, intent.run).map_err(LifecycleError::AttemptBudget)?;
         self.run(intent)
     }
 
@@ -142,7 +142,7 @@ where
             return ResumeAction::AlreadyBound(outcome);
         }
         if let Some(ledger) = self.attempt_ledger
-            && let Err(error) = ledger.consume(&intent.order, intent.attempt)
+            && let Err(error) = ledger.consume(&intent.order, intent.attempt, intent.run)
         {
             return ResumeAction::Interrupted(LifecycleError::AttemptBudget(error));
         }

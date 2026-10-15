@@ -132,19 +132,19 @@ fn intent(activation: u64) -> ExecutionIntent {
     }
 }
 
-struct LimitedAttempts { max: u32, rows: Mutex<HashSet<(OrderId, Attempt)>> }
+struct LimitedAttempts { max: u32, rows: Mutex<HashSet<(OrderId, Attempt, RunId)>> }
 impl AttemptLedger for LimitedAttempts {
-    fn consume(&self, order: &OrderId, attempt: Attempt) -> Result<(), PortError> {
+    fn consume(&self, order: &OrderId, attempt: Attempt, run: RunId) -> Result<(), PortError> {
         let mut rows = self.rows.lock().unwrap();
-        if rows.contains(&(order.clone(), attempt)) { return Ok(()); }
-        if rows.iter().filter(|(seen, _)| seen == order).count() >= self.max as usize {
+        if rows.contains(&(order.clone(), attempt, run)) { return Ok(()); }
+        if rows.iter().filter(|(seen, _, _)| seen == order).count() >= self.max as usize {
             return Err(PortError::AttemptBudgetExhausted { max_attempts: self.max });
         }
-        rows.insert((order.clone(), attempt));
+        rows.insert((order.clone(), attempt, run));
         Ok(())
     }
     fn consumed(&self, order: &OrderId) -> Result<u32, PortError> {
-        Ok(self.rows.lock().unwrap().iter().filter(|(seen, _)| seen == order).count() as u32)
+        Ok(self.rows.lock().unwrap().iter().filter(|(seen, _, _)| seen == order).count() as u32)
     }
 }
 

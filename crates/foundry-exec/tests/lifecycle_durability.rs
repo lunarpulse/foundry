@@ -236,7 +236,7 @@ fn all_ports_reopen_after_w1_and_w2_and_bind_the_complete_outcome_once() {
             assert_eq!(executor.resume(&key), match point {
                 CrashPoint::W1 => ResumeAction::ReDispatch,
                 CrashPoint::W2 => ResumeAction::ReBind,
-                CrashPoint::W3 | CrashPoint::W4 => unreachable!("this test covers W1/W2"),
+                CrashPoint::W3 | CrashPoint::W4 | CrashPoint::W5 => unreachable!("this test covers W1/W2"),
             });
             assert_eq!(executor.outcome(&key), Some(expected(&work)));
             assert_eq!(executor.resume(&key), ResumeAction::AlreadyBound(expected(&work)));
