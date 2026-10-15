@@ -104,7 +104,7 @@ impl Harness for CliHarness {
                 BaseSelection::Origin => Some(git_repo_commit(
                     &workdir.join("repo"), "refs/remotes/origin/main^{commit}",
                 )?),
-                BaseSelection::Commit(_) => None,
+                BaseSelection::Commit(commit) => Some(commit.clone()),
             };
             let manifest = InputManifest {
                 order_id: order_id.clone(),
@@ -127,6 +127,12 @@ impl Harness for CliHarness {
             // SECURITY (plan §11): env allowlist — minimal environment only.
             // No publish credentials ever reach the Die.
             let mut cmd = Command::new(&binary);
+            let isolated_stage = matches!(&protocol.base, BaseSelection::Commit(_));
+            cmd.kill_on_drop(isolated_stage);
+            #[cfg(unix)]
+            if isolated_stage {
+                cmd.process_group(0);
+            }
             cmd.current_dir(&workdir)
                 .arg("--profile")
                 .arg(&manifest.profile)
@@ -157,6 +163,14 @@ impl Harness for CliHarness {
                     let mut child = cmd
                         .spawn()
                         .map_err(|e| PortError::Retryable(format!("spawn: {e}")))?;
+                    // A stage must stop writing before its output is sealed,
+                    // including subprocesses left behind on success or timeout.
+                    #[cfg(unix)]
+                    let _stage_processes = if isolated_stage {
+                        child.id().map(StageProcessGroup)
+                    } else {
+                        None
+                    };
                     child
                         .wait()
                         .await
@@ -198,6 +212,22 @@ impl Harness for CliHarness {
                 exit_code: status.code().unwrap_or(-1),
             })
         }
+    }
+}
+
+#[cfg(unix)]
+struct StageProcessGroup(u32);
+
+#[cfg(unix)]
+impl Drop for StageProcessGroup {
+    fn drop(&mut self) {
+        // A missing group means the Die already exited without descendants.
+        // Use the system kill utility to avoid adding an unsafe signal call.
+        let _ = std::process::Command::new("/bin/kill")
+            .args(["-KILL", "--", &format!("-{}", self.0)])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
 }
 

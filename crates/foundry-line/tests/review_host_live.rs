@@ -546,6 +546,59 @@ fn independent_host_connections_allow_exactly_one_hold_cas_winner() {
 }
 
 #[test]
+fn opening_another_host_cannot_reclaim_a_live_resume() {
+    let db=Db::new();let trace=Arc::new(Mutex::new(Trace::default()));
+    for i in 0..3 { trace.lock().unwrap().outputs.push_back(output(None,false,i)); }
+    trace.lock().unwrap().outputs.push_back(output(Some("intent_gap"),true,3));
+    let mut initial=host(&db,trace.clone(),Arc::new(AtomicBool::new(false)));
+    let hold=initial.try_dispatch(&intent("live-resume",1)).unwrap().held.unwrap();drop(initial);
+    trace.lock().unwrap().outputs.push_back(StageOutput{produced_commit:Some("commit-B".into()),..StageOutput::default()});
+    passed_outputs(&trace);
+    struct Pausing(Fake,Arc<std::sync::Barrier>,Arc<std::sync::Barrier>);
+    impl StageExecutor for Pausing {
+        fn execute(&mut self,task:&StageTask)->Result<StageOutput,String>{
+            if task.fix_context.is_some(){self.1.wait();self.2.wait();}
+            self.0.execute(task)
+        }
+        fn restore_session(&mut self,id:&str,dir:&Path)->Result<(),String>{self.0.restore_session(id,dir)}
+    }
+    let entered=Arc::new(std::sync::Barrier::new(2));let release=Arc::new(std::sync::Barrier::new(2));
+    let pack=Path::new(env!("CARGO_MANIFEST_DIR")).join(PACK);
+    let mut active=PackReviewHost::new(&pack,Pausing(Fake(trace,Arc::new(AtomicBool::new(false))),entered.clone(),release.clone()),&db.0).unwrap();
+    let id=hold.hold_instance_id.clone();
+    let worker=std::thread::spawn(move||active.resume("live-resume",&id,"replan_full","first"));
+    entered.wait();
+    let mut newcomer=PackReviewHost::new(&pack,foundry_line::UnavailableStageExecutor,&db.0).unwrap();
+    let status=newcomer.latest_run("live-resume",1).unwrap().unwrap().status;
+    let second=newcomer.commit_pass("live-resume",&hold.hold_instance_id,"second");
+    release.wait();let resumed=worker.join().unwrap();
+    assert_eq!(status,"resuming");assert!(second.is_err());assert!(resumed.is_ok(),"{resumed:?}");
+}
+
+#[test]
+fn crash_after_resume_claim_recovers_snapshot_and_can_retry() {
+    let db=Db::new();let trace=Arc::new(Mutex::new(Trace::default()));
+    for i in 0..3 { trace.lock().unwrap().outputs.push_back(output(None,false,i)); }
+    trace.lock().unwrap().outputs.push_back(output(Some("intent_gap"),true,3));
+    let mut original=host(&db,trace.clone(),Arc::new(AtomicBool::new(false)));
+    let hold=original.try_dispatch(&intent("crash-resume",1)).unwrap().held.unwrap();drop(original);
+    let conn=connection(&db);
+    // Fault injection: the durable CAS committed, then the process died after
+    // accepting one stage but before saving a new engine checkpoint.
+    conn.execute("UPDATE review_runs SET status='resuming',hold_json=json_set(hold_json,'$.resume_sequence',1) WHERE order_id='crash-resume'",[]).unwrap();
+    conn.execute("INSERT INTO review_stage_attempts(order_id,run_id,sequence,stage_id,status) SELECT order_id,run_id,99,'interrupted','accepted' FROM review_runs WHERE order_id='crash-resume'",[]).unwrap();
+    drop(conn);
+    let mut restarted=host(&db,trace.clone(),Arc::new(AtomicBool::new(false)));
+    let recovered=restarted.latest_run("crash-resume",1).unwrap().unwrap();
+    assert_eq!(recovered.status,"held");assert_eq!(recovered.hold_instance_id.as_deref(),Some(hold.hold_instance_id.as_str()));
+    trace.lock().unwrap().outputs.push_back(StageOutput{produced_commit:Some("commit-B".into()),..StageOutput::default()});
+    passed_outputs(&trace);
+    restarted.resume("crash-resume",&hold.hold_instance_id,"replan_full","retry").unwrap();
+    let final_run=restarted.latest_run("crash-resume",1).unwrap().unwrap();
+    assert_eq!(final_run.status,"resolved");assert_eq!(final_run.hold_json.unwrap().parse::<serde_json::Value>().unwrap()["resume_sequence"],2);
+}
+
+#[test]
 fn resuming_run_cannot_be_bypassed_by_another_activation() {
     let db=Db::new();let trace=Arc::new(Mutex::new(Trace::default()));passed_outputs(&trace);
     let mut h=host(&db,trace.clone(),Arc::new(AtomicBool::new(false)));

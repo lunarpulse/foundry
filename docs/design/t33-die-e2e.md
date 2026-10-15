@@ -11,11 +11,16 @@ the `UnavailableStageExecutor` behavior. Set `FOUNDRY_TUPLES` and
 `FOUNDRY_REVIEW_PACK` as usual for the tuple store and frozen review pack.
 
 The executor clones the configured local repository without checking out a
-branch, then detaches at the task base commit. A fix task uses `fix_context` as
+branch, then detaches at the task base commit. Lens and verification tasks use
+the latest artifact commit as their base. Verified generated commits are kept
+in `session_root/.commits.git` and fetched into subsequent workdirs; the source
+repository is not modified. A fix task uses `fix_context` as
 its manifest base and sets `fix_context=true`; other stages use `base_commit`.
 The manifest and Die log remain under the execution work directory. Session
 records and a copy of the most recent `die-output.json` live under the session
-root.
+root. The stage's sealed output is the structured `die-output.json`; process
+stdout/stderr remain in the sibling `attempt-0.log`. Reused session IDs restore
+the previous result into each new workdir, including shared lens sessions.
 
 ## Evidence bundle r1-r9
 
@@ -36,7 +41,7 @@ tuple database is configured by `FOUNDRY_TUPLES`; the lifecycle journal is
 | r6 | Sealed tuple | In the tuple DB: `SELECT order_id,attempt,run_id,generation,immutable_commit,artifact_location,generations_json FROM artifact_tuples WHERE order_id=? ORDER BY run_id,generation;` Confirm the final tuple's `immutable_commit` equals the last generation commit and the final host result's `result_commit`. |
 | r7 | Human hold decision | `SELECT status,hold_json FROM review_runs WHERE order_id=? ORDER BY rowid;` `hold_json.human_events` records the actor, timestamp, action, and resume target. |
 | r8 | Approval and publication transition | `GET /api/orders/{order_id}` shows the ledger events. The terminal review result appears in `host_results`; lifecycle events include the later approval and transition to `Publishing`. |
-| r9 | Full journal-chain integrity | `GET /api/verify` returns `chain_valid`; the raw journal rows from r1 can also be checked in sequence using each row's `prev_hash` against the previous row's `hash`. |
+| r9 | Full journal-chain integrity | Authenticated `GET /api/audit/verify` returns `chain_valid`. For a manual full-chain check, use `SELECT seq,event_json,prev_hash,hash FROM ledger ORDER BY seq;` across all orders, since the hash chain is global. Checking only the order-filtered r1 rows is insufficient. |
 
 The host evidence is in SQLite tables `review_runs`, `review_stage_attempts`,
 `review_sessions`, and `host_results`. Human decisions are persisted in

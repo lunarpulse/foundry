@@ -461,7 +461,10 @@ async fn manifest_and_argv_agree_for_every_protocol_switch_combination() {
             };
             let test_order = order();
             let h = CliHarness::new(binary, "coding profile ; '$()'", 30).with_protocol(protocol.clone());
-            h.run(&test_order, 3, &dir).await.unwrap();
+            let output = h.run(&test_order, 3, &dir).await.unwrap();
+            if let BaseSelection::Commit(commit) = &base {
+                assert_eq!(&output.base_commit, commit);
+            }
             let consumed = std::fs::read(dir.join("consumed.json")).unwrap();
             assert_eq!(consumed, std::fs::read(dir.join("input-manifest.json")).unwrap());
             let manifest: InputManifest = serde_json::from_slice(&consumed).unwrap();

@@ -45,12 +45,10 @@ impl PackReviewHost {
         if !pack_path.as_ref().is_absolute() { return Err(HostError::Persistence("FOUNDRY_REVIEW_PACK must be absolute".into())); }
         let snap = load_pack(pack_path.as_ref()).map_err(|e| HostError::Persistence(e.to_string()))?;
         if snap.digest() != REVIEW_PACK_DIGEST { return Err(HostError::Persistence(format!("unexpected review pack digest: {}", snap.digest()))); }
-        let conn = open_db(db_path.as_ref()).map_err(HostError::Persistence)?;
-        // A process restart cannot distinguish a crashed continuation from a
-        // live one, so startup fences every durable resuming claim back to
-        // held. The hold remains consumable through the existing CAS path.
-        conn.execute("UPDATE review_runs SET status='held' WHERE status='resuming'", []).map_err(sqlerr).map_err(HostError::Persistence)?;
-        Ok(Self { pack_path: pack_path.as_ref().to_path_buf(), db_path: fs::canonicalize(db_path.as_ref()).map_err(sqlerr).map_err(HostError::Persistence)?, executor: Box::new(executor), conn, pack_digest: snap.digest().to_owned(), dispatches: 0, source_commit: option_env!("FOUNDRY_SOURCE_COMMIT").map(str::to_owned).or_else(||std::env::var("FOUNDRY_SOURCE_COMMIT").ok()) })
+        let mut conn = open_db(db_path.as_ref()).map_err(HostError::Persistence)?;
+        let db_path=fs::canonicalize(db_path.as_ref()).map_err(sqlerr).map_err(HostError::Persistence)?;
+        recover_resuming(&mut conn, &db_path).map_err(HostError::Persistence)?;
+        Ok(Self { pack_path: pack_path.as_ref().to_path_buf(), db_path, executor: Box::new(executor), conn, pack_digest: snap.digest().to_owned(), dispatches: 0, source_commit: option_env!("FOUNDRY_SOURCE_COMMIT").map(str::to_owned).or_else(||std::env::var("FOUNDRY_SOURCE_COMMIT").ok()) })
     }
     pub fn with_source_commit(mut self, commit: impl Into<String>) -> Result<Self, HostError> {
         let commit = commit.into();
@@ -246,7 +244,7 @@ impl DispatchHost for PackReviewHost {
                     fresh_sessions.insert(session_id.clone(), task_session.clone());
                 }
                 let task=StageTask { stage_id:id.clone(), role:role.clone(), lens_bytes, session_id:task_session,
-                    fix_context:None, base_commit:base.clone(), artifact_commit:latest_commit.clone(), inputs, workdir };
+                    fix_context:None, base_commit:latest_commit.clone(), artifact_commit:latest_commit.clone(), inputs, workdir };
                 let out=match self.executor.execute(&task).and_then(|out|accept_output(&task,out)) {
                     Ok(out)=>out,
                     Err(error)=>{
@@ -341,6 +339,10 @@ impl DispatchHost for PackReviewHost {
         if let foundry_exec::ReviewHoldAction::Resume{target}=&action {
             if !hold.resume_targets.iter().any(|candidate|candidate==target){return Err(HostError::Worker("resume target is not allowed".into()));}
             self.executor.ensure_available().map_err(HostError::Worker)?;
+            // This OS lock survives independent DB connections and is released
+            // by the kernel on process death. Startup must not steal a live CAS.
+            let _claim=resume_claim(&self.db_path,&run_id).map_err(HostError::Worker)?
+                .ok_or_else(||HostError::Worker("review continuation is still running".into()))?;
             let resume_sequence=doc["resume_sequence"].as_u64().unwrap_or(0).checked_add(1).ok_or_else(||HostError::Persistence("resume sequence exhausted".into()))?;
             doc["resume_sequence"]=serde_json::json!(resume_sequence);
             history.push(serde_json::json!({"actor":actor,"at":chrono::Utc::now().to_rfc3339(),"action":"resume","target":target}));
@@ -375,7 +377,6 @@ impl DispatchHost for PackReviewHost {
 impl PackReviewHost {
     fn continue_held_engine(&mut self, order:&str, attempt:i64, run_id:&str, target:&str, mut doc:serde_json::Value)->Result<(),HostError>{
         let intent:ExecutionIntent=serde_json::from_value(doc["intent"].clone()).map_err(sqlerr).map_err(HostError::Persistence)?;
-        let base_commit=parse_external_ref(&intent.external_ref).map(|parts|parts.2).ok_or_else(||HostError::Persistence("held intent has invalid external_ref".into()))?;
         let mut state=foundry_pack::EngineState::import(doc["engine_state"].as_str().ok_or_else(||HostError::Persistence("held run has no engine snapshot".into()))?).map_err(HostError::Persistence)?;
         let run_root=self.db_path.with_extension("review-runs").join(format!("{:x}",Sha256::digest(run_id.as_bytes())));
         let snapshot_run=doc["snapshot_run_id"].as_str().unwrap_or(run_id);
@@ -440,7 +441,7 @@ impl PackReviewHost {
                     self.conn.execute("UPDATE review_runs SET status='invalidated' WHERE order_id=?1 AND status IN ('passed','held','failed')",[order]).map_err(packerr)?;
                     task_session=format!("{session_key}:fresh:{run_id}:resume-{resume_sequence}");fresh_sessions.insert(session_key.clone(),task_session.clone());
                 }
-                let task=StageTask{stage_id:id.clone(),role:role.clone(),lens_bytes,session_id:task_session,fix_context:None,base_commit:base_commit.clone(),artifact_commit:latest_commit.clone(),inputs,workdir};
+                let task=StageTask{stage_id:id.clone(),role:role.clone(),lens_bytes,session_id:task_session,fix_context:None,base_commit:latest_commit.clone(),artifact_commit:latest_commit.clone(),inputs,workdir};
                 charge_review_budget(&mut self.conn,order,&intent)?;
                 self.conn.execute("INSERT INTO review_stage_attempts(order_id,run_id,sequence,stage_id,status) VALUES(?1,?2,?3,?4,'accepted')",params![order,run_id,sequence,id]).map_err(packerr)?;
                 let output=match self.executor.execute(&task).and_then(|o|accept_output(&task,o)){Ok(o)=>o,Err(error)=>{
@@ -493,6 +494,30 @@ impl PackReviewHost {
 
 #[derive(serde::Serialize,serde::Deserialize)]
 struct SessionReceipt { session_id:String, output:String, sha256:String }
+
+fn resume_claim(db:&Path,run_id:&str)->Result<Option<fs::File>,String>{
+    let directory=db.with_extension("review-claims");
+    fs::create_dir_all(&directory).map_err(sqlerr)?;
+    let file=fs::OpenOptions::new().create(true).truncate(false).write(true)
+        .open(directory.join(format!("{:x}.lock",Sha256::digest(run_id.as_bytes())))).map_err(sqlerr)?;
+    match file.try_lock(){
+        Ok(())=>Ok(Some(file)),
+        Err(fs::TryLockError::WouldBlock)=>Ok(None),
+        Err(fs::TryLockError::Error(error))=>Err(sqlerr(error)),
+    }
+}
+fn recover_resuming(conn:&mut Connection,db:&Path)->Result<(),String>{
+    let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sqlerr)?;
+    let rows={let mut query=tx.prepare("SELECT order_id,run_id FROM review_runs WHERE status='resuming'").map_err(sqlerr)?;
+        query.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).map_err(sqlerr)?
+            .collect::<Result<Vec<_>,_>>().map_err(sqlerr)?};
+    for (order,run) in rows {
+        if let Some(_claim)=resume_claim(db,&run)? {
+            tx.execute("UPDATE review_runs SET status='held' WHERE order_id=?1 AND run_id=?2 AND status='resuming'",params![order,run]).map_err(sqlerr)?;
+        }
+    }
+    tx.commit().map_err(sqlerr)
+}
 
 
 fn redrive_session_key(order:&str,node:&str)->String {

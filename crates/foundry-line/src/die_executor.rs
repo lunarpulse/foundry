@@ -4,6 +4,7 @@ use foundry_domain::ports::Harness;
 use foundry_domain::{ExternalRef, Order};
 use foundry_harness_cli::{BaseSelection, CliHarness, DieProtocol, InputManifest};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs,
@@ -122,7 +123,22 @@ impl StageExecutor for DieStageExecutor {
 
     fn execute(&mut self, task: &StageTask) -> Result<StageOutput, String> {
         self.ensure_available()?;
-        prepare_workdir(&self.repo_path, &task.workdir, &task.base_commit)?;
+        let record_path = self.session_path(&task.session_id)?;
+        if record_path.exists() && !self.restored.contains_key(&task.session_id) {
+            self.restore_session(&task.session_id, &task.workdir)?;
+        }
+        prepare_workdir(
+            &self.repo_path,
+            &task.workdir,
+            &task.base_commit,
+            &self.session_root,
+        )?;
+        let output_path = task.workdir.join("die-output.json");
+        match fs::remove_file(&output_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("remove stale Die output: {e}")),
+        }
         let mut protocol = self.protocol(task);
         if let Some(restored) = self.restored.remove(&task.session_id) {
             protocol
@@ -133,6 +149,18 @@ impl StageExecutor for DieStageExecutor {
                 restored.output_path.display()
             ));
         }
+        let expected_manifest = InputManifest {
+            order_id: task.session_id.clone(),
+            attempt: 0,
+            task: format!("{}:{}", task.role, task.stage_id),
+            profile: self.profile.clone(),
+            base: match &protocol.base {
+                BaseSelection::Commit(base) => base.clone(),
+                _ => unreachable!("stage protocol uses an explicit commit"),
+            },
+            fix_context: protocol.fix_context,
+            context: protocol.context.clone(),
+        };
         let harness =
             CliHarness::new(&self.binary, &self.profile, self.timeout_secs).with_protocol(protocol);
         let external = ExternalRef::intake(
@@ -140,21 +168,51 @@ impl StageExecutor for DieStageExecutor {
             &format!("{}:{}", task.role, task.stage_id),
         );
         let order = Order::new(task.session_id.clone(), external, chrono::Utc::now());
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| format!("create Die runtime: {e}"))?;
-        let die = runtime
-            .block_on(harness.run(&order, 0, &task.workdir))
-            .map_err(|e| format!("Die execution failed: {e:?}"))?;
+        // Line and the HTTP handlers call this synchronous port inside Tokio.
+        // Keep the local runtime on a plain thread so neither current-thread
+        // nor multithread Tokio callers attempt to nest Runtime::block_on.
+        let die = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| format!("create Die runtime: {e}"))?;
+                    runtime
+                        .block_on(harness.run(&order, 0, &task.workdir))
+                        .map_err(|e| format!("Die execution failed: {e:?}"))
+                })
+                .join()
+                .map_err(|_| "Die runtime thread panicked".to_owned())?
+        })?;
         if die.exit_code != 0 {
             return Err(format!("Die exited with code {}", die.exit_code));
         }
-        let output_path = task.workdir.join("die-output.json");
         let bytes =
             fs::read(&output_path).map_err(|e| format!("read {}: {e}", output_path.display()))?;
         let output: DieOutputFile =
             serde_json::from_slice(&bytes).map_err(|e| format!("parse Die output: {e}"))?;
+        if matches!(task.role.as_str(), "verify" | "lens") {
+            let raw: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|e| format!("parse Die output: {e}"))?;
+            if !raw
+                .get("verdict_categories")
+                .is_some_and(serde_json::Value::is_array)
+            {
+                return Err("verification Die output missing verdict_categories".into());
+            }
+            let head = git_text(&task.workdir, &["rev-parse", "HEAD^{commit}"])?;
+            if head != task.artifact_commit
+                || output
+                    .inspected_commit
+                    .as_ref()
+                    .is_some_and(|commit| commit != &head)
+            {
+                return Err(
+                    "verification HEAD does not match artifact_commit (BindingMismatch)".into(),
+                );
+            }
+        }
         if matches!(task.role.as_str(), "verify" | "lens") && output.produced_commit.is_some() {
             return Err(format!("{} Die output included produced_commit", task.role));
         }
@@ -174,16 +232,20 @@ impl StageExecutor for DieStageExecutor {
             &fs::read(&manifest_path).map_err(|e| format!("read input manifest: {e}"))?,
         )
         .map_err(|e| format!("parse input manifest: {e}"))?;
-        save_session(
-            &self.session_root,
-            &self.session_path(&task.session_id)?,
-            &manifest,
-            &output_path,
-        )?;
+        if manifest != expected_manifest {
+            return Err("Die modified the input manifest (BindingMismatch)".into());
+        }
+        if let Some(commit) = output.produced_commit.as_deref() {
+            cache_commit(&self.session_root, &task.workdir, commit)?;
+        }
+        save_session(&self.session_root, &record_path, &manifest, &output_path)?;
         Ok(StageOutput {
             verdict_category: output.verdict_category,
             findings: output.findings,
-            log_path: die.log_path,
+            // Seal the structured result, which downstream lenses consume.
+            // A successful Die may be silent; its process log stays alongside
+            // this file as attempt-0.log for execution diagnostics.
+            log_path: output_path.to_string_lossy().into_owned(),
             inspected_commit: output.inspected_commit,
             verdict_categories: output.verdict_categories,
             produced_commit: output.produced_commit,
@@ -213,8 +275,26 @@ impl StageExecutor for DieStageExecutor {
     }
 }
 
-fn prepare_workdir(repo: &Path, workdir: &Path, base: &str) -> Result<(), String> {
+fn prepare_workdir(
+    repo: &Path,
+    workdir: &Path,
+    base: &str,
+    session_root: &Path,
+) -> Result<(), String> {
+    if !matches!(base.len(), 40 | 64) || !base.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("base_commit is not a full git SHA (BindingMismatch)".into());
+    }
     fs::create_dir_all(workdir).map_err(|e| format!("create workdir: {e}"))?;
+    for entry in fs::read_dir(workdir).map_err(|e| format!("read workdir: {e}"))? {
+        if entry
+            .map_err(|e| format!("read workdir entry: {e}"))?
+            .file_name()
+            != ".die-session"
+        {
+            return Err("Die workdir must be empty except for a restored session".into());
+        }
+    }
+    let repo = fs::canonicalize(repo).map_err(|e| format!("resolve repository: {e}"))?;
     let session_dir = workdir.join(".die-session");
     let session_stash = workdir.with_extension(format!("die-session-stash-{}", std::process::id()));
     if session_dir.exists() {
@@ -223,7 +303,7 @@ fn prepare_workdir(repo: &Path, workdir: &Path, base: &str) -> Result<(), String
     }
     let clone = Command::new("git")
         .args(["clone", "--no-checkout"])
-        .arg(repo)
+        .arg(&repo)
         .arg(workdir)
         .output()
         .map_err(|e| {
@@ -233,7 +313,6 @@ fn prepare_workdir(repo: &Path, workdir: &Path, base: &str) -> Result<(), String
             format!("git clone: {e}")
         })?;
     if !clone.status.success() {
-        let _ = fs::remove_dir_all(workdir);
         if session_stash.exists() {
             let _ = fs::create_dir_all(workdir);
             let _ = fs::rename(&session_stash, &session_dir);
@@ -243,6 +322,28 @@ fn prepare_workdir(repo: &Path, workdir: &Path, base: &str) -> Result<(), String
             String::from_utf8_lossy(&clone.stderr)
         ));
     }
+    let cache = session_root.join(".commits.git");
+    if cache.exists() {
+        let _lock = cache_lock(session_root)?;
+        // Generated commits live in the shared object store rather than the
+        // source repository. Fetch explicitly before checking out a new head.
+        if git_text(workdir, &["cat-file", "-e", &format!("{base}^{{commit}}")]).is_err() {
+            let fetched = Command::new("git")
+                .arg("-C")
+                .arg(workdir)
+                .args(["fetch", "--no-tags"])
+                .arg(fs::canonicalize(&cache).map_err(|e| e.to_string())?)
+                .arg(base)
+                .output()
+                .map_err(|e| format!("fetch generated base: {e}"))?;
+            if !fetched.status.success() {
+                return Err(format!(
+                    "fetch generated base: {}",
+                    String::from_utf8_lossy(&fetched.stderr)
+                ));
+            }
+        }
+    }
     let checkout = Command::new("git")
         .arg("-C")
         .arg(workdir)
@@ -250,7 +351,6 @@ fn prepare_workdir(repo: &Path, workdir: &Path, base: &str) -> Result<(), String
         .output()
         .map_err(|e| format!("git checkout: {e}"))?;
     if !checkout.status.success() {
-        let _ = fs::remove_dir_all(workdir);
         if session_stash.exists() {
             let _ = fs::create_dir_all(workdir);
             let _ = fs::rename(&session_stash, &session_dir);
@@ -271,6 +371,48 @@ fn prepare_workdir(repo: &Path, workdir: &Path, base: &str) -> Result<(), String
     Ok(())
 }
 
+fn cache_lock(root: &Path) -> Result<fs::File, String> {
+    fs::create_dir_all(root).map_err(|e| format!("create session root: {e}"))?;
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(root.join(".commits.lock"))
+        .map_err(|e| format!("open commit cache lock: {e}"))?;
+    lock.lock().map_err(|e| format!("lock commit cache: {e}"))?;
+    Ok(lock)
+}
+
+fn cache_commit(root: &Path, workdir: &Path, commit: &str) -> Result<(), String> {
+    let _lock = cache_lock(root)?;
+    let cache = root.join(".commits.git");
+    if !cache.exists() {
+        let init = Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&cache)
+            .output()
+            .map_err(|e| format!("create commit cache: {e}"))?;
+        if !init.status.success() {
+            return Err("create commit cache failed".into());
+        }
+    }
+    let fetched = Command::new("git")
+        .arg("-C")
+        .arg(&cache)
+        .args(["fetch", "--no-tags"])
+        .arg(fs::canonicalize(workdir).map_err(|e| e.to_string())?)
+        .arg(format!("{commit}:refs/heads/{commit}"))
+        .output()
+        .map_err(|e| format!("save generated commit: {e}"))?;
+    if !fetched.status.success() {
+        return Err(format!(
+            "save generated commit: {}",
+            String::from_utf8_lossy(&fetched.stderr)
+        ));
+    }
+    Ok(())
+}
+
 fn verify_produced_commit(workdir: &Path, commit: &str, base: &str) -> Result<(), String> {
     if !matches!(commit.len(), 40 | 64) || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("produced_commit is not a full git SHA".into());
@@ -286,9 +428,15 @@ fn verify_produced_commit(workdir: &Path, commit: &str, base: &str) -> Result<()
     if head != commit {
         return Err("produced_commit is not the workdir HEAD".into());
     }
-    let parents = git_text(workdir, &["rev-list", "--parents", "-n", "1", commit])?;
-    let fields: Vec<_> = parents.split_whitespace().collect();
-    if fields.len() != 2 || fields[1] != base {
+    // Read the object's real headers, rather than a revision walk affected by
+    // worker-written replacement refs, grafts, or shallow-boundary metadata.
+    let object = git_text(workdir, &["cat-file", "-p", commit])?;
+    let parents: Vec<_> = object
+        .lines()
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| line.strip_prefix("parent "))
+        .collect();
+    if parents.as_slice() != [base] {
         return Err("produced_commit parent does not match base (BindingMismatch)".into());
     }
     Ok(())
@@ -296,6 +444,7 @@ fn verify_produced_commit(workdir: &Path, commit: &str, base: &str) -> Result<()
 
 fn git_text(dir: &Path, args: &[&str]) -> Result<String, String> {
     let output = Command::new("git")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
         .args(args)
         .current_dir(dir)
         .output()
@@ -317,8 +466,13 @@ fn save_session(
     output_path: &Path,
 ) -> Result<(), String> {
     fs::create_dir_all(root).map_err(|e| format!("create session root: {e}"))?;
-    let output_copy = root.join(format!("{}.output.json", manifest.order_id));
-    fs::copy(output_path, &output_copy).map_err(|e| format!("save session output: {e}"))?;
+    let bytes = fs::read(output_path).map_err(|e| format!("read session output: {e}"))?;
+    let outputs = root.join("outputs");
+    fs::create_dir_all(&outputs).map_err(|e| format!("create session outputs: {e}"))?;
+    let output_copy = fs::canonicalize(&outputs)
+        .map_err(|e| e.to_string())?
+        .join(format!("{:x}.json", Sha256::digest(&bytes)));
+    fs::write(&output_copy, bytes).map_err(|e| format!("save session output: {e}"))?;
     let record = SessionRecord {
         manifest: manifest.clone(),
         output_copy,
