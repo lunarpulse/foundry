@@ -8,9 +8,37 @@ pub mod fake;
 
 use foundry_domain::Order;
 use foundry_domain::ports::{DieOutput, Harness, PortError, PortResult};
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::process::Command;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BaseSelection {
+    #[default]
+    Latest,
+    Origin,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DieProtocol {
+    pub base: BaseSelection,
+    pub fix_context: bool,
+    pub context: Vec<String>,
+}
+
+/// Stable input contract written before invoking the external Die.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InputManifest {
+    pub order_id: String,
+    pub attempt: u32,
+    pub task: String,
+    pub profile: String,
+    pub base: String,
+    pub fix_context: bool,
+    pub context: Vec<String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct CliHarness {
@@ -20,6 +48,8 @@ pub struct CliHarness {
     pub profile: String,
     /// Per-attempt timeout in seconds.
     pub timeout_secs: u64,
+    /// Pack/caller supplied Die protocol configuration.
+    pub protocol: DieProtocol,
 }
 
 impl CliHarness {
@@ -28,7 +58,13 @@ impl CliHarness {
             binary: binary.into(),
             profile: profile.into(),
             timeout_secs,
+            protocol: DieProtocol::default(),
         }
+    }
+
+    pub fn with_protocol(mut self, protocol: DieProtocol) -> Self {
+        self.protocol = protocol;
+        self
     }
 }
 
@@ -42,6 +78,7 @@ impl Harness for CliHarness {
         let binary = self.binary.clone();
         let profile = self.profile.clone();
         let timeout_secs = self.timeout_secs;
+        let protocol = self.protocol.clone();
         let order_id = order.id.clone();
         let dedup_key = order.external.dedup_key.clone();
         let workdir = workdir.to_path_buf();
@@ -53,6 +90,34 @@ impl Harness for CliHarness {
                     binary.display()
                 )));
             }
+
+            let base_name = match protocol.base {
+                BaseSelection::Latest => "latest",
+                BaseSelection::Origin => "origin",
+            };
+            let base_commit = match protocol.base {
+                BaseSelection::Latest => git_head(&workdir),
+                BaseSelection::Origin => {
+                    let commit = git_ref(&workdir.join("repo"), "origin/main");
+                    if commit.is_empty() {
+                        return Err(PortError::Permanent(format!(
+                            "die base origin/main not found in {}",
+                            workdir.join("repo").display()
+                        )));
+                    }
+                    commit
+                }
+            };
+            let manifest = InputManifest {
+                order_id: order_id.clone(),
+                attempt,
+                task: dedup_key.clone(),
+                profile: profile.clone(),
+                base: base_name.to_string(),
+                fix_context: protocol.fix_context,
+                context: protocol.context.clone(),
+            };
+            write_manifest_atomic(&workdir, attempt, &manifest)?;
 
             let log_path = workdir.join(format!("attempt-{attempt}.log"));
             let log_file = std::fs::File::create(&log_path)
@@ -80,6 +145,10 @@ impl Harness for CliHarness {
                 .stdin(Stdio::null())
                 .stdout(Stdio::from(log_file))
                 .stderr(Stdio::from(log_err));
+            if protocol.fix_context {
+                cmd.arg("--fix-context");
+            }
+            cmd.arg("--base").arg(base_name);
 
             let child = tokio::time::timeout(
                 std::time::Duration::from_secs(timeout_secs),
@@ -100,7 +169,6 @@ impl Harness for CliHarness {
             .map_err(|_| PortError::Retryable(format!("die timeout after {timeout_secs}s")))?;
             let status = child?;
 
-            let base = git_head(&workdir);
             // The Die wrapper clones the gate repo into `workdir/repo`, so
             // HEAD may live one level down (measured 2026-10-07: git_head on
             // the bare workdir returned "" → empty digest → approval refused
@@ -123,7 +191,7 @@ impl Harness for CliHarness {
 
             Ok(DieOutput {
                 attempt,
-                base_commit: base,
+                base_commit,
                 result_commit,
                 log_path: log_path.display().to_string(),
                 exit_code: status.code().unwrap_or(-1),
@@ -132,9 +200,44 @@ impl Harness for CliHarness {
     }
 }
 
+fn write_manifest_atomic(workdir: &Path, attempt: u32, manifest: &InputManifest) -> PortResult<()> {
+    let target = workdir.join("input-manifest.json");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = workdir.join(format!(
+        ".input-manifest-{}-{attempt}-{nonce}.tmp",
+        std::process::id()
+    ));
+    let result = (|| {
+        let bytes = serde_json::to_vec(manifest)
+            .map_err(|e| PortError::Permanent(format!("serialize input manifest: {e}")))?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|e| PortError::Permanent(format!("create input manifest temp: {e}")))?;
+        use std::io::Write;
+        file.write_all(&bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|e| PortError::Permanent(format!("write input manifest: {e}")))?;
+        std::fs::rename(&temporary, &target)
+            .map_err(|e| PortError::Permanent(format!("rename input manifest: {e}")))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
 fn git_head(dir: &Path) -> String {
+    git_ref(dir, "HEAD")
+}
+
+fn git_ref(dir: &Path, reference: &str) -> String {
     std::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
+        .args(["rev-parse", reference])
         .current_dir(dir)
         .output()
         .ok()
