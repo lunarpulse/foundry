@@ -29,7 +29,8 @@ pub trait IntentLog {
     /// Records an immutable identity `(order, attempt, run, activation)`.
     fn append(&mut self, intent: &ExecutionIntent);
     /// Durably claims dispatch before the host call. This marker does not prove
-    /// the host accepted work: once set, recovery waits rather than redispatches.
+    /// the host accepted work. Recovery waits unless the host proves no receipt
+    /// exists for this activation.
     fn mark_started(&mut self, key: &(OrderId, Attempt, RunId), activation: u64);
     fn latest(&self, key: &(OrderId, Attempt, RunId)) -> Option<ExecutionIntent>;
     /// Reads a specific activation, retaining history for delayed retries.
@@ -47,17 +48,27 @@ pub trait DispatchHost {
     /// activation identity before returning it. External work and session writes
     /// remain owned by this adapter.
     fn dispatch(&mut self, intent: &ExecutionIntent) -> Self::Result;
+
+    /// Fallible dispatch boundary used by Executor. Legacy infallible hosts keep
+    /// their fail-stop contract; fallible adapters must override this method.
+    fn try_dispatch(&mut self, intent: &ExecutionIntent) -> Result<Self::Result, crate::host::HostError> {
+        Ok(self.dispatch(intent))
+    }
+
     fn dispatch_count(&self) -> u64;
 
-    /// Whether the host durably recorded receipt of this exact activation.
-    /// Legacy hosts without receipt support report false.
+    /// Whether this exact activation was, or may have been, accepted. `false`
+    /// must prove durable receipt absence under the exclusive execution owner.
+    /// Unsupported receipts and ambiguous reads must never return false: legacy
+    /// hosts conservatively wait. Read errors must fail-stop, not imply absence.
     fn accepted(&self, _intent: &ExecutionIntent) -> bool {
-        false
+        true
     }
 
     /// Reads a durably saved result after restart, without starting external work
-    /// or consuming the receipt. `None` means no result is available yet, never
-    /// permission to redispatch. Read failures must stop execution, not return None.
+    /// or consuming the receipt. `None` alone does not permit redispatch; only
+    /// `accepted(intent) == false` proves it safe for started work. Read failures
+    /// must stop execution, not return None.
     fn recover_result(&mut self, intent: &ExecutionIntent) -> Option<Self::Result>;
 }
 

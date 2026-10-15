@@ -133,6 +133,8 @@ impl SessionReceipt {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "receipt", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Receipt {
+    /// Complete durable worker output; this receipt does not choose graph routing.
+    Host(crate::host::HostResult),
     Emit(EmitReceipt),
     Promotion(PromotionReceipt),
     Session(SessionReceipt),

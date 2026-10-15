@@ -18,7 +18,7 @@ struct TestDir(PathBuf);
 impl TestDir {
     fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = PathBuf::from("/tmp/b2c_review/test-data").join(format!(
+        let path = std::env::temp_dir().join("test-data").join(format!(
             "durability-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed),
         ));
         fs::create_dir_all(&path).unwrap();
@@ -30,7 +30,7 @@ impl Drop for TestDir {
     fn drop(&mut self) {
         use std::io::Write;
         let mut inventory = fs::OpenOptions::new().create(true).append(true)
-            .open("/tmp/b2c_review/runtime-temporaries.txt").unwrap();
+            .open(std::env::temp_dir().join("runtime-temporaries.txt")).unwrap();
         for entry in fs::read_dir(&self.0).unwrap() {
             inventory.write_all(format!("{} (deleted)\n", entry.unwrap().path().display()).as_bytes()).unwrap();
         }
@@ -51,7 +51,7 @@ fn write<T: Serialize>(path: &Path, value: &T) {
     {
         use std::io::Write;
         let mut inventory = std::fs::OpenOptions::new().create(true).append(true)
-            .open("/tmp/b2c_review/runtime-temporaries.txt").unwrap();
+            .open(std::env::temp_dir().join("runtime-temporaries.txt")).unwrap();
         inventory.write_all(format!("{} (rename temporary)\n", temporary.display()).as_bytes()).unwrap();
     }
     fs::write(&temporary, serde_json::to_vec(value).unwrap()).unwrap();
@@ -265,4 +265,10 @@ fn failed_durable_intent_write_stops_before_any_host_effect() {
     assert_eq!(host.dispatch_count(), 0);
     assert!(!host.path.exists());
     assert!(!store.0.exists());
+}
+
+#[test]
+fn b3a_fixture_uses_configured_temp_directory() {
+    let dir = TestDir::new();
+    assert!(dir.0.starts_with(std::env::temp_dir()), "fixture escaped TMPDIR: {}", dir.0.display());
 }

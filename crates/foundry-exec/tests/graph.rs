@@ -556,7 +556,7 @@ impl ReviewDir {
     fn new() -> Self {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::path::Path::new("/tmp/b2c_review/test-data").join(format!(
+        let path = std::env::temp_dir().join("test-data").join(format!(
             "graph-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
         std::fs::create_dir_all(&path).unwrap();
         Self(path)
@@ -566,7 +566,7 @@ impl Drop for ReviewDir {
     fn drop(&mut self) {
         use std::io::Write;
         let mut inventory = std::fs::OpenOptions::new().create(true).append(true)
-            .open("/tmp/b2c_review/runtime-temporaries.txt").unwrap();
+            .open(std::env::temp_dir().join("runtime-temporaries.txt")).unwrap();
         for entry in std::fs::read_dir(&self.0).unwrap() {
             inventory.write_all(format!("{} (deleted)\n", entry.unwrap().path().display()).as_bytes()).unwrap();
         }
@@ -695,7 +695,7 @@ fn write_emit(path: &std::path::Path, state: &EmitState) {
     {
         use std::io::Write;
         let mut inventory = std::fs::OpenOptions::new().create(true).append(true)
-            .open("/tmp/b2c_review/runtime-temporaries.txt").unwrap();
+            .open(std::env::temp_dir().join("runtime-temporaries.txt")).unwrap();
         inventory.write_all(format!("{} (rename temporary)\n", pending.display()).as_bytes()).unwrap();
     }
     std::fs::write(&pending, serde_json::to_vec(state).unwrap()).unwrap();
@@ -1067,4 +1067,95 @@ fn b2c_outcome_fixture_latest_observes_committed_bindings() {
     log.commit(&outcome);
     assert_eq!(OutcomeStore::latest(&log, &key), Some(outcome));
     assert_eq!(OutcomeStore::latest(&log, &(OrderId("other".into()), Attempt(1), RunId(2))), None);
+}
+
+#[test]
+fn b3a_fixture_uses_configured_temp_directory() {
+    let dir = ReviewDir::new();
+    assert!(dir.0.starts_with(std::env::temp_dir()), "fixture escaped TMPDIR: {}", dir.0.display());
+}
+
+#[derive(Default)]
+struct DieLedger {
+    accepted: HashSet<foundry_exec::HostKey>,
+    results: HashMap<foundry_exec::HostKey, foundry_exec::HostResult>,
+}
+impl foundry_exec::HostLedger for DieLedger {
+    fn accept(&mut self, key: &foundry_exec::HostKey) -> Result<(), String> {
+        self.accepted.insert(key.clone());
+        Ok(())
+    }
+    fn is_accepted(&self, key: &foundry_exec::HostKey) -> bool { self.accepted.contains(key) }
+    fn save(&mut self, key: &foundry_exec::HostKey, result: &foundry_exec::HostResult) -> Result<(), String> {
+        assert!(self.accepted.contains(key));
+        self.results.entry(key.clone()).or_insert_with(|| result.clone());
+        Ok(())
+    }
+    fn load(&self, key: &foundry_exec::HostKey) -> Option<foundry_exec::HostResult> { self.results.get(key).cloned() }
+}
+struct GraphDieWorker { calls: u64, fail: bool }
+impl foundry_exec::DieWorker for GraphDieWorker {
+    fn run(&mut self, _: &foundry_exec::HostKey, _: &str) -> Result<foundry_exec::HostResult, String> {
+        self.calls += 1;
+        if self.fail { return Err("graph worker fault".into()); }
+        Ok(foundry_exec::HostResult {
+            base_commit: "base".into(), result_commit: "commit-is-not-a-graph-node".into(),
+            log_path: "/work/worker.log".into(), exit_code: 0,
+        })
+    }
+}
+
+#[test]
+fn b3a_die_worker_errors_reach_graph_fault_and_retry_never_repeats_work() {
+    let pack = review_pack();
+    for cursor in ["lenses", "fixdie"] {
+        let mut rig = Rig::default();
+        let mut worker = GraphDieWorker { calls: 0, fail: true };
+        let mut ledger = DieLedger::default();
+        let mut host = foundry_exec::DieHostAdapter::new(&mut worker, &mut ledger);
+        let mut driver = GraphDriver::new(&pack, &mut rig.intents, &mut host, &mut rig.outcomes,
+            &mut rig.counters, &mut rig.sink, &mut rig.emits, OrderId("order-1".into()), Attempt(1),
+            RunId(2), Generation(3), Epoch(0), "fixture", Some(tuple()));
+        assert!(matches!(driver.advance(cursor), GraphStep::Fault(reason)
+            if reason.contains("Host(Worker") && reason.contains("graph worker fault")));
+        assert!(matches!(driver.advance(cursor), GraphStep::Fault(reason) if reason.contains("AwaitResult")));
+        drop(driver);
+        drop(host);
+        assert_eq!(worker.calls, 1);
+        assert!(rig.outcomes.outcomes.is_empty());
+        assert!(!rig.counters.0.iter().any(|(_, _, row)| matches!(row, CounterRecord::Completed { .. })));
+    }
+}
+
+#[test]
+fn b3a_die_graph_w2_restart_uses_pack_continuation_and_complete_host_receipt() {
+    let pack = review_pack();
+    for cursor in ["lenses", "fixdie"] {
+        let mut rig = Rig::default();
+        let mut worker = GraphDieWorker { calls: 0, fail: false };
+        let mut ledger = DieLedger::default();
+        {
+            let mut host = foundry_exec::DieHostAdapter::new(&mut worker, &mut ledger);
+            let mut driver = GraphDriver::new(&pack, &mut rig.intents, &mut host, &mut rig.outcomes,
+                &mut rig.counters, &mut rig.sink, &mut rig.emits, OrderId("order-1".into()), Attempt(1),
+                RunId(2), Generation(3), Epoch(0), "fixture", Some(tuple()));
+            driver.arm_fault(foundry_exec::CrashPoint::W2);
+            assert!(matches!(driver.advance(cursor), GraphStep::Fault(reason) if reason.contains("W2")));
+        }
+        assert_eq!(worker.calls, 1);
+        let expected_next = pack.nodes().iter().find(|node| node.id == cursor).unwrap()
+            .value["on_done"].as_str().unwrap();
+        let mut host = foundry_exec::DieHostAdapter::new(&mut worker, &mut ledger);
+        let mut driver = GraphDriver::restore(&pack, &mut rig.intents, &mut host, &mut rig.outcomes,
+            &mut rig.counters, &mut rig.sink, &mut rig.emits, OrderId("order-1".into()), Attempt(1),
+            RunId(2), Generation(3), Epoch(0), "fixture", Some(tuple()));
+        assert!(matches!(driver.start(), GraphStep::Advanced { next, .. } if next == expected_next));
+        drop(driver);
+        drop(host);
+        assert_eq!(worker.calls, 1);
+        let bound = OutcomeStore::latest(&rig.outcomes, &(OrderId("order-1".into()), Attempt(1), RunId(2))).unwrap();
+        assert!(matches!(bound.receipts.as_slice(), [foundry_exec::Receipt::Host(result)]
+            if result.result_commit == "commit-is-not-a-graph-node" && result.exit_code == 0));
+        assert!(bound.cursor.is_none());
+    }
 }

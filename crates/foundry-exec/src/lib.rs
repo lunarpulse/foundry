@@ -13,7 +13,7 @@ pub mod types;
 pub use budget::{Budget, ReservationOutcome};
 pub use emit::{EmitLog, EmitOutcome, EmitSink, complete_after_w4, emit_once};
 pub use graph::{GraphDriver, GraphStep};
-pub use host::{DieHostAdapter, DieWorker, HostKey, HostLedger, HostResult};
+pub use host::{DieHostAdapter, DieWorker, HostError, HostKey, HostLedger, HostResult};
 pub use hold::{HoldCasOutcome, HoldCommand, HoldInstanceId, HoldOperation, cas_hold};
 pub use inject::{CrashPoint, FaultInjector};
 pub use lifecycle::{DispatchResult, Executor, LifecycleError, ResumeAction, RunStep};

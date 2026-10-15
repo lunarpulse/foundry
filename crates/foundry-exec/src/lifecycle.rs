@@ -30,8 +30,9 @@ pub enum ResumeAction {
     AlreadyBound(ExecutionOutcome),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LifecycleError {
+    Host(crate::host::HostError),
     Crash(CrashPoint),
     IntentConflict(u64),
     ActivationPending(u64),
@@ -109,7 +110,8 @@ where
 
     /// Resolves a previously recorded activation. W1 redispatches; W2 recovers
     /// the host result and binds it without dispatching again. Started work without
-    /// a durable result waits only when the host has a durable acceptance receipt.
+    /// a durable result waits unless the host proves receipt absence. Legacy hosts
+    /// without receipt support conservatively wait.
     pub fn resume(&mut self, key: &IntentKey) -> ResumeAction {
         let Some(intent) = self.intents.latest(key) else {
             return ResumeAction::NeedsFreshRun;
@@ -166,7 +168,7 @@ where
     ) -> Result<ExecutionOutcome, LifecycleError> {
         self.faults.fire(CrashPoint::W1).map_err(LifecycleError::Crash)?;
         self.intents.mark_started(key, intent.activation);
-        let result = self.host.dispatch(intent);
+        let result = self.host.try_dispatch(intent).map_err(LifecycleError::Host)?;
         self.bind_result(intent, result)
     }
 

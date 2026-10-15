@@ -388,3 +388,29 @@ fn review_no_intent_requires_a_fresh_run_without_external_effects() {
     assert_eq!(executor.dispatch_count(), 0);
     assert!(executor.outcome(&key()).is_none());
 }
+
+// A host predating receipt support cannot prove dispatch never reached it.
+struct LegacyHost { calls: u64 }
+impl DispatchHost for LegacyHost {
+    type Result = DispatchResult;
+    fn dispatch(&mut self, _: &ExecutionIntent) -> DispatchResult {
+        self.calls += 1;
+        DispatchResult::default()
+    }
+    fn dispatch_count(&self) -> u64 { self.calls }
+    fn recover_result(&mut self, _: &ExecutionIntent) -> Option<DispatchResult> { None }
+}
+
+#[test]
+fn b3a_legacy_host_without_receipts_waits_on_run_and_resume() {
+    let mut intents = MemoryIntentLog::default();
+    intents.append(&intent(8));
+    intents.mark_started(&key(), 8);
+    let mut host = LegacyHost { calls: 1 }; // Work may already have happened.
+    let mut outcomes = MemoryOutcomeStore::default();
+    let mut executor = Executor::new(&mut intents, &mut host, &mut outcomes);
+    assert_eq!(executor.run(intent(8)), Err(foundry_exec::LifecycleError::AwaitResult(8)));
+    assert_eq!(executor.resume(&key()), ResumeAction::AwaitResult);
+    assert_eq!(executor.dispatch_count(), 1);
+    assert!(executor.outcome(&key()).is_none());
+}
