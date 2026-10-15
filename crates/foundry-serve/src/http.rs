@@ -4,12 +4,10 @@
 //! response embeds the snapshot meta (review #2). Bind 127.0.0.1 by default
 //! — UI-1 approve actions open up in M3 with Identity (plan §4).
 use crate::ServeState;
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::Deserialize;
 use std::sync::Arc;
 
 pub fn router(state: Arc<ServeState>) -> Router {
@@ -18,6 +16,10 @@ pub fn router(state: Arc<ServeState>) -> Router {
         .route("/api/orders/{id}", get(crate::read_guard::detail_handler))
         // UI-1: human approve action (T27) — single token mint per POST
         .route("/api/orders/{id}/approve", post(crate::approve_v2::approve))
+        .route("/api/orders/{id}/review/hold/{hold_id}/resume", post(crate::review_hold::resume))
+        .route("/api/orders/{id}/review/hold/{hold_id}/commit-pass", post(crate::review_hold::commit_pass))
+        .route("/api/orders/{id}/review/hold/{hold_id}/commit-fail", post(crate::review_hold::commit_fail))
+        .route("/api/orders/{id}/review/hold/{hold_id}/abort", post(crate::review_hold::abort))
         .route("/api/audit/verify", get(crate::read_guard::verify_handler))
         .route("/api/status", get(status))
         // M5.2 T60b: the production policy-application entry (N1
@@ -32,52 +34,6 @@ async fn board() -> impl IntoResponse {
     (
         [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
         include_str!("../assets/index.html"),
-    )
-}
-
-#[derive(Deserialize)]
-struct OrdersQuery {
-    state: Option<String>,
-    limit: Option<usize>,
-}
-
-async fn orders(
-    State(st): State<Arc<ServeState>>,
-    Query(q): Query<OrdersQuery>,
-) -> impl IntoResponse {
-    // cap limit: unbounded card lists are an ops trap (review #2)
-    let limit = q.limit.unwrap_or(200).min(500);
-    let resp = st.orders(q.state.as_deref(), limit);
-    (
-        [(axum::http::header::CACHE_CONTROL, "no-store")],
-        Json(resp),
-    )
-}
-
-async fn order_detail(
-    State(st): State<Arc<ServeState>>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
-    match st.order_detail(&id) {
-        Some(d) => (
-            StatusCode::OK,
-            [(axum::http::header::CACHE_CONTROL, "no-store")],
-            Json(d),
-        )
-            .into_response(),
-        None => (
-            StatusCode::NOT_FOUND,
-            [(axum::http::header::CACHE_CONTROL, "no-store")],
-            Json(serde_json::json!({"error": "unknown order", "order_id": id})),
-        )
-            .into_response(),
-    }
-}
-
-async fn verify(State(st): State<Arc<ServeState>>) -> impl IntoResponse {
-    (
-        [(axum::http::header::CACHE_CONTROL, "no-store")],
-        Json(st.verify()),
     )
 }
 

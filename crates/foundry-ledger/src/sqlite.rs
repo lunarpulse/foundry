@@ -268,6 +268,7 @@ fn intent_of(event: &OrderEvent) -> String {
         OrderEvent::DieFailed { reason, .. } | OrderEvent::InspectionFailed { reason } => {
             reason.clone()
         }
+        OrderEvent::ReviewHeld { reason } => reason.clone(),
         _ => String::new(),
     }
 }

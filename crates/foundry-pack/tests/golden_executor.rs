@@ -179,3 +179,16 @@ fn counter_overflow_holds_and_missing_counter_never_falls_through_to_pass(){
     let mut state=engine.initial_state(BTreeMap::new());state.counters.remove("loopbacks");
     assert_eq!(engine.run(&mut state,&input(vec!["bad_plan".into()]),16).unwrap_err().code,"E_EXEC_CONDITION");
 }
+
+#[test]
+fn engine_state_round_trip_preserves_the_next_resumed_outcome(){
+    let (engine,_)=setup();
+    let mut original=engine.initial_state(BTreeMap::new());
+    engine.run(&mut original,&input(vec!["intent_gap".into()]),16).unwrap();
+    let json=original.export();
+    let mut restored=foundry_pack::EngineState::import(&json).unwrap();
+    let left=engine.resume_staged(&mut original,"replan_full",|_,_,input,_|Ok(input.clone())).unwrap();
+    let right=engine.resume_staged(&mut restored,"replan_full",|_,_,input,_|Ok(input.clone())).unwrap();
+    assert_eq!(left,right);
+    assert_eq!(original.counters,restored.counters);
+}

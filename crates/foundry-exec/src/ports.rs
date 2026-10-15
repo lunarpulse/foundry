@@ -167,6 +167,15 @@ pub trait DispatchHost {
     /// `accepted(intent) == false` proves it safe for started work. Read failures
     /// must stop execution, not return None.
     fn recover_result(&mut self, intent: &ExecutionIntent) -> Option<Self::Result>;
+
+    /// Reads the greatest durable review run for an order attempt.
+    fn latest_run(&self, _order: &str, _attempt: u64) -> Result<Option<crate::review_run::RunRecord>, crate::host::HostError> {
+        Ok(None)
+    }
+
+    fn resolve_hold(&mut self, _order:&str, _hold_id:&str, _action:crate::review_run::ReviewHoldAction, _actor:&str) -> Result<(),crate::host::HostError> {
+        Err(crate::host::HostError::Worker("review hold resolution is unsupported".into()))
+    }
 }
 
 /// Atomic persistence boundary for an outcome and its continuation data.

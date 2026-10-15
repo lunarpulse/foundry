@@ -8,7 +8,7 @@ pub enum EngineAction {
     Emit { event: String, payload: String },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HoldEntry {
     pub node_id: String,
     pub entry_counters: BTreeMap<String, u64>,
@@ -23,7 +23,7 @@ pub struct StepOutcome {
     pub terminal: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RunInput {
     pub verdicts: Vec<String>,
     pub has_findings: bool,
@@ -31,7 +31,8 @@ pub struct RunInput {
     pub timeout: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EngineState {
     pub counters: BTreeMap<String, u64>,
     current: Option<String>,
@@ -122,6 +123,11 @@ impl GraphEngine {
     }
 
     pub fn resume(&self, state: &mut EngineState, target_node: &str) -> Result<StepOutcome> {
+        self.resume_staged(state, target_node, |_, _, input, _| Ok(input.clone()))
+    }
+
+    pub fn resume_staged<F>(&self, state: &mut EngineState, target_node: &str, mut execute: F) -> Result<StepOutcome>
+    where F: FnMut(&str, bool, &RunInput, &BTreeMap<String, u64>) -> Result<RunInput> {
         let held = state.hold.as_ref().ok_or_else(|| exec_error("E_EXEC_NOT_HELD", "resume requires a hold state"))?;
         let allowed = match self.nodes.get(&held.node_id) {
             Some(Kind::Hold { resume_targets }) => resume_targets,
@@ -140,7 +146,7 @@ impl GraphEngine {
         input.timeout = false; // A human resume starts a fresh execution attempt.
         state.current = Some(target_node.to_owned());
         state.hold = None;
-        let mut outcome = self.execute(state, &input, target_node.to_owned(), 10_000)?;
+        let mut outcome = self.execute_staged(state, &input, target_node.to_owned(), 10_000, &mut execute)?;
         outcome.destinations.insert(0, target_node.to_owned());
         Ok(outcome)
     }
@@ -280,6 +286,16 @@ impl GraphEngine {
         state.hold = Some(hold);
         state.current = Some(target.to_owned());
         Ok(outcome.clone())
+    }
+}
+
+impl EngineState {
+    pub fn export(&self) -> String {
+        serde_json::to_string(self).expect("EngineState serialization is infallible")
+    }
+
+    pub fn import(json: &str) -> std::result::Result<EngineState, String> {
+        serde_json::from_str(json).map_err(|error| error.to_string())
     }
 }
 

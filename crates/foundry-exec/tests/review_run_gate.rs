@@ -59,7 +59,7 @@ impl Db {
 impl Drop for Db { fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); let _ = std::fs::remove_file(self.0.with_extension("db-wal")); let _ = std::fs::remove_file(self.0.with_extension("db-shm")); } }
 
 fn runner(exit_code: i32, base: &str, result: &str, refs: Arc<Mutex<Vec<String>>>, path: &std::path::Path) -> impl ReviewRunPort {
-    let host = Host { result: HostResult { base_commit: base.into(), result_commit: result.into(), log_path: "review.log".into(), exit_code }, refs };
+    let host = Host { result: HostResult { base_commit: base.into(), result_commit: result.into(), log_path: "review.log".into(), exit_code, generations: Vec::new(), held: None }, refs };
     DurableReviewRun::new(Sink::default(), Log::default(), Box::new(host), Box::new(Intents::default()),
         Arc::new(SqliteTupleStore::open(path).unwrap()) as Arc<dyn TupleStore>)
 }
@@ -70,12 +70,20 @@ fn request() -> ReviewRunRequest {
         epoch: Epoch(3), activation: 9 }
 }
 
+fn generation_runner(chain: Vec<foundry_exec::GenerationCommit>, final_commit: &str, path: &std::path::Path) -> impl ReviewRunPort {
+    let host = Host { result: HostResult { base_commit: "base".into(), result_commit: final_commit.into(),
+        log_path: "review.log".into(), exit_code: 0, generations: chain, held: None }, refs: Arc::new(Mutex::new(Vec::new())) };
+    DurableReviewRun::new(Sink::default(), Log::default(), Box::new(host), Box::new(Intents::default()),
+        Arc::new(SqliteTupleStore::open(path).unwrap()) as Arc<dyn TupleStore>)
+}
+
 #[test]
 fn successful_review_is_bound_to_die_commits_and_publishes_a_tuple() {
     let db = Db::new();
     let refs = Arc::new(Mutex::new(Vec::new()));
     let mut run = runner(0, "base", "result", refs.clone(), &db.0);
     let evidence = run.run(request()).unwrap();
+    let foundry_exec::ReviewRunOutcome::Completed(evidence)=evidence else { panic!("expected completed review") };
     assert_eq!(evidence.verdict, foundry_exec::ReviewVerdict::Passed);
     assert_eq!(evidence.tuple_key.run, RunId(22));
     assert_eq!(refs.lock().unwrap().as_slice(), &["review:o-31:4:base..result"]);
@@ -112,6 +120,34 @@ fn host_error_is_fail_closed() {
     let tuples = Arc::new(SqliteTupleStore::open(&db.0).unwrap()) as Arc<dyn TupleStore>;
     let mut run = DurableReviewRun::new(Sink::default(), Log::default(), Box::new(Broken), Box::new(Intents::default()), tuples);
     assert!(matches!(run.run(request()), Err(ReviewRunError::Dispatch(HostError::Worker(_)))));
+}
+
+#[test]
+fn generation_chain_binds_tuple_to_final_head_and_rejects_malformed_chains() {
+    let db = Db::new();
+    let chain = vec![
+        foundry_exec::GenerationCommit { generation: 0, commit: "result".into(), fix_log_path: String::new() },
+        foundry_exec::GenerationCommit { generation: 1, commit: "fixed".into(), fix_log_path: "fix.log".into() },
+    ];
+    let mut run = generation_runner(chain.clone(), "fixed", &db.0);
+    assert!(matches!(run.run(request()).unwrap(), foundry_exec::ReviewRunOutcome::Completed(_)));
+    let tuple = SqliteTupleStore::open(&db.0).unwrap().latest(&OrderId("o-31".into()), Attempt(4)).unwrap().unwrap();
+    assert_eq!(tuple.immutable_commit.0, "fixed");
+    assert_eq!(tuple.generations, chain);
+
+    let malformed = [
+        vec![foundry_exec::GenerationCommit { generation: 0, commit: "wrong".into(), fix_log_path: String::new() }],
+        vec![chain[0].clone(), foundry_exec::GenerationCommit { generation: 2, commit: "fixed".into(), fix_log_path: "fix.log".into() }],
+        vec![chain[0].clone(), foundry_exec::GenerationCommit { generation: 1, commit: "fixed".into(), fix_log_path: String::new() }],
+    ];
+    for entries in malformed {
+        let db = Db::new();
+        let mut run = generation_runner(entries, "fixed", &db.0);
+        assert_eq!(run.run(request()).unwrap_err(), ReviewRunError::BindingMismatch);
+    }
+    let db = Db::new();
+    let mut run = generation_runner(chain, "different", &db.0);
+    assert_eq!(run.run(request()).unwrap_err(), ReviewRunError::BindingMismatch);
 }
 
 
@@ -191,13 +227,13 @@ fn promotion_window_is_not_consumable_and_retry_repairs_it_without_republish() {
     let inner = SqliteTupleStore::open(&db.0).unwrap();
     let tuples = Arc::new(FailOncePromotion { inner, fail: std::sync::atomic::AtomicBool::new(true) });
     let refs = Arc::new(Mutex::new(Vec::new()));
-    let host = Host { result: HostResult { base_commit: "base".into(), result_commit: "result".into(), log_path: "review.log".into(), exit_code: 0 }, refs: refs.clone() };
+    let host = Host { result: HostResult { base_commit: "base".into(), result_commit: "result".into(), log_path: "review.log".into(), exit_code: 0, generations: Vec::new(), held: None }, refs: refs.clone() };
     let publishes = Arc::new(Mutex::new(0));
     let mut run = DurableReviewRun::new(CountSink(publishes.clone()), Log::default(), Box::new(host), Box::new(Intents::default()), tuples.clone());
     assert!(matches!(run.run(request()), Err(ReviewRunError::Tuple(foundry_exec::PortError::Store(_)))));
     assert!(tuples.latest(&request().order, request().attempt).unwrap().is_some());
     assert!(tuples.latest_promoted(&request().order, request().attempt).unwrap().is_none());
-    let evidence = run.run(request()).unwrap();
+    let foundry_exec::ReviewRunOutcome::Completed(evidence) = run.run(request()).unwrap() else { panic!("expected completed review") };
     assert_eq!(evidence.verdict, foundry_exec::ReviewVerdict::Passed);
     assert_eq!(tuples.latest_promoted(&request().order, request().attempt).unwrap().unwrap().immutable_commit.0, "result");
     assert_eq!(*publishes.lock().unwrap(), 1);
@@ -217,12 +253,13 @@ fn pipeline_stops_at_each_failure_and_reuses_emit_receipts_on_retry() {
                 base_commit: if failure == "base" { "wrong" } else { "base" }.into(),
                 result_commit: if failure == "result" { "wrong" } else { "result" }.into(),
                 log_path: "review.log".into(), exit_code: if failure == "reject" { 1 } else { 0 },
+                generations: Vec::new(), held: None,
             })),
             Box::new(TracedIntents(trace.clone(), Intents::default())), tuples.clone(),
         );
         let result = runner.run(request());
         match failure {
-            "none" => { assert_eq!(result.unwrap().emit_receipt.key.run, RunId(22)); }
+            "none" => { let foundry_exec::ReviewRunOutcome::Completed(result)=result.unwrap() else { panic!("expected completed review") }; assert_eq!(result.emit_receipt.key.run, RunId(22)); }
             "reject" => assert!(matches!(result, Err(ReviewRunError::Rejected { .. }))),
             "base" | "result" => assert_eq!(result, Err(ReviewRunError::BindingMismatch)),
             "stale" => assert_eq!(result, Err(ReviewRunError::Emit(foundry_exec::EmitOutcome::StaleRejected))),

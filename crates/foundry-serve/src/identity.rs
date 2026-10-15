@@ -12,9 +12,10 @@
 //!      every privileged op re-checks CURRENT account state.
 //!   C4 ApprovalToken lifecycle — issue-time AND consume-time checks;
 //!      consumption is recorded exactly once (atomic single-row insert).
-use foundry_domain::ports::{ActorKind, Decision};
 use rusqlite::Connection;
 use std::path::Path;
+#[cfg(test)]
+use foundry_domain::ports::ActorKind;
 
 /// Capability enum — every privileged operation has exactly one entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +26,7 @@ pub enum Capability {
     RetryCancel,
     CastRun,
     AdminRoles,
+    ResolveReviewHold,
 }
 
 /// Role -> capability matrix (plan C1). This IS the authorization
@@ -47,10 +49,12 @@ impl Role {
                 | (Role::Owner, RetryCancel)
                 | (Role::Owner, CastRun)
                 | (Role::Owner, AdminRoles)
+                | (Role::Owner, ResolveReviewHold)
                 | (Role::Approver, ReadBoard)
                 | (Role::Approver, Approve)
                 | (Role::Approver, Promote)
                 | (Role::Approver, RetryCancel)
+                | (Role::Approver, ResolveReviewHold)
                 | (Role::Observer, ReadBoard)
         )
     }

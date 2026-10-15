@@ -16,13 +16,13 @@ pub mod types;
 pub use budget::{Budget, ReservationOutcome};
 pub use emit::{EmitLog, EmitOutcome, EmitSink, complete_after_w4, emit_once};
 pub use graph::{GraphDriver, GraphStep};
-pub use host::{DieHostAdapter, DieWorker, HostError, HostKey, HostLedger, HostResult};
+pub use host::{DieHostAdapter, DieWorker, GenerationCommit, HostError, HostKey, HostLedger, HostResult};
 pub use attempt_budget::AttemptBudget;
 pub use hold::{HoldApplied, HoldCasOutcome, HoldCommand, HoldInstanceId, HoldOperation, HoldState, HoldStatus, apply_hold, cas_hold};
 pub use inject::{CrashPoint, FaultInjector};
 pub use lifecycle::{DispatchResult, Executor, LifecycleError, ResumeAction, RunStep};
 pub use ports::{AttemptLedger, CounterLog, CounterRecord, DispatchHost, EpochGate, HoldStore, IntentLog, OutcomeStore, PortError, Recorded, TupleStore};
-pub use review_run::{DurableReviewRun, ReviewEvidence, ReviewRunError, ReviewRunPort, ReviewRunRequest, ReviewVerdict};
+pub use review_run::{DurableReviewRun, HeldOutcome, ReviewEvidence, ReviewHoldAction, ReviewRunError, ReviewRunOutcome, ReviewRunPort, ReviewRunRequest, ReviewVerdict, RunRecord};
 pub use tuple_sqlite::SqliteTupleStore;
 pub use types::{
     ActivationRef, ArtifactLocation, ArtifactTuple, ArtifactTupleKey, Attempt, EmitReceipt, Epoch,

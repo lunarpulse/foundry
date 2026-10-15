@@ -9,16 +9,13 @@ use std::sync::Arc;
 use http_body_util::BodyExt;
 use tower::ServiceExt; // for .oneshot
 
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn state() -> Arc<ServeState> {
     // isolated env: temp ledger + temp governance journal
     let dir = std::env::temp_dir().join(format!("t60b-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    // tests in this file are #[tokio::test] single-threaded per test
-    // but run in parallel with each other; env is process-wide, so we
-    // take the test lock via a global mutex to serialize state setup.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     unsafe {
         std::env::set_var("FOUNDRY_LEDGER", dir.join("ledger.db"));
         std::env::set_var("FOUNDRY_GOVERNANCE_DB", dir.join("gov.db"));
@@ -43,6 +40,7 @@ fn state() -> Arc<ServeState> {
 
 #[tokio::test]
 async fn route_is_registered_and_rejects_without_session() {
+    let _guard = ENV_LOCK.lock().await;
     let st = state();
     let router = foundry_serve::http::router(st);
     let resp = router
@@ -66,6 +64,7 @@ async fn route_is_registered_and_rejects_without_session() {
 
 #[tokio::test]
 async fn route_rejects_garbage_session() {
+    let _guard = ENV_LOCK.lock().await;
     let st = state();
     let router = foundry_serve::http::router(st);
     let resp = router
@@ -87,6 +86,7 @@ async fn route_rejects_garbage_session() {
 
 #[tokio::test]
 async fn route_rejects_malformed_body() {
+    let _guard = ENV_LOCK.lock().await;
     let st = state();
     let router = foundry_serve::http::router(st);
     let resp = router

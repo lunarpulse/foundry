@@ -51,7 +51,7 @@ fn review_tuples(order: &str, digest: &str) -> std::sync::Arc<ReviewTuples> {
     let tuple = ArtifactTuple {
         order: ExecOrderId(order.into()), attempt: ExecAttempt(1), run: foundry_exec::RunId(1),
         generation: Generation(0), immutable_commit: ImmutableCommit(digest.into()),
-        artifact_location: ArtifactLocation("review.log".into()),
+        artifact_location: ArtifactLocation("review.log".into()), generations: Vec::new(),
     };
     store.record(&tuple).unwrap();
     let receipt = EmitReceipt { key: tuple.key(), event: "publish".into(), at: chrono::Utc::now() };

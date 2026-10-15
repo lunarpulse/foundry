@@ -185,6 +185,8 @@ impl DieWorker for Worker {
             result_commit: format!("result-{work}"),
             log_path: "/work/die.log".into(),
             exit_code: 0,
+            generations: Vec::new(),
+            held: None,
         })
     }
 }
@@ -217,6 +219,8 @@ fn expected_result() -> HostResult {
         result_commit: "result-workdir-A".into(),
         log_path: "/work/die.log".into(),
         exit_code: 0,
+        generations: Vec::new(),
+        held: None,
     }
 }
 

@@ -24,7 +24,7 @@ fn tuple(run: u64, generation: u64, digest: &str) -> ArtifactTuple {
         order: OrderId("ord-1".into()), attempt: Attempt(2),
         run: foundry_exec::RunId(run), generation: Generation(generation),
         immutable_commit: ImmutableCommit(digest.into()),
-        artifact_location: ArtifactLocation(format!("review-{run}.log")),
+        artifact_location: ArtifactLocation(format!("review-{run}.log")), generations: Vec::new(),
     }
 }
 

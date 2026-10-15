@@ -389,6 +389,9 @@ impl StreamRuntime {
         }
         // (M7.1 리뷰 MAJOR-4) 런타임의 로그를 스트림에 주입 — enroll
         // 거부가 영구 기록된다.
+        // Stream is single-thread-owned; Arc is retained for the runtime's
+        // existing shared handle type, without promising cross-thread use.
+        #[allow(clippy::arc_with_non_send_sync)]
         let arc = Arc::new(stream);
         *arc.orch.lock().unwrap() = Some(self.orch.clone());
         g.push(arc);
@@ -742,14 +745,16 @@ impl StreamRuntime {
             let result = self.review_run.lock().unwrap().as_mut()
                 .ok_or("review evidence unavailable: review runner not configured")?
                 .run(request).map_err(|er| format!("review run failed: {er:?}"))?;
+            let result = match result {
+                foundry_exec::ReviewRunOutcome::Completed(result) => result,
+                foundry_exec::ReviewRunOutcome::Held(_) => return Err("review held for human resolution".into()),
+            };
             if result.verdict != foundry_exec::ReviewVerdict::Passed
                 || result.tuple_key.order.0 != order_id
                 || result.tuple_key.attempt.0 != att as u64
                 || result.tuple_key.run.0 != att as u64
                 || result.emit_receipt.key != result.tuple_key
-            {
-                return Err("review evidence binding mismatch".into());
-            }
+            { return Err("review evidence binding mismatch".into()); }
         }
         self.require_review_tuple(order_id, att, &die.result_commit)?;
         let rows = foundry_ledger::SqliteLedger::open(e.journal())
@@ -835,10 +840,10 @@ impl StreamRuntime {
     fn edges_of(&self, order_id: &str) -> Result<Vec<String>, String> {
         let rows = self.orch.read_all().map_err(|e| e.to_string())?;
         for r in rows {
-            if let OrchestrationKind::PlanDeclared { edges, .. } = &r.kind {
-                if let Some((_, preds)) = edges.iter().find(|(o, _)| o == order_id) {
-                    return Ok(preds.clone());
-                }
+            if let OrchestrationKind::PlanDeclared { edges, .. } = &r.kind
+                && let Some((_, preds)) = edges.iter().find(|(o, _)| o == order_id)
+            {
+                return Ok(preds.clone());
             }
         }
         Err(format!("undeclared: {order_id}"))
@@ -848,12 +853,11 @@ impl StreamRuntime {
     fn assignment_of(&self, order_id: &str) -> Result<Option<(String, String)>, String> {
         let rows = self.orch.read_all().map_err(|e| e.to_string())?;
         for r in rows {
-            if let OrchestrationKind::PlanDeclared { plan_id, edges, streams } = &r.kind {
-                if edges.iter().any(|(o, _)| o == order_id) {
-                    if let Some((_, s)) = streams.iter().find(|(o, _)| o == order_id) {
-                        return Ok(Some((plan_id.clone(), s.clone())));
-                    }
-                }
+            if let OrchestrationKind::PlanDeclared { plan_id, edges, streams } = &r.kind
+                && edges.iter().any(|(o, _)| o == order_id)
+                && let Some((_, s)) = streams.iter().find(|(o, _)| o == order_id)
+            {
+                return Ok(Some((plan_id.clone(), s.clone())));
             }
         }
         Ok(None)
@@ -1200,7 +1204,7 @@ mod tests {
     fn finish_die_segment_requires_latest_bound_evidence() {
         struct NoReview;
         impl ReviewRunPort for NoReview {
-            fn run(&mut self, _: ReviewRunRequest) -> Result<foundry_exec::ReviewEvidence, foundry_exec::ReviewRunError> {
+            fn run(&mut self, _: ReviewRunRequest) -> Result<foundry_exec::ReviewRunOutcome, foundry_exec::ReviewRunError> {
                 panic!("matching tuple must bypass review dispatch");
             }
         }
@@ -1221,7 +1225,7 @@ mod tests {
                         attempt: ExecAttempt(if mode == "wrong-attempt" { 2 } else { 1 }),
                         run: RunId(7), generation: foundry_exec::Generation(0),
                         immutable_commit: foundry_exec::ImmutableCommit(if mode == "mismatch" { "other" } else { "result" }.into()),
-                        artifact_location: foundry_exec::ArtifactLocation("review.log".into()),
+                        artifact_location: foundry_exec::ArtifactLocation("review.log".into()), generations: Vec::new(),
                     };
                     tuples.record(&tuple).unwrap();
                     if mode == "existing" {
@@ -1258,7 +1262,7 @@ mod tests {
             order: ExecOrderId(order.into()), attempt: ExecAttempt(2), run: RunId(1),
             generation: foundry_exec::Generation(0),
             immutable_commit: foundry_exec::ImmutableCommit(digest.into()),
-            artifact_location: foundry_exec::ArtifactLocation("review.log".into()),
+            artifact_location: foundry_exec::ArtifactLocation("review.log".into()), generations: Vec::new(),
         };
         store.record(&tuple).unwrap();
         store.promote(&tuple.key(), &foundry_exec::EmitReceipt { key: tuple.key(), event: "publish".into(), at: chrono::Utc::now() }).unwrap();
@@ -1335,7 +1339,7 @@ mod tests {
             order: ExecOrderId(oid.into()), attempt: ExecAttempt(1), run: RunId(1),
             generation: foundry_exec::Generation(0),
             immutable_commit: foundry_exec::ImmutableCommit(format!("dig-{oid}")),
-            artifact_location: foundry_exec::ArtifactLocation("review.log".into()),
+            artifact_location: foundry_exec::ArtifactLocation("review.log".into()), generations: Vec::new(),
         };
         foundry_exec::TupleStore::record(&tuple_store, &tuple).unwrap();
         foundry_exec::TupleStore::promote(&tuple_store, &tuple.key(), &foundry_exec::EmitReceipt {

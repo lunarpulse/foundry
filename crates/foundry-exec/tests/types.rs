@@ -10,7 +10,7 @@ fn tuple() -> ArtifactTuple {
         run: RunId(2),
         generation: Generation(3),
         immutable_commit: ImmutableCommit("commit-abc".into()),
-        artifact_location: ArtifactLocation("artifacts/result".into()),
+        artifact_location: ArtifactLocation("artifacts/result".into()), generations: Vec::new(),
     }
 }
 

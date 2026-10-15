@@ -192,7 +192,7 @@ fn tuple() -> ArtifactTuple {
         run: RunId(2),
         generation: Generation(3),
         immutable_commit: ImmutableCommit("abc".into()),
-        artifact_location: ArtifactLocation("artifact://one".into()),
+        artifact_location: ArtifactLocation("artifact://one".into()), generations: Vec::new(),
     }
 }
 fn promote(log: &mut Log, tuple: &ArtifactTuple) {
@@ -1113,6 +1113,7 @@ impl foundry_exec::DieWorker for GraphDieWorker {
         Ok(foundry_exec::HostResult {
             base_commit: "base".into(), result_commit: "commit-is-not-a-graph-node".into(),
             log_path: "/work/worker.log".into(), exit_code: 0,
+            generations: Vec::new(), held: None,
         })
     }
 }

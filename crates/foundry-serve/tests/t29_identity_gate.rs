@@ -92,6 +92,7 @@ fn approval_tuple_store(tag: &str) -> SqliteTupleStore {
         "t29-tuples-{tag}-{}",
         std::process::id()
     ));
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let tuple_path = dir.join("tuples.db");
     // Every test in this binary that reaches the approval handler holds
@@ -110,6 +111,7 @@ fn seed_approval_tuple(tag: &str) {
         generation: Generation(0),
         immutable_commit: ImmutableCommit("commit-xyz".into()),
         artifact_location: ArtifactLocation("review-log:t29-identity-gate".into()),
+        generations: Vec::new(),
     };
     store.record(&tuple).unwrap();
     let key = tuple.key();

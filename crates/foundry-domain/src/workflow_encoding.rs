@@ -95,6 +95,7 @@ pub enum EdgeEvent {
     DieSucceeded,
     DieFailed,
     InspectionPassed,
+    ReviewHeld,
     InspectionFailed,
     Approved,
     Rejected,
@@ -149,6 +150,8 @@ impl EmbeddedWorkflow {
                     to: T::BackEdge { token: "attempt+1", to: S::Queued },
                 },
                 EncodedEdge { event: E::InspectionPassed, from: S::Inspecting, guard: None, to: T::State(S::FurnaceHold) },
+                EncodedEdge { event: E::InspectionPassed, from: S::FurnaceHold, guard: None, to: T::State(S::FurnaceHold) },
+                EncodedEdge { event: E::ReviewHeld, from: S::Inspecting, guard: None, to: T::State(S::FurnaceHold) },
                 // InspectionFailed: no-op 즉시 종단; ¬no-op ∧ (MAX | 재시도)
                 EncodedEdge { event: E::InspectionFailed, from: S::Inspecting, guard: NoOpTaxonomy, to: T::State(S::Failed) },
                 EncodedEdge {
@@ -163,6 +166,9 @@ impl EmbeddedWorkflow {
                     guard: Conj(vec![NoNoOp, RetriesRemain]),
                     to: T::BackEdge { token: "attempt+1", to: S::Queued },
                 },
+                EncodedEdge { event: E::InspectionFailed, from: S::FurnaceHold, guard: NoOpTaxonomy, to: T::State(S::Failed) },
+                EncodedEdge { event: E::InspectionFailed, from: S::FurnaceHold, guard: Conj(vec![NoNoOp, MaxAttemptsExhausted]), to: T::State(S::Failed) },
+                EncodedEdge { event: E::InspectionFailed, from: S::FurnaceHold, guard: Conj(vec![NoNoOp, RetriesRemain]), to: T::BackEdge { token: "attempt+1", to: S::Queued } },
                 // hold: FurnaceHold (정지 — 외부 재개)
                 EncodedEdge { event: E::Approved, from: S::FurnaceHold, guard: ApprovalBindsArtifact, to: T::State(S::Publishing) },
                 EncodedEdge { event: E::Rejected, from: S::FurnaceHold, guard: None, to: T::State(S::Rejected) },
@@ -225,6 +231,7 @@ pub fn edge_event_of(ev: &OrderEvent) -> EdgeEvent {
         OrderEvent::DieSucceeded { .. } => EdgeEvent::DieSucceeded,
         OrderEvent::DieFailed { .. } => EdgeEvent::DieFailed,
         OrderEvent::InspectionPassed => EdgeEvent::InspectionPassed,
+        OrderEvent::ReviewHeld { .. } => EdgeEvent::ReviewHeld,
         OrderEvent::InspectionFailed { .. } => EdgeEvent::InspectionFailed,
         OrderEvent::Approved { .. } => EdgeEvent::Approved,
         OrderEvent::Rejected { .. } => EdgeEvent::Rejected,
@@ -266,6 +273,7 @@ mod tests {
             (OrderEvent::DieFailed { attempt: base, reason: "transient".into() }, 1),
             (OrderEvent::DieFailed { attempt: base.saturating_sub(1), reason: "transient".into() }, 1), // stale 프로브
             (OrderEvent::InspectionPassed, 1),
+            (OrderEvent::ReviewHeld { reason: "review held".into() }, 1),
             (OrderEvent::InspectionFailed { reason: "lint".into() }, 1),
             (OrderEvent::InspectionFailed { reason: "no-op: empty".into() }, 1),
             (OrderEvent::Approved { intent: "i".into(), artifact_digest: "d".into() }, 1),

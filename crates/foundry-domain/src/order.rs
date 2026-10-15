@@ -141,6 +141,7 @@ pub enum OrderEvent {
         reason: String,
     },
     InspectionPassed,
+    ReviewHeld { reason: String },
     InspectionFailed {
         reason: String,
     },
@@ -281,11 +282,21 @@ impl Order {
                 }
             }
             (OrderEvent::InspectionPassed, OrderState::Inspecting) => OrderState::FurnaceHold,
+            (OrderEvent::InspectionPassed, OrderState::FurnaceHold) => OrderState::FurnaceHold,
+            (OrderEvent::ReviewHeld { .. }, OrderState::Inspecting) => OrderState::FurnaceHold,
             (OrderEvent::InspectionFailed { reason }, OrderState::Inspecting) => {
                 // T19 taxonomy: an empty diff when a change was required is
                 // NOT retryable — retrying produces the same empty diff (M1
                 // defect #8: 3 no-op attempts then publish 422). Terminal.
                 // Other inspection failures stay retryable like DieFailed.
+                if reason.starts_with("no-op") || self.attempt >= MAX_ATTEMPTS {
+                    OrderState::Failed
+                } else {
+                    self.attempt += 1;
+                    OrderState::Queued
+                }
+            }
+            (OrderEvent::InspectionFailed { reason }, OrderState::FurnaceHold) => {
                 if reason.starts_with("no-op") || self.attempt >= MAX_ATTEMPTS {
                     OrderState::Failed
                 } else {

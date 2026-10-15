@@ -146,16 +146,16 @@ impl TupleStore for MemTuples {
 
 struct FakeReview(Arc<MemTuples>);
 impl ReviewRunPort for FakeReview {
-    fn run(&mut self, req: ReviewRunRequest) -> Result<ReviewEvidence, foundry_exec::ReviewRunError> {
+    fn run(&mut self, req: ReviewRunRequest) -> Result<foundry_exec::ReviewRunOutcome, foundry_exec::ReviewRunError> {
         let tuple = ArtifactTuple {
             order: req.order, attempt: req.attempt, run: req.run, generation: Generation(0),
-            immutable_commit: ImmutableCommit(req.artifact_digest), artifact_location: ArtifactLocation("fake-review.log".into()),
+            immutable_commit: ImmutableCommit(req.artifact_digest), artifact_location: ArtifactLocation("fake-review.log".into()), generations: Vec::new(),
         };
         let key = tuple.key();
         let receipt = EmitReceipt { key: key.clone(), event: "publish".into(), at: chrono::Utc::now() };
         self.0.record(&tuple).map_err(foundry_exec::ReviewRunError::Tuple)?;
         self.0.promote(&key, &receipt).map_err(foundry_exec::ReviewRunError::Tuple)?;
-        Ok(ReviewEvidence { emit_receipt: receipt, tuple_key: key, verdict: ReviewVerdict::Passed })
+        Ok(foundry_exec::ReviewRunOutcome::Completed(ReviewEvidence { emit_receipt: receipt, tuple_key: key, verdict: ReviewVerdict::Passed }))
     }
 }
 
@@ -450,7 +450,7 @@ async fn completed_die_reuses_latest_matching_tuple_without_a_runner() {
         order: OrderId("review-existing".into()), attempt: Attempt(1),
         run: foundry_exec::RunId(7), generation: Generation(0),
         immutable_commit: ImmutableCommit("die-1".into()),
-        artifact_location: ArtifactLocation("existing-review.log".into()),
+        artifact_location: ArtifactLocation("existing-review.log".into()), generations: Vec::new(),
     };
     tuples.record(&tuple).unwrap();
     tuples.promote(&tuple.key(), &EmitReceipt { key: tuple.key(), event: "publish".into(), at: chrono::Utc::now() }).unwrap();
@@ -469,7 +469,7 @@ async fn latest_mismatch_blocks_reentry_approval_and_publish() {
         tuples.record(&ArtifactTuple {
             order: OrderId("latest-mismatch".into()), attempt: Attempt(1),
             run: foundry_exec::RunId(run), generation: Generation(0),
-            immutable_commit: ImmutableCommit(digest.into()), artifact_location: ArtifactLocation("review.log".into()),
+            immutable_commit: ImmutableCommit(digest.into()), artifact_location: ArtifactLocation("review.log".into()), generations: Vec::new(),
         }).unwrap();
     }
     let line = mk_unreviewed_line().with_tuple_store(tuples);
@@ -502,7 +502,7 @@ async fn inspecting_reentry_reuses_matching_tuple_and_commits_once() {
     let tuples = Arc::new(MemTuples::default());
     let tuple = ArtifactTuple {
         order: OrderId("review-resume".into()), attempt: Attempt(1), run: foundry_exec::RunId(9), generation: Generation(0),
-        immutable_commit: ImmutableCommit("digest".into()), artifact_location: ArtifactLocation("review.log".into()),
+        immutable_commit: ImmutableCommit("digest".into()), artifact_location: ArtifactLocation("review.log".into()), generations: Vec::new(),
     };
     tuples.record(&tuple).unwrap();
     tuples.promote(&tuple.key(), &EmitReceipt { key: tuple.key(), event: "publish".into(), at: chrono::Utc::now() }).unwrap();

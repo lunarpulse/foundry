@@ -15,7 +15,7 @@ use tuple_store::{DiskTuples, TestDir, WriteStop, read, write};
 fn tuple(run: u64) -> ArtifactTuple {
     ArtifactTuple { order: OrderId("order".into()), attempt: Attempt(1), run: RunId(run),
         generation: Generation(2), immutable_commit: ImmutableCommit("commit".into()),
-        artifact_location: ArtifactLocation("artifact".into()) }
+        artifact_location: ArtifactLocation("artifact".into()), generations: Vec::new() }
 }
 
 // This is the entire downstream surface: no Path, directory or scanner argument.

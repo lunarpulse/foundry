@@ -29,7 +29,7 @@ fn rehydrate_requires_latest_evidence_for_publishing_unknown_and_shipped() {
         assert!(matches!(rehydrate(&ledger, &root, &tuples), Err(RehydrateError::ReviewEvidenceUnavailable { .. })));
         let tuple = |run, digest: &str| ArtifactTuple {
             order: OrderId(order.id.clone()), attempt: Attempt(1), run: RunId(run), generation: Generation(0),
-            immutable_commit: ImmutableCommit(digest.into()), artifact_location: ArtifactLocation("review.log".into()),
+            immutable_commit: ImmutableCommit(digest.into()), artifact_location: ArtifactLocation("review.log".into()), generations: Vec::new(),
         };
         let approved = tuple(1, "digest");
         tuples.record(&approved).unwrap();

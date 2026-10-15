@@ -33,11 +33,32 @@ pub struct HostKey {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct GenerationCommit {
+    pub generation: u64,
+    pub commit: String,
+    pub fix_log_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HoldState {
+    pub hold_instance_id: String,
+    pub reason: String,
+    pub resume_targets: Vec<String>,
+    pub deadline_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HostResult {
     pub base_commit: String,
     pub result_commit: String,
     pub log_path: String,
     pub exit_code: i32,
+    #[serde(default)]
+    pub generations: Vec<GenerationCommit>,
+    #[serde(default)]
+    pub held: Option<HoldState>,
 }
 
 // A commit or log path is not a graph continuation. Bind the complete worker

@@ -158,6 +158,8 @@ pub struct ArtifactTuple {
     pub generation: Generation,
     pub immutable_commit: ImmutableCommit,
     pub artifact_location: ArtifactLocation,
+    #[serde(default)]
+    pub generations: Vec<crate::host::GenerationCommit>,
 }
 
 impl ArtifactTuple {
@@ -185,6 +187,7 @@ impl ArtifactTuple {
             hash.update((field.len() as u64).to_be_bytes());
             hash.update(field);
         }
+        hash.update(serde_json::to_vec(&self.generations).expect("generation chain serialization"));
         format!("{:x}", hash.finalize())
     }
 }

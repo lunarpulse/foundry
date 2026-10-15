@@ -219,3 +219,26 @@ cargo test 전체 green + 생성/삭제 파일 리포트 정합 (부모 대조).
   실행 환경의 같은 변수를 요구한다. 실행 cwd의 git HEAD는 사용하지 않으며,
   출처 미설정은 외부 실행 수용 전에 실패한다. 옛 저널의 누락 증거를 추정하거나
   마이그레이션하지 않는다.
+
+## T33-A — 세대 결속과 인간 hold API (부분 구현 상태)
+- `HostResult.generations`는 입력 커밋 세대 0과 fix 산출물 세대를 기록한다.
+  러너는 번호 연속성·입력 커밋·fix log·최종 result 결속을 검사하고, 유효한
+  체인을 튜플에 저장한다. 기존 빈 체인은 기존 result_commit 검사 경로를 유지한다.
+- `PackReviewHost`는 patch redrive에서 `fix` role stage를 실행하고 새 커밋을
+  다음 verify dispatch의 artifact로 전달한다. verify가 만든 `produced_commit`은
+  신뢰 경계 위반으로 거부하며 fix가 커밋을 만들지 못하면 기존 barrier hold다.
+- pack `EngineState` JSON export/import, `resume_staged`, durable hold snapshot,
+  hold instance CAS, 행위자·시각 journal, 지연 deadline 기록 및 4개 serve route를
+  추가했다. hold는 `ReviewRunOutcome::Held`로 Line의 `ReviewHeld` 이벤트를 거쳐
+  FurnaceHold에 기록되며 domain attempt를 소비하지 않는다.
+- Line은 resolved hold 결과를 새 run으로 회수하고 튜플의 최종 immutable commit을
+  주문 digest에 반영한다. Pack DB에서 최신 `(order, attempt)` run을 조회한다.
+- 제한: 인간 `resume(target)`은 target allowlist를 검사하지만 현재 제품 host에서
+  재개 StageExecutor 실행을 완료하지 못한다. serve가 주입하는 executor는
+  `UnavailableStageExecutor`이므로 해당 경로는 fail-closed 오류다. staged 재개,
+  그에 따른 연속 hold·재시작 결속, full Line/API CAS 시나리오를 T33-A에서 완료한
+  것으로 간주하지 않는다. commit_pass/commit_fail/abort의 DB 해소·재실행도
+  별도 종단 시험이 필요하다.
+- Prepare 배치 분석은 FurnaceHold에서의 `InspectionPassed` self-loop와
+  `InspectionFailed` retry 경로를 게이트를 우회하지 않는 전이로 취급한다.
+  승인 없는 Publishing 경로를 허용하는 변경은 아니다.

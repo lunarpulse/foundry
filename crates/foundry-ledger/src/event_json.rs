@@ -50,6 +50,7 @@ enum JsonEvent {
         reason: String,
     },
     InspectionPassed,
+    ReviewHeld { reason: String },
     InspectionFailed {
         reason: String,
     },
@@ -83,6 +84,7 @@ impl From<&OrderEvent> for JsonEvent {
             OrderEvent::DieSucceeded { attempt } => JsonEvent::DieSucceeded { attempt },
             OrderEvent::DieFailed { attempt, reason } => JsonEvent::DieFailed { attempt, reason },
             OrderEvent::InspectionPassed => JsonEvent::InspectionPassed,
+            OrderEvent::ReviewHeld { reason } => JsonEvent::ReviewHeld { reason },
             OrderEvent::InspectionFailed { reason } => JsonEvent::InspectionFailed { reason },
             OrderEvent::Approved {
                 intent,
@@ -111,6 +113,7 @@ impl From<JsonEvent> for OrderEvent {
             JsonEvent::DieSucceeded { attempt } => OrderEvent::DieSucceeded { attempt },
             JsonEvent::DieFailed { attempt, reason } => OrderEvent::DieFailed { attempt, reason },
             JsonEvent::InspectionPassed => OrderEvent::InspectionPassed,
+            JsonEvent::ReviewHeld { reason } => OrderEvent::ReviewHeld { reason },
             JsonEvent::InspectionFailed { reason } => OrderEvent::InspectionFailed { reason },
             JsonEvent::Approved {
                 intent,

@@ -166,6 +166,7 @@ fn event_family_from_name(name: &str) -> Option<EdgeEvent> {
         "DieSucceeded" => EdgeEvent::DieSucceeded,
         "DieFailed" => EdgeEvent::DieFailed,
         "InspectionPassed" => EdgeEvent::InspectionPassed,
+        "ReviewHeld" => EdgeEvent::ReviewHeld,
         "InspectionFailed" => EdgeEvent::InspectionFailed,
         "Approved" => EdgeEvent::Approved,
         "Rejected" => EdgeEvent::Rejected,
@@ -293,7 +294,15 @@ enum PreparePlacement {
 ///   기술한다. 승인 없이 진행 가능한 갈래가 아님은 보장된다).
 /// Prepare의 전분기 규칙: 도달 상태의 만족 가능한 출구가 전부 이 집합
 /// (승인 소비 또는 안전한 종단)이어야 한다.
-const GATE_FAMILIES: &[EdgeEvent] = &[EdgeEvent::Approved, EdgeEvent::Rejected];
+// InspectionPassed may now self-loop at FurnaceHold after review re-entry.
+// It preserves the gate state and cannot advance to publishing, so it is a
+// safe gate-family edge for Prepare placement analysis.
+const GATE_FAMILIES: &[EdgeEvent] = &[
+    EdgeEvent::Approved,
+    EdgeEvent::Rejected,
+    EdgeEvent::InspectionPassed,
+    EdgeEvent::InspectionFailed,
+];
 
 /// **전분기 도달성 분석** (플랜 v6 F): Prepare 노드까지의 스텝열을 따라
 /// 도달 가능한 상태 집합을 계산하고, 그 상태들의 만족 가능한 출발 엣지가
@@ -381,6 +390,7 @@ fn probe_events(fam: EdgeEvent, base: u32) -> Vec<foundry_domain::OrderEvent> {
         EdgeEvent::DieSucceeded => vec![OrderEvent::DieSucceeded { attempt: base }],
         EdgeEvent::DieFailed => vec![OrderEvent::DieFailed { attempt: base, reason: format!("err-{base}") }],
         EdgeEvent::InspectionPassed => vec![OrderEvent::InspectionPassed],
+        EdgeEvent::ReviewHeld => vec![OrderEvent::ReviewHeld { reason: "review held".into() }],
         EdgeEvent::InspectionFailed => vec![
             OrderEvent::InspectionFailed { reason: format!("no-op-{base}") },
             OrderEvent::InspectionFailed { reason: format!("real-{base}") },

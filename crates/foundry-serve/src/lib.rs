@@ -13,6 +13,7 @@ pub mod fake_noop;
 pub mod health;
 pub mod http;
 pub mod identity;
+pub mod review_hold;
 pub mod policy_http;
 pub mod serve_wiring;
 pub mod privacy;
@@ -124,10 +125,8 @@ pub type AppLine =
 /// literal tilde silently points at a nonexistent file (astra 3rd).
 fn foundry_ledger_path() -> std::path::PathBuf {
     let raw = std::env::var("FOUNDRY_LEDGER").unwrap_or_else(|_| "~/.foundry/ledger.db".into());
-    if let Some(rest) = raw.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return std::path::PathBuf::from(home).join(rest);
-        }
+    if let Some(rest) = raw.strip_prefix("~/") && let Ok(home) = std::env::var("HOME") {
+        return std::path::PathBuf::from(home).join(rest);
     }
     std::path::PathBuf::from(raw)
 }
@@ -248,7 +247,7 @@ impl ServeState {
         }
         let mut list: Vec<Card> = cards
             .into_values()
-            .filter(|c| state_filter.map_or(true, |f| c.state == f))
+            .filter(|c| state_filter.is_none_or(|f| c.state == f))
             .collect();
         for c in &list {
             *counts.entry(c.state.clone()).or_default() += 1;
@@ -274,8 +273,7 @@ impl ServeState {
             .collect();
         let state = rows
             .iter()
-            .filter(|r| r.order_id == order_id)
-            .last()
+            .rfind(|r| r.order_id == order_id)
             .map(|r| r.to_state.clone())?;
         Some(OrderDetail {
             height: meta.height,

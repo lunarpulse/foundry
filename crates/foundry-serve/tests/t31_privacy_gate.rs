@@ -27,8 +27,10 @@ const CANARY_GH: &str = "ghp_CANARYtoken556677889900aabb";
 
 fn db(tag: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!("t31-{}-{}.db", tag, std::process::id()));
-    for ext in ["", ".identity.db", ".scope.db"] {
-        let _ = std::fs::remove_file(format!("{}{}", p.display(), ext));
+    for path in [p.clone(), p.with_extension("identity.db"), p.with_extension("scope.db")] {
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
     p
 }
