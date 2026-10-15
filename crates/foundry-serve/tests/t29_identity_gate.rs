@@ -5,11 +5,17 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::routing::Router;
 use foundry_domain::{Order, OrderEvent, OrderState};
+use foundry_exec::{
+    ArtifactLocation, ArtifactTuple, Attempt, EmitReceipt, Generation, ImmutableCommit, OrderId,
+    RunId, SqliteTupleStore, TupleStore,
+};
 use foundry_serve::ServeState;
 use foundry_serve::identity::{Identity, PasswordHasher, Role};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tower::ServiceExt;
+
+static APPROVAL_TUPLE_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct FastHasher;
 impl PasswordHasher for FastHasher {
@@ -81,6 +87,44 @@ async fn setup_with_users(tag: &str) -> Arc<ServeState> {
     st
 }
 
+fn approval_tuple_store(tag: &str) -> SqliteTupleStore {
+    let dir = std::env::temp_dir().join(format!(
+        "t29-tuples-{tag}-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let tuple_path = dir.join("tuples.db");
+    // Every test in this binary that reaches the approval handler holds
+    // APPROVAL_TUPLE_ENV, so no request reads this variable during mutation.
+    unsafe { std::env::set_var("FOUNDRY_TUPLES", &tuple_path) };
+
+    SqliteTupleStore::open(&tuple_path).unwrap()
+}
+
+fn seed_approval_tuple(tag: &str) {
+    let store = approval_tuple_store(tag);
+    let tuple = ArtifactTuple {
+        order: OrderId("o-29".into()),
+        attempt: Attempt(1),
+        run: RunId(1),
+        generation: Generation(0),
+        immutable_commit: ImmutableCommit("commit-xyz".into()),
+        artifact_location: ArtifactLocation("review-log:t29-identity-gate".into()),
+    };
+    store.record(&tuple).unwrap();
+    let key = tuple.key();
+    store
+        .promote(
+            &key,
+            &EmitReceipt {
+                key: key.clone(),
+                event: "publish".into(),
+                at: chrono::Utc::now(),
+            },
+        )
+        .unwrap();
+}
+
 async fn login(st: &ServeState, user: &str) -> String {
     let mut id = st.identity.lock().await;
     id.login(user, "pw", &FastHasher, 300).unwrap()
@@ -112,6 +156,8 @@ async fn req(app: Router, token: Option<&str>, intent: &str) -> (StatusCode, ser
 
 #[tokio::test(flavor = "multi_thread")]
 async fn approval_requires_authentication() {
+    let _tuple_env = APPROVAL_TUPLE_ENV.lock().await;
+    drop(approval_tuple_store("noauth"));
     let st = setup_with_users("noauth").await;
     let app = Router::new().merge(foundry_serve::http::router(st.clone()));
     let (code, body) = req(app, None, "bump").await;
@@ -121,6 +167,8 @@ async fn approval_requires_authentication() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn observer_forbidden_approver_allowed() {
+    let _tuple_env = APPROVAL_TUPLE_ENV.lock().await;
+    seed_approval_tuple("roles");
     // observer: 403
     let st = setup_with_users("roles").await;
     let app = Router::new().merge(foundry_serve::http::router(st.clone()));
@@ -153,6 +201,8 @@ async fn observer_forbidden_approver_allowed() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn disabled_user_session_dies_instantly() {
+    let _tuple_env = APPROVAL_TUPLE_ENV.lock().await;
+    drop(approval_tuple_store("disable"));
     let st = setup_with_users("disable").await;
     let tok = login(&st, "obs").await;
     // owner disables obs
@@ -175,6 +225,8 @@ async fn disabled_user_session_dies_instantly() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn token_consumed_once_replay_refused() {
+    let _tuple_env = APPROVAL_TUPLE_ENV.lock().await;
+    seed_approval_tuple("replay");
     let st = setup_with_users("replay").await;
     let tok = login(&st, "root").await;
     let app = Router::new().merge(foundry_serve::http::router(st.clone()));

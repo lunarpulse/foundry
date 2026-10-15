@@ -9,6 +9,8 @@ pub mod hold;
 pub mod inject;
 pub mod lifecycle;
 pub mod ports;
+pub mod review_run;
+pub mod tuple_sqlite;
 pub mod types;
 
 pub use budget::{Budget, ReservationOutcome};
@@ -20,6 +22,8 @@ pub use hold::{HoldApplied, HoldCasOutcome, HoldCommand, HoldInstanceId, HoldOpe
 pub use inject::{CrashPoint, FaultInjector};
 pub use lifecycle::{DispatchResult, Executor, LifecycleError, ResumeAction, RunStep};
 pub use ports::{AttemptLedger, CounterLog, CounterRecord, DispatchHost, EpochGate, HoldStore, IntentLog, OutcomeStore, PortError, Recorded, TupleStore};
+pub use review_run::{DurableReviewRun, ReviewEvidence, ReviewRunError, ReviewRunPort, ReviewRunRequest, ReviewVerdict};
+pub use tuple_sqlite::SqliteTupleStore;
 pub use types::{
     ActivationRef, ArtifactLocation, ArtifactTuple, ArtifactTupleKey, Attempt, EmitReceipt, Epoch,
     ExecutionIntent, ExecutionOutcome, FenceVerdict, FencingToken, Generation, ImmutableCommit,

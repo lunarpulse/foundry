@@ -9,6 +9,7 @@ foundry-domain = { path = "../foundry-domain" }
 foundry-ledger = { path = "../foundry-ledger" }
 foundry-furnace = { path = "../foundry-furnace" }
 foundry-harness-cli = { path = "../foundry-harness-cli" }
+foundry-exec = { path = "../foundry-exec" }
 tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

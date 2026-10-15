@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 foundry-line = { path = "../foundry-line" }
+foundry-exec = { path = "../foundry-exec" }
 foundry-domain = { path = "../foundry-domain" }
 foundry-ledger = { path = "../foundry-ledger" }
 tokio.workspace = true

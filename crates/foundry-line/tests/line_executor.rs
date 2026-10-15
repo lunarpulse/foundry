@@ -2,12 +2,13 @@
 //! logic under test. Verify: lease, atomic journal, retry/backoff, attempt
 //! fencing, idempotent publish, approval≠publish.
 use foundry_domain::ports::{
-    ApprovalToken, Decision, DieOutput, Gate, Harness, Ledger, Policy, PortError, PortResult,
+    ApprovalToken, Decision, Gate, Ledger, Policy, PortResult,
     PublishOutcome, Publisher,
 };
 use foundry_domain::{ActorId, ActorKind, ExternalRef, Order, OrderEvent, OrderState};
 use foundry_harness_cli::fake::FakeHarness;
 use foundry_line::{Line, LineConfig, backoff_delay};
+use foundry_exec::{ArtifactLocation, ArtifactTuple, ArtifactTupleKey, Attempt, EmitReceipt, Generation, ImmutableCommit, OrderId, PortError as ExecError, Recorded, ReviewEvidence, ReviewRunPort, ReviewRunRequest, ReviewVerdict, TupleStore};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as TMutex;
@@ -115,7 +116,47 @@ fn order(id: &str) -> Order {
 
 type TestLine = Line<OpenGate, FakeHarness, MemLedger, ScriptedPublisher>;
 
+#[derive(Default)]
+struct MemTuples(Mutex<Vec<(ArtifactTuple, Option<EmitReceipt>)>>);
+impl TupleStore for MemTuples {
+    fn record(&self, tuple: &ArtifactTuple) -> Result<Recorded, ExecError> {
+        let mut rows = self.0.lock().unwrap();
+        if let Some((old, _)) = rows.iter().find(|(old, _)| old.key() == tuple.key()) {
+            return if old == tuple { Ok(Recorded) } else { Err(ExecError::Permanent("tuple collision".into())) };
+        }
+        rows.push((tuple.clone(), None));
+        Ok(Recorded)
+    }
+    fn latest(&self, order: &OrderId, attempt: Attempt) -> Result<Option<ArtifactTuple>, ExecError> {
+        Ok(self.0.lock().unwrap().iter().filter(|(t, _)| &t.order == order && t.attempt == attempt)
+            .max_by_key(|(t, _)| (t.run, t.generation)).map(|(t, _)| t.clone()))
+    }
+    fn promote(&self, key: &ArtifactTupleKey, receipt: &EmitReceipt) -> Result<(), ExecError> {
+        let mut rows = self.0.lock().unwrap();
+        let (_, slot) = rows.iter_mut().find(|(t, _)| t.key() == *key).ok_or(ExecError::MissingEmitReceipt)?;
+        if receipt.key != *key { return Err(ExecError::MissingEmitReceipt); }
+        *slot = Some(receipt.clone());
+        Ok(())
+    }
+}
+
+struct FakeReview(Arc<MemTuples>);
+impl ReviewRunPort for FakeReview {
+    fn run(&mut self, req: ReviewRunRequest) -> Result<ReviewEvidence, foundry_exec::ReviewRunError> {
+        let tuple = ArtifactTuple {
+            order: req.order, attempt: req.attempt, run: req.run, generation: Generation(0),
+            immutable_commit: ImmutableCommit(req.artifact_digest), artifact_location: ArtifactLocation("fake-review.log".into()),
+        };
+        let key = tuple.key();
+        let receipt = EmitReceipt { key: key.clone(), event: "publish".into(), at: chrono::Utc::now() };
+        self.0.record(&tuple).map_err(foundry_exec::ReviewRunError::Tuple)?;
+        self.0.promote(&key, &receipt).map_err(foundry_exec::ReviewRunError::Tuple)?;
+        Ok(ReviewEvidence { emit_receipt: receipt, tuple_key: key, verdict: ReviewVerdict::Passed })
+    }
+}
+
 fn mk_line(harness: FakeHarness, publisher: ScriptedPublisher) -> TestLine {
+    let tuples = Arc::new(MemTuples::default());
     Line::new(
         Arc::new(OpenGate),
         Arc::new(harness),
@@ -123,10 +164,20 @@ fn mk_line(harness: FakeHarness, publisher: ScriptedPublisher) -> TestLine {
         Arc::new(publisher),
         Arc::new(AllowPolicy),
     )
+    .with_review_run(FakeReview(tuples.clone()))
+    .with_tuple_store(tuples)
     .with_cfg(LineConfig {
         base_backoff_ms: 1,
         max_backoff_ms: 5,
     }) // tests: fast
+}
+
+fn mk_unreviewed_line() -> TestLine {
+    Line::new(
+        Arc::new(OpenGate), Arc::new(FakeHarness::default()),
+        Arc::new(TMutex::new(MemLedger::default())), Arc::new(ScriptedPublisher::default()),
+        Arc::new(AllowPolicy),
+    ).with_cfg(LineConfig { base_backoff_ms: 1, max_backoff_ms: 1 })
 }
 
 // ---------- tests ----------
@@ -159,6 +210,55 @@ async fn drive_runs_received_to_furnace_hold() {
 }
 
 #[tokio::test]
+async fn missing_review_runner_never_commits_inspection_passed() {
+    let line = mk_unreviewed_line();
+    line.submit(order("review-missing")).await;
+    line.acquire_lease("watch").await.unwrap();
+    assert_eq!(line.drive("review-missing").await.unwrap(), OrderState::Failed);
+    let rows = line.ledger.lock().await.rows.lock().unwrap().clone();
+    assert!(rows.iter().any(|(_, ev, _, _)| matches!(ev, OrderEvent::InspectionFailed { .. })));
+    assert!(!rows.iter().any(|(_, ev, _, _)| matches!(ev, OrderEvent::InspectionPassed)));
+}
+
+#[tokio::test]
+async fn inspecting_reentry_without_tuple_stays_inspecting() {
+    let line = mk_line(FakeHarness::default(), ScriptedPublisher::default());
+    let mut o = order("review-reentry");
+    o.artifact_digest = Some("digest".into());
+    line.submit(o).await;
+    let a = sys();
+    for ev in [OrderEvent::Queued, OrderEvent::DieStarted, OrderEvent::DieSucceeded { attempt: 1 }] {
+        line.commit_for_test("review-reentry", &ev, OrderState::Received, OrderState::Working, &a).await.unwrap();
+    }
+    assert_eq!(line.drive("review-reentry").await.unwrap(), OrderState::Inspecting);
+    let rows = line.ledger.lock().await.rows.lock().unwrap().clone();
+    assert!(!rows.iter().any(|(_, ev, _, _)| matches!(ev, OrderEvent::InspectionPassed)));
+}
+
+#[tokio::test]
+async fn approval_and_publish_refuse_when_latest_tuple_is_missing() {
+    let line = mk_line(FakeHarness::default(), ScriptedPublisher::default());
+    let mut o = order("tuple-required");
+    o.artifact_digest = Some("digest".into());
+    line.submit(o).await;
+    let human = actor();
+    for ev in [
+        OrderEvent::Queued,
+        OrderEvent::DieStarted,
+        OrderEvent::DieSucceeded { attempt: 1 },
+        OrderEvent::InspectionPassed,
+    ] {
+        line.commit_for_test("tuple-required", &ev, OrderState::Inspecting, OrderState::FurnaceHold, &human).await.unwrap();
+    }
+    let token = ApprovalToken { order_id: "tuple-required".into(), intent: "approve".into(),
+        artifact_digest: "digest".into(), actor: human.clone(), granted_at: chrono::Utc::now() };
+    assert!(line.approve("tuple-required", &token, "approve", &human).await.is_err());
+    line.commit_for_test("tuple-required", &OrderEvent::Approved { intent: "test".into(), artifact_digest: "digest".into() },
+        OrderState::FurnaceHold, OrderState::Publishing, &human).await.unwrap();
+    assert!(line.publish("tuple-required", &human).await.is_err());
+}
+
+#[tokio::test]
 async fn retry_with_backoff_until_success() {
     let line = mk_line(FakeHarness::fail_first(2), ScriptedPublisher::default());
     line.submit(order("o-b")).await;
@@ -186,7 +286,7 @@ async fn lease_is_exclusive() {
 
 #[tokio::test]
 async fn approval_then_publish_confirmed() {
-    let mut pubr = ScriptedPublisher::default();
+    let pubr = ScriptedPublisher::default();
     pubr.responses
         .lock()
         .unwrap()
@@ -224,7 +324,7 @@ async fn approval_then_publish_confirmed() {
 
 #[tokio::test]
 async fn publish_unknown_records_state() {
-    let mut pubr = ScriptedPublisher::default();
+    let pubr = ScriptedPublisher::default();
     pubr.responses
         .lock()
         .unwrap()
@@ -284,8 +384,7 @@ async fn every_transition_is_journaled() {
     line.acquire_lease("watch").await.unwrap();
     line.drive("o-f").await.unwrap();
 
-    let led = line.ledger.lock().await;
-    let rows = led.rows.lock().unwrap();
+    let rows = line.ledger.lock().await.rows.lock().unwrap().clone();
     let o = line.get("o-f").await.unwrap();
     // last journaled to-state == current state (no un-journaled transitions)
     assert_eq!(rows.last().unwrap().3, o.state());
@@ -313,8 +412,7 @@ async fn t19_noop_die_with_change_required_fails() {
     let o = line.get("o-noop1").await.unwrap();
     assert_eq!(o.state(), OrderState::Failed);
     // journal carries the honest reason
-    let led = line.ledger.lock().await;
-    let rows = led.rows.lock().unwrap();
+    let rows = line.ledger.lock().await.rows.lock().unwrap().clone();
     let last = rows.last().unwrap();
     match &last.1 {
         OrderEvent::InspectionFailed { reason } => {
@@ -323,8 +421,6 @@ async fn t19_noop_die_with_change_required_fails() {
         other => panic!("expected InspectionFailed, got {other:?}"),
     }
     // publish must be unreachable
-    drop(rows);
-    drop(led);
     let pub_res = line.publish("o-noop1", &sys()).await;
     assert!(
         pub_res.is_err(),

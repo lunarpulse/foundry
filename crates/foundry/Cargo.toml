@@ -17,6 +17,7 @@ foundry-orch = { path = "../foundry-orch" }
 foundry-approval = { path = "../foundry-approval" }
 foundry-workflow = { path = "../foundry-workflow" }
 foundry-line = { path = "../foundry-line" }
+foundry-exec = { path = "../foundry-exec" }
 foundry-blueprint = { path = "../foundry-blueprint" }
 foundry-ledger = { path = "../foundry-ledger" }
 foundry-harness-cli = { path = "../foundry-harness-cli" }

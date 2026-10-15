@@ -18,7 +18,32 @@ use crate::stream::{Stream, StreamRuntime};
 use crate::{OrchestrationKind, OrchestrationLog};
 use foundry_domain::order::{ExternalRef, Order};
 use foundry_domain::{OrderEvent, OrderState};
-use foundry_workflow::{Outcome, WorkflowEngine};
+use foundry_workflow::Outcome;
+use foundry_exec::{ArtifactLocation, ArtifactTuple, ArtifactTupleKey, Attempt as ExecAttempt, EmitReceipt, Generation, ImmutableCommit, OrderId as ExecOrderId, PortError as ExecPortError, Recorded, TupleStore};
+use std::sync::Mutex;
+
+#[derive(Default)]
+struct ReviewTuples(Mutex<Vec<ArtifactTuple>>);
+impl TupleStore for ReviewTuples {
+    fn record(&self, tuple: &ArtifactTuple) -> Result<Recorded, ExecPortError> {
+        self.0.lock().unwrap().push(tuple.clone()); Ok(Recorded)
+    }
+    fn latest(&self, order: &ExecOrderId, attempt: ExecAttempt) -> Result<Option<ArtifactTuple>, ExecPortError> {
+        Ok(self.0.lock().unwrap().iter().filter(|t| &t.order == order && t.attempt == attempt)
+            .max_by_key(|t| (t.run, t.generation)).cloned())
+    }
+    fn promote(&self, _: &ArtifactTupleKey, _: &EmitReceipt) -> Result<(), ExecPortError> { Ok(()) }
+}
+
+fn review_tuples(order: &str, digest: &str) -> std::sync::Arc<ReviewTuples> {
+    let store = std::sync::Arc::new(ReviewTuples::default());
+    store.record(&ArtifactTuple {
+        order: ExecOrderId(order.into()), attempt: ExecAttempt(1), run: foundry_exec::RunId(1),
+        generation: Generation(0), immutable_commit: ImmutableCommit(digest.into()),
+        artifact_location: ArtifactLocation("review.log".into()),
+    }).unwrap();
+    store
+}
 
 fn tmpdir(name: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("foundry-t61-{name}-{}", std::process::id()));
@@ -463,8 +488,8 @@ fn t61_advance_to_gate_entry_point() {
     let orch = OrchestrationLog::open(&d.join("orch.db")).unwrap();
     orch.declare_plan(
         "plan-g",
-        vec![("t-g1".into(), vec![])],
-        vec![("t-g1".into(), "s-g".into())],
+        vec![("t-g1".into(), vec![]), ("t-g2".into(), vec![])],
+        vec![("t-g1".into(), "s-g".into()), ("t-g2".into(), "s-g".into())],
     )
     .unwrap();
     let mut ap = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
@@ -483,12 +508,21 @@ fn t61_advance_to_gate_entry_point() {
         ch.bind_preset_from_ledger("sz-g", "bmad-quickloop", "plan-g").unwrap();
     }
     let rt = StreamRuntime::new(OrchestrationLog::open(&d.join("orch.db")).unwrap());
+    rt.set_tuple_store(review_tuples("t-g1", "gate-digest"));
     rt.add_stream(Stream::new_with_root("s-g", &d, "bmad-quickloop").unwrap()).unwrap();
     rt.bind_approval_ledger(
         foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
     )
     .unwrap();
-    rt.dispatch("t-g1", mkorder("t-g1", true)).unwrap();
+    let mut no_evidence = mkorder("t-g2", true);
+    no_evidence.artifact_digest = Some("no-tuple".into());
+    rt.dispatch("t-g2", no_evidence).unwrap();
+    assert!(rt.advance_to_gate("s-g", "t-g2", "exec-g").is_err());
+    let no_evidence_rows = rt.stream("s-g").unwrap().journal_rows().unwrap();
+    assert!(!no_evidence_rows.iter().any(|r| r.order_id == "t-g2" && r.event.contains("InspectionPassed")));
+    let mut order = mkorder("t-g1", true);
+    order.artifact_digest = Some("gate-digest".into());
+    rt.dispatch("t-g1", order).unwrap();
     // 프로덕션 진입점 — 게이트 도달.
     let st = rt.advance_to_gate("s-g", "t-g1", "exec-g").unwrap();
     assert_eq!(st, OrderState::FurnaceHold, "order at the approval gate");
@@ -603,15 +637,20 @@ fn t61_post_rebuild_redispatch_refused() {
     }
     // 1세대 런타임 — dispatch + 게이트 진행(저널에 행 생김).
     let rt = StreamRuntime::new(OrchestrationLog::open(&d.join("orch.db")).unwrap());
+    let tuples = review_tuples("t-rd", "gate-digest");
+    rt.set_tuple_store(tuples.clone());
     rt.add_stream(Stream::new_with_root("s-rd", &d, "bmad-quickloop").unwrap()).unwrap();
     rt.bind_approval_ledger(
         foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
     )
     .unwrap();
-    rt.dispatch("t-rd", mkorder("t-rd", true)).unwrap();
+    let mut order = mkorder("t-rd", true);
+    order.artifact_digest = Some("gate-digest".into());
+    rt.dispatch("t-rd", order).unwrap();
     rt.advance_to_gate("s-rd", "t-rd", "exec-rd1").unwrap();
     // 크래시 — 같은 저널로 2세대 런타임(dispatched 세트 공백).
     let rt2 = StreamRuntime::new(OrchestrationLog::open(&d.join("orch.db")).unwrap());
+    rt2.set_tuple_store(tuples);
     rt2.add_stream(Stream::new_with_root("s-rd", &d, "bmad-quickloop").unwrap()).unwrap();
     rt2.bind_approval_ledger(
         foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),

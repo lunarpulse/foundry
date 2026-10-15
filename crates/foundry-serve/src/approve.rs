@@ -24,6 +24,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde::Deserialize;
 use std::sync::Arc;
+use foundry_exec::SqliteTupleStore;
 
 #[derive(Deserialize)]
 pub struct ApproveBody {
@@ -44,6 +45,13 @@ pub async fn approve(
     Path(id): Path<String>,
     body: Option<Json<ApproveBody>>,
 ) -> impl IntoResponse {
+    let tuple_path = std::env::var("FOUNDRY_TUPLES").unwrap_or_else(|_| "~/.foundry/tuples.db".into());
+    let tuple_path = expand_tilde(&tuple_path);
+    let tuples = match SqliteTupleStore::open(&tuple_path) {
+        Ok(store) => Arc::new(store),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"tuple store unavailable","detail":format!("{e:?}")}))).into_response(),
+    };
+    st.line.set_tuple_store(tuples.clone());
     let intent = match body {
         Some(Json(b)) if !b.intent.trim().is_empty() => b.intent,
         _ => {
@@ -70,7 +78,7 @@ pub async fn approve(
             )
                 .into_response();
         }
-        match foundry_line::rehydrate::rehydrate(&st.ledger, std::path::Path::new("/tmp")) {
+        match foundry_line::rehydrate::rehydrate(&st.ledger, std::path::Path::new("/tmp"), tuples.as_ref()) {
             Ok(orders) => {
                 for o in orders {
                     st.line.submit(o).await;
@@ -140,6 +148,13 @@ pub async fn approve(
         )
             .into_response(),
     }
+}
+
+fn expand_tilde(raw: &str) -> std::path::PathBuf {
+    if let Some(rest) = raw.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") { return std::path::PathBuf::from(home).join(rest); }
+    }
+    raw.into()
 }
 
 fn human_actor() -> foundry_domain::ActorId {

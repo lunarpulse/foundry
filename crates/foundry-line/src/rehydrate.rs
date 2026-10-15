@@ -4,6 +4,7 @@
 //! approve-path ergonomics: read → verify → replay → bind digests for
 //! actionable (FurnaceHold) lifecycles from the workdir HEAD.
 use foundry_domain::OrderState;
+use foundry_exec::{Attempt, OrderId, TupleStore};
 use foundry_ledger::SqliteLedger;
 use std::path::Path;
 
@@ -16,11 +17,14 @@ pub enum RehydrateError {
     DigestUnavailable {
         order_id: String,
     },
+    /// The approval gate has no matching durable review tuple.
+    ReviewEvidenceUnavailable { order_id: String },
 }
 
 pub fn rehydrate(
     ledger: &SqliteLedger,
     _workdir_root: &Path,
+    tuples: &dyn TupleStore,
 ) -> Result<Vec<foundry_domain::Order>, RehydrateError> {
     let rows = ledger
         .read_all()
@@ -51,15 +55,19 @@ pub fn rehydrate(
         if order.state() == OrderState::FurnaceHold {
             let attempt = order.attempt().max(1);
             let repo = foundry_domain::repo_path(&ro.order_id, attempt);
-            if repo.join(".git").exists() {
-                if let Ok(h) = git_head(&repo) {
-                    order.artifact_digest = Some(h);
-                }
+            if repo.join(".git").exists() && let Ok(h) = git_head(&repo) {
+                order.artifact_digest = Some(h);
             }
             if order.artifact_digest.is_none() {
                 return Err(RehydrateError::DigestUnavailable {
                     order_id: ro.order_id.clone(),
                 });
+            }
+            let digest = order.artifact_digest.as_deref().unwrap_or_default();
+            let tuple = tuples.latest(&OrderId(order.id.clone()), Attempt(attempt as u64))
+                .map_err(|e| RehydrateError::Replay(format!("tuple read failed: {e:?}")))?;
+            if !tuple.is_some_and(|tuple| tuple.immutable_commit.0 == digest) {
+                return Err(RehydrateError::ReviewEvidenceUnavailable { order_id: ro.order_id.clone() });
             }
         }
         out.push(order);
@@ -77,10 +85,7 @@ fn git_head(repo: &Path) -> std::io::Result<String> {
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "git rev-parse failed",
-        ))
+        Err(std::io::Error::other("git rev-parse failed"))
     }
 }
 
@@ -127,7 +132,13 @@ mod tests {
         drop(led);
         let led = SqliteLedger::open(&db).unwrap();
         // FurnaceHold without a workdir → DigestUnavailable (by design)
-        match rehydrate(&led, Path::new("/tmp")) {
+        struct EmptyTuples;
+        impl TupleStore for EmptyTuples {
+            fn record(&self, _: &foundry_exec::ArtifactTuple) -> Result<foundry_exec::Recorded, foundry_exec::PortError> { Ok(foundry_exec::Recorded) }
+            fn latest(&self, _: &OrderId, _: Attempt) -> Result<Option<foundry_exec::ArtifactTuple>, foundry_exec::PortError> { Ok(None) }
+            fn promote(&self, _: &foundry_exec::ArtifactTupleKey, _: &foundry_exec::EmitReceipt) -> Result<(), foundry_exec::PortError> { Ok(()) }
+        }
+        match rehydrate(&led, Path::new("/tmp"), &EmptyTuples) {
             Err(RehydrateError::DigestUnavailable { order_id }) => assert_eq!(order_id, oid),
             other => panic!("expected DigestUnavailable, got {other:?}"),
         }

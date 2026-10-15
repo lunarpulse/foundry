@@ -15,6 +15,7 @@ use crate::error::LineError;
 use crate::PublishReceipt;
 use foundry_domain::ports::{Gate, Harness, Ledger, Policy, PortError, PublishOutcome, Publisher};
 use foundry_domain::{ActorId, ActorKind, Order, OrderEvent, OrderState, workdir_path};
+use foundry_exec::{Attempt, Epoch, OrderId, ReviewRunPort, ReviewRunRequest, RunId, TupleStore};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -53,6 +54,8 @@ where
     pub ledger: Arc<Mutex<L>>,
     pub publisher: Arc<PUB>,
     pub policy: Arc<dyn Policy + Send + Sync>,
+    review_run: std::sync::Mutex<Option<Box<dyn ReviewRunPort>>>,
+    tuple_store: std::sync::Mutex<Option<Arc<dyn TupleStore>>>,
     pub cfg: LineConfig,
     lease: Mutex<Option<String>>,
     /// In-memory store for M0 (single process, single writer).
@@ -80,6 +83,8 @@ where
             ledger,
             publisher,
             policy,
+            review_run: std::sync::Mutex::new(None),
+            tuple_store: std::sync::Mutex::new(None),
             cfg: LineConfig::default(),
             lease: Mutex::new(None),
             orders: Mutex::new(HashMap::new()),
@@ -89,6 +94,30 @@ where
     pub fn with_cfg(mut self, cfg: LineConfig) -> Self {
         self.cfg = cfg;
         self
+    }
+
+    pub fn with_review_run(self, review_run: impl ReviewRunPort + 'static) -> Self {
+        *self.review_run.lock().unwrap() = Some(Box::new(review_run));
+        self
+    }
+
+    pub fn with_tuple_store(mut self, tuple_store: Arc<dyn TupleStore>) -> Self {
+        *self.tuple_store.get_mut().unwrap() = Some(tuple_store);
+        self
+    }
+
+    pub fn set_tuple_store(&self, tuple_store: Arc<dyn TupleStore>) {
+        *self.tuple_store.lock().unwrap() = Some(tuple_store);
+    }
+
+    fn has_review_tuple(&self, order: &Order) -> Result<bool, LineError> {
+        let store_guard = self.tuple_store.lock().unwrap();
+        let Some(store) = store_guard.as_ref() else { return Ok(false); };
+        let digest = order.artifact_digest.as_deref().unwrap_or_default();
+        if digest.is_empty() { return Ok(false); }
+        store.latest(&OrderId(order.id.clone()), Attempt(order.attempt() as u64))
+            .map(|tuple| tuple.is_some_and(|tuple| tuple.immutable_commit.0 == digest))
+            .map_err(|e| LineError::Port(order.id.clone(), foundry_domain::ports::PortError::Permanent(format!("tuple store: {e:?}"))))
     }
 
     /// Test/integration helper: commit a specific event WITHOUT running
@@ -230,26 +259,19 @@ where
                                     o.artifact_digest = Some(die_out.result_commit.clone());
                                 }
                             }
-                            // Inspector (T19): real verdict — no-op taxonomy
-                            // (PreflightNoWork -> Rejected, empty-diff-with-
-                            // change-required -> Failed, defect #8).
-                            // diff-empty evidence: no commit produced, or the
-                            // "new" commit IS the base (M1 defect #8 shape)
+                            // Preserve the no-op taxonomy, but require durable
+                            // review evidence before the passing transition.
                             let noop = die_out.result_commit.is_empty()
                                 || die_out.result_commit == die_out.base_commit;
-                            let diff = foundry_domain::inspector::DiffStats {
-                                files_changed: if noop { 0 } else { 1 },
-                                lines_changed: if noop { 0 } else { 1 },
-                            };
-                            let verdict = foundry_domain::inspector::inspect(
-                                &diff,
-                                foundry_domain::inspector::change_required(&order),
-                            );
-                            let ev = foundry_domain::inspector::event_for(&verdict);
-                            self.commit(order_id, ev, attempt, &actor).await?;
-                            match verdict {
-                                foundry_domain::inspector::Verdict::PreflightNoWork { .. }
-                                | foundry_domain::inspector::Verdict::ExpectedChangeButEmptyDiff => {
+                            if noop {
+                                let verdict = foundry_domain::inspector::inspect(
+                                    &foundry_domain::inspector::DiffStats { files_changed: 0, lines_changed: 0 },
+                                    foundry_domain::inspector::change_required(&order),
+                                );
+                                self.commit(order_id, foundry_domain::inspector::event_for(&verdict), attempt, &actor).await?;
+                                match verdict {
+                                    foundry_domain::inspector::Verdict::PreflightNoWork { .. }
+                                    | foundry_domain::inspector::Verdict::ExpectedChangeButEmptyDiff => {
                                     // terminal — stop driving this order,
                                     // report its now-terminal state
                                     let st = {
@@ -260,8 +282,41 @@ where
                                             .unwrap_or(OrderState::Failed)
                                     };
                                     return Ok(st);
+                                    }
+                                    _ => {}
                                 }
-                                _ => {}
+                            } else {
+                                let request = ReviewRunRequest {
+                                    order: OrderId(order_id.to_string()), attempt: Attempt(attempt as u64),
+                                    run: RunId(attempt as u64), base_commit: die_out.base_commit,
+                                    result_commit: die_out.result_commit.clone(), artifact_digest: die_out.result_commit,
+                                    epoch: Epoch(0), activation: order.version,
+                                };
+                                let review = match self.review_run.lock().unwrap().as_mut() {
+                                    Some(runner) => runner.run(request),
+                                    None => Err(foundry_exec::ReviewRunError::MissingRunner),
+                                };
+                                match review {
+                                    Ok(evidence) if evidence.verdict == foundry_exec::ReviewVerdict::Passed => {
+                                        let current = self.get(order_id).await.ok_or_else(|| LineError::UnknownOrder(order_id.to_string()))?;
+                                        let bound = evidence.tuple_key.order.0 == order_id
+                                            && evidence.tuple_key.attempt.0 == attempt as u64
+                                            && evidence.tuple_key.run.0 == attempt as u64
+                                            && evidence.emit_receipt.key == evidence.tuple_key
+                                            && self.has_review_tuple(&current)?;
+                                        if bound {
+                                            self.commit(order_id, OrderEvent::InspectionPassed, attempt, &actor).await?;
+                                        } else {
+                                            self.commit(order_id, OrderEvent::InspectionFailed { reason: "review evidence tuple mismatch".into() }, attempt, &actor).await?;
+                                        }
+                                    }
+                                    Ok(_) => {
+                                        self.commit(order_id, OrderEvent::InspectionFailed { reason: "review returned no passing verdict".into() }, attempt, &actor).await?;
+                                    }
+                                    Err(error) => {
+                                        self.commit(order_id, OrderEvent::InspectionFailed { reason: format!("review failed: {error:?}") }, attempt, &actor).await?;
+                                    }
+                                }
                             }
                         }
                         Err(PortError::Retryable(reason)) => {
@@ -305,13 +360,11 @@ where
                     return Ok(OrderState::Working);
                 }
                 OrderState::Inspecting => {
-                    self.commit(
-                        order_id,
-                        OrderEvent::InspectionPassed,
-                        order.attempt(),
-                        &actor,
-                    )
-                    .await?;
+                    if self.has_review_tuple(&order)? {
+                        self.commit(order_id, OrderEvent::InspectionPassed, order.attempt(), &actor).await?;
+                    } else {
+                        return Ok(OrderState::Inspecting);
+                    }
                 }
                 OrderState::FurnaceHold => {
                     return Ok(OrderState::FurnaceHold); // human decides
@@ -344,6 +397,9 @@ where
             .ok_or_else(|| LineError::UnknownOrder(order_id.to_string()))?;
 
         let digest = order.artifact_digest.clone().unwrap_or_default();
+        if !self.has_review_tuple(&order)? {
+            return Err(LineError::Port(order_id.to_string(), foundry_domain::ports::PortError::Permanent("review evidence required".into())));
+        }
         self.gate
             .verify(&order, token, &digest)
             .map_err(|e| LineError::Port(order_id.to_string(), e))?;
@@ -370,6 +426,9 @@ where
         let attempt = order.attempt();
         let operation_id = format!("{order_id}:{attempt}");
         let digest = order.artifact_digest.clone().unwrap_or_default();
+        if !self.has_review_tuple(&order)? {
+            return Err(LineError::Port(order_id.to_string(), foundry_domain::ports::PortError::Permanent("review evidence required".into())));
+        }
 
         let mut last_pr_url: Option<String> = None;
         match self.publisher.publish(&order, &operation_id, &digest).await {

@@ -13,11 +13,11 @@
 
 use crate::refusal::{record_refusal, RefusalCode};
 use crate::{OrchestrationKind, OrchestrationLog};
-use foundry_domain::order::{ExternalRef, Order};
-use foundry_domain::ports::Ledger as _;
+use foundry_domain::order::Order;
 use foundry_domain::{OrderEvent, OrderState};
 use foundry_workflow::recovery::RecoveryRunner;
 use foundry_workflow::{Outcome, WorkflowEngine};
+use foundry_exec::{Attempt as ExecAttempt, Epoch, OrderId as ExecOrderId, ReviewRunPort, ReviewRunRequest, RunId, TupleStore};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -235,6 +235,8 @@ pub struct StreamRuntime {
     streams: Mutex<Vec<Arc<Stream>>>,
     /// (astra r1 결합) 입장 차단 — 코디네이터가 소유.
     admission_blocked: std::sync::atomic::AtomicBool,
+    tuple_store: Mutex<Option<Arc<dyn TupleStore>>>,
+    review_run: Mutex<Option<Box<dyn ReviewRunPort>>>,
 }
 
 /// (publish-bridge v1.6 D2) 발행 전 재료 — precheck이 가드 해제 후 반환.
@@ -253,7 +255,27 @@ impl StreamRuntime {
             approval_path: Mutex::new(None),
             streams: Mutex::new(Vec::new()),
             admission_blocked: std::sync::atomic::AtomicBool::new(false),
+            tuple_store: Mutex::new(None),
+            review_run: Mutex::new(None),
         }
+    }
+
+    pub fn set_tuple_store(&self, tuples: Arc<dyn TupleStore>) {
+        *self.tuple_store.lock().unwrap() = Some(tuples);
+    }
+
+    pub fn set_review_run(&self, runner: impl ReviewRunPort + 'static) {
+        *self.review_run.lock().unwrap() = Some(Box::new(runner));
+    }
+
+    fn require_review_tuple(&self, order_id: &str, attempt: u32, digest: &str) -> Result<(), String> {
+        if digest.is_empty() { return Err("review evidence unavailable: empty artifact digest".into()); }
+        let guard = self.tuple_store.lock().unwrap();
+        let store = guard.as_ref().ok_or("review evidence unavailable: tuple reader not configured")?;
+        let tuple = store.latest(&ExecOrderId(order_id.into()), ExecAttempt(attempt as u64))
+            .map_err(|e| format!("review tuple read failed: {e:?}"))?;
+        if tuple.is_some_and(|tuple| tuple.immutable_commit.0 == digest) { Ok(()) }
+        else { Err("review evidence unavailable: matching tuple missing".into()) }
     }
 
     /// 발행 전 주문 상태와 발행 재료를 확인한다. 엔진 가드는 반환 전에 해제한다.
@@ -274,6 +296,7 @@ impl StreamRuntime {
                 return Err(format!("order {order_id} has empty artifact digest"));
             }
             let attempt = order.attempt().max(1);
+            self.require_review_tuple(order_id, attempt, &digest)?;
             PublishMaterial { digest, attempt, op_id: format!("{order_id}:{attempt}") }
         };
         Ok(material)
@@ -309,6 +332,8 @@ impl StreamRuntime {
         if state != OrderState::Publishing {
             return Err(format!("order {order_id} must be Publishing or Shipped, was {state}"));
         }
+        let order = engine.order(order_id).ok_or(format!("order {order_id} not enrolled"))?;
+        self.require_review_tuple(order_id, order.attempt().max(1), order.artifact_digest.as_deref().unwrap_or(""))?;
         engine.acquire(order_id, exec).map_err(|e| format!("publish lock: {e:?}"))?;
         let ctx = crate::test_support::replay_ctx(order_id, &rows);
         let ledger: &'static mut foundry_ledger::SqliteLedger = Box::leak(Box::new(
@@ -426,6 +451,8 @@ impl StreamRuntime {
     ) -> Result<(), String> {
         let e = self.stream(stream_id).ok_or(format!("stream {stream_id} not registered"))?;
         let mut eng = e.engine_if_unfenced()?;
+        let order = eng.order(order_id).ok_or(format!("order {order_id} not enrolled"))?;
+        self.require_review_tuple(order_id, order.attempt().max(1), order.artifact_digest.as_deref().unwrap_or(""))?;
         let rows = foundry_ledger::SqliteLedger::open(e.journal())
             .map_err(|er| format!("journal: {er:?}"))?
             .read_all()
@@ -599,6 +626,10 @@ impl StreamRuntime {
                 foundry_ledger::SqliteLedger::open(e.journal())
                     .map_err(|er| format!("journal: {er:?}"))?,
             ));
+            if ev == foundry_domain::OrderEvent::InspectionPassed {
+                let digest = eng.order(order_id).and_then(|o| o.artifact_digest.as_deref()).unwrap_or("");
+                self.require_review_tuple(order_id, att, digest)?;
+            }
             eng.dispatch_replay_ctx(order_id, exec, &ev, att, &ctx, ro)
                 .map_err(|er| format!("advance event: {er:?}"))?;
         }
@@ -693,6 +724,34 @@ impl StreamRuntime {
                 die.base_commit
             ));
         }
+        let has_tuple = {
+            let guard = self.tuple_store.lock().unwrap();
+            let store = guard.as_ref().ok_or("review evidence unavailable: tuple reader not configured")?;
+            store.latest(&ExecOrderId(order_id.into()), ExecAttempt(att as u64))
+                .map_err(|er| format!("review tuple read failed: {er:?}"))?
+                .is_some_and(|tuple| tuple.immutable_commit.0 == die.result_commit)
+        };
+        if !has_tuple {
+            let order = eng.order(order_id).ok_or(format!("order {order_id} unknown"))?;
+            let request = ReviewRunRequest {
+                order: ExecOrderId(order_id.into()), attempt: ExecAttempt(att as u64),
+                run: RunId(att as u64), base_commit: die.base_commit.clone(),
+                result_commit: die.result_commit.clone(), artifact_digest: die.result_commit.clone(),
+                epoch: Epoch(0), activation: order.version,
+            };
+            let result = self.review_run.lock().unwrap().as_mut()
+                .ok_or("review evidence unavailable: review runner not configured")?
+                .run(request).map_err(|er| format!("review run failed: {er:?}"))?;
+            if result.verdict != foundry_exec::ReviewVerdict::Passed
+                || result.tuple_key.order.0 != order_id
+                || result.tuple_key.attempt.0 != att as u64
+                || result.tuple_key.run.0 != att as u64
+                || result.emit_receipt.key != result.tuple_key
+            {
+                return Err("review evidence binding mismatch".into());
+            }
+        }
+        self.require_review_tuple(order_id, att, &die.result_commit)?;
         let rows = foundry_ledger::SqliteLedger::open(e.journal())
             .map_err(|er| format!("journal: {er:?}"))?
             .read_all()
@@ -1121,6 +1180,7 @@ impl<'r> RecoveryCoordinator<'r> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use foundry_domain::order::ExternalRef;
 
     fn tmpdir(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("foundry-t58-{name}-{}", std::process::id()));
@@ -1139,10 +1199,24 @@ mod tests {
     mod publish {
     use super::*;
 
+    fn tuples(path: &Path, order: &str, digest: &str) -> Arc<foundry_exec::SqliteTupleStore> {
+        use foundry_exec::TupleStore as _;
+        let store = Arc::new(foundry_exec::SqliteTupleStore::open(path).unwrap());
+        store.record(&foundry_exec::ArtifactTuple {
+            order: ExecOrderId(order.into()), attempt: ExecAttempt(2), run: RunId(1),
+            generation: foundry_exec::Generation(0),
+            immutable_commit: foundry_exec::ImmutableCommit(digest.into()),
+            artifact_location: foundry_exec::ArtifactLocation("review.log".into()),
+        }).unwrap();
+        store
+    }
+
     fn publish_fixture(name: &str, state: OrderState) -> (PathBuf, StreamRuntime) {
         let d = tmpdir(name);
         let orch = OrchestrationLog::open(&d.join("orch.db")).unwrap();
         let rt = StreamRuntime::new(orch);
+        let tuple_store = tuples(&d.join("tuples.db"), "pub-order", "digest-1");
+        rt.set_tuple_store(tuple_store);
         rt.add_stream(Stream::new("publish", &d).unwrap()).unwrap();
         let mut order = mkorder("pub-order");
         order.force_state_for_test(state, 2);
@@ -1201,6 +1275,15 @@ mod tests {
         grant_id: &str,
         ap_db: &Path,
     ) {
+        let tuple_path = ap_db.with_file_name(format!("{oid}-tuples.db"));
+        let tuple_store = foundry_exec::SqliteTupleStore::open(&tuple_path).unwrap();
+        foundry_exec::TupleStore::record(&tuple_store, &foundry_exec::ArtifactTuple {
+            order: ExecOrderId(oid.into()), attempt: ExecAttempt(1), run: RunId(1),
+            generation: foundry_exec::Generation(0),
+            immutable_commit: foundry_exec::ImmutableCommit(format!("dig-{oid}")),
+            artifact_location: foundry_exec::ArtifactLocation("review.log".into()),
+        }).unwrap();
+        rt.set_tuple_store(Arc::new(tuple_store));
         let mut ap = foundry_approval::ApprovalLedger::open(ap_db).unwrap();
         let e = rt.stream(stream_id).unwrap();
         {

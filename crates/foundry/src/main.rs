@@ -450,13 +450,22 @@ fn build_line(die: &str, ledger: SqliteLedger) -> Arc<AppLine> {
         token_path: expand("~/.foundry/gh_token").into(),
         base: "main".into(),
     };
-    Arc::new(Line::new(
+    let line = Line::new(
         Arc::new(DigestGate),
         Arc::new(harness),
         Arc::new(TMutex::new(ledger)),
         Arc::new(publisher),
         Arc::new(LocalPolicy),
-    ))
+    );
+    if let Ok(tuples) = foundry_exec::SqliteTupleStore::open(tuple_db_path()) {
+        line.set_tuple_store(Arc::new(tuples));
+    }
+    Arc::new(line)
+}
+
+fn tuple_db_path() -> std::path::PathBuf {
+    let raw = std::env::var("FOUNDRY_TUPLES").unwrap_or_else(|_| "~/.foundry/tuples.db".into());
+    expand(&raw).into()
 }
 
 async fn approve(order_id: String, intent: String, db: &str) -> i32 {
@@ -478,7 +487,11 @@ async fn approve(order_id: String, intent: String, db: &str) -> i32 {
                 return 1;
             }
         };
-        match foundry_line::rehydrate::rehydrate(&ledger_ro, std::path::Path::new("/tmp")) {
+        let tuples = match foundry_exec::SqliteTupleStore::open(tuple_db_path()) {
+            Ok(store) => store,
+            Err(e) => { eprintln!("✗ tuple store open failed: {e:?}"); return 1; }
+        };
+        match foundry_line::rehydrate::rehydrate(&ledger_ro, std::path::Path::new("/tmp"), &tuples) {
             Ok(orders) => {
                 let n_waiting = orders
                     .iter()

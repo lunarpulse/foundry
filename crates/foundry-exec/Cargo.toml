@@ -9,4 +9,5 @@ foundry-pack = { path = "../foundry-pack" }
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
+rusqlite.workspace = true
 sha2 = "0.10"
