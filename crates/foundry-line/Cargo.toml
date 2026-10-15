@@ -10,6 +10,12 @@ foundry-ledger = { path = "../foundry-ledger" }
 foundry-furnace = { path = "../foundry-furnace" }
 foundry-harness-cli = { path = "../foundry-harness-cli" }
 foundry-exec = { path = "../foundry-exec" }
+foundry-pack = { path = "../foundry-pack" }
+rusqlite = "0.32"
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+toml = "0.8"
+sha2.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

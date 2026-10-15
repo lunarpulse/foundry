@@ -512,8 +512,14 @@ dependencies = [
  "foundry-furnace",
  "foundry-harness-cli",
  "foundry-ledger",
+ "foundry-pack",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
  "thiserror",
  "tokio",
+ "toml",
  "tracing",
 ]
 

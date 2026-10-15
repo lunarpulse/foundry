@@ -103,6 +103,16 @@ impl GraphEngine {
         self.execute(state, input, current, max_steps)
     }
 
+    /// Run the graph while yielding each dispatch/redrive boundary to a host.
+    /// The returned input from a dispatch becomes the input used by subsequent
+    /// routes. Redrive callbacks are for pack-declared pre-stages and their
+    /// returned input is intentionally ignored.
+    pub fn run_staged<F>(&self, state: &mut EngineState, input: &RunInput, max_steps: u32, mut execute: F) -> Result<StepOutcome>
+    where F: FnMut(&str, bool, &RunInput) -> Result<RunInput> {
+        let current = state.current.clone().unwrap_or_else(|| self.entry.clone());
+        self.execute_staged(state, input, current, max_steps, &mut execute)
+    }
+
     pub fn resume(&self, state: &mut EngineState, target_node: &str) -> Result<StepOutcome> {
         let held = state.hold.as_ref().ok_or_else(|| exec_error("E_EXEC_NOT_HELD", "resume requires a hold state"))?;
         let allowed = match self.nodes.get(&held.node_id) {
@@ -123,12 +133,20 @@ impl GraphEngine {
         Ok(outcome)
     }
 
-    fn execute(&self, state: &mut EngineState, input: &RunInput, mut current: String, max_steps: u32) -> Result<StepOutcome> {
+    fn execute(&self, state: &mut EngineState, input: &RunInput, current: String, max_steps: u32) -> Result<StepOutcome> {
+        self.execute_staged(state, input, current, max_steps, &mut |_, _, input| Ok(input.clone()))
+    }
+
+    fn execute_staged<F>(&self, state: &mut EngineState, input: &RunInput, mut current: String, max_steps: u32, execute_stage: &mut F) -> Result<StepOutcome>
+    where F: FnMut(&str, bool, &RunInput) -> Result<RunInput> {
+        let mut input = input.clone();
         let mut outcome = StepOutcome { destinations: Vec::new(), actions: Vec::new(), hold: None, terminal: false };
         for _ in 0..max_steps {
             let kind = self.nodes.get(&current).ok_or_else(|| exec_error("E_EXEC_UNKNOWN_NODE", format!("unknown node {current}")))?;
             match kind {
                 Kind::Dispatch { on_done, hold_target, verify } => {
+                    input = execute_stage(&current, false, &input)?;
+                    state.last_input = Some(input.clone());
                     state.active_hold_target = Some(hold_target.clone());
                     if *verify {
                         state.verify_evidence = true;
@@ -138,6 +156,7 @@ impl GraphEngine {
                     current = on_done.clone();
                 }
                 Kind::Redrive { on_done, hold_target, bump } => {
+                    let _ = execute_stage(&current, true, &input)?;
                     state.active_hold_target = Some(hold_target.clone());
                     state.verify_evidence = false;
                     if let Some(counter) = bump
@@ -149,7 +168,7 @@ impl GraphEngine {
                     current = on_done.clone();
                 }
                 Kind::Route { branches } => {
-                    let branch = branches.iter().find(|b| evaluate(&b.condition, input, &state.counters).unwrap_or(false))
+                    let branch = branches.iter().find(|b| evaluate(&b.condition, &input, &state.counters).unwrap_or(false))
                         .ok_or_else(|| exec_error("E_EXEC_NO_BRANCH", format!("no matching branch at {current}")))?;
                     for action in &branch.actions {
                         match action {

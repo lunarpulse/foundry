@@ -16,7 +16,7 @@ use foundry_domain::{ActorId, ActorKind, ExternalRef, Order};
 use foundry_harness_cli::CliHarness;
 use foundry_harness_cli::fake::FakeHarness;
 use foundry_ledger::SqliteLedger;
-use foundry_line::Line;
+use foundry_line::{Line, PackReviewHost, UnavailableStageExecutor, durable_review_run};
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex as TMutex;
@@ -450,14 +450,24 @@ fn build_line(die: &str, ledger: SqliteLedger) -> Arc<AppLine> {
         token_path: expand("~/.foundry/gh_token").into(),
         base: "main".into(),
     };
-    let line = Line::new(
+    let mut line = Line::new(
         Arc::new(DigestGate),
         Arc::new(harness),
         Arc::new(TMutex::new(ledger)),
         Arc::new(publisher),
         Arc::new(LocalPolicy),
     );
-    if let Ok(tuples) = foundry_exec::SqliteTupleStore::open(tuple_db_path()) {
+    if let Ok(pack) = std::env::var("FOUNDRY_REVIEW_PACK") {
+        let tuples: Arc<dyn foundry_exec::TupleStore> = Arc::new(
+            foundry_exec::SqliteTupleStore::open(tuple_db_path()).unwrap_or_else(|e| panic!("tuple store: {e:?}"))
+        );
+        line.set_tuple_store(tuples.clone());
+        let host = PackReviewHost::new(&pack, UnavailableStageExecutor, PackReviewHost::default_db_path())
+            .unwrap_or_else(|e| panic!("review host setup: {e:?}"));
+        let runner = durable_review_run(host, PackReviewHost::default_db_path(), tuples)
+            .unwrap_or_else(|e| panic!("review runner setup: {e}"));
+        line = line.with_review_run(runner);
+    } else if let Ok(tuples) = foundry_exec::SqliteTupleStore::open(tuple_db_path()) {
         line.set_tuple_store(Arc::new(tuples));
     }
     Arc::new(line)

@@ -19,7 +19,7 @@ pub mod privacy;
 pub mod read_guard;
 pub mod scope;
 use foundry_ledger::{LedgerRow, SqliteLedger};
-use foundry_line::line::Line;
+use foundry_line::{line::Line, PackReviewHost, UnavailableStageExecutor, durable_review_run};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -156,13 +156,28 @@ impl ServeState {
         let path: PathBuf = ledger_path.into();
         let ledger = SqliteLedger::open(&path).map_err(|e| format!("open ledger: {e:?}"))?;
         let ledger2 = SqliteLedger::open(&path).map_err(|e| format!("open ledger: {e:?}"))?;
-        let line: AppLine = Line::new(
+        let mut line: AppLine = Line::new(
             Arc::new(fake_noop::ServeGate),
             Arc::new(fake_noop::NoopHarness),
             Arc::new(tokio::sync::Mutex::new(ledger2)),
             Arc::new(fake_noop::NoopPublisher),
             Arc::new(fake_noop::AllowHumanPolicy),
         );
+        if let Ok(pack) = std::env::var("FOUNDRY_REVIEW_PACK") {
+            let tuple_path = std::env::var("FOUNDRY_TUPLES").unwrap_or_else(|_| "~/.foundry/tuples.db".into());
+            let tuple_path = if let Some(rest) = tuple_path.strip_prefix("~/") {
+                std::env::var("HOME").map(PathBuf::from).unwrap_or_default().join(rest)
+            } else { PathBuf::from(tuple_path) };
+            let tuples: Arc<dyn foundry_exec::TupleStore> = Arc::new(
+                foundry_exec::SqliteTupleStore::open(&tuple_path).map_err(|e| format!("tuple store: {e:?}"))?
+            );
+            line.set_tuple_store(tuples.clone());
+            let host = PackReviewHost::new(&pack, UnavailableStageExecutor, PackReviewHost::default_db_path())
+                .map_err(|e| format!("review host: {e:?}"))?;
+            let runner = durable_review_run(host, PackReviewHost::default_db_path(), tuples)
+                .map_err(|e| format!("review runner: {e}"))?;
+            line = line.with_review_run(runner);
+        }
         let ident =
             identity::Identity::open(std::path::Path::new(&path.with_extension("identity.db")))
                 .map_err(|e| format!("identity open: {e}"))?;
