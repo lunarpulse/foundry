@@ -1,0 +1,88 @@
+entry = "review"
+
+[counters]
+fix_rounds = 0
+
+[[nodes]]
+id = "review"
+kind = "dispatch"
+stages = [
+  { id = "scan", lenses = ["lens-scan.md"], role = "lens", output_schema = "schema-findings.toml" },
+  { id = "confirm", lenses = ["lens-confirm.md"], role = "verify", after = ["scan"], output_schema = "schema-findings.toml" },
+]
+side_records = ["comments"]
+on_done = "decide"
+hold_target = "hold"
+on_verify_invalid = "hold"
+on_no_valid = "hold"
+resume_targets = ["fix"]
+
+[[nodes]]
+id = "decide"
+kind = "route"
+
+[[nodes.branches]]
+when = 'budget_exhausted() || timeout()'
+goto = "hold"
+
+[[nodes.branches]]
+when = 'any_in(verdicts, ["blocking"]) && !count_lt(fix_rounds, 1)'
+goto = "hold"
+
+[[nodes.branches]]
+when = 'any_in(verdicts, ["blocking"])'
+goto = "fix"
+
+[[nodes.branches]]
+when = 'has_findings(any)'
+goto = "commented"
+
+[[nodes.branches]]
+when = "true"
+goto = "done"
+
+[[nodes]]
+id = "fix"
+kind = "redrive"
+target = "die-workdir"
+payload = "findings"
+base = "latest"
+bump = "fix_rounds"
+on_done = "review"
+hold_target = "hold"
+on_redrive_error = "hold"
+
+[[nodes]]
+id = "done"
+kind = "emit"
+event = "InspectionPassed"
+payload_from = "summary"
+
+[[nodes]]
+id = "hold"
+kind = "hold"
+resume_targets = ["fix"]
+
+[[nodes]]
+id = "commented"
+kind = "hold"
+resume_targets = []
+
+[[output.on_error]]
+state = "ok"
+policy = "accept-stage"
+
+[[output.on_error]]
+state = "dispatch_error"
+policy = "discard-stage"
+
+[[output.on_error]]
+state = "parse_error"
+policy = "discard-finding"
+
+[[output.on_error]]
+state = "timeout"
+policy = "hold"
+
+[hold]
+timeout_s = 0

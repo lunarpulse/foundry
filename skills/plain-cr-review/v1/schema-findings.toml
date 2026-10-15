@@ -1,0 +1,13 @@
+# Plain review output contract. Finding records use verdict and weight fields.
+[record]
+fields = ["verdict", "weight", "findings", "summary"]
+verdict_values = ["blocking", "nit", "clean"]
+
+[[output]]
+name = "findings"
+groups_from = "## "
+active = true
+
+[[output]]
+name = "summary"
+from = "first_paragraph"

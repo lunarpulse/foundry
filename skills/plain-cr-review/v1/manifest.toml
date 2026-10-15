@@ -1,0 +1,6 @@
+id = "plain-cr-review"
+interface_version = 1
+kind = "review-pack"
+version = "1.0.0"
+files = ["lens-scan.md", "lens-confirm.md", "lens-fix.md", "schema-findings.toml", "policy.toml"]
+digest = "48029eed0f940c61c7d7a01132234a5d81eb4c261a2ee34af4ea18d60f6fcf29"
