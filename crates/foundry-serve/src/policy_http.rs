@@ -13,12 +13,12 @@
 //! The handler owns the pipeline+layer+coordinator trio through
 //! ServeState.policy (T60b wiring): there is NO other production
 //! path that constructs these — inventory.rs is the record.
-use crate::serve_wiring::apply_policy_via_serve;
 use crate::ServeState;
+use crate::serve_wiring::apply_policy_via_serve;
+use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use axum::Json;
 use foundry_watch::policy_apply::{ApplyCommand, PolicyApplicationLayer};
 use foundry_watch::retro::InsightPipeline;
 use std::sync::Arc;
@@ -34,7 +34,10 @@ pub struct PolicyState {
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<String> {
-    let v = headers.get(axum::http::header::AUTHORIZATION)?.to_str().ok()?;
+    let v = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
     v.strip_prefix("Bearer ").map(|s| s.to_string())
 }
 
@@ -46,7 +49,12 @@ pub async fn apply(
 ) -> impl IntoResponse {
     let token = match bearer_token(&headers) {
         Some(t) => t,
-        None => return (StatusCode::UNAUTHORIZED, "missing bearer session".to_string()),
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                "missing bearer session".to_string(),
+            );
+        }
     };
     let mut identity = st.identity.lock().await;
     let mut layer = st.policy.layer.lock().await;
@@ -68,10 +76,13 @@ pub async fn apply(
         Ok(msg) => (StatusCode::OK, msg),
         Err(e) => {
             let (code, msg) = match e {
-                crate::serve_wiring::ServeWiringError::Unauthenticated(d) => (StatusCode::UNAUTHORIZED, d),
-                crate::serve_wiring::ServeWiringError::Forbidden { current_role } => {
-                    (StatusCode::FORBIDDEN, format!("current role {current_role} may not apply policy"))
+                crate::serve_wiring::ServeWiringError::Unauthenticated(d) => {
+                    (StatusCode::UNAUTHORIZED, d)
                 }
+                crate::serve_wiring::ServeWiringError::Forbidden { current_role } => (
+                    StatusCode::FORBIDDEN,
+                    format!("current role {current_role} may not apply policy"),
+                ),
                 _ => (StatusCode::CONFLICT, format!("{e:?}")),
             };
             (code, msg)

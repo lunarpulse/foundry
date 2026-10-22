@@ -31,12 +31,19 @@ fn docker(args: &[&str]) -> Result<String, String> {
     if out.status.success() {
         Ok(stdout)
     } else {
-        Err(format!("docker {} -> {}: {}", args.join(" "), out.status, stderr.trim()))
+        Err(format!(
+            "docker {} -> {}: {}",
+            args.join(" "),
+            out.status,
+            stderr.trim()
+        ))
     }
 }
 
 fn require_daemon() {
-    let up = Command::new("docker").args(["version", "--format", "{{.Server.Version}}"]).output();
+    let up = Command::new("docker")
+        .args(["version", "--format", "{{.Server.Version}}"])
+        .output();
     match up {
         Ok(o) if o.status.success() => {
             let v = String::from_utf8_lossy(&o.stdout).trim().to_string();
@@ -57,7 +64,8 @@ fn setup() -> Result<(), String> {
     let _ = docker(&["rm", "-f", "t56w-live"]);
     let _ = docker(&["network", "rm", NET]);
     docker(&["network", "create", "--internal", NET])?;
-    docker(&["pull", "-q", "busybox:1.37"]).and_then(|_| docker(&["tag", "busybox:1.37", IMG]).map(|_| ()))
+    docker(&["pull", "-q", "busybox:1.37"])
+        .and_then(|_| docker(&["tag", "busybox:1.37", IMG]).map(|_| ()))
 }
 
 /// The derived argv from the LIBRARY — production and test share one
@@ -82,29 +90,63 @@ fn runtime_boundary_mandatory() {
 
     // --- the derived argv is the ONLY flag source: screening on it
     let argv = derived_run_args("t56w-argv", &["true"]);
-    assert!(argv.contains(&"--read-only".to_string()), "read-only in derived argv: {argv:?}");
-    assert!(argv.contains(&"--cap-drop=ALL".to_string()), "cap-drop=ALL in derived argv");
-    assert!(argv.windows(2).any(|w| w[0] == "--security-opt" && w[1] == "no-new-privileges"));
-    assert!(argv.windows(2).any(|w| w[0] == "--network" && w[1] == NET), "the ONLY network is the internal proxy net");
+    assert!(
+        argv.contains(&"--read-only".to_string()),
+        "read-only in derived argv: {argv:?}"
+    );
+    assert!(
+        argv.contains(&"--cap-drop=ALL".to_string()),
+        "cap-drop=ALL in derived argv"
+    );
+    assert!(
+        argv.windows(2)
+            .any(|w| w[0] == "--security-opt" && w[1] == "no-new-privileges")
+    );
+    assert!(
+        argv.windows(2).any(|w| w[0] == "--network" && w[1] == NET),
+        "the ONLY network is the internal proxy net"
+    );
     // full-spelling enforcement: no short/alternate forms anywhere
-    for bad in ["-v", "--volume", "--mount", "-it", "-i", "-t", "--privileged", "--pid=host", "--network=host"] {
-        assert!(!argv.contains(&bad.to_string()), "forbidden flag {bad} in derived argv: {argv:?}");
+    for bad in [
+        "-v",
+        "--volume",
+        "--mount",
+        "-it",
+        "-i",
+        "-t",
+        "--privileged",
+        "--pid=host",
+        "--network=host",
+    ] {
+        assert!(
+            !argv.contains(&bad.to_string()),
+            "forbidden flag {bad} in derived argv: {argv:?}"
+        );
     }
     // attached spellings: -v/path:/path and --volume=/path:/path and
     // --mount=... must not appear as PREFIXES of any token either
     for tok in &argv {
         for pfx in ["-v/", "--volume=", "--mount="] {
-            assert!(!tok.starts_with(pfx), "attached mount spelling {tok} forbidden: {argv:?}");
+            assert!(
+                !tok.starts_with(pfx),
+                "attached mount spelling {tok} forbidden: {argv:?}"
+            );
         }
     }
     // non-root user in the derived argv
     assert!(
-        argv.windows(2).any(|w| w[0] == "--user" && w[1] == "65534:65534"),
+        argv.windows(2)
+            .any(|w| w[0] == "--user" && w[1] == "65534:65534"),
         "derived argv must run as nobody (65534): {argv:?}"
     );
     // no credential-bearing env passthrough
     let spec = foundry_watch::model_proxy::cast_container_spec(IMG, NET);
-    assert!(!spec.env_passthrough.iter().any(|e| e.contains("KEY") || e.contains("TOKEN")));
+    assert!(
+        !spec
+            .env_passthrough
+            .iter()
+            .any(|e| e.contains("KEY") || e.contains("TOKEN"))
+    );
 
     // --- R1: external egress refused (derived argv).
     // N3: a FAILED probe run must FAIL the test, not pass it via an
@@ -112,10 +154,17 @@ fn runtime_boundary_mandatory() {
     // exists) and then require the non-zero exit.
     let egress_out = run_derived(
         "t56w-r1",
-        &["sh", "-c", "wget -q -T 3 -O /dev/null http://93.184.216.34/ 2>&1; echo rc=$?; echo probe-done"],
+        &[
+            "sh",
+            "-c",
+            "wget -q -T 3 -O /dev/null http://93.184.216.34/ 2>&1; echo rc=$?; echo probe-done",
+        ],
     )
     .expect("R1 probe must execute — a docker failure is a test failure, not a pass");
-    assert!(egress_out.contains("probe-done"), "probe output identifiable: {egress_out}");
+    assert!(
+        egress_out.contains("probe-done"),
+        "probe output identifiable: {egress_out}"
+    );
     assert!(
         !egress_out.lines().any(|l| l.trim() == "rc=0"),
         "external egress must fail on the internal proxy network, got: {egress_out}"
@@ -128,12 +177,20 @@ fn runtime_boundary_mandatory() {
         &["sh", "-c", "find / -maxdepth 3 \\( -name gh_token -o -name die.env -o -name notifier.env \\) 2>/dev/null | head -3; id; echo probe-done"],
     )
     .expect("R2 probe must execute");
-    assert!(creds_out.contains("probe-done"), "probe output identifiable: {creds_out}");
     assert!(
-        !creds_out.contains("gh_token") && !creds_out.contains("die.env") && !creds_out.contains("notifier.env"),
+        creds_out.contains("probe-done"),
+        "probe output identifiable: {creds_out}"
+    );
+    assert!(
+        !creds_out.contains("gh_token")
+            && !creds_out.contains("die.env")
+            && !creds_out.contains("notifier.env"),
         "credentials must not be visible inside the cast container: {creds_out}"
     );
-    assert!(creds_out.contains("uid=65534"), "live container runs as nobody: {creds_out}");
+    assert!(
+        creds_out.contains("uid=65534"),
+        "live container runs as nobody: {creds_out}"
+    );
 
     // --- R3: read-only rootfs. Distinguish the INTENDED denial from
     // unrelated failures: uid 65534 could lack write permission
@@ -142,10 +199,17 @@ fn runtime_boundary_mandatory() {
     // denial in the hardened run is attributable to --read-only.
     let write_out = run_derived(
         "t56w-r3",
-        &["sh", "-c", "exec 2>&1; echo x > /probe; rc=$?; echo rc=$rc; echo probe-done"],
+        &[
+            "sh",
+            "-c",
+            "exec 2>&1; echo x > /probe; rc=$?; echo rc=$rc; echo probe-done",
+        ],
     )
     .expect("R3 hardened probe must execute");
-    assert!(write_out.contains("probe-done"), "probe output identifiable: {write_out}");
+    assert!(
+        write_out.contains("probe-done"),
+        "probe output identifiable: {write_out}"
+    );
     assert!(
         !write_out.lines().any(|l| l.trim() == "rc=0"),
         "rootfs write must fail in the hardened run: {write_out}"
@@ -164,7 +228,11 @@ fn runtime_boundary_mandatory() {
         env_passthrough: spec.env_passthrough.clone(),
     };
     let mut argv_ctl = foundry_watch::model_proxy::docker_argv(&spec_ctl, "t56w-r3ctl");
-    argv_ctl.extend(["sh".to_string(), "-c".to_string(), "echo x > /tmp/probe-ctl 2>&1; echo rc=$?; echo probe-done".to_string()]);
+    argv_ctl.extend([
+        "sh".to_string(),
+        "-c".to_string(),
+        "echo x > /tmp/probe-ctl 2>&1; echo rc=$?; echo probe-done".to_string(),
+    ]);
     let refs: Vec<&str> = argv_ctl.iter().map(|s| s.as_str()).collect();
     let ctl_out = docker(&refs).expect("R3 control probe must execute");
     assert!(
@@ -185,16 +253,26 @@ fn runtime_boundary_mandatory() {
     let cfg = docker(&["inspect", "t56w-live"]).expect("inspect");
     let v: serde_json::Value = serde_json::from_str(&cfg).expect("inspect JSON");
     let hc = &v[0]["HostConfig"];
-    assert_eq!(hc["CapDrop"].as_array().map(|a| a.len()), Some(1), "CapDrop live");
+    assert_eq!(
+        hc["CapDrop"].as_array().map(|a| a.len()),
+        Some(1),
+        "CapDrop live"
+    );
     assert_eq!(hc["CapDrop"][0].as_str(), Some("ALL"), "cap-drop ALL live");
     assert_eq!(hc["ReadonlyRootfs"].as_bool(), Some(true), "read-only live");
     assert!(
-        hc["SecurityOpt"].as_array().map(|a| a.iter().any(|x| x.as_str() == Some("no-new-privileges"))).unwrap_or(false),
+        hc["SecurityOpt"]
+            .as_array()
+            .map(|a| a.iter().any(|x| x.as_str() == Some("no-new-privileges")))
+            .unwrap_or(false),
         "no-new-privileges live"
     );
     // non-root live: Config.User must be 65534:65534
     let user = v[0]["Config"]["User"].as_str().unwrap_or("");
-    assert_eq!(user, "65534:65534", "live container user is nobody, got: {user:?}");
+    assert_eq!(
+        user, "65534:65534",
+        "live container user is nobody, got: {user:?}"
+    );
     // no mounts live
     let mounts = v[0]["Mounts"].as_array().map(|a| a.len()).unwrap_or(0);
     assert_eq!(mounts, 0, "zero mounts live");
@@ -212,11 +290,16 @@ fn docker_daemon_absence_is_a_documented_failure_not_a_skip() {
     // panic message content when the daemon IS absent, and passes
     // trivially when it is present (the mandatory test above is the
     // real observation).
-    let up = Command::new("docker").args(["version", "--format", "{{.Server.Version}}"]).output();
+    let up = Command::new("docker")
+        .args(["version", "--format", "{{.Server.Version}}"])
+        .output();
     let daemon = matches!(&up, Ok(o) if o.status.success());
     if daemon {
         return; // present: nothing to prove here
     }
     let result = std::panic::catch_unwind(require_daemon);
-    assert!(result.is_err(), "require_daemon must PANIC when the daemon is absent (no skip path)");
+    assert!(
+        result.is_err(),
+        "require_daemon must PANIC when the daemon is absent (no skip path)"
+    );
 }

@@ -29,18 +29,32 @@ pub struct ProviderEndpoint {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProxyError {
-    UnknownProvider { name: String },
+    UnknownProvider {
+        name: String,
+    },
     /// caller tried to supply any of the forbidden fields
     CallerSuppliedUrl,
     CallerSuppliedAuth,
     CallerSuppliedHeaders,
     /// the target resolved/redirected somewhere outside the fixed origin
-    OffOrigin { provider: String, attempted: String },
-    ResponseTooLarge { provider: String, got: u64, max: u64 },
+    OffOrigin {
+        provider: String,
+        attempted: String,
+    },
+    ResponseTooLarge {
+        provider: String,
+        got: u64,
+        max: u64,
+    },
     /// run is cancelled/fenced or budget scope invalid — refuse to spend
-    RunNotAdmissible { run: String, reason: String },
+    RunNotAdmissible {
+        run: String,
+        reason: String,
+    },
     /// error bodies are screened: no upstream echo of internals
-    ScreenedError { public: String },
+    ScreenedError {
+        public: String,
+    },
 }
 
 /// A proxy request. NOTE WHAT IS ABSENT: no url, no headers, no auth
@@ -71,7 +85,10 @@ pub struct ModelProxy {
 }
 
 impl ModelProxy {
-    pub fn new(providers: Vec<ProviderEndpoint>, admissible: impl Fn(&str) -> Result<(), String> + Send + Sync + 'static) -> Self {
+    pub fn new(
+        providers: Vec<ProviderEndpoint>,
+        admissible: impl Fn(&str) -> Result<(), String> + Send + Sync + 'static,
+    ) -> Self {
         ModelProxy {
             providers: providers.into_iter().map(|p| (p.name.clone(), p)).collect(),
             admissible: Box::new(admissible),
@@ -82,10 +99,15 @@ impl ModelProxy {
     /// fields simply do not exist in ProxyRequest, and provider names
     /// resolve ONLY against the registered table.
     pub fn validate(&self, req: &ProxyRequest) -> Result<&ProviderEndpoint, ProxyError> {
-        (self.admissible)(&req.run).map_err(|reason| ProxyError::RunNotAdmissible { run: req.run.clone(), reason })?;
+        (self.admissible)(&req.run).map_err(|reason| ProxyError::RunNotAdmissible {
+            run: req.run.clone(),
+            reason,
+        })?;
         self.providers
             .get(&req.provider)
-            .ok_or_else(|| ProxyError::UnknownProvider { name: req.provider.clone() })
+            .ok_or_else(|| ProxyError::UnknownProvider {
+                name: req.provider.clone(),
+            })
     }
 
     /// Egress screening: given the connection target the transport
@@ -97,7 +119,9 @@ impl ModelProxy {
         let p = self
             .providers
             .get(provider)
-            .ok_or_else(|| ProxyError::UnknownProvider { name: provider.to_string() })?;
+            .ok_or_else(|| ProxyError::UnknownProvider {
+                name: provider.to_string(),
+            })?;
         if normalize_origin(target_origin) != normalize_origin(&p.origin) {
             return Err(ProxyError::OffOrigin {
                 provider: provider.to_string(),
@@ -112,7 +136,16 @@ impl ModelProxy {
     /// replaced. Cast must not learn the proxy's filesystem.
     pub fn screen_error(&self, upstream: &str) -> String {
         let mut out = upstream.to_string();
-        for secret_hint in ["/home/", "/root/", "gh_token", "die.env", "notifier.env", "identity.db", "Authorization:", "Bearer "] {
+        for secret_hint in [
+            "/home/",
+            "/root/",
+            "gh_token",
+            "die.env",
+            "notifier.env",
+            "identity.db",
+            "Authorization:",
+            "Bearer ",
+        ] {
             if out.contains(secret_hint) {
                 out = "upstream error (details screened)".to_string();
                 break;
@@ -126,11 +159,18 @@ impl ModelProxy {
     /// (not truncated — truncated model output would silently corrupt
     /// reproducibility).
     pub fn check_response_size(&self, provider: &str, got: u64) -> Result<(), ProxyError> {
-        let p = self.providers
+        let p = self
+            .providers
             .get(provider)
-            .ok_or_else(|| ProxyError::UnknownProvider { name: provider.to_string() })?;
+            .ok_or_else(|| ProxyError::UnknownProvider {
+                name: provider.to_string(),
+            })?;
         if got > p.max_response_bytes {
-            return Err(ProxyError::ResponseTooLarge { provider: provider.to_string(), got, max: p.max_response_bytes });
+            return Err(ProxyError::ResponseTooLarge {
+                provider: provider.to_string(),
+                got,
+                max: p.max_response_bytes,
+            });
         }
         Ok(())
     }
@@ -275,8 +315,17 @@ mod tests {
         // the compile-time boundary: ProxyRequest has no url/headers/auth
         let r = req("deepseek", "run-1");
         let serialized = serde_json::to_string(&r).unwrap();
-        for absent in ["\"url\"", "\"headers\"", "\"authorization\"", "\"api_key\"", "\"token\""] {
-            assert!(!serialized.contains(absent), "ProxyRequest must not carry {absent}");
+        for absent in [
+            "\"url\"",
+            "\"headers\"",
+            "\"authorization\"",
+            "\"api_key\"",
+            "\"token\"",
+        ] {
+            assert!(
+                !serialized.contains(absent),
+                "ProxyRequest must not carry {absent}"
+            );
         }
         assert!(proxy().validate(&r).is_ok());
     }
@@ -306,7 +355,10 @@ mod tests {
     fn redirect_off_origin_refused() {
         let p = proxy();
         // provider origin itself passes
-        assert!(p.screen_egress("deepseek", "https://api.deepseek.com/").is_ok());
+        assert!(
+            p.screen_egress("deepseek", "https://api.deepseek.com/")
+                .is_ok()
+        );
         // redirect to attacker host: refused
         assert!(matches!(
             p.screen_egress("deepseek", "https://evil.example.com"),
@@ -341,10 +393,19 @@ mod tests {
     #[test]
     fn upstream_errors_are_screened() {
         let p = proxy();
-        assert_eq!(p.screen_error("connection refused to /home/cosmo/.foundry/gh_token"), "upstream error (details screened)");
-        assert_eq!(p.screen_error("Bearer sk-live-xxxx rejected"), "upstream error (details screened)");
+        assert_eq!(
+            p.screen_error("connection refused to /home/cosmo/.foundry/gh_token"),
+            "upstream error (details screened)"
+        );
+        assert_eq!(
+            p.screen_error("Bearer sk-live-xxxx rejected"),
+            "upstream error (details screened)"
+        );
         // ordinary errors pass with content intact
-        assert_eq!(p.screen_error("429 rate limited, retry later"), "429 rate limited, retry later");
+        assert_eq!(
+            p.screen_error("429 rate limited, retry later"),
+            "429 rate limited, retry later"
+        );
     }
 
     #[test]
@@ -364,10 +425,17 @@ mod tests {
         let argv = docker_argv(&spec, "cast-1");
         // no volume mounts at all
         assert!(spec.mounts.is_empty());
-        assert!(!argv.iter().any(|a| a == "-v" || a.starts_with("--volume")),
-            "no volume flags in cast argv: {argv:?}");
+        assert!(
+            !argv.iter().any(|a| a == "-v" || a.starts_with("--volume")),
+            "no volume flags in cast argv: {argv:?}"
+        );
         // no API keys in the environment
-        assert!(!spec.env_passthrough.iter().any(|e| e.contains("KEY") || e.contains("TOKEN")));
+        assert!(
+            !spec
+                .env_passthrough
+                .iter()
+                .any(|e| e.contains("KEY") || e.contains("TOKEN"))
+        );
         // hardening flags present
         assert!(argv.contains(&"--cap-drop=ALL".to_string()));
         assert!(argv.contains(&"--read-only".to_string()));
@@ -384,8 +452,10 @@ mod tests {
         let spec = cast_container_spec("foundry-cast:1", "proxynet");
         let provider_key_names = ["DEEPSEEK_API_KEY", "GLM_API_KEY"];
         for k in provider_key_names {
-            assert!(!spec.env_passthrough.contains(&k.to_string()),
-                "cast env must never contain {k}");
+            assert!(
+                !spec.env_passthrough.contains(&k.to_string()),
+                "cast env must never contain {k}"
+            );
         }
     }
 }

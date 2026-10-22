@@ -187,9 +187,7 @@ impl EvaluationProtocol {
 /// The canonical freeze: the protocol M5 evaluation runs under.
 /// Judging policy depends on this protocol — which is why the
 /// protocol's nodes sit inside the protected closure.
-pub fn frozen_protocol_v1(
-    partitions: BTreeMap<String, Partition>,
-) -> EvaluationProtocol {
+pub fn frozen_protocol_v1(partitions: BTreeMap<String, Partition>) -> EvaluationProtocol {
     let mut synth = BTreeSet::new();
     synth.insert(Partition::Train);
     synth.insert(Partition::Dev);
@@ -235,20 +233,32 @@ pub fn frozen_policy_graph() -> PolicyGraph {
     };
     PolicyGraph {
         nodes: [
-            n("judging_policy", PolicyClass::ProtectedGovernance, &[
-                "metric_definitions",
-                "cohort_definitions",
-                "scoring_rule",
-                "weight_update_rule",
-                "evaluator_partitions",
-                "source_history_ledger",
-            ]),
+            n(
+                "judging_policy",
+                PolicyClass::ProtectedGovernance,
+                &[
+                    "metric_definitions",
+                    "cohort_definitions",
+                    "scoring_rule",
+                    "weight_update_rule",
+                    "evaluator_partitions",
+                    "source_history_ledger",
+                ],
+            ),
             n("metric_definitions", PolicyClass::ProtectedGovernance, &[]),
             n("cohort_definitions", PolicyClass::ProtectedGovernance, &[]),
             n("scoring_rule", PolicyClass::ProtectedGovernance, &[]),
             n("weight_update_rule", PolicyClass::ProtectedGovernance, &[]),
-            n("evaluator_partitions", PolicyClass::ProtectedGovernance, &[]),
-            n("source_history_ledger", PolicyClass::ProtectedGovernance, &[]),
+            n(
+                "evaluator_partitions",
+                PolicyClass::ProtectedGovernance,
+                &[],
+            ),
+            n(
+                "source_history_ledger",
+                PolicyClass::ProtectedGovernance,
+                &[],
+            ),
             // worker-behavior surface: loop MAY propose, but application
             // routes through M3 (C-P1)
             n("model_routing", PolicyClass::CandidateAffecting, &[]),
@@ -267,9 +277,7 @@ pub fn frozen_policy_graph() -> PolicyGraph {
 /// Deterministic weight derivation (C-S1: weights are derived state).
 /// Given per-source correctness outcomes under the frozen rule, the
 /// next weights are a pure function — there is no operator knob.
-pub fn derive_weights(
-    sources: &BTreeMap<String, Vec<bool>>,
-) -> BTreeMap<String, f64> {
+pub fn derive_weights(sources: &BTreeMap<String, Vec<bool>>) -> BTreeMap<String, f64> {
     let mut out = BTreeMap::new();
     for (src, outcomes) in sources {
         let mut w = 1.0f64;
@@ -304,8 +312,10 @@ mod tests {
         let visible = p.manifests_for_phase("synthesis");
         assert!(visible.contains(&"m-train-1"));
         assert!(visible.contains(&"m-dev-1"));
-        assert!(!visible.iter().any(|m| m.starts_with("m-hold")),
-            "synthesis must never see holdout digests (non-addressability)");
+        assert!(
+            !visible.iter().any(|m| m.starts_with("m-hold")),
+            "synthesis must never see holdout digests (non-addressability)"
+        );
     }
 
     #[test]
@@ -330,7 +340,10 @@ mod tests {
             .map(|(m, _)| m.as_str())
             .collect();
         let contaminated = holdout.iter().any(|h| lesson_refs_holdout.contains(h));
-        assert!(contaminated, "fixture must actually reference a holdout digest");
+        assert!(
+            contaminated,
+            "fixture must actually reference a holdout digest"
+        );
         // (the enforcement point: lesson ingestion rejects any content
         // string containing a holdout digest — pinned by this test's
         // existence in the gate suite)
@@ -355,8 +368,10 @@ mod tests {
     fn direct_self_reference_refused() {
         let g = frozen_policy_graph();
         for target in ["judging_policy", "metric_definitions", "scoring_rule"] {
-            assert!(g.proposal_admissible(target).is_err(),
-                "direct judging-policy change '{target}' must be refused");
+            assert!(
+                g.proposal_admissible(target).is_err(),
+                "direct judging-policy change '{target}' must be refused"
+            );
         }
     }
 
@@ -364,14 +379,22 @@ mod tests {
     fn transitive_self_reference_refused() {
         let g = frozen_policy_graph();
         // the astra attack: not the policy itself, but its inputs
-        assert!(g.proposal_admissible("cohort_definitions").is_err(),
-            "'exclude hard orders from the success metric' = closure attack");
-        assert!(g.proposal_admissible("weight_update_rule").is_err(),
-            "weight rule is inside the closure");
-        assert!(g.proposal_admissible("evaluator_partitions").is_err(),
-            "'move this item to train' = closure attack");
-        assert!(g.proposal_admissible("source_history_ledger").is_err(),
-            "'reset this source's history' = closure attack");
+        assert!(
+            g.proposal_admissible("cohort_definitions").is_err(),
+            "'exclude hard orders from the success metric' = closure attack"
+        );
+        assert!(
+            g.proposal_admissible("weight_update_rule").is_err(),
+            "weight rule is inside the closure"
+        );
+        assert!(
+            g.proposal_admissible("evaluator_partitions").is_err(),
+            "'move this item to train' = closure attack"
+        );
+        assert!(
+            g.proposal_admissible("source_history_ledger").is_err(),
+            "'reset this source's history' = closure attack"
+        );
     }
 
     #[test]
@@ -403,13 +426,19 @@ mod tests {
         let mut g2 = g.clone();
         g2.nodes.insert(
             "deep_input".into(),
-            PolicyNode { id: "deep_input".into(), class: PolicyClass::Operational, depends_on: vec![] },
+            PolicyNode {
+                id: "deep_input".into(),
+                class: PolicyClass::Operational,
+                depends_on: vec![],
+            },
         );
         let mm = g2.nodes.get_mut("cohort_definitions").unwrap();
         mm.depends_on.push("deep_input".into());
         let c2 = g2.protected_closure();
-        assert!(c2.contains("deep_input"),
-            "two hops below the judging policy is still protected");
+        assert!(
+            c2.contains("deep_input"),
+            "two hops below the judging policy is still protected"
+        );
     }
 
     #[test]

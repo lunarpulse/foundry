@@ -100,7 +100,11 @@ pub enum VerifyError {
     EffectWithoutIntent { seq: i64, op_id: String },
     /// payload digest changed between intent and effect — the applied
     /// thing is not the reviewed thing (C-A1 stale/artifact mismatch)
-    PayloadMismatch { op_id: String, intent: String, effect: String },
+    PayloadMismatch {
+        op_id: String,
+        intent: String,
+        effect: String,
+    },
     /// two intents for one op_id (nondeterministic generation)
     DuplicateIntent { op_id: String },
     /// seq not contiguous (gap = lost events; the chain does not
@@ -111,16 +115,23 @@ pub enum VerifyError {
 impl std::fmt::Display for VerifyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnsupportedSchemaVersion { seq, got, latest } =>
-                write!(f, "seq {seq}: schema v{got} unsupported (latest v{latest}) — explicit dispatch required"),
-            Self::EffectWithoutIntent { seq, op_id } =>
-                write!(f, "seq {seq}: effect for op {op_id} has no pending intent"),
-            Self::PayloadMismatch { op_id, intent, effect } =>
-                write!(f, "op {op_id}: payload digest changed intent->effect ({intent} != {effect})"),
-            Self::DuplicateIntent { op_id } =>
-                write!(f, "duplicate intent for op {op_id}"),
-            Self::SeqGap { expected, got } =>
-                write!(f, "seq gap: expected {expected}, got {got}"),
+            Self::UnsupportedSchemaVersion { seq, got, latest } => write!(
+                f,
+                "seq {seq}: schema v{got} unsupported (latest v{latest}) — explicit dispatch required"
+            ),
+            Self::EffectWithoutIntent { seq, op_id } => {
+                write!(f, "seq {seq}: effect for op {op_id} has no pending intent")
+            }
+            Self::PayloadMismatch {
+                op_id,
+                intent,
+                effect,
+            } => write!(
+                f,
+                "op {op_id}: payload digest changed intent->effect ({intent} != {effect})"
+            ),
+            Self::DuplicateIntent { op_id } => write!(f, "duplicate intent for op {op_id}"),
+            Self::SeqGap { expected, got } => write!(f, "seq gap: expected {expected}, got {got}"),
         }
     }
 }
@@ -151,7 +162,10 @@ pub fn verify_stream(events: &[GovernanceEvent]) -> Result<Vec<OpState>, Vec<Ver
             continue; // cannot interpret further — explicit stop, not skip
         }
         if e.seq != seq_expected {
-            errs.push(VerifyError::SeqGap { expected: seq_expected, got: e.seq });
+            errs.push(VerifyError::SeqGap {
+                expected: seq_expected,
+                got: e.seq,
+            });
             seq_expected = e.seq; // resync to continue finding more
         }
         seq_expected += 1;
@@ -159,32 +173,46 @@ pub fn verify_stream(events: &[GovernanceEvent]) -> Result<Vec<OpState>, Vec<Ver
         match e.phase {
             Phase::Pending => {
                 if states.contains_key(&e.op_id) {
-                    errs.push(VerifyError::DuplicateIntent { op_id: e.op_id.clone() });
+                    errs.push(VerifyError::DuplicateIntent {
+                        op_id: e.op_id.clone(),
+                    });
                 } else {
-                    states.insert(e.op_id.clone(), OpState::Pending { payload_digest: e.payload_digest.clone() });
+                    states.insert(
+                        e.op_id.clone(),
+                        OpState::Pending {
+                            payload_digest: e.payload_digest.clone(),
+                        },
+                    );
                 }
             }
-            Phase::Committed | Phase::Aborted => {
-                match states.get(&e.op_id) {
-                    None => errs.push(VerifyError::EffectWithoutIntent { seq: e.seq, op_id: e.op_id.clone() }),
-                    Some(OpState::Pending { payload_digest }) => {
-                        if *payload_digest != e.payload_digest {
-                            errs.push(VerifyError::PayloadMismatch {
-                                op_id: e.op_id.clone(),
-                                intent: payload_digest.clone(),
-                                effect: e.payload_digest.clone(),
-                            });
-                        }
-                        let next = if e.phase == Phase::Committed {
-                            OpState::Committed { payload_digest: e.payload_digest.clone() }
-                        } else {
-                            OpState::Aborted { payload_digest: e.payload_digest.clone() }
-                        };
-                        states.insert(e.op_id.clone(), next);
+            Phase::Committed | Phase::Aborted => match states.get(&e.op_id) {
+                None => errs.push(VerifyError::EffectWithoutIntent {
+                    seq: e.seq,
+                    op_id: e.op_id.clone(),
+                }),
+                Some(OpState::Pending { payload_digest }) => {
+                    if *payload_digest != e.payload_digest {
+                        errs.push(VerifyError::PayloadMismatch {
+                            op_id: e.op_id.clone(),
+                            intent: payload_digest.clone(),
+                            effect: e.payload_digest.clone(),
+                        });
                     }
-                    Some(_) => errs.push(VerifyError::DuplicateIntent { op_id: e.op_id.clone() }),
+                    let next = if e.phase == Phase::Committed {
+                        OpState::Committed {
+                            payload_digest: e.payload_digest.clone(),
+                        }
+                    } else {
+                        OpState::Aborted {
+                            payload_digest: e.payload_digest.clone(),
+                        }
+                    };
+                    states.insert(e.op_id.clone(), next);
                 }
-            }
+                Some(_) => errs.push(VerifyError::DuplicateIntent {
+                    op_id: e.op_id.clone(),
+                }),
+            },
         }
     }
 
@@ -228,9 +256,9 @@ pub fn recovery_policy(op: OpKind) -> RecoveryPolicy {
         | OpKind::LessonSeal
         | OpKind::LessonRevoke => RecoveryPolicy::AbortAndSurface,
         // naturally idempotent
-        OpKind::PredictionScore
-        | OpKind::BudgetRelease
-        | OpKind::RunCancel => RecoveryPolicy::RollForwardIdempotent,
+        OpKind::PredictionScore | OpKind::BudgetRelease | OpKind::RunCancel => {
+            RecoveryPolicy::RollForwardIdempotent
+        }
         // proposals/syntheses/reservations are pure ledger appends —
         // pending intent alone is already the complete effect
         OpKind::PolicyProposal
@@ -289,7 +317,13 @@ mod tests {
     #[test]
     fn crash_between_intent_and_effect_leaves_pending() {
         // crash after step 1: only the intent exists
-        let evs = vec![ev(1, OpKind::PolicyApplication, Phase::Pending, "op-2", "d2")];
+        let evs = vec![ev(
+            1,
+            OpKind::PolicyApplication,
+            Phase::Pending,
+            "op-2",
+            "d2",
+        )];
         let states = verify_stream(&evs).unwrap();
         assert_eq!(states.len(), 1);
         assert!(matches!(states[0], OpState::Pending { .. }));
@@ -306,7 +340,11 @@ mod tests {
     fn idempotent_ops_roll_forward() {
         let evs = vec![ev(1, OpKind::PredictionScore, Phase::Pending, "op-3", "d3")];
         let r = recover(&evs[0], 2);
-        assert_eq!(r.phase, Phase::Committed, "prediction scoring rolls forward");
+        assert_eq!(
+            r.phase,
+            Phase::Committed,
+            "prediction scoring rolls forward"
+        );
         let mut after = evs.clone();
         after.push(r);
         assert!(verify_stream(&after).is_ok());
@@ -352,7 +390,10 @@ mod tests {
         ];
         assert!(matches!(
             verify_stream(&evs).unwrap_err()[0],
-            VerifyError::SeqGap { expected: 2, got: 3 }
+            VerifyError::SeqGap {
+                expected: 2,
+                got: 3
+            }
         ));
     }
 

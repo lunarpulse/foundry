@@ -5,20 +5,20 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::routing::Router;
 use foundry_domain::{Order, OrderEvent, OrderState};
+use foundry_serve::ServeState;
 use foundry_serve::identity::{Identity, PasswordHasher, Role};
 use foundry_serve::privacy;
-use foundry_serve::ServeState;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tower::ServiceExt;
 
 struct FastHasher;
 impl PasswordHasher for FastHasher {
-    fn hash(&self, p: &str) -> String {
-        format!("fast${p}")
+    fn hash(&self, p: &str) -> Result<String, String> {
+        Ok(format!("fast${p}"))
     }
-    fn verify(&self, p: &str, hash: &str) -> bool {
-        self.hash(p) == hash
+    fn verify(&self, p: &str, hash: &str) -> Result<bool, String> {
+        Ok(self.hash(p)? == hash)
     }
 }
 
@@ -27,7 +27,11 @@ const CANARY_GH: &str = "ghp_CANARYtoken556677889900aabb";
 
 fn db(tag: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!("t31-{}-{}.db", tag, std::process::id()));
-    for path in [p.clone(), p.with_extension("identity.db"), p.with_extension("scope.db")] {
+    for path in [
+        p.clone(),
+        p.with_extension("identity.db"),
+        p.with_extension("scope.db"),
+    ] {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
@@ -64,7 +68,13 @@ async fn plant_poisoned_row(st: &ServeState, id: &str) {
         id: format!("worker-with-{CANARY_KEY}"), // actor carries a canary too
     };
     st.line
-        .commit_for_test(id, &OrderEvent::Queued, OrderState::Received, OrderState::Queued, &a)
+        .commit_for_test(
+            id,
+            &OrderEvent::Queued,
+            OrderState::Received,
+            OrderState::Queued,
+            &a,
+        )
         .await
         .unwrap();
     // poison the raw row's event text directly (simulating a leaky
@@ -94,7 +104,9 @@ async fn get_body(app: Router, path: &str, token: &str) -> (StatusCode, String) 
         .await
         .unwrap();
     let code = resp.status();
-    let b = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let b = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     (code, String::from_utf8_lossy(&b).to_string())
 }
 
@@ -116,7 +128,13 @@ async fn detail_view_never_serializes_payloads_or_actors() {
         id: format!("w-{CANARY_KEY}"),
     };
     st.line
-        .commit_for_test("o-p", &OrderEvent::Queued, OrderState::Received, OrderState::Queued, &a)
+        .commit_for_test(
+            "o-p",
+            &OrderEvent::Queued,
+            OrderState::Received,
+            OrderState::Queued,
+            &a,
+        )
         .await
         .unwrap();
 
@@ -127,10 +145,16 @@ async fn detail_view_never_serializes_payloads_or_actors() {
     )
     .await;
     assert_eq!(code, StatusCode::OK);
-    assert!(!body.contains(CANARY_KEY), "actor canary leaked in detail: {body}");
+    assert!(
+        !body.contains(CANARY_KEY),
+        "actor canary leaked in detail: {body}"
+    );
     assert!(!body.contains(CANARY_GH));
     // actor is entirely absent from the API surface (T31: raw ledger only)
-    assert!(!body.contains("\"actor\""), "actor field must not serialize");
+    assert!(
+        !body.contains("\"actor\""),
+        "actor field must not serialize"
+    );
     // chain fields still present (auditability preserved)
     assert!(body.contains("prev_hash") && body.contains("hash"));
 }
@@ -161,17 +185,27 @@ async fn status_endpoint_secret_free() {
     let app = Router::new().merge(foundry_serve::http::router(st));
     // /api/status intentionally UNauthenticated (health) — must be clean
     let resp = app
-        .oneshot(Request::builder().uri("/api/status").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/api/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
-    let b = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let b = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let text = String::from_utf8_lossy(&b);
     assert!(!text.contains(CANARY_KEY));
     assert!(!text.contains("/home/"), "no paths in status");
     // the "gh_token" KEY is a filename existence label (M1 secret-free
     // design); what must never appear is a token-shaped VALUE.
     assert!(!text.contains(CANARY_KEY));
-    assert!(privacy::scan_for_leaks(&text).is_empty(), "no credential-shaped values in status");
+    assert!(
+        privacy::scan_for_leaks(&text).is_empty(),
+        "no credential-shaped values in status"
+    );
 }
 
 #[test]

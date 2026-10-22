@@ -1,8 +1,8 @@
 //! T6 — CLI adapter tests: env isolation + FakeHarness determinism.
 use foundry_domain::ports::Harness;
 use foundry_domain::{ExternalRef, Order};
-use foundry_harness_cli::{BaseSelection, CliHarness, DieProtocol, InputManifest};
 use foundry_harness_cli::fake::FakeHarness;
+use foundry_harness_cli::{BaseSelection, CliHarness, DieProtocol, InputManifest};
 use std::path::PathBuf;
 
 fn order() -> Order {
@@ -182,10 +182,17 @@ async fn manifest_is_atomically_written_with_protocol_values() {
             context: vec!["src/main.rs".into(), "README.md".into()],
         }
     );
-    assert!(out.base_commit.is_empty(), "latest preserves existing workdir HEAD semantics");
-    assert!(std::fs::read_dir(&dir)
-        .unwrap()
-        .all(|entry| !entry.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
+    assert!(
+        out.base_commit.is_empty(),
+        "latest preserves existing workdir HEAD semantics"
+    );
+    assert!(std::fs::read_dir(&dir).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp")
+    }));
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -200,7 +207,10 @@ async fn fix_context_is_forwarded_as_cli_flag() {
     });
     h.run(&order(), 1, &dir).await.unwrap();
     let args = std::fs::read_to_string(dir.join("attempt-1.log")).unwrap();
-    assert!(args.lines().any(|line| line == "--fix-context"), "args: {args}");
+    assert!(
+        args.lines().any(|line| line == "--fix-context"),
+        "args: {args}"
+    );
     assert!(args.contains("--base\nlatest"), "args: {args}");
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -212,7 +222,9 @@ async fn origin_base_uses_origin_main_commit() {
     // Distinguish the remote base from HEAD so a HEAD-for-Origin regression fails.
     let advanced = std::process::Command::new("git")
         .args(["commit", "--allow-empty", "-qm", "advanced-head"])
-        .current_dir(dir.join("repo")).status().unwrap();
+        .current_dir(dir.join("repo"))
+        .status()
+        .unwrap();
     assert!(advanced.success());
     let binary = executable_script(&dir, "#!/bin/sh\nexit 0\n");
     let h = CliHarness::new(binary, "coding", 30).with_protocol(DieProtocol {
@@ -221,10 +233,8 @@ async fn origin_base_uses_origin_main_commit() {
     });
     let out = h.run(&order(), 1, &dir).await.unwrap();
     assert_eq!(out.base_commit, expected);
-    let manifest: InputManifest = serde_json::from_slice(
-        &std::fs::read(dir.join("input-manifest.json")).unwrap(),
-    )
-    .unwrap();
+    let manifest: InputManifest =
+        serde_json::from_slice(&std::fs::read(dir.join("input-manifest.json")).unwrap()).unwrap();
     assert_eq!(manifest.base, "origin");
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -243,21 +253,32 @@ async fn missing_origin_main_is_permanent_and_does_not_run_die() {
         ..DieProtocol::default()
     });
     let err = h.run(&order(), 1, &dir).await.unwrap_err();
-    assert!(matches!(err, foundry_domain::ports::PortError::Permanent(_)));
+    assert!(matches!(
+        err,
+        foundry_domain::ports::PortError::Permanent(_)
+    ));
     assert!(!marker.exists(), "Die must not run without origin/main");
     assert!(!dir.join("input-manifest.json").exists());
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-
 #[tokio::test]
 async fn latest_keeps_post_die_workdir_head_semantics() {
     let dir = temp_dir("latest-head");
     let before = seed_repo(&dir, false);
-    let binary = executable_script(&dir, "#!/bin/sh\n/usr/bin/git -c user.name=t -c user.email=t@t.local commit --allow-empty -qm die\n");
-    let out = CliHarness::new(binary, "coding", 30).run(&order(), 1, &dir).await.unwrap();
+    let binary = executable_script(
+        &dir,
+        "#!/bin/sh\n/usr/bin/git -c user.name=t -c user.email=t@t.local commit --allow-empty -qm die\n",
+    );
+    let out = CliHarness::new(binary, "coding", 30)
+        .run(&order(), 1, &dir)
+        .await
+        .unwrap();
     assert_ne!(out.result_commit, before);
-    assert_eq!(out.base_commit, out.result_commit, "Latest must retain the pre-T30 post-Die lookup");
+    assert_eq!(
+        out.base_commit, out.result_commit,
+        "Latest must retain the pre-T30 post-Die lookup"
+    );
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -272,7 +293,10 @@ async fn origin_refuses_parent_repository_discovery() {
         ..DieProtocol::default()
     });
     let error = h.run(&order(), 1, &dir).await.unwrap_err();
-    assert!(matches!(error, foundry_domain::ports::PortError::Permanent(_)));
+    assert!(matches!(
+        error,
+        foundry_domain::ports::PortError::Permanent(_)
+    ));
     assert!(!dir.join("die-ran").exists());
     assert!(!dir.join("input-manifest.json").exists());
     std::fs::remove_dir_all(dir).unwrap();
@@ -283,17 +307,26 @@ async fn origin_result_uses_the_same_nested_repository_as_base() {
     let dir = temp_dir("origin-result");
     seed_repo(&dir, true);
     let before = seed_repo(&dir.join("repo"), true);
-    let binary = executable_script(&dir, "#!/bin/sh\ncd repo\n/usr/bin/git -c user.name=t -c user.email=t@t.local commit --allow-empty -qm die\n");
+    let binary = executable_script(
+        &dir,
+        "#!/bin/sh\ncd repo\n/usr/bin/git -c user.name=t -c user.email=t@t.local commit --allow-empty -qm die\n",
+    );
     let h = CliHarness::new(binary, "coding", 30).with_protocol(DieProtocol {
         base: BaseSelection::Origin,
         ..DieProtocol::default()
     });
     let out = h.run(&order(), 1, &dir).await.unwrap();
-    let result = std::process::Command::new("git").args(["rev-parse", "HEAD"])
-        .current_dir(dir.join("repo")).output().unwrap();
+    let result = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(dir.join("repo"))
+        .output()
+        .unwrap();
     assert!(result.status.success());
     assert_eq!(out.base_commit, before);
-    assert_eq!(out.result_commit, String::from_utf8(result.stdout).unwrap().trim());
+    assert_eq!(
+        out.result_commit,
+        String::from_utf8(result.stdout).unwrap().trim()
+    );
     assert_ne!(out.result_commit, out.base_commit);
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -309,15 +342,27 @@ async fn manifest_rename_failure_cleans_up_and_can_be_retried() {
     let h = CliHarness::new(binary, "coding", 30);
     for _ in 0..2 {
         let err = h.run(&order(), 1, &dir).await.unwrap_err();
-        assert!(matches!(err, foundry_domain::ports::PortError::Permanent(ref message) if message.contains("rename input manifest")));
-        assert_eq!(std::fs::read_to_string(target.join("old")).unwrap(), "untouched");
+        assert!(
+            matches!(err, foundry_domain::ports::PortError::Permanent(ref message) if message.contains("rename input manifest"))
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("old")).unwrap(),
+            "untouched"
+        );
         assert!(!dir.join("die-ran").exists());
-        assert!(std::fs::read_dir(&dir).unwrap().all(|entry| !entry.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
+        assert!(std::fs::read_dir(&dir).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
     }
     std::fs::remove_dir_all(target).unwrap();
     h.run(&order(), 1, &dir).await.unwrap();
     assert!(dir.join("die-ran").exists());
-    let manifest: InputManifest = serde_json::from_slice(&std::fs::read(dir.join("input-manifest.json")).unwrap()).unwrap();
+    let manifest: InputManifest =
+        serde_json::from_slice(&std::fs::read(dir.join("input-manifest.json")).unwrap()).unwrap();
     assert_eq!(manifest.attempt, 1);
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -333,15 +378,28 @@ async fn manifest_replacement_keeps_open_readers_on_the_complete_old_document() 
     let target = dir.join("input-manifest.json");
     let old = std::fs::read(&target).unwrap();
     let mut reader = std::fs::File::open(&target).unwrap();
-    let protocol = DieProtocol { context: vec!["x".repeat(1024 * 1024)], ..DieProtocol::default() };
-    h.with_protocol(protocol.clone()).run(&order(), 2, &dir).await.unwrap();
+    let protocol = DieProtocol {
+        context: vec!["x".repeat(1024 * 1024)],
+        ..DieProtocol::default()
+    };
+    h.with_protocol(protocol.clone())
+        .run(&order(), 2, &dir)
+        .await
+        .unwrap();
     let mut held_bytes = Vec::new();
     reader.read_to_end(&mut held_bytes).unwrap();
-    assert_eq!(held_bytes, old, "an open reader must never observe an in-place partial replacement");
+    assert_eq!(
+        held_bytes, old,
+        "an open reader must never observe an in-place partial replacement"
+    );
     let manifest: InputManifest = serde_json::from_slice(&std::fs::read(&target).unwrap()).unwrap();
     assert_eq!(manifest.attempt, 2);
     assert_eq!(manifest.context, protocol.context);
-    assert_eq!(std::fs::read(dir.join("consumed.json")).unwrap(), std::fs::read(&target).unwrap(), "Die must read the complete new manifest at launch");
+    assert_eq!(
+        std::fs::read(dir.join("consumed.json")).unwrap(),
+        std::fs::read(&target).unwrap(),
+        "Die must read the complete new manifest at launch"
+    );
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -367,11 +425,15 @@ fn origin_output_and_environment_are_checked_in_isolated_processes() {
     seed_repo(&foreign, true);
     let foreign_commit = std::process::Command::new("git")
         .args(["commit", "--allow-empty", "-qm", "foreign"])
-        .current_dir(&foreign).status().unwrap();
+        .current_dir(&foreign)
+        .status()
+        .unwrap();
     assert!(foreign_commit.success());
     let foreign_ref = std::process::Command::new("git")
         .args(["update-ref", "refs/remotes/origin/main", "HEAD"])
-        .current_dir(&foreign).status().unwrap();
+        .current_dir(&foreign)
+        .status()
+        .unwrap();
     assert!(foreign_ref.success());
     let mockbin = dir.join("mockbin");
     std::fs::create_dir(&mockbin).unwrap();
@@ -393,8 +455,10 @@ fn origin_output_and_environment_are_checked_in_isolated_processes() {
     ] {
         std::fs::write(dir.join("git-output"), output).unwrap();
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-        command.args(["--exact", "origin_isolated_child", "--nocapture"])
-            .env("FOUNDRY_REVIEW_MODE", mode).env("FOUNDRY_REVIEW_DIR", &dir)
+        command
+            .args(["--exact", "origin_isolated_child", "--nocapture"])
+            .env("FOUNDRY_REVIEW_MODE", mode)
+            .env("FOUNDRY_REVIEW_DIR", &dir)
             .env("FOUNDRY_REVIEW_EXPECTED", &expected)
             .env("GITHUB_TOKEN", "review-secret-github")
             .env("OPENROUTER_API_KEY", "review-secret-router")
@@ -402,13 +466,19 @@ fn origin_output_and_environment_are_checked_in_isolated_processes() {
             .env("FOUNDRY_CONTEXT", "protocol-env-poison")
             .env("FOUNDRY_FIX_CONTEXT", "protocol-env-poison");
         if mode == "environment" {
-            command.env("GIT_DIR", foreign.join(".git")).env("GIT_WORK_TREE", &foreign);
+            command
+                .env("GIT_DIR", foreign.join(".git"))
+                .env("GIT_WORK_TREE", &foreign);
         } else {
             command.env("PATH", format!("{}:/usr/bin:/bin", mockbin.display()));
         }
         let result = command.output().unwrap();
         if !result.status.success() {
-            failures.push(format!("{mode}: {}\n{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr)));
+            failures.push(format!(
+                "{mode}: {}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            ));
         }
     }
     std::fs::remove_dir_all(dir).unwrap();
@@ -417,20 +487,30 @@ fn origin_output_and_environment_are_checked_in_isolated_processes() {
 
 #[tokio::test]
 async fn origin_isolated_child() {
-    let Ok(mode) = std::env::var("FOUNDRY_REVIEW_MODE") else { return; };
+    let Ok(mode) = std::env::var("FOUNDRY_REVIEW_MODE") else {
+        return;
+    };
     let dir = PathBuf::from(std::env::var_os("FOUNDRY_REVIEW_DIR").unwrap());
     let binary = executable_script(&dir, "#!/bin/sh\ntouch die-ran\n/usr/bin/env\n");
     let _ = std::fs::remove_file(dir.join("die-ran"));
     let h = CliHarness::new(binary, "coding", 30).with_protocol(DieProtocol {
-        base: BaseSelection::Origin, fix_context: true, context: vec!["context-sentinel".into()],
+        base: BaseSelection::Origin,
+        fix_context: true,
+        context: vec!["context-sentinel".into()],
     });
     let result = h.run(&order(), 1, &dir).await;
     if matches!(mode.as_str(), "multiline" | "empty" | "malformed") {
-        assert!(matches!(result, Err(foundry_domain::ports::PortError::Permanent(_))), "{mode}: {result:?}");
+        assert!(
+            matches!(result, Err(foundry_domain::ports::PortError::Permanent(_))),
+            "{mode}: {result:?}"
+        );
         assert!(!dir.join("die-ran").exists());
     } else {
         let out = result.unwrap();
-        assert_eq!(out.base_commit, std::env::var("FOUNDRY_REVIEW_EXPECTED").unwrap());
+        assert_eq!(
+            out.base_commit,
+            std::env::var("FOUNDRY_REVIEW_EXPECTED").unwrap()
+        );
         if mode == "environment" {
             assert_eq!(out.result_commit, out.base_commit);
         }
@@ -438,35 +518,57 @@ async fn origin_isolated_child() {
             let log = std::fs::read_to_string(out.log_path).unwrap();
             for line in log.lines() {
                 let (key, value) = line.split_once('=').unwrap();
-                assert!(["PATH", "HOME", "FOUNDRY_ORDER_ID", "FOUNDRY_ATTEMPT", "PWD"].contains(&key), "unexpected env: {key}");
-                assert!(!value.contains("review-secret") && !value.contains("protocol-env-poison") && !value.contains("context-sentinel"));
+                assert!(
+                    ["PATH", "HOME", "FOUNDRY_ORDER_ID", "FOUNDRY_ATTEMPT", "PWD"].contains(&key),
+                    "unexpected env: {key}"
+                );
+                assert!(
+                    !value.contains("review-secret")
+                        && !value.contains("protocol-env-poison")
+                        && !value.contains("context-sentinel")
+                );
             }
-            assert!(log.lines().any(|line| line == "PATH=/usr/bin:/bin:/usr/local/bin"));
+            assert!(
+                log.lines()
+                    .any(|line| line == "PATH=/usr/bin:/bin:/usr/local/bin")
+            );
             assert!(log.lines().any(|line| line == "FOUNDRY_ORDER_ID=o-h1"));
             assert!(log.lines().any(|line| line == "FOUNDRY_ATTEMPT=1"));
         }
     }
 }
 
-
 #[tokio::test]
 async fn manifest_and_argv_agree_for_every_protocol_switch_combination() {
-    for base in [BaseSelection::Latest, BaseSelection::Origin, BaseSelection::Commit("a".repeat(40))] {
+    for base in [
+        BaseSelection::Latest,
+        BaseSelection::Origin,
+        BaseSelection::Commit("a".repeat(40)),
+    ] {
         for fix_context in [false, true] {
             let dir = temp_dir("protocol-parity");
             seed_repo(&dir.join("repo"), true);
-            let binary = executable_script(&dir, "#!/bin/sh\nprintf '%s\\0' \"$@\" > argv.bin\ncp input-manifest.json consumed.json\n");
+            let binary = executable_script(
+                &dir,
+                "#!/bin/sh\nprintf '%s\\0' \"$@\" > argv.bin\ncp input-manifest.json consumed.json\n",
+            );
             let protocol = DieProtocol {
-                base: base.clone(), fix_context, context: vec!["src/a path.rs".into(), "README.md".into()],
+                base: base.clone(),
+                fix_context,
+                context: vec!["src/a path.rs".into(), "README.md".into()],
             };
             let test_order = order();
-            let h = CliHarness::new(binary, "coding profile ; '$()'", 30).with_protocol(protocol.clone());
+            let h = CliHarness::new(binary, "coding profile ; '$()'", 30)
+                .with_protocol(protocol.clone());
             let output = h.run(&test_order, 3, &dir).await.unwrap();
             if let BaseSelection::Commit(commit) = &base {
                 assert_eq!(&output.base_commit, commit);
             }
             let consumed = std::fs::read(dir.join("consumed.json")).unwrap();
-            assert_eq!(consumed, std::fs::read(dir.join("input-manifest.json")).unwrap());
+            assert_eq!(
+                consumed,
+                std::fs::read(dir.join("input-manifest.json")).unwrap()
+            );
             let manifest: InputManifest = serde_json::from_slice(&consumed).unwrap();
             assert_eq!(manifest.order_id, test_order.id);
             assert_eq!(manifest.attempt, 3);
@@ -474,15 +576,24 @@ async fn manifest_and_argv_agree_for_every_protocol_switch_combination() {
             assert_eq!(manifest.profile, h.profile);
             assert_eq!(manifest.context, protocol.context);
             assert_eq!(manifest.fix_context, fix_context);
-            let expected_base=match &base { BaseSelection::Latest=>"latest",BaseSelection::Origin=>"origin",BaseSelection::Commit(commit)=>commit.as_str() };
+            let expected_base = match &base {
+                BaseSelection::Latest => "latest",
+                BaseSelection::Origin => "origin",
+                BaseSelection::Commit(commit) => commit.as_str(),
+            };
             assert_eq!(manifest.base, expected_base);
             let raw_args = std::fs::read(dir.join("argv.bin")).unwrap();
             assert_eq!(raw_args.last(), Some(&0));
             let actual: Vec<&[u8]> = raw_args[..raw_args.len() - 1].split(|b| *b == 0).collect();
             let mut expected = vec!["--profile", &manifest.profile, "--task", &manifest.task];
-            if manifest.fix_context { expected.push("--fix-context"); }
+            if manifest.fix_context {
+                expected.push("--fix-context");
+            }
             expected.extend(["--base", &manifest.base]);
-            assert_eq!(actual, expected.iter().map(|s| s.as_bytes()).collect::<Vec<_>>());
+            assert_eq!(
+                actual,
+                expected.iter().map(|s| s.as_bytes()).collect::<Vec<_>>()
+            );
             std::fs::remove_dir_all(dir).unwrap();
         }
     }

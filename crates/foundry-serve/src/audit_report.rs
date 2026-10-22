@@ -20,6 +20,205 @@ use sha2::{Digest, Sha256};
 
 pub const GENERATOR_VERSION: u32 = 1;
 
+/// ProductAtomicV1 source inventory. This is deliberately separate from the
+/// v1 metric envelope: only a verified source snapshot is marked available.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProductAuditSourceV2 {
+    pub source: String,
+    pub availability: String,
+    pub identity: Option<String>,
+    pub schema: Option<String>,
+    pub prefix_sequence: Option<i64>,
+    pub head_hash: Option<String>,
+    pub snapshot_digest: Option<String>,
+    pub cutoff: Option<String>,
+    pub missing_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProductAuditReportV2 {
+    pub schema_version: u32,
+    pub generated_at: String,
+    pub sources: Vec<ProductAuditSourceV2>,
+}
+
+/// Operational inventory for a ProductAtomicV1 scoped projection. It is not
+/// an organization-wide security audit and carries no global S1 coordinates.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScopedProductAuditSourceV3 {
+    pub source: String,
+    pub availability: String,
+    pub schema: Option<String>,
+    pub projection_digest: Option<String>,
+    pub coverage: Option<String>,
+    pub missing_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScopedProductAuditReportV3 {
+    pub schema_version: u32,
+    pub generated_at: String,
+    pub projection: crate::privacy::ScopedProductExportDocument,
+    pub sources: Vec<ScopedProductAuditSourceV3>,
+}
+
+pub fn scoped_product_inventory_v3(
+    snapshot: &foundry_ledger::ScopedEvidenceSnapshot,
+    generated_at: chrono::DateTime<chrono::Utc>,
+    context: &str,
+    key: &crate::privacy::ExportKey,
+) -> Result<ScopedProductAuditReportV3, String> {
+    let projection = crate::privacy::scoped_product_export(snapshot, context, key)?;
+    let availability = if projection.source_coverage_complete && !projection.has_more {
+        "available"
+    } else {
+        "partial"
+    };
+    let mut sources = vec![ScopedProductAuditSourceV3 {
+        source: "S1".into(),
+        availability: availability.into(),
+        schema: Some("ProductAtomicV1 scoped lifecycle projection".into()),
+        projection_digest: Some(projection.projected_digest.clone()),
+        coverage: Some(projection.coverage.clone()),
+        missing_reason: if projection.has_more {
+            Some("authorized order selection is truncated to this page".into())
+        } else if !projection.source_coverage_complete {
+            Some("some selected S1 rows lack verified lifecycle scope provenance".into())
+        } else {
+            None
+        },
+    }];
+    for (source, reason) in [
+        (
+            "S2",
+            "no verified ProductAtomicV1 snapshot adapter is configured",
+        ),
+        (
+            "S3",
+            "no verified ProductAtomicV1 snapshot adapter is configured",
+        ),
+        (
+            "S4",
+            "mutable host evidence is not mounted in the scoped audit",
+        ),
+        (
+            "S5",
+            "no verified external publish evidence adapter is configured",
+        ),
+        (
+            "S6",
+            "tuple promotion evidence is not mounted in the scoped audit",
+        ),
+        (
+            "M6",
+            "governance evidence is not mounted in the scoped audit",
+        ),
+        (
+            "governance",
+            "governance evidence is not mounted in the scoped audit",
+        ),
+        (
+            "casting",
+            "casting evidence is not mounted in the scoped audit",
+        ),
+    ] {
+        sources.push(ScopedProductAuditSourceV3 {
+            source: source.into(),
+            availability: "unavailable".into(),
+            schema: None,
+            projection_digest: None,
+            coverage: None,
+            missing_reason: Some(reason.into()),
+        });
+    }
+    Ok(ScopedProductAuditReportV3 {
+        schema_version: 3,
+        generated_at: generated_at.to_rfc3339(),
+        projection,
+        sources,
+    })
+}
+
+/// Build a truthful product source inventory from the selected ProductStore.
+/// Missing subsystems remain explicit and are never represented as empty data.
+pub fn product_inventory_v2(
+    installation_id: &str,
+    database_id: &str,
+    snapshot: &foundry_ledger::product::ProductProjectionSnapshot,
+    generated_at: chrono::DateTime<chrono::Utc>,
+) -> Result<ProductAuditReportV2, String> {
+    let rows_json = serde_json::to_vec(&snapshot.rows).map_err(|_| "S1 snapshot digest failed")?;
+    let key = crate::privacy::ExportKey::generate().map_err(|_| "audit context unavailable")?;
+    use rand_core::RngCore as _;
+    let mut context_bytes = [0_u8; 16];
+    rand_core::OsRng
+        .try_fill_bytes(&mut context_bytes)
+        .map_err(|_| "audit context unavailable")?;
+    let context = hex(&context_bytes);
+    context_bytes.fill(0);
+    let source_identity = format!(
+        "installation:{};database:{}",
+        key.alias(&context, "installation", installation_id),
+        key.alias(&context, "database", database_id),
+    );
+    let mut sources = vec![ProductAuditSourceV2 {
+        source: "S1".into(),
+        availability: "available".into(),
+        identity: Some(source_identity),
+        schema: Some("ProductAtomicV1 ledger".into()),
+        prefix_sequence: Some(snapshot.head_sequence),
+        head_hash: Some(snapshot.head_hash.clone()),
+        snapshot_digest: Some(hex(&Sha256::digest(rows_json))),
+        cutoff: Some(generated_at.to_rfc3339()),
+        missing_reason: None,
+    }];
+    for (name, reason) in [
+        ("S2", "no ProductAtomicV1 snapshot adapter is configured"),
+        ("S3", "no ProductAtomicV1 snapshot adapter is configured"),
+        (
+            "S4",
+            "mutable host evidence is not mounted in ProductAtomicV1",
+        ),
+        (
+            "S5",
+            "no verified external publish evidence adapter is configured",
+        ),
+        (
+            "S6",
+            "tuple promotion database is not mounted in ProductAtomicV1 audit",
+        ),
+        (
+            "M6",
+            "governance source is not mounted in ProductAtomicV1 audit",
+        ),
+        (
+            "governance",
+            "governance source is not mounted in ProductAtomicV1 audit",
+        ),
+        (
+            "casting",
+            "casting source is not mounted in ProductAtomicV1 audit",
+        ),
+    ] {
+        sources.push(ProductAuditSourceV2 {
+            source: name.into(),
+            availability: "unavailable".into(),
+            identity: None,
+            schema: None,
+            prefix_sequence: None,
+            head_hash: None,
+            snapshot_digest: None,
+            cutoff: None,
+            missing_reason: Some(reason.into()),
+        });
+    }
+    Ok(ProductAuditReportV2 {
+        schema_version: 2,
+        generated_at: generated_at.to_rfc3339(),
+        sources,
+    })
+}
+
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
@@ -116,8 +315,7 @@ fn chain_hash_prefix(rows: &[LedgerRow], prefix_len: usize) -> Option<String> {
     }
     use sha2::Digest;
     let mut prev = "GENESIS".to_string();
-    for i in 0..prefix_len {
-        let r = &rows[i];
+    for (i, r) in rows.iter().take(prefix_len).enumerate() {
         if r.seq != (i as i64) + 1 || r.prev_hash != prev {
             return None;
         }
@@ -167,7 +365,8 @@ fn compute_metrics(prefix: &[LedgerRow], casting: &CastingFacts) -> AuditMetrics
     // per-order last state = as-of snapshot (kanban semantics)
     let mut last: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     // first time each order reaches a terminal state (once per order)
-    let mut terminal_first: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    let mut terminal_first: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
     // approval latency samples (hold -> publishing per order)
     let mut hold_at: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     let mut latencies: Vec<u64> = Vec::new();
@@ -180,13 +379,15 @@ fn compute_metrics(prefix: &[LedgerRow], casting: &CastingFacts) -> AuditMetrics
         if r.to_state == "furnace_hold" {
             hold_at.insert(r.order_id.clone(), ts);
         }
-        if r.to_state == "publishing" {
-            if let Some(t0) = hold_at.get(&r.order_id) {
-                latencies.push((ts - t0).max(0) as u64);
-            }
+        if r.to_state == "publishing"
+            && let Some(t0) = hold_at.get(&r.order_id)
+        {
+            latencies.push((ts - t0).max(0) as u64);
         }
-        if matches!(r.to_state.as_str(), "shipped" | "failed" | "rejected" | "canceled")
-            && !terminal_first.contains_key(&r.order_id)
+        if matches!(
+            r.to_state.as_str(),
+            "shipped" | "failed" | "rejected" | "canceled"
+        ) && !terminal_first.contains_key(&r.order_id)
         {
             terminal_first.insert(r.order_id.clone(), r.to_state.clone());
         }
@@ -210,8 +411,16 @@ fn compute_metrics(prefix: &[LedgerRow], casting: &CastingFacts) -> AuditMetrics
     } else {
         let avail = casting.run_costs.iter().filter(|c| c.is_some()).count();
         let cov = avail as f64 / casting.run_costs.len() as f64;
-        let covered_total = casting.run_costs.iter().filter_map(|c| c.map(|x| x.0)).sum::<u64>();
-        let covered_reasoning = casting.run_costs.iter().filter_map(|c| c.map(|x| x.1)).sum::<u64>();
+        let covered_total = casting
+            .run_costs
+            .iter()
+            .filter_map(|c| c.map(|x| x.0))
+            .sum::<u64>();
+        let covered_reasoning = casting
+            .run_costs
+            .iter()
+            .filter_map(|c| c.map(|x| x.1))
+            .sum::<u64>();
         if avail == 0 {
             (None, None, Some(0.0))
         } else {
@@ -316,7 +525,18 @@ mod tests {
     use super::*;
 
     /// entry_hash mirror (v1 shape) — identical to the ledger's own.
-    fn entry_hash(seq: i64, order: &str, from: &str, to: &str, event: &str, actor: &str, intent: &str, at: &str, prev: &str) -> String {
+    #[allow(clippy::too_many_arguments)]
+    fn entry_hash(
+        seq: i64,
+        order: &str,
+        from: &str,
+        to: &str,
+        event: &str,
+        actor: &str,
+        intent: &str,
+        at: &str,
+        prev: &str,
+    ) -> String {
         let payload = format!("{seq}|{order}|{from}|{to}|{event}|{actor}|{intent}|{at}|{prev}");
         hex(&Sha256::digest(payload.as_bytes()))
     }
@@ -366,7 +586,10 @@ mod tests {
         let casting = CastingFacts::default();
         let r1 = generate(&rows, &casting).unwrap();
         let r2 = generate(&rows, &casting).unwrap();
-        assert_eq!(r1.content_digest, r2.content_digest, "same prefix -> identical digest");
+        assert_eq!(
+            r1.content_digest, r2.content_digest,
+            "same prefix -> identical digest"
+        );
     }
 
     #[test]
@@ -383,7 +606,10 @@ mod tests {
             other => panic!("expected extension, got {other:?}"),
         }
         // and the report still verifies against the exact original
-        assert_eq!(verify(&report, &rows, &casting).unwrap(), VerifyOutcome::Valid);
+        assert_eq!(
+            verify(&report, &rows, &casting).unwrap(),
+            VerifyOutcome::Valid
+        );
     }
 
     #[test]
@@ -394,7 +620,10 @@ mod tests {
         let truncated = &rows[..2];
         assert!(matches!(
             verify(&report, truncated, &casting),
-            Err(VerifyError::LedgerTruncated { prefix_len: 3, current_len: 2 })
+            Err(VerifyError::LedgerTruncated {
+                prefix_len: 3,
+                current_len: 2
+            })
         ));
     }
 
@@ -417,7 +646,11 @@ mod tests {
         let mut relinked = Vec::new();
         let mut prev = "GENESIS".to_string();
         for (i, r) in rows.iter().enumerate() {
-            let to = if i == 1 { "failed" } else { r.to_state.as_str() };
+            let to = if i == 1 {
+                "failed"
+            } else {
+                r.to_state.as_str()
+            };
             let nr = mk_row(r.seq, &r.order_id, to, &r.at, &prev);
             prev = nr.hash.clone();
             relinked.push(nr);
@@ -458,8 +691,16 @@ mod tests {
         let m = compute_metrics(&rows, &CastingFacts::default());
         // first terminal reach recorded once per (order, state-on-first-reach):
         // 'failed' is o-1's FIRST terminal — recorded once, not twice
-        assert_eq!(m.terminal_orders.get("failed"), Some(&1), "first-reach counted once despite 2 failures");
-        assert_eq!(m.state_counts_asof.get("shipped"), Some(&1), "as-of state is shipped");
+        assert_eq!(
+            m.terminal_orders.get("failed"),
+            Some(&1),
+            "first-reach counted once despite 2 failures"
+        );
+        assert_eq!(
+            m.state_counts_asof.get("shipped"),
+            Some(&1),
+            "as-of state is shipped"
+        );
         // shipped never shows in terminal_orders: o-1's first terminal was failed
         assert_eq!(m.terminal_orders.get("shipped"), None);
     }
@@ -477,12 +718,18 @@ mod tests {
         assert_eq!(m.cost_reasoning_tokens_total, Some(40));
         assert_eq!(m.cost_coverage, Some(0.5), "coverage gap disclosed");
         // ALL unavailable -> None, never 0
-        let casting2 = CastingFacts { promotions: vec![], run_costs: vec![None, None] };
+        let casting2 = CastingFacts {
+            promotions: vec![],
+            run_costs: vec![None, None],
+        };
         let m2 = compute_metrics(&rows, &casting2);
         assert_eq!(m2.cost_tokens_total, None, "unavailable != 0");
         assert_eq!(m2.cost_coverage, Some(0.0));
         // full coverage
-        let casting3 = CastingFacts { promotions: vec![], run_costs: vec![Some((10, 5)), Some((20, 5))] };
+        let casting3 = CastingFacts {
+            promotions: vec![],
+            run_costs: vec![Some((10, 5)), Some((20, 5))],
+        };
         let m3 = compute_metrics(&rows, &casting3);
         assert_eq!(m3.cost_tokens_total, Some(30));
         assert_eq!(m3.cost_coverage, Some(1.0));

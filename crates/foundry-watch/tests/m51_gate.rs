@@ -12,18 +12,22 @@
 //!   W7 audit precision             — truncation/tamper/mutation named
 //!   W8 real crash injection        — SIGKILL, committed facts survive
 //!   W9 back-compat                 — legacy digest path still applies (M5 contract intact)
-use foundry_watch::audit_precision::{audit, AuditError, HeadPin};
-use foundry_watch::bundles::{BundleProfile, BundleStore, CandidateBundle, DependencyPins, LessonSnapshot};
+use foundry_watch::audit_precision::{AuditError, HeadPin, audit};
+use foundry_watch::bundles::{
+    BundleProfile, BundleStore, CandidateBundle, DependencyPins, LessonSnapshot,
+};
 use foundry_watch::casting_wiring::{
-    issue_bundle_token_for_domain, legacy_profile, profile_from_bundle, promote_with_store_token,
-    DomainTokenGate, WiringError,
+    DomainTokenGate, WiringError, issue_bundle_token_for_domain, legacy_profile,
+    profile_from_bundle, promote_with_store_token,
 };
 use foundry_watch::command_binding::{HardenedApply, HardenedError, ProposalContent};
 use foundry_watch::coordinator::GovernanceCoordinator;
 use foundry_watch::evidence_recompute::{EvidenceReader, PermissiveReader};
 use foundry_watch::governance_events::{GovernanceEvent, OpKind, Phase};
 use foundry_watch::policy_apply::{ApplyCommand, PolicyApplicationLayer, Role};
-use foundry_watch::retro::{EvidenceEnvelope, InsightPipeline, InsightRecord, PolicyDiff, Prediction, QueryCatalog};
+use foundry_watch::retro::{
+    EvidenceEnvelope, InsightPipeline, InsightRecord, PolicyDiff, Prediction, QueryCatalog,
+};
 use std::collections::BTreeMap;
 
 fn ev(op_id: &str, phase: Phase) -> GovernanceEvent {
@@ -40,7 +44,10 @@ fn ev(op_id: &str, phase: Phase) -> GovernanceEvent {
 }
 
 fn pipeline_with(changes: BTreeMap<String, String>) -> InsightPipeline {
-    let mut p = InsightPipeline::new(QueryCatalog::frozen_v1(), foundry_watch::evaluation_protocol::frozen_policy_graph());
+    let mut p = InsightPipeline::new(
+        QueryCatalog::frozen_v1(),
+        foundry_watch::evaluation_protocol::frozen_policy_graph(),
+    );
     let mut e = EvidenceEnvelope {
         ledger_prefix_len: 1,
         ledger_prefix_head_hash: "h".into(),
@@ -61,7 +68,10 @@ fn pipeline_with(changes: BTreeMap<String, String>) -> InsightPipeline {
         insight_id: "I1".into(),
         claim: "c".into(),
         evidence: e,
-        proposal: Some(PolicyDiff { target: "poll_interval".into(), changes }),
+        proposal: Some(PolicyDiff {
+            target: "poll_interval".into(),
+            changes,
+        }),
         prediction: Some(Prediction {
             metric: "retry_rate_by_task_class".into(),
             direction: "down".into(),
@@ -75,7 +85,9 @@ fn pipeline_with(changes: BTreeMap<String, String>) -> InsightPipeline {
 }
 
 fn ok_changes() -> BTreeMap<String, String> {
-    [("max_retries".to_string(), "2".to_string())].into_iter().collect()
+    [("max_retries".to_string(), "2".to_string())]
+        .into_iter()
+        .collect()
 }
 
 fn cmd(digest: String, base: u32) -> ApplyCommand {
@@ -146,18 +158,19 @@ fn g2_full_command_binding() -> bool {
         Err(HardenedError::UnclassifiedField { .. })
     );
     // digest determinism
-    let l4 = d == ProposalContent {
-        insight_id: "I1".into(),
-        evidence_result_digest: honest.proposals()[0].evidence.result_digest.clone(),
-        target: "poll_interval".into(),
-        changes: ok_changes(),
-        prediction_metric: "retry_rate_by_task_class".into(),
-        prediction_direction: "down".into(),
-        prediction_threshold: "<0.25".into(),
-        prediction_window: "next-2-retro-windows".into(),
-        base_policy_version: 0,
-    }
-    .digest();
+    let l4 = d
+        == ProposalContent {
+            insight_id: "I1".into(),
+            evidence_result_digest: honest.proposals()[0].evidence.result_digest.clone(),
+            target: "poll_interval".into(),
+            changes: ok_changes(),
+            prediction_metric: "retry_rate_by_task_class".into(),
+            prediction_direction: "down".into(),
+            prediction_threshold: "<0.25".into(),
+            prediction_window: "next-2-retro-windows".into(),
+            base_policy_version: 0,
+        }
+        .digest();
     l1 && l2 && l3 && l4
 }
 
@@ -174,12 +187,23 @@ fn bundle_store() -> (BundleStore, String) {
     let mut st = BundleStore::default();
     let b = CandidateBundle::build(
         "cand-g",
-        BundleProfile { model: "deepseek-v4".into(), temperature: Some(0.0), seed: Some(7), max_output_tokens: 1024 },
+        BundleProfile {
+            model: "deepseek-v4".into(),
+            temperature: Some(0.0),
+            seed: Some(7),
+            max_output_tokens: 1024,
+        },
         "solve {{task}}",
-        vec![LessonSnapshot { lesson_id: "L1".into(), content_hash: lesson_hash("prefer map"), content: "prefer map".into() }],
+        vec![LessonSnapshot {
+            lesson_id: "L1".into(),
+            content_hash: lesson_hash("prefer map"),
+            content: "prefer map".into(),
+        }],
         DependencyPins {
             image_digest: "sha256:aa".into(),
-            tool_digests: [("cargo".to_string(), "sha256:bb".into())].into_iter().collect(),
+            tool_digests: [("cargo".to_string(), "sha256:bb".into())]
+                .into_iter()
+                .collect(),
             model_revision: Some("rev-9".into()),
         },
     )
@@ -213,7 +237,8 @@ fn g3_casting_wired() -> bool {
     );
     // token needs domain consumption
     let mut events = Vec::new();
-    let ok = issue_bundle_token_for_domain(&mut st, &mut events, &GateHumanGate, &d, "gtok").is_ok();
+    let ok =
+        issue_bundle_token_for_domain(&mut st, &mut events, &GateHumanGate, &d, "gtok").is_ok();
     let e = events.len() == 2;
     let f = promote_with_store_token(&mut st, &record, "gtok").is_ok();
     a && b && c && ok && e && f
@@ -248,7 +273,13 @@ fn g4_serve_resolves_roles() -> bool {
     // and the legit path applies (authority = owner approver)
     let mut layer2 = PolicyApplicationLayer::new();
     let ok = layer2
-        .apply(&cmd(d, 0), &p, &foundry_watch::evaluation_protocol::frozen_policy_graph(), "gate", 1)
+        .apply(
+            &cmd(d, 0),
+            &p,
+            &foundry_watch::evaluation_protocol::frozen_policy_graph(),
+            "gate",
+            1,
+        )
         .is_ok();
     refused && smuggle && ok
 }
@@ -256,7 +287,12 @@ fn g4_serve_resolves_roles() -> bool {
 fn g5_dual_recomputation() -> bool {
     struct RealSrc;
     impl EvidenceReader for RealSrc {
-        fn run_query(&self, _q: &str, _p: &BTreeMap<String, String>, _l: u64) -> Result<String, String> {
+        fn run_query(
+            &self,
+            _q: &str,
+            _p: &BTreeMap<String, String>,
+            _l: u64,
+        ) -> Result<String, String> {
             Ok(r#"{"dep_bump":0.41}"#.into())
         }
         fn ledger_head_at(&self, _l: u64) -> Result<String, String> {
@@ -317,11 +353,21 @@ fn g6_docker_mandatory_live() -> bool {
     // derived argv carries the full hardening set
     let hard = argv.contains(&"--read-only".to_string())
         && argv.contains(&"--cap-drop=ALL".to_string())
-        && argv.windows(2).any(|w| w[0] == "--user" && w[1] == "65534:65534")
+        && argv
+            .windows(2)
+            .any(|w| w[0] == "--user" && w[1] == "65534:65534")
         && !argv.iter().any(|a| a == "-v" || a.starts_with("--volume"));
-    let _ = std::process::Command::new("docker").args(["rm", "-f", "m51g-live"]).status();
-    let _ = std::process::Command::new("docker").args(["network", "rm", "m51g-net"]).status();
-    std::process::Command::new("docker").args(["network", "create", "--internal", "m51g-net"]).output().map(|o| o.status.success()).unwrap_or(false);
+    let _ = std::process::Command::new("docker")
+        .args(["rm", "-f", "m51g-live"])
+        .status();
+    let _ = std::process::Command::new("docker")
+        .args(["network", "rm", "m51g-net"])
+        .status();
+    std::process::Command::new("docker")
+        .args(["network", "create", "--internal", "m51g-net"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
     // docker_argv ENDS with the image: insert -d just before it
     let mut full = argv.clone();
     let img_at = full.len() - 1;
@@ -329,7 +375,10 @@ fn g6_docker_mandatory_live() -> bool {
     full.extend(["sleep".to_string(), "10".to_string()]);
     let refs: Vec<&str> = full.iter().map(|s| s.as_str()).collect();
     let run_out = std::process::Command::new("docker").args(&refs).output();
-    let ok = run_out.as_ref().map(|o| o.status.success()).unwrap_or(false);
+    let ok = run_out
+        .as_ref()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
     if !ok {
         let out = run_out.unwrap();
         let err = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -337,15 +386,22 @@ fn g6_docker_mandatory_live() -> bool {
     }
     let mut live_cfg = false;
     if ok {
-        let cfg = std::process::Command::new("docker").args(["inspect", "m51g-live"]).output().unwrap();
+        let cfg = std::process::Command::new("docker")
+            .args(["inspect", "m51g-live"])
+            .output()
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&cfg.stdout).unwrap();
         let hc = &v[0]["HostConfig"];
         live_cfg = hc["CapDrop"][0].as_str() == Some("ALL")
             && hc["ReadonlyRootfs"].as_bool() == Some(true)
             && v[0]["Config"]["User"].as_str() == Some("65534:65534");
     }
-    let _ = std::process::Command::new("docker").args(["rm", "-f", "m51g-live"]).status();
-    let _ = std::process::Command::new("docker").args(["network", "rm", "m51g-net"]).status();
+    let _ = std::process::Command::new("docker")
+        .args(["rm", "-f", "m51g-live"])
+        .status();
+    let _ = std::process::Command::new("docker")
+        .args(["network", "rm", "m51g-net"])
+        .status();
     hard && ok && live_cfg
 }
 
@@ -356,7 +412,11 @@ fn g7_audit_precision() -> bool {
         c.append(ev(op, Phase::Committed)).unwrap();
     }
     let (max_seq, count) = c.head().unwrap();
-    let pin = HeadPin { max_seq, count, chain_head: foundry_watch::audit_precision::chain_head(&c.replay().unwrap()) };
+    let pin = HeadPin {
+        max_seq,
+        count,
+        chain_head: foundry_watch::audit_precision::chain_head(&c.replay().unwrap()),
+    };
     let clean = audit(&c, &pin) == Ok(());
     // truncation named
     let mut cut = GovernanceCoordinator::open_in_memory().unwrap();
@@ -364,7 +424,11 @@ fn g7_audit_precision() -> bool {
     cut.append(ev("x", Phase::Committed)).unwrap();
     let trunc = matches!(
         audit(&cut, &pin),
-        Err(AuditError::Truncated { pin_max_seq: 4, observed_max_seq: 2, observed_count: 2 })
+        Err(AuditError::Truncated {
+            pin_max_seq: 4,
+            observed_max_seq: 2,
+            observed_count: 2
+        })
     );
     // wholesale (injection) named
     let mut fat = GovernanceCoordinator::open_in_memory().unwrap();
@@ -373,7 +437,11 @@ fn g7_audit_precision() -> bool {
     }
     let wholesale = matches!(
         audit(&fat, &pin),
-        Err(AuditError::WholesaleTamper { pin_count: 4, observed_count: 6, .. })
+        Err(AuditError::WholesaleTamper {
+            pin_count: 4,
+            observed_count: 6,
+            ..
+        })
     );
     clean && trunc && wholesale
 }
@@ -417,7 +485,8 @@ fn g8_real_crash_injection() -> bool {
         .filter(|e| matches!(e.phase, Phase::Committed))
         .count()
         >= 3;
-    let writable = coord.append(ev("post", Phase::Pending)).unwrap() == stream.last().unwrap().seq + 1;
+    let writable =
+        coord.append(ev("post", Phase::Pending)).unwrap() == stream.last().unwrap().seq + 1;
     let _ = std::fs::remove_dir_all(&dir);
     killed && valid && committed && writable
 }
@@ -428,7 +497,8 @@ fn g9_back_compat_legacy_digest() -> bool {
     // path, it does not break the old one).
     let p = pipeline_with(ok_changes());
     let rec = &p.proposals()[0];
-    let legacy_d = PolicyApplicationLayer::digest_of(&[&rec.insight_id, &rec.evidence.result_digest]);
+    let legacy_d =
+        PolicyApplicationLayer::digest_of(&[&rec.insight_id, &rec.evidence.result_digest]);
     let mut layer = PolicyApplicationLayer::new();
     layer
         .apply(
@@ -444,15 +514,42 @@ fn g9_back_compat_legacy_digest() -> bool {
 #[test]
 fn m51_gate() {
     let results: Vec<(&str, bool)> = vec![
-        ("W1 single durable journal (coordinator, no test-time merge)", g1_single_journal_replaces_test_time_merge()),
-        ("W2 full command binding (2-layer substitution refusal)", g2_full_command_binding()),
-        ("W3 casting wired (bundle route, domain-bound tokens)", g3_casting_wired()),
-        ("W4 serve resolves current roles (identity composition)", g4_serve_resolves_roles()),
-        ("W5 dual recomputation (forged self-consistent fails)", g5_dual_recomputation()),
-        ("W6 Docker mandatory live (no skip path)", g6_docker_mandatory_live()),
-        ("W7 audit precision (truncation/tamper/mutation named)", g7_audit_precision()),
-        ("W8 real SIGKILL durability (committed facts survive)", g8_real_crash_injection()),
-        ("W9 back-compat (legacy digest path applies)", g9_back_compat_legacy_digest()),
+        (
+            "W1 single durable journal (coordinator, no test-time merge)",
+            g1_single_journal_replaces_test_time_merge(),
+        ),
+        (
+            "W2 full command binding (2-layer substitution refusal)",
+            g2_full_command_binding(),
+        ),
+        (
+            "W3 casting wired (bundle route, domain-bound tokens)",
+            g3_casting_wired(),
+        ),
+        (
+            "W4 serve resolves current roles (identity composition)",
+            g4_serve_resolves_roles(),
+        ),
+        (
+            "W5 dual recomputation (forged self-consistent fails)",
+            g5_dual_recomputation(),
+        ),
+        (
+            "W6 Docker mandatory live (no skip path)",
+            g6_docker_mandatory_live(),
+        ),
+        (
+            "W7 audit precision (truncation/tamper/mutation named)",
+            g7_audit_precision(),
+        ),
+        (
+            "W8 real SIGKILL durability (committed facts survive)",
+            g8_real_crash_injection(),
+        ),
+        (
+            "W9 back-compat (legacy digest path applies)",
+            g9_back_compat_legacy_digest(),
+        ),
     ];
     let mut pass = 0;
     for (name, ok) in &results {
@@ -462,5 +559,9 @@ fn m51_gate() {
         }
     }
     println!("M5.1 gate: {}/{} PASS", pass, results.len());
-    assert_eq!(pass, results.len(), "M5.1 gate must be 9/9 — every REJECT condition stays closed");
+    assert_eq!(
+        pass,
+        results.len(),
+        "M5.1 gate must be 9/9 — every REJECT condition stays closed"
+    );
 }

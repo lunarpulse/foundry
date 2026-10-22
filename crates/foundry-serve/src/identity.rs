@@ -12,10 +12,10 @@
 //!      every privileged op re-checks CURRENT account state.
 //!   C4 ApprovalToken lifecycle — issue-time AND consume-time checks;
 //!      consumption is recorded exactly once (atomic single-row insert).
-use rusqlite::Connection;
-use std::path::Path;
 #[cfg(test)]
 use foundry_domain::ports::ActorKind;
+use rusqlite::Connection;
+use std::path::Path;
 
 /// Capability enum — every privileged operation has exactly one entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +72,8 @@ pub enum IdentityError {
     NotBootstrapped,
     LastOwner,
     TokenAlreadyConsumed,
+    Hasher(String),
+    Randomness,
     Db(String),
 }
 
@@ -88,6 +90,8 @@ impl std::fmt::Display for IdentityError {
             Self::NotBootstrapped => write!(f, "no owner exists — run local bootstrap"),
             Self::LastOwner => write!(f, "cannot disable or demote the last owner"),
             Self::TokenAlreadyConsumed => write!(f, "approval token already consumed"),
+            Self::Hasher(_) => write!(f, "password credential processing failed"),
+            Self::Randomness => write!(f, "secure session generation failed"),
             Self::Db(e) => write!(f, "db: {e}"),
         }
     }
@@ -101,8 +105,8 @@ pub struct Identity {
 /// Production uses argon2id; the interface exists because C3 requires
 /// calibrated hashing, and unit tests must not take seconds each.
 pub trait PasswordHasher {
-    fn hash(&self, password: &str) -> String;
-    fn verify(&self, password: &str, hash: &str) -> bool;
+    fn hash(&self, password: &str) -> Result<String, String>;
+    fn verify(&self, password: &str, hash: &str) -> Result<bool, String>;
 }
 
 /// Argon2id (production). Chosen over bcrypt per review #4
@@ -110,38 +114,12 @@ pub trait PasswordHasher {
 pub struct ArgonHasher;
 
 impl PasswordHasher for ArgonHasher {
-    fn hash(&self, password: &str) -> String {
-        let salt = os_rand_16();
-        let h = argon2_simple(password, &salt);
-        format!("argon2id${}${}", hex(&salt), h)
+    fn hash(&self, password: &str) -> Result<String, String> {
+        foundry_ledger::product_identity::ProductPasswordKdf::hash(password)
     }
-    fn verify(&self, password: &str, hash: &str) -> bool {
-        let parts: Vec<&str> = hash.split('$').collect();
-        if parts.len() != 3 || parts[0] != "argon2id" {
-            return false;
-        }
-        let salt = unhex(parts[1]).unwrap_or_default();
-        let h = argon2_simple(password, &salt);
-        constant_time_eq(h.as_bytes(), parts[2].as_bytes())
+    fn verify(&self, password: &str, hash: &str) -> Result<bool, String> {
+        foundry_ledger::product_identity::ProductPasswordKdf::verify(password, hash)
     }
-}
-
-/// PHC-style framing over a memory-hard core. We avoid pulling the
-/// argon2 crate into the workspace for M4-min: this is a documented
-/// sha512-based KDF with per-hash salt + fixed iterations. NOT a
-/// full Argon2 implementation — swap to the `argon2` crate before any
-/// network-exposed deployment (documented in deploy profile, T34).
-fn argon2_simple(password: &str, salt: &[u8]) -> String {
-    // 8 rounds of salted sha512 (stretch) — cheap unit tests, still
-    // far from a plain hash. Deployment swap point is single-line.
-    let mut acc = Vec::with_capacity(salt.len() + password.len() + 8);
-    acc.extend_from_slice(salt);
-    acc.extend_from_slice(password.as_bytes());
-    for i in 0..8u32 {
-        acc.extend_from_slice(&i.to_le_bytes());
-        acc = sha512(&acc).to_vec();
-    }
-    hex(&sha512(&acc))
 }
 
 fn sha512(data: &[u8]) -> [u8; 64] {
@@ -151,33 +129,13 @@ fn sha512(data: &[u8]) -> [u8; 64] {
     h.finalize().into()
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
-fn os_rand_16() -> [u8; 16] {
-    use std::io::Read;
-    let mut b = [0u8; 16];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut b))
-        .expect("/dev/urandom");
-    b
-}
-
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
-fn unhex(s: &str) -> Option<Vec<u8>> {
-    (0..s.len() / 2)
-        .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok())
-        .collect()
+
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex(&Sha256::digest(data))
 }
 
 #[derive(Debug, Clone)]
@@ -203,6 +161,12 @@ impl Identity {
             );
             CREATE TABLE IF NOT EXISTS sessions (
                 token TEXT PRIMARY KEY,
+                username TEXT NOT NULL REFERENCES users(username),
+                expires_at TEXT NOT NULL,
+                revoked INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS sessions_v2 (
+                token_digest TEXT PRIMARY KEY,
                 username TEXT NOT NULL REFERENCES users(username),
                 expires_at TEXT NOT NULL,
                 revoked INTEGER NOT NULL DEFAULT 0
@@ -241,7 +205,7 @@ impl Identity {
         self.con
             .execute(
                 "INSERT INTO users (username, pw_hash, role, disabled, created_at) VALUES (?1,?2,'owner',0,?3)",
-                rusqlite::params![username, h.hash(password), chrono::Utc::now().to_rfc3339()],
+                rusqlite::params![username, h.hash(password).map_err(IdentityError::Hasher)?, chrono::Utc::now().to_rfc3339()],
             )
             .map_err(|e| IdentityError::Db(e.to_string()))?;
         Ok(())
@@ -263,7 +227,7 @@ impl Identity {
         self.con
             .execute(
                 "INSERT INTO users (username, pw_hash, role, disabled, created_at) VALUES (?1,?2,?3,0,?4)",
-                rusqlite::params![username, h.hash(password), role_name(role), chrono::Utc::now().to_rfc3339()],
+                rusqlite::params![username, h.hash(password).map_err(IdentityError::Hasher)?, role_name(role), chrono::Utc::now().to_rfc3339()],
             )
             .map_err(|e| IdentityError::Db(e.to_string()))?;
         Ok(())
@@ -301,6 +265,12 @@ impl Identity {
                 [username],
             )
             .map_err(|e| IdentityError::Db(e.to_string()))?;
+        self.con
+            .execute(
+                "UPDATE sessions_v2 SET revoked=1 WHERE username=?1",
+                [username],
+            )
+            .map_err(|e| IdentityError::Db(e.to_string()))?;
         Ok(())
     }
 
@@ -332,18 +302,25 @@ impl Identity {
             Ok(v) => v,
             Err(_) => return Err(IdentityError::UnknownUser),
         };
-        if !h.verify(password, &pw_hash) {
+        if !h
+            .verify(password, &pw_hash)
+            .map_err(IdentityError::Hasher)?
+        {
             return Err(IdentityError::BadCredentials);
         }
         if disabled == 1 {
             return Err(IdentityError::Disabled);
         }
-        let token = hex(&sha512(&os_rand_16())); // opaque, 128-bit
+        let mut token_bytes = [0u8; 32];
+        rand_core::RngCore::try_fill_bytes(&mut rand_core::OsRng, &mut token_bytes)
+            .map_err(|_| IdentityError::Randomness)?;
+        let token = hex(&token_bytes); // 256-bit opaque bearer
+        let token_digest = sha256_hex(token.as_bytes());
         let expires = (chrono::Utc::now() + chrono::Duration::seconds(ttl_secs)).to_rfc3339();
         self.con
             .execute(
-                "INSERT INTO sessions (token, username, expires_at, revoked) VALUES (?1,?2,?3,0)",
-                rusqlite::params![token, username, expires],
+                "INSERT INTO sessions_v2 (token_digest, username, expires_at, revoked) VALUES (?1,?2,?3,0)",
+                rusqlite::params![token_digest, username, expires],
             )
             .map_err(|e| IdentityError::Db(e.to_string()))?;
         Ok(token)
@@ -352,9 +329,10 @@ impl Identity {
     /// C3: every privileged op resolves the CURRENT account state —
     /// the session token carries no role claims.
     pub fn resolve_session(&self, token: &str) -> Result<AuthenticatedUser, IdentityError> {
+        let token_digest = sha256_hex(token.as_bytes());
         let row: Result<(String, String, i64, i64), _> = self.con.query_row(
-            "SELECT s.username, s.expires_at, s.revoked, u.disabled FROM sessions s JOIN users u ON u.username=s.username WHERE s.token=?1",
-            [token],
+            "SELECT s.username, s.expires_at, s.revoked, u.disabled FROM sessions_v2 s JOIN users u ON u.username=s.username WHERE s.token_digest=?1",
+            [token_digest],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         );
         let (username, expires, revoked, disabled) = match row {
@@ -388,8 +366,12 @@ impl Identity {
     }
 
     pub fn logout(&mut self, token: &str) -> Result<(), IdentityError> {
+        let token_digest = sha256_hex(token.as_bytes());
         self.con
-            .execute("UPDATE sessions SET revoked=1 WHERE token=?1", [token])
+            .execute(
+                "UPDATE sessions_v2 SET revoked=1 WHERE token_digest=?1",
+                [token_digest],
+            )
             .map_err(|e| IdentityError::Db(e.to_string()))?;
         Ok(())
     }
@@ -466,11 +448,21 @@ mod tests {
 
     struct FastHasher;
     impl PasswordHasher for FastHasher {
-        fn hash(&self, p: &str) -> String {
-            format!("fast${}", hex(&sha512(p.as_bytes())))
+        fn hash(&self, p: &str) -> Result<String, String> {
+            Ok(format!("fast${}", hex(&sha512(p.as_bytes()))))
         }
-        fn verify(&self, p: &str, hash: &str) -> bool {
-            self.hash(p) == hash
+        fn verify(&self, p: &str, hash: &str) -> Result<bool, String> {
+            Ok(self.hash(p)? == hash)
+        }
+    }
+
+    struct FailingHasher;
+    impl PasswordHasher for FailingHasher {
+        fn hash(&self, _: &str) -> Result<String, String> {
+            Err("credential canary".into())
+        }
+        fn verify(&self, _: &str, _: &str) -> Result<bool, String> {
+            Err("credential canary".into())
         }
     }
 
@@ -482,6 +474,38 @@ mod tests {
             username: "root".into(),
             role: Role::Owner,
         }
+    }
+
+    #[test]
+    fn production_hasher_emits_strict_argon2id_phc() {
+        let hasher = ArgonHasher;
+        let phc = hasher.hash("correct horse battery staple").unwrap();
+        assert!(phc.starts_with("$argon2id$v=19$m=65536,t=3,p=1$"));
+        assert!(hasher.verify("correct horse battery staple", &phc).unwrap());
+        assert!(!hasher.verify("wrong", &phc).unwrap());
+        assert!(!hasher.verify("anything", "argon2id$legacy$sha512").unwrap());
+        assert!(
+            !hasher
+                .verify("anything", "$argon2id$v=19$m=8,t=1,p=1$bad$bad")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn hasher_failures_are_fallible_and_do_not_create_accounts_or_leak_details() {
+        let mut identity = id();
+        let error = identity
+            .bootstrap_owner("root", "pw", &FailingHasher)
+            .unwrap_err();
+        assert!(matches!(error, IdentityError::Hasher(_)));
+        assert!(!error.to_string().contains("credential canary"));
+        assert!(!identity.has_owner().unwrap());
+        identity.bootstrap_owner("root", "pw", &FastHasher).unwrap();
+        let error = identity
+            .login("root", "pw", &FailingHasher, 60)
+            .unwrap_err();
+        assert!(matches!(error, IdentityError::Hasher(_)));
+        assert!(!error.to_string().contains("credential canary"));
     }
 
     #[test]

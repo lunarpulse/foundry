@@ -2,7 +2,10 @@
 // so the underlying stores can be re-read. Types are non-Drop by design.
 #![allow(clippy::drop_non_drop)]
 
-use std::{collections::{HashMap, HashSet}, sync::Mutex};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Mutex,
+};
 
 use chrono::{TimeZone, Utc};
 use foundry_exec::inject::{CrashPoint, FaultInjector};
@@ -42,10 +45,13 @@ impl IntentLog for MemoryIntentLog {
     }
 
     fn get(&self, key: &Key, activation: u64) -> Option<ExecutionIntent> {
-        self.rows.iter().find(|intent| {
-            (intent.order.clone(), intent.attempt, intent.run) == *key
-                && intent.activation == activation
-        }).cloned()
+        self.rows
+            .iter()
+            .find(|intent| {
+                (intent.order.clone(), intent.attempt, intent.run) == *key
+                    && intent.activation == activation
+            })
+            .cloned()
     }
 }
 
@@ -101,10 +107,14 @@ struct MemoryOutcomeStore {
 
 impl OutcomeStore for MemoryOutcomeStore {
     fn commit(&mut self, outcome: &ExecutionOutcome) {
-        if self.rows.contains_key(&(outcome.intent_key.clone(), outcome.activation)) {
+        if self
+            .rows
+            .contains_key(&(outcome.intent_key.clone(), outcome.activation))
+        {
             return;
         }
-        self.latest_activations.insert(outcome.intent_key.clone(), outcome.activation);
+        self.latest_activations
+            .insert(outcome.intent_key.clone(), outcome.activation);
         self.rows
             .entry((outcome.intent_key.clone(), outcome.activation))
             .or_insert_with(|| outcome.clone());
@@ -132,50 +142,88 @@ fn intent(activation: u64) -> ExecutionIntent {
     }
 }
 
-struct LimitedAttempts { max: u32, rows: Mutex<HashSet<(OrderId, Attempt, RunId)>> }
+struct LimitedAttempts {
+    max: u32,
+    rows: Mutex<HashSet<(OrderId, Attempt, RunId)>>,
+}
 impl AttemptLedger for LimitedAttempts {
     fn consume(&self, order: &OrderId, attempt: Attempt, run: RunId) -> Result<(), PortError> {
         let mut rows = self.rows.lock().unwrap();
-        if rows.contains(&(order.clone(), attempt, run)) { return Ok(()); }
-        if rows.iter().filter(|(seen, seen_attempt, _)| seen == order && *seen_attempt == attempt).count() >= self.max as usize {
-            return Err(PortError::AttemptBudgetExhausted { max_attempts: self.max });
+        if rows.contains(&(order.clone(), attempt, run)) {
+            return Ok(());
+        }
+        if rows
+            .iter()
+            .filter(|(seen, seen_attempt, _)| seen == order && *seen_attempt == attempt)
+            .count()
+            >= self.max as usize
+        {
+            return Err(PortError::AttemptBudgetExhausted {
+                max_attempts: self.max,
+            });
         }
         rows.insert((order.clone(), attempt, run));
         Ok(())
     }
     fn consumed(&self, order: &OrderId) -> Result<u32, PortError> {
-        Ok(self.rows.lock().unwrap().iter().filter(|(seen, _, _)| seen == order).count() as u32)
+        Ok(self
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(seen, _, _)| seen == order)
+            .count() as u32)
     }
 }
 
 #[test]
 fn executor_consumes_attempt_before_dispatch_and_keeps_it_after_success() {
-    let ledger = LimitedAttempts { max: 1, rows: Mutex::new(HashSet::new()) };
-    let mut intents = MemoryIntentLog::default(); let mut host = FakeHost::default();
+    let ledger = LimitedAttempts {
+        max: 1,
+        rows: Mutex::new(HashSet::new()),
+    };
+    let mut intents = MemoryIntentLog::default();
+    let mut host = FakeHost::default();
     let mut outcomes = MemoryOutcomeStore::default();
-    let mut executor = Executor::new(&mut intents, &mut host, &mut outcomes).with_attempt_ledger(&ledger);
+    let mut executor =
+        Executor::new(&mut intents, &mut host, &mut outcomes).with_attempt_ledger(&ledger);
     assert!(matches!(executor.run(intent(0)), Ok(RunStep::Bound(_))));
     assert_eq!(ledger.consumed(&OrderId("order-1".into())).unwrap(), 1);
     let mut next_attempt = intent(1);
     next_attempt.attempt = Attempt(1);
     next_attempt.run = RunId(3);
-    assert_eq!(executor.run(next_attempt).unwrap_err(), foundry_exec::lifecycle::LifecycleError::AttemptBudget(
-        PortError::AttemptBudgetExhausted { max_attempts: 1 }));
+    assert_eq!(
+        executor.run(next_attempt).unwrap_err(),
+        foundry_exec::lifecycle::LifecycleError::AttemptBudget(PortError::AttemptBudgetExhausted {
+            max_attempts: 1
+        })
+    );
     assert_eq!(executor.dispatch_count(), 1);
     assert_eq!(ledger.consumed(&OrderId("order-1".into())).unwrap(), 1);
 }
 
 #[test]
 fn b4_resume_cannot_dispatch_an_unadmitted_attempt() {
-    let ledger = LimitedAttempts { max: 0, rows: Mutex::new(HashSet::new()) };
+    let ledger = LimitedAttempts {
+        max: 0,
+        rows: Mutex::new(HashSet::new()),
+    };
     for started in [false, true] {
-        let mut intents = MemoryIntentLog::default(); let mut host = FakeHost::default();
+        let mut intents = MemoryIntentLog::default();
+        let mut host = FakeHost::default();
         let mut outcomes = MemoryOutcomeStore::default();
         intents.append(&intent(0));
-        if started { intents.mark_started(&key(), 0); }
-        let mut executor = Executor::new(&mut intents, &mut host, &mut outcomes).with_attempt_ledger(&ledger);
-        assert_eq!(executor.resume(&key()), ResumeAction::Interrupted(foundry_exec::LifecycleError::AttemptBudget(
-            PortError::AttemptBudgetExhausted { max_attempts: 0 })));
+        if started {
+            intents.mark_started(&key(), 0);
+        }
+        let mut executor =
+            Executor::new(&mut intents, &mut host, &mut outcomes).with_attempt_ledger(&ledger);
+        assert_eq!(
+            executor.resume(&key()),
+            ResumeAction::Interrupted(foundry_exec::LifecycleError::AttemptBudget(
+                PortError::AttemptBudgetExhausted { max_attempts: 0 }
+            ))
+        );
         assert_eq!(executor.dispatch_count(), 0);
         assert!(executor.outcome(&key()).is_none());
     }
@@ -184,20 +232,41 @@ fn b4_resume_cannot_dispatch_an_unadmitted_attempt() {
 #[test]
 fn b4_attempt_consumption_survives_w1_and_w2_restart() {
     for point in [CrashPoint::W1, CrashPoint::W2] {
-        let ledger = LimitedAttempts { max: 1, rows: Mutex::new(HashSet::new()) };
-        let mut intents = MemoryIntentLog::default(); let mut host = FakeHost::default();
+        let ledger = LimitedAttempts {
+            max: 1,
+            rows: Mutex::new(HashSet::new()),
+        };
+        let mut intents = MemoryIntentLog::default();
+        let mut host = FakeHost::default();
         let mut outcomes = MemoryOutcomeStore::default();
         {
-            let mut executor = Executor::with_faults(&mut intents, &mut host, &mut outcomes,
-                FaultInjector::armed_at(point)).with_attempt_ledger(&ledger);
+            let mut executor = Executor::with_faults(
+                &mut intents,
+                &mut host,
+                &mut outcomes,
+                FaultInjector::armed_at(point),
+            )
+            .with_attempt_ledger(&ledger);
             assert!(executor.run(intent(0)).is_err());
         }
         assert_eq!(ledger.consumed(&key().0).unwrap(), 1);
-        let mut executor = Executor::new(&mut intents, &mut host, &mut outcomes).with_attempt_ledger(&ledger);
-        assert_eq!(executor.resume(&key()), if point == CrashPoint::W1 { ResumeAction::ReDispatch } else { ResumeAction::ReBind });
+        let mut executor =
+            Executor::new(&mut intents, &mut host, &mut outcomes).with_attempt_ledger(&ledger);
+        assert_eq!(
+            executor.resume(&key()),
+            if point == CrashPoint::W1 {
+                ResumeAction::ReDispatch
+            } else {
+                ResumeAction::ReBind
+            }
+        );
         assert_eq!(executor.dispatch_count(), 1);
-        let mut fresh = intent(0); fresh.run = RunId(3);
-        assert!(matches!(executor.run(fresh), Err(foundry_exec::LifecycleError::AttemptBudget(_))));
+        let mut fresh = intent(0);
+        fresh.run = RunId(3);
+        assert!(matches!(
+            executor.run(fresh),
+            Err(foundry_exec::LifecycleError::AttemptBudget(_))
+        ));
         assert_eq!(ledger.consumed(&key().0).unwrap(), 1);
     }
 }
@@ -310,9 +379,14 @@ fn review_w1_of_new_activation_does_not_return_the_previous_outcome() {
     let mut intents = MemoryIntentLog::default();
     let mut host = FakeHost::default();
     let mut outcomes = MemoryOutcomeStore::default();
-    Executor::new(&mut intents, &mut host, &mut outcomes).run(intent(8)).unwrap();
+    Executor::new(&mut intents, &mut host, &mut outcomes)
+        .run(intent(8))
+        .unwrap();
     let mut executor = Executor::with_faults(
-        &mut intents, &mut host, &mut outcomes, FaultInjector::armed_at(CrashPoint::W1),
+        &mut intents,
+        &mut host,
+        &mut outcomes,
+        FaultInjector::armed_at(CrashPoint::W1),
     );
     assert!(executor.run(intent(9)).is_err());
     assert_eq!(executor.resume(&key()), ResumeAction::ReDispatch);
@@ -325,9 +399,14 @@ fn review_w2_of_new_activation_recovers_its_own_result() {
     let mut intents = MemoryIntentLog::default();
     let mut host = FakeHost::default();
     let mut outcomes = MemoryOutcomeStore::default();
-    Executor::new(&mut intents, &mut host, &mut outcomes).run(intent(8)).unwrap();
+    Executor::new(&mut intents, &mut host, &mut outcomes)
+        .run(intent(8))
+        .unwrap();
     let mut executor = Executor::with_faults(
-        &mut intents, &mut host, &mut outcomes, FaultInjector::armed_at(CrashPoint::W2),
+        &mut intents,
+        &mut host,
+        &mut outcomes,
+        FaultInjector::armed_at(CrashPoint::W2),
     );
     assert!(executor.run(intent(9)).is_err());
     assert_eq!(executor.resume(&key()), ResumeAction::ReBind);
@@ -352,7 +431,10 @@ fn review_unbound_activation_cannot_be_hidden_by_a_new_one() {
     let mut host = FakeHost::default();
     let mut outcomes = MemoryOutcomeStore::default();
     let mut executor = Executor::with_faults(
-        &mut intents, &mut host, &mut outcomes, FaultInjector::armed_at(CrashPoint::W2),
+        &mut intents,
+        &mut host,
+        &mut outcomes,
+        FaultInjector::armed_at(CrashPoint::W2),
     );
     assert!(executor.run(intent(8)).is_err());
     assert!(executor.run(intent(9)).is_err());
@@ -385,17 +467,27 @@ fn review_started_without_a_result_waits_and_never_dispatches() {
     let mut executor = Executor::new(&mut intents, &mut host, &mut outcomes);
     assert_eq!(executor.resume(&key()), ResumeAction::AwaitResult);
     assert_eq!(executor.resume(&key()), ResumeAction::AwaitResult);
-    assert_eq!(executor.run(intent(8)), Err(foundry_exec::LifecycleError::AwaitResult(8)));
+    assert_eq!(
+        executor.run(intent(8)),
+        Err(foundry_exec::LifecycleError::AwaitResult(8))
+    );
     assert!(executor.outcome(&key()).is_none());
     assert_eq!(executor.dispatch_count(), 0);
     drop(executor);
-    host.recovered = Some((key(), 8, DispatchResult {
-        cursor: Some("completed-later".into()),
-        ..DispatchResult::default()
-    }));
+    host.recovered = Some((
+        key(),
+        8,
+        DispatchResult {
+            cursor: Some("completed-later".into()),
+            ..DispatchResult::default()
+        },
+    ));
     let mut executor = Executor::new(&mut intents, &mut host, &mut outcomes);
     assert_eq!(executor.resume(&key()), ResumeAction::ReBind);
-    assert_eq!(executor.outcome(&key()).unwrap().cursor.as_deref(), Some("completed-later"));
+    assert_eq!(
+        executor.outcome(&key()).unwrap().cursor.as_deref(),
+        Some("completed-later")
+    );
     assert_eq!(executor.dispatch_count(), 0);
 }
 
@@ -422,7 +514,10 @@ fn review_run_retries_both_crash_windows_without_a_second_intent_or_dispatch() {
         let mut host = FakeHost::default();
         let mut outcomes = MemoryOutcomeStore::default();
         let mut executor = Executor::with_faults(
-            &mut intents, &mut host, &mut outcomes, FaultInjector::armed_at(point),
+            &mut intents,
+            &mut host,
+            &mut outcomes,
+            FaultInjector::armed_at(point),
         );
         assert!(executor.run(intent(8)).is_err());
         let mut retried = intent(8);
@@ -442,11 +537,15 @@ fn review_resume_can_crash_at_w2_and_recover_without_redispatch() {
     let mut outcomes = MemoryOutcomeStore::default();
     intents.append(&intent(8));
     let mut executor = Executor::with_faults(
-        &mut intents, &mut host, &mut outcomes, FaultInjector::armed_at(CrashPoint::W2),
+        &mut intents,
+        &mut host,
+        &mut outcomes,
+        FaultInjector::armed_at(CrashPoint::W2),
     );
-    assert_eq!(executor.resume(&key()), ResumeAction::Interrupted(
-        foundry_exec::LifecycleError::Crash(CrashPoint::W2),
-    ));
+    assert_eq!(
+        executor.resume(&key()),
+        ResumeAction::Interrupted(foundry_exec::LifecycleError::Crash(CrashPoint::W2),)
+    );
     assert!(executor.outcome(&key()).is_none());
     assert_eq!(executor.resume(&key()), ResumeAction::ReBind);
     assert_eq!(executor.dispatch_count(), 1);
@@ -464,15 +563,21 @@ fn review_no_intent_requires_a_fresh_run_without_external_effects() {
 }
 
 // A host predating receipt support cannot prove dispatch never reached it.
-struct LegacyHost { calls: u64 }
+struct LegacyHost {
+    calls: u64,
+}
 impl DispatchHost for LegacyHost {
     type Result = DispatchResult;
     fn dispatch(&mut self, _: &ExecutionIntent) -> DispatchResult {
         self.calls += 1;
         DispatchResult::default()
     }
-    fn dispatch_count(&self) -> u64 { self.calls }
-    fn recover_result(&mut self, _: &ExecutionIntent) -> Option<DispatchResult> { None }
+    fn dispatch_count(&self) -> u64 {
+        self.calls
+    }
+    fn recover_result(&mut self, _: &ExecutionIntent) -> Option<DispatchResult> {
+        None
+    }
 }
 
 #[test]
@@ -483,7 +588,10 @@ fn b3a_legacy_host_without_receipts_waits_on_run_and_resume() {
     let mut host = LegacyHost { calls: 1 }; // Work may already have happened.
     let mut outcomes = MemoryOutcomeStore::default();
     let mut executor = Executor::new(&mut intents, &mut host, &mut outcomes);
-    assert_eq!(executor.run(intent(8)), Err(foundry_exec::LifecycleError::AwaitResult(8)));
+    assert_eq!(
+        executor.run(intent(8)),
+        Err(foundry_exec::LifecycleError::AwaitResult(8))
+    );
     assert_eq!(executor.resume(&key()), ResumeAction::AwaitResult);
     assert_eq!(executor.dispatch_count(), 1);
     assert!(executor.outcome(&key()).is_none());
@@ -491,22 +599,35 @@ fn b3a_legacy_host_without_receipts_waits_on_run_and_resume() {
 
 #[test]
 fn r7_executor_retries_and_activations_share_a_run_but_run_99_cannot_bypass_exhaustion() {
-    let ledger = LimitedAttempts { max: 2, rows: Mutex::new(HashSet::new()) };
-    let mut intents = MemoryIntentLog::default(); let mut host = FakeHost::default();
+    let ledger = LimitedAttempts {
+        max: 2,
+        rows: Mutex::new(HashSet::new()),
+    };
+    let mut intents = MemoryIntentLog::default();
+    let mut host = FakeHost::default();
     let mut outcomes = MemoryOutcomeStore::default();
-    let mut executor = Executor::new(&mut intents, &mut host, &mut outcomes).with_attempt_ledger(&ledger);
+    let mut executor =
+        Executor::new(&mut intents, &mut host, &mut outcomes).with_attempt_ledger(&ledger);
     executor.run(intent(0)).unwrap();
     executor.run(intent(0)).unwrap();
     executor.run(intent(1)).unwrap();
     assert_eq!(ledger.consumed(&key().0).unwrap(), 1);
-    let mut fresh = intent(0); fresh.run = RunId(3);
+    let mut fresh = intent(0);
+    fresh.run = RunId(3);
     executor.run(fresh.clone()).unwrap();
     executor.run(fresh.clone()).unwrap();
-    assert!(matches!(executor.resume(&(fresh.order.clone(), fresh.attempt, fresh.run)), ResumeAction::AlreadyBound(_)));
+    assert!(matches!(
+        executor.resume(&(fresh.order.clone(), fresh.attempt, fresh.run)),
+        ResumeAction::AlreadyBound(_)
+    ));
     assert_eq!(ledger.consumed(&key().0).unwrap(), 2);
     fresh.run = RunId(99);
-    assert_eq!(executor.run(fresh), Err(foundry_exec::LifecycleError::AttemptBudget(
-        PortError::AttemptBudgetExhausted { max_attempts: 2 })));
+    assert_eq!(
+        executor.run(fresh),
+        Err(foundry_exec::LifecycleError::AttemptBudget(
+            PortError::AttemptBudgetExhausted { max_attempts: 2 }
+        ))
+    );
     assert_eq!(executor.dispatch_count(), 3);
     assert_eq!(ledger.consumed(&key().0).unwrap(), 2);
 }

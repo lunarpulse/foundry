@@ -56,13 +56,17 @@ pub fn guard_satisfied(g: &Guard, ev: &OrderEvent, current_attempt: u32) -> bool
         },
         Guard::MaxAttemptsExhausted => current_attempt >= crate::order::MAX_ATTEMPTS,
         Guard::RetriesRemain => current_attempt < crate::order::MAX_ATTEMPTS,
-        Guard::NoOpTaxonomy => matches!(ev, OrderEvent::InspectionFailed { reason } if reason.starts_with("no-op")),
+        Guard::NoOpTaxonomy => {
+            matches!(ev, OrderEvent::InspectionFailed { reason } if reason.starts_with("no-op"))
+        }
         Guard::NoNoOp => match ev {
             OrderEvent::InspectionFailed { reason } => !reason.starts_with("no-op"),
             _ => true,
         },
         Guard::ApprovalBindsArtifact => match ev {
-            OrderEvent::Approved { artifact_digest, .. } => !artifact_digest.is_empty(),
+            OrderEvent::Approved {
+                artifact_digest, ..
+            } => !artifact_digest.is_empty(),
             _ => true,
         },
         Guard::None => true,
@@ -110,7 +114,10 @@ pub enum EdgeEvent {
 pub enum EdgeTarget {
     State(OrderState),
     /// back-edge: 재진입 토큰(attempt+1)을 소비하고 to로 복귀.
-    BackEdge { token: &'static str, to: OrderState },
+    BackEdge {
+        token: &'static str,
+        to: OrderState,
+    },
 }
 
 /// 내장 워크플로 — M1-M5 주문 상태머신의 전체·구조 보존 부호화.
@@ -133,9 +140,24 @@ impl EmbeddedWorkflow {
             schema_version: 1,
             edges: vec![
                 // ---- happy path ----
-                EncodedEdge { event: E::Queued, from: S::Received, guard: None, to: T::State(S::Queued) },
-                EncodedEdge { event: E::DieStarted, from: S::Queued, guard: AttemptClaimMatches, to: T::State(S::Working) },
-                EncodedEdge { event: E::DieSucceeded, from: S::Working, guard: AttemptNotStale, to: T::State(S::Inspecting) },
+                EncodedEdge {
+                    event: E::Queued,
+                    from: S::Received,
+                    guard: None,
+                    to: T::State(S::Queued),
+                },
+                EncodedEdge {
+                    event: E::DieStarted,
+                    from: S::Queued,
+                    guard: AttemptClaimMatches,
+                    to: T::State(S::Working),
+                },
+                EncodedEdge {
+                    event: E::DieSucceeded,
+                    from: S::Working,
+                    guard: AttemptNotStale,
+                    to: T::State(S::Inspecting),
+                },
                 // DieFailed: stale 펜스 ∧ (MAX | 재시도) — 연접 (astra BLOCKER)
                 EncodedEdge {
                     event: E::DieFailed,
@@ -147,13 +169,36 @@ impl EmbeddedWorkflow {
                     event: E::DieFailed,
                     from: S::Working,
                     guard: Conj(vec![AttemptNotStale, RetriesRemain]),
-                    to: T::BackEdge { token: "attempt+1", to: S::Queued },
+                    to: T::BackEdge {
+                        token: "attempt+1",
+                        to: S::Queued,
+                    },
                 },
-                EncodedEdge { event: E::InspectionPassed, from: S::Inspecting, guard: None, to: T::State(S::FurnaceHold) },
-                EncodedEdge { event: E::InspectionPassed, from: S::FurnaceHold, guard: None, to: T::State(S::FurnaceHold) },
-                EncodedEdge { event: E::ReviewHeld, from: S::Inspecting, guard: None, to: T::State(S::FurnaceHold) },
+                EncodedEdge {
+                    event: E::InspectionPassed,
+                    from: S::Inspecting,
+                    guard: None,
+                    to: T::State(S::FurnaceHold),
+                },
+                EncodedEdge {
+                    event: E::InspectionPassed,
+                    from: S::FurnaceHold,
+                    guard: None,
+                    to: T::State(S::FurnaceHold),
+                },
+                EncodedEdge {
+                    event: E::ReviewHeld,
+                    from: S::Inspecting,
+                    guard: None,
+                    to: T::State(S::FurnaceHold),
+                },
                 // InspectionFailed: no-op 즉시 종단; ¬no-op ∧ (MAX | 재시도)
-                EncodedEdge { event: E::InspectionFailed, from: S::Inspecting, guard: NoOpTaxonomy, to: T::State(S::Failed) },
+                EncodedEdge {
+                    event: E::InspectionFailed,
+                    from: S::Inspecting,
+                    guard: NoOpTaxonomy,
+                    to: T::State(S::Failed),
+                },
                 EncodedEdge {
                     event: E::InspectionFailed,
                     from: S::Inspecting,
@@ -164,27 +209,108 @@ impl EmbeddedWorkflow {
                     event: E::InspectionFailed,
                     from: S::Inspecting,
                     guard: Conj(vec![NoNoOp, RetriesRemain]),
-                    to: T::BackEdge { token: "attempt+1", to: S::Queued },
+                    to: T::BackEdge {
+                        token: "attempt+1",
+                        to: S::Queued,
+                    },
                 },
-                EncodedEdge { event: E::InspectionFailed, from: S::FurnaceHold, guard: NoOpTaxonomy, to: T::State(S::Failed) },
-                EncodedEdge { event: E::InspectionFailed, from: S::FurnaceHold, guard: Conj(vec![NoNoOp, MaxAttemptsExhausted]), to: T::State(S::Failed) },
-                EncodedEdge { event: E::InspectionFailed, from: S::FurnaceHold, guard: Conj(vec![NoNoOp, RetriesRemain]), to: T::BackEdge { token: "attempt+1", to: S::Queued } },
+                EncodedEdge {
+                    event: E::InspectionFailed,
+                    from: S::FurnaceHold,
+                    guard: NoOpTaxonomy,
+                    to: T::State(S::Failed),
+                },
+                EncodedEdge {
+                    event: E::InspectionFailed,
+                    from: S::FurnaceHold,
+                    guard: Conj(vec![NoNoOp, MaxAttemptsExhausted]),
+                    to: T::State(S::Failed),
+                },
+                EncodedEdge {
+                    event: E::InspectionFailed,
+                    from: S::FurnaceHold,
+                    guard: Conj(vec![NoNoOp, RetriesRemain]),
+                    to: T::BackEdge {
+                        token: "attempt+1",
+                        to: S::Queued,
+                    },
+                },
                 // hold: FurnaceHold (정지 — 외부 재개)
-                EncodedEdge { event: E::Approved, from: S::FurnaceHold, guard: ApprovalBindsArtifact, to: T::State(S::Publishing) },
-                EncodedEdge { event: E::Rejected, from: S::FurnaceHold, guard: None, to: T::State(S::Rejected) },
+                EncodedEdge {
+                    event: E::Approved,
+                    from: S::FurnaceHold,
+                    guard: ApprovalBindsArtifact,
+                    to: T::State(S::Publishing),
+                },
+                EncodedEdge {
+                    event: E::Rejected,
+                    from: S::FurnaceHold,
+                    guard: None,
+                    to: T::State(S::Rejected),
+                },
                 // approval → Shipped 직행 금지 (v3 비평 #1): 엣지 부재가 증명
-                EncodedEdge { event: E::PublishConfirmed, from: S::Publishing, guard: None, to: T::State(S::Shipped) },
-                EncodedEdge { event: E::PublishUnknown, from: S::Publishing, guard: None, to: T::State(S::Unknown) },
+                EncodedEdge {
+                    event: E::PublishConfirmed,
+                    from: S::Publishing,
+                    guard: None,
+                    to: T::State(S::Shipped),
+                },
+                EncodedEdge {
+                    event: E::PublishUnknown,
+                    from: S::Publishing,
+                    guard: None,
+                    to: T::State(S::Unknown),
+                },
                 // hold: UnknownOutcome (정지 — 조정이 재판정)
-                EncodedEdge { event: E::PublishConfirmed, from: S::Unknown, guard: None, to: T::State(S::Shipped) },
-                EncodedEdge { event: E::Rejected, from: S::Unknown, guard: None, to: T::State(S::Rejected) },
+                EncodedEdge {
+                    event: E::PublishConfirmed,
+                    from: S::Unknown,
+                    guard: None,
+                    to: T::State(S::Shipped),
+                },
+                EncodedEdge {
+                    event: E::Rejected,
+                    from: S::Unknown,
+                    guard: None,
+                    to: T::State(S::Rejected),
+                },
                 // ---- cancellation ----
-                EncodedEdge { event: E::Canceled, from: S::Received, guard: None, to: T::State(S::Canceled) },
-                EncodedEdge { event: E::Canceled, from: S::Queued, guard: None, to: T::State(S::Canceled) },
-                EncodedEdge { event: E::CancelRequested, from: S::Working, guard: None, to: T::State(S::Canceling) },
-                EncodedEdge { event: E::CancelRequested, from: S::Publishing, guard: None, to: T::State(S::Canceling) },
-                EncodedEdge { event: E::CancelRequested, from: S::Unknown, guard: None, to: T::State(S::Canceling) },
-                EncodedEdge { event: E::CancelConfirmed, from: S::Canceling, guard: None, to: T::State(S::Canceled) },
+                EncodedEdge {
+                    event: E::Canceled,
+                    from: S::Received,
+                    guard: None,
+                    to: T::State(S::Canceled),
+                },
+                EncodedEdge {
+                    event: E::Canceled,
+                    from: S::Queued,
+                    guard: None,
+                    to: T::State(S::Canceled),
+                },
+                EncodedEdge {
+                    event: E::CancelRequested,
+                    from: S::Working,
+                    guard: None,
+                    to: T::State(S::Canceling),
+                },
+                EncodedEdge {
+                    event: E::CancelRequested,
+                    from: S::Publishing,
+                    guard: None,
+                    to: T::State(S::Canceling),
+                },
+                EncodedEdge {
+                    event: E::CancelRequested,
+                    from: S::Unknown,
+                    guard: None,
+                    to: T::State(S::Canceling),
+                },
+                EncodedEdge {
+                    event: E::CancelConfirmed,
+                    from: S::Canceling,
+                    guard: None,
+                    to: T::State(S::Canceled),
+                },
             ],
             holds: vec![Hold::FurnaceHold, Hold::UnknownOutcome],
         }
@@ -219,7 +345,10 @@ impl EmbeddedWorkflow {
 
     /// (이벤트 패밀리, 원천) 매칭 엣지 전부 — 증명·엔진 공용.
     pub fn edges_matching(&self, ev: &EdgeEvent, from: OrderState) -> Vec<&EncodedEdge> {
-        self.edges.iter().filter(|e| &e.event == ev && e.from == from).collect()
+        self.edges
+            .iter()
+            .filter(|e| &e.event == ev && e.from == from)
+            .collect()
     }
 }
 
@@ -246,7 +375,7 @@ pub fn edge_event_of(ev: &OrderEvent) -> EdgeEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::order::{ExternalRef, Order, MAX_ATTEMPTS};
+    use crate::order::{ExternalRef, MAX_ATTEMPTS, Order};
 
     fn mk(s: OrderState, attempt: u32) -> Order {
         let mut o = Order::new("x".into(), ExternalRef::cron("a", "b"), Default::default());
@@ -256,10 +385,18 @@ mod tests {
 
     fn states() -> Vec<OrderState> {
         vec![
-            OrderState::Received, OrderState::Queued, OrderState::Working,
-            OrderState::Inspecting, OrderState::FurnaceHold, OrderState::Publishing,
-            OrderState::Unknown, OrderState::Shipped, OrderState::Failed,
-            OrderState::Rejected, OrderState::Canceling, OrderState::Canceled,
+            OrderState::Received,
+            OrderState::Queued,
+            OrderState::Working,
+            OrderState::Inspecting,
+            OrderState::FurnaceHold,
+            OrderState::Publishing,
+            OrderState::Unknown,
+            OrderState::Shipped,
+            OrderState::Failed,
+            OrderState::Rejected,
+            OrderState::Canceling,
+            OrderState::Canceled,
         ]
     }
 
@@ -270,17 +407,61 @@ mod tests {
             (OrderEvent::DieStarted, base.max(1)),
             (OrderEvent::DieSucceeded { attempt: base }, 1),
             (OrderEvent::DieSucceeded { attempt: 0 }, 1), // stale 프로브
-            (OrderEvent::DieFailed { attempt: base, reason: "transient".into() }, 1),
-            (OrderEvent::DieFailed { attempt: base.saturating_sub(1), reason: "transient".into() }, 1), // stale 프로브
+            (
+                OrderEvent::DieFailed {
+                    attempt: base,
+                    reason: "transient".into(),
+                },
+                1,
+            ),
+            (
+                OrderEvent::DieFailed {
+                    attempt: base.saturating_sub(1),
+                    reason: "transient".into(),
+                },
+                1,
+            ), // stale 프로브
             (OrderEvent::InspectionPassed, 1),
-            (OrderEvent::ReviewHeld { reason: "review held".into() }, 1),
-            (OrderEvent::InspectionFailed { reason: "lint".into() }, 1),
-            (OrderEvent::InspectionFailed { reason: "no-op: empty".into() }, 1),
-            (OrderEvent::Approved { intent: "i".into(), artifact_digest: "d".into() }, 1),
-            (OrderEvent::Approved { intent: "i".into(), artifact_digest: String::new() }, 1),
+            (
+                OrderEvent::ReviewHeld {
+                    reason: "review held".into(),
+                },
+                1,
+            ),
+            (
+                OrderEvent::InspectionFailed {
+                    reason: "lint".into(),
+                },
+                1,
+            ),
+            (
+                OrderEvent::InspectionFailed {
+                    reason: "no-op: empty".into(),
+                },
+                1,
+            ),
+            (
+                OrderEvent::Approved {
+                    intent: "i".into(),
+                    artifact_digest: "d".into(),
+                },
+                1,
+            ),
+            (
+                OrderEvent::Approved {
+                    intent: "i".into(),
+                    artifact_digest: String::new(),
+                },
+                1,
+            ),
             (OrderEvent::Rejected { intent: "i".into() }, 1),
             (OrderEvent::PublishConfirmed { pr_url: "u".into() }, 1),
-            (OrderEvent::PublishUnknown { operation_id: "op".into() }, 1),
+            (
+                OrderEvent::PublishUnknown {
+                    operation_id: "op".into(),
+                },
+                1,
+            ),
             (OrderEvent::CancelRequested { reason: "r".into() }, 1),
             (OrderEvent::Canceled { reason: "r".into() }, 1),
             (OrderEvent::CancelConfirmed, 1),
@@ -311,17 +492,18 @@ mod tests {
                         // edge's OWN guard to hold for this probe — not just
                         // any edge with the right destination.
                         let dest_ok = matching.iter().any(|e| {
-                            guard_satisfied(&e.guard, &ev, base) && match &e.to {
-                                EdgeTarget::State(t) => {
-                                    *t == reached
-                                        && (o.attempt() == before
-                                            || (e.event == EdgeEvent::DieStarted
-                                                && o.attempt() == before.max(1)))
+                            guard_satisfied(&e.guard, &ev, base)
+                                && match &e.to {
+                                    EdgeTarget::State(t) => {
+                                        *t == reached
+                                            && (o.attempt() == before
+                                                || (e.event == EdgeEvent::DieStarted
+                                                    && o.attempt() == before.max(1)))
+                                    }
+                                    EdgeTarget::BackEdge { to, .. } => {
+                                        *to == reached && o.attempt() == before + 1
+                                    }
                                 }
-                                EdgeTarget::BackEdge { to, .. } => {
-                                    *to == reached && o.attempt() == before + 1
-                                }
-                            }
                         });
                         assert!(
                             dest_ok,
@@ -354,66 +536,119 @@ mod tests {
     fn e3_conjunction_guards_are_load_bearing() {
         // stale DieFailed: 재시도 여지가 있어도(attempt 1 < MAX) 거부
         let mut o = mk(OrderState::Working, 1);
-        assert!(o.transition(OrderEvent::DieFailed { attempt: 0, reason: "x".into() }, 1).is_err());
+        assert!(
+            o.transition(
+                OrderEvent::DieFailed {
+                    attempt: 0,
+                    reason: "x".into()
+                },
+                1
+            )
+            .is_err()
+        );
         // stale DieFailed: MAX여도(attempt 3, payload 2) 거부 — stale 성분
         let mut o = mk(OrderState::Working, MAX_ATTEMPTS);
-        assert!(o
-            .transition(OrderEvent::DieFailed { attempt: MAX_ATTEMPTS - 1, reason: "x".into() }, 1)
-            .is_err());
+        assert!(
+            o.transition(
+                OrderEvent::DieFailed {
+                    attempt: MAX_ATTEMPTS - 1,
+                    reason: "x".into()
+                },
+                1
+            )
+            .is_err()
+        );
         // no-op: 재시도 여지가 있어도(attempt 1) 즉시 종단
         let mut o = mk(OrderState::Inspecting, 1);
         assert_eq!(
-            o.transition(OrderEvent::InspectionFailed { reason: "no-op: empty".into() }, 1).unwrap(),
+            o.transition(
+                OrderEvent::InspectionFailed {
+                    reason: "no-op: empty".into()
+                },
+                1
+            )
+            .unwrap(),
             OrderState::Failed
         );
         // 비 no-op MAX: 종단 (¬no-op ∧ MAX)
         let mut o = mk(OrderState::Inspecting, MAX_ATTEMPTS);
         assert_eq!(
-            o.transition(OrderEvent::InspectionFailed { reason: "lint".into() }, 1).unwrap(),
+            o.transition(
+                OrderEvent::InspectionFailed {
+                    reason: "lint".into()
+                },
+                1
+            )
+            .unwrap(),
             OrderState::Failed
         );
         // 비 no-op 재시도: 백엣지+토큰 (¬no-op ∧ 재시도)
         let mut o = mk(OrderState::Inspecting, 1);
         assert_eq!(
-            o.transition(OrderEvent::InspectionFailed { reason: "lint".into() }, 1).unwrap(),
+            o.transition(
+                OrderEvent::InspectionFailed {
+                    reason: "lint".into()
+                },
+                1
+            )
+            .unwrap(),
             OrderState::Queued
         );
         assert_eq!(o.attempt(), 2, "re-entry token: attempt+1");
         // ApprovalBindsArtifact: 빈 digest 거부
         let mut o = mk(OrderState::FurnaceHold, 1);
-        assert!(o
-            .transition(OrderEvent::Approved { intent: "i".into(), artifact_digest: String::new() }, 1)
-            .is_err());
+        assert!(
+            o.transition(
+                OrderEvent::Approved {
+                    intent: "i".into(),
+                    artifact_digest: String::new()
+                },
+                1
+            )
+            .is_err()
+        );
     }
 
     /// **E4 금지 전이 부재** (v3 비평 #1).
     #[test]
     fn e4_forbidden_edges_absent() {
         let wf = EmbeddedWorkflow::frozen_v1();
-        assert!(!wf.edges.iter().any(|e|
-            e.event == EdgeEvent::Approved && matches!(e.to, EdgeTarget::State(OrderState::Shipped))));
-        assert!(!wf.edges.iter().any(|e|
-            e.event == EdgeEvent::Approved && e.from == OrderState::Publishing));
+        assert!(!wf.edges.iter().any(|e| e.event == EdgeEvent::Approved
+            && matches!(e.to, EdgeTarget::State(OrderState::Shipped))));
+        assert!(
+            !wf.edges
+                .iter()
+                .any(|e| e.event == EdgeEvent::Approved && e.from == OrderState::Publishing)
+        );
     }
 
     /// **E5 결정성**: 같은 스트림 → 같은 전이 흔적.
     #[test]
     fn e5_deterministic_replay_shape() {
         let run = |n: u64| {
-            let mut o = Order::new(format!("o{n}"), ExternalRef::cron("a", "b"), Default::default());
+            let mut o = Order::new(
+                format!("o{n}"),
+                ExternalRef::cron("a", "b"),
+                Default::default(),
+            );
             let evs = [
                 OrderEvent::Queued,
                 OrderEvent::DieStarted,
                 OrderEvent::DieSucceeded { attempt: 1 },
                 OrderEvent::InspectionPassed,
-                OrderEvent::Approved { intent: "i".into(), artifact_digest: "d".into() },
+                OrderEvent::Approved {
+                    intent: "i".into(),
+                    artifact_digest: "d".into(),
+                },
                 OrderEvent::PublishConfirmed { pr_url: "u".into() },
             ];
             evs.iter()
                 .map(|ev| {
                     format!(
                         "{:?}",
-                        o.transition(ev.clone(), 1).map(|s| format!("{s:?}")).map_err(|e| e.to_string())
+                        o.transition(ev.clone(), 1)
+                            .map(|s| format!("{s:?}"))
+                            .map_err(|e| e.to_string())
                     )
                 })
                 .collect::<Vec<_>>()
@@ -428,10 +663,18 @@ mod tests {
         let mut v2 = EmbeddedWorkflow::frozen_v1();
         v2.schema_version = 2;
         assert_ne!(v1.digest(), v2.digest(), "version identity must be covered");
-        assert_eq!(v1.digest(), EmbeddedWorkflow::frozen_v1().digest(), "idempotent");
+        assert_eq!(
+            v1.digest(),
+            EmbeddedWorkflow::frozen_v1().digest(),
+            "idempotent"
+        );
         let mut tampered = EmbeddedWorkflow::frozen_v1();
         tampered.edges[3].guard = Guard::None;
-        assert_ne!(v1.digest(), tampered.digest(), "content change still covered");
+        assert_ne!(
+            v1.digest(),
+            tampered.digest(),
+            "content change still covered"
+        );
     }
 
     /// **E8 (r3 재작)**: 위조 엣지 주입 — **E2와 동일한 검사 루프**를
@@ -479,7 +722,10 @@ mod tests {
             "same-family edge with a contradictory guard must NOT be realizable — the guard filter is load-bearing in the shared checker"
         );
         // 그리고 이 모순 가드 없이는 실현 가능함을 확인 (가드가 거부의 원인)
-        let legitimate = EncodedEdge { guard: Guard::AttemptNotStale, ..guard_evading.clone() };
+        let legitimate = EncodedEdge {
+            guard: Guard::AttemptNotStale,
+            ..guard_evading.clone()
+        };
         assert!(
             edge_realizable(&legitimate, &wf),
             "the same edge with its true guard IS realizable — the family/destination logic is sound"
@@ -503,9 +749,12 @@ mod tests {
                         EdgeTarget::State(t) => {
                             *t == reached
                                 && (o.attempt() == before
-                                    || (e.event == EdgeEvent::DieStarted && o.attempt() == before.max(1)))
+                                    || (e.event == EdgeEvent::DieStarted
+                                        && o.attempt() == before.max(1)))
                         }
-                        EdgeTarget::BackEdge { to, .. } => *to == reached && o.attempt() == before + 1,
+                        EdgeTarget::BackEdge { to, .. } => {
+                            *to == reached && o.attempt() == before + 1
+                        }
                     };
                     if ok {
                         return true;
@@ -531,7 +780,9 @@ mod tests {
                     if matching.is_empty() {
                         continue; // E1 영역 밖 (엣지 없음 = 도메인도 거부해야 — E1이 이미 검증)
                     }
-                    let any_guard_ok = matching.iter().any(|e| guard_satisfied(&e.guard, &ev, base));
+                    let any_guard_ok = matching
+                        .iter()
+                        .any(|e| guard_satisfied(&e.guard, &ev, base));
                     if !any_guard_ok {
                         probes += 1;
                         let mut o = mk(s, base);

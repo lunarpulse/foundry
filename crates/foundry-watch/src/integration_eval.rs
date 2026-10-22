@@ -43,9 +43,13 @@ pub enum IntegrationVerdict {
 
 #[derive(Debug, Clone)]
 pub enum IntegrationError {
-    UnknownBundle { digest: String },
+    UnknownBundle {
+        digest: String,
+    },
     /// candidate output echoes holdout material — leakage evidence
-    HoldoutEcho { item: String },
+    HoldoutEcho {
+        item: String,
+    },
 }
 
 /// Per-item result of the final evaluation, partitioned.
@@ -99,7 +103,13 @@ impl<'a> IntegrationGate<'a> {
             .iter()
             .filter(|e| e.op_id.starts_with("eval:"))
             .count() as u64;
-        IntegrationGate { protocol, bundles, governance, gov_seq, eval_instance }
+        IntegrationGate {
+            protocol,
+            bundles,
+            governance,
+            gov_seq,
+            eval_instance,
+        }
     }
 
     fn gov(&mut self, phase: Phase, op_id: &str, payload: &str) {
@@ -116,11 +126,16 @@ impl<'a> IntegrationGate<'a> {
         });
     }
 
-    pub fn evaluate(&mut self, input: &FinalEvaluationInput) -> Result<IntegrationOutcome, IntegrationError> {
+    pub fn evaluate(
+        &mut self,
+        input: &FinalEvaluationInput,
+    ) -> Result<IntegrationOutcome, IntegrationError> {
         // the bundle must still verify (consumption-time, T46)
         self.bundles
             .get_verified(&input.bundle_digest)
-            .map_err(|_| IntegrationError::UnknownBundle { digest: input.bundle_digest.clone() })?;
+            .map_err(|_| IntegrationError::UnknownBundle {
+                digest: input.bundle_digest.clone(),
+            })?;
 
         // op_id = the OPERATION INSTANCE (T45 lesson: one op_id = one
         // intent/effect pair). The same bundle can be evaluated many
@@ -150,7 +165,9 @@ impl<'a> IntegrationGate<'a> {
         // memorizer pass) ...
         for it in &input.items {
             if !holdout.contains(it.manifest.as_str()) {
-                let err = IntegrationError::HoldoutEcho { item: it.manifest.clone() };
+                let err = IntegrationError::HoldoutEcho {
+                    item: it.manifest.clone(),
+                };
                 self.gov(Phase::Aborted, &op_id, &payload);
                 return Err(err);
             }
@@ -160,7 +177,9 @@ impl<'a> IntegrationGate<'a> {
         for it in &input.items {
             for h in &holdout {
                 if it.output_excerpt.contains(h) && h != &it.manifest.as_str() {
-                    let err = IntegrationError::HoldoutEcho { item: format!("{} echoes {}", it.manifest, h) };
+                    let err = IntegrationError::HoldoutEcho {
+                        item: format!("{} echoes {}", it.manifest, h),
+                    };
                     self.gov(Phase::Aborted, &op_id, &payload);
                     return Err(err);
                 }
@@ -183,12 +202,19 @@ impl<'a> IntegrationGate<'a> {
         }
 
         // AXIS 1 — guardrails (M3 pass-through, same veto semantics)
-        if !input.new_serious_failure_classes.is_empty() || input.shipped_to_failed_regressions > 0 {
+        if !input.new_serious_failure_classes.is_empty() || input.shipped_to_failed_regressions > 0
+        {
             let out = IntegrationOutcome {
                 verdict: IntegrationVerdict::Refused,
                 reasons: vec![
-                    format!("guardrail: serious classes {:?}", input.new_serious_failure_classes),
-                    format!("guardrail: {} regression(s)", input.shipped_to_failed_regressions),
+                    format!(
+                        "guardrail: serious classes {:?}",
+                        input.new_serious_failure_classes
+                    ),
+                    format!(
+                        "guardrail: {} regression(s)",
+                        input.shipped_to_failed_regressions
+                    ),
                 ]
                 .into_iter()
                 .filter(|r| !r.ends_with("0 regression(s)"))
@@ -219,7 +245,9 @@ impl<'a> IntegrationGate<'a> {
         let _ = train; // train manifests are never consulted at final eval
         let out = IntegrationOutcome {
             verdict: IntegrationVerdict::Promotable,
-            reasons: vec![format!("guardrails clean; {holdout_pass}/{holdout_total} holdout pass — transfer demonstrated")],
+            reasons: vec![format!(
+                "guardrails clean; {holdout_pass}/{holdout_total} holdout pass — transfer demonstrated"
+            )],
             protocol_digest: payload.clone(),
         };
         self.gov(Phase::Committed, &op_id, &payload);
@@ -248,10 +276,19 @@ mod tests {
     fn bundle_in(store: &mut BundleStore) -> String {
         let b = CandidateBundle::build(
             "cand-i1",
-            BundleProfile { model: "m".into(), temperature: Some(0.0), seed: Some(1), max_output_tokens: 8 },
+            BundleProfile {
+                model: "m".into(),
+                temperature: Some(0.0),
+                seed: Some(1),
+                max_output_tokens: 8,
+            },
             "p",
             vec![],
-            DependencyPins { image_digest: "i".into(), tool_digests: Default::default(), model_revision: Some("r".into()) },
+            DependencyPins {
+                image_digest: "i".into(),
+                tool_digests: Default::default(),
+                model_revision: Some("r".into()),
+            },
         )
         .unwrap();
         store.put(b)
@@ -261,7 +298,11 @@ mod tests {
         ["m-hold-1", "m-hold-2", "m-hold-3"]
             .iter()
             .zip(pass)
-            .map(|(m, p)| ItemResult { manifest: m.to_string(), passed: *p, output_excerpt: format!("out for {m}") })
+            .map(|(m, p)| ItemResult {
+                manifest: m.to_string(),
+                passed: *p,
+                output_excerpt: format!("out for {m}"),
+            })
             .collect()
     }
 
@@ -303,7 +344,10 @@ mod tests {
         assert_eq!(out.verdict, IntegrationVerdict::Refused);
         let mut i2 = input(&d, &[true, true, true]);
         i2.shipped_to_failed_regressions = 2;
-        assert_eq!(gate.evaluate(&i2).unwrap().verdict, IntegrationVerdict::Refused);
+        assert_eq!(
+            gate.evaluate(&i2).unwrap().verdict,
+            IntegrationVerdict::Refused
+        );
     }
 
     #[test]
@@ -313,7 +357,11 @@ mod tests {
         let (p, mut g) = (protocol(), Vec::new());
         let mut gate = IntegrationGate::new(&p, &bs, &mut g);
         let mut i = input(&d, &[true, true, true]);
-        i.items[0] = ItemResult { manifest: "m-train-1".into(), passed: true, output_excerpt: "x".into() };
+        i.items[0] = ItemResult {
+            manifest: "m-train-1".into(),
+            passed: true,
+            output_excerpt: "x".into(),
+        };
         assert!(matches!(
             gate.evaluate(&i),
             Err(IntegrationError::HoldoutEcho { .. })
@@ -356,10 +404,19 @@ mod tests {
         // tamper: same key, different bundle
         let b2 = CandidateBundle::build(
             "cand-i1",
-            BundleProfile { model: "m".into(), temperature: Some(0.0), seed: Some(1), max_output_tokens: 8 },
+            BundleProfile {
+                model: "m".into(),
+                temperature: Some(0.0),
+                seed: Some(1),
+                max_output_tokens: 8,
+            },
             "p EVIL",
             vec![],
-            DependencyPins { image_digest: "i".into(), tool_digests: Default::default(), model_revision: Some("r".into()) },
+            DependencyPins {
+                image_digest: "i".into(),
+                tool_digests: Default::default(),
+                model_revision: Some("r".into()),
+            },
         )
         .unwrap();
         bs.put(b2);
@@ -386,7 +443,9 @@ mod tests {
             let mut gate = IntegrationGate::new(&p, &bs, &mut g);
             gate.evaluate(&input(&d, &[false, false, false])).unwrap();
         }
-        assert!(crate::governance_events::verify_stream(&g).is_ok(),
-            "both evaluations verify as paired events");
+        assert!(
+            crate::governance_events::verify_stream(&g).is_ok(),
+            "both evaluations verify as paired events"
+        );
     }
 }

@@ -28,6 +28,10 @@
   dialog::backdrop { background:rgba(0,0,0,.6); }
   pre { background:#10131a; border:1px solid var(--line); border-radius:6px; padding:10px; font-size:11.5px; overflow:auto; max-height:60vh; }
   #banner { display:none; background:#3b2a10; color:#f5c451; padding:6px 20px; font-size:12px; }
+  input, button { background:#10131a; color:var(--txt); border:1px solid var(--line); border-radius:5px; padding:8px; font:inherit; }
+  button { cursor:pointer; }
+  #product-login { max-width:440px; margin:8vh auto; padding:18px; background:var(--card); border:1px solid var(--line); border-radius:8px; }
+  #product-login form { display:grid; gap:10px; }
 </style>
 </head>
 <body>
@@ -42,6 +46,62 @@
 <script>
 const COLS = ["received","queued","working","review","waiting","publishing","shipped","unknown","failed","rejected","canceling","canceled"];
 const LABEL = {received:"Received",queued:"Queued",working:"Working",review:"Inspecting",waiting:"FurnaceHold",publishing:"Publishing",shipped:"Shipped",unknown:"Unknown",failed:"Failed",rejected:"Rejected",canceling:"Canceling",canceled:"Canceled"};
+let productMode = false;
+let productBearer = null; // deliberately memory-only; a reload requires a new login
+
+async function detectProductMode(){
+  const response = await fetch("/api/product/session");
+  if (response.status === 404) return false;
+  productMode = true;
+  renderProductLogin();
+  return true;
+}
+
+function renderProductLogin(message=""){
+  const board=document.getElementById("board");
+  board.style.display="block";
+  board.innerHTML = `<section id="product-login"><h2>Foundry Product</h2><p>Bearer credentials stay in this page's memory. Reloading requires a new login.</p><form id="login-form"><input name="actor_id" autocomplete="username" placeholder="Account" required maxlength="256"><input name="password" type="password" autocomplete="current-password" placeholder="Password" required maxlength="1024"><button>Sign in</button></form><p id="login-error">${esc(message)}</p></section>`;
+  document.getElementById("login-form").onsubmit=async e=>{
+    e.preventDefault();
+    const form=new FormData(e.currentTarget);
+    const response=await fetch("/api/product/login",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({actor_id:form.get("actor_id"),password:form.get("password")})});
+    const data=await response.json().catch(()=>({}));
+    e.currentTarget.reset();
+    if(!response.ok){document.getElementById("login-error").textContent="Authentication failed";return;}
+    productBearer=data.access_token;
+    showProductUnavailable();
+  };
+}
+
+function showProductUnavailable(){
+  const board=document.getElementById("board"); board.style.display="block";
+  board.innerHTML=`<section id="product-login"><h2>Product session active</h2><p>Bearer credentials remain in memory. Refresh this page to sign in again.</p><div id="product-holds">Loading active review holds…</div><button id="refresh-holds">Refresh</button> <button id="logout">Sign out</button><p id="login-error"></p></section>`;
+  document.getElementById("refresh-holds").onclick=loadProductHolds;
+  loadProductHolds();
+  document.getElementById("logout").onclick=async()=>{
+    await fetch("/api/product/logout",{method:"POST",headers:{authorization:`Bearer ${productBearer}`}});
+    productBearer=null; renderProductLogin("Signed out");
+  };
+}
+
+async function loadProductHolds(){
+  const host=document.getElementById("product-holds"); if(!host||!productBearer)return;
+  const response=await fetch("/api/product/review/holds",{headers:{authorization:`Bearer ${productBearer}`}});
+  if(!response.ok){host.textContent=response.status===401?"Session expired; sign in again.":"Review holds unavailable for this account.";return;}
+  const data=await response.json();
+  if(!data.holds?.length){host.textContent="No active review holds.";return;}
+  host.innerHTML=data.holds.map((h,i)=>`<article class="card waiting" data-hold-index="${i}"><b>${esc(h.order_id)}</b> · ${esc(h.hold_instance_id)}<br><small>lifecycle ${h.expectation.lifecycle}, attempt ${h.expectation.attempt}, run ${h.expectation.originating_run} · ${esc(h.deadline)}</small>${h.allowed_targets.length?`<div><select class="resume-target">${h.allowed_targets.map(t=>`<option value="${esc(t)}">${esc(t)}</option>`).join("")}</select> <button data-decision="resume">Resume</button></div>`:""}<div><button data-decision="commit_pass">Commit pass</button> <button data-decision="commit_fail">Commit fail</button> <button data-decision="abort">Abort</button></div></article>`).join("");
+  host.querySelectorAll("[data-decision]").forEach(button=>button.onclick=async()=>{
+    const card=button.closest("[data-hold-index]"), hold=data.holds[Number(card.dataset.holdIndex)];
+    const decision=button.dataset.decision, target=card.querySelector(".resume-target")?.value;
+    const headers={authorization:`Bearer ${productBearer}`,"content-type":"application/json","idempotency-key":crypto.randomUUID()};
+    const result=await fetch(`/api/product/orders/${encodeURIComponent(hold.order_id)}/review/holds/${encodeURIComponent(hold.hold_instance_id)}/accept`,{method:"POST",headers,body:JSON.stringify({expected:hold.expectation,decision,target:decision==="resume"?target:null})});
+    const body=await result.json().catch(()=>({}));
+    const message=document.getElementById("login-error");
+    message.textContent=body.progress?`Decision ${body.progress.phase}; operation ${body.receipt.operation_id}`:(result.ok?`Decision accepted; operation ${body.receipt?.operation_id??"unknown"}`:"Decision unavailable; the hold may have changed.");
+    await loadProductHolds();
+  });
+}
 
 async function tick(){
   try {
@@ -89,7 +149,7 @@ async function openOrder(id){
 }
 function esc(s){ const d=document.createElement("div"); d.textContent=s??""; return d.innerHTML; }
 document.getElementById("dlg").onclick=e=>{ if(e.target.id==="dlg") e.target.close(); };
-tick(); setInterval(tick, 3000);
+detectProductMode().then(isProduct=>{ if(!isProduct){tick();setInterval(tick,3000);} }).catch(()=>{tick();setInterval(tick,3000);});
 </script>
 </body>
 </html>

@@ -61,11 +61,14 @@ impl RecoveryRunner {
             .map_err(|e| RecoveryError::Ledger(format!("{e:?}")))?;
 
         // (3) 엔진 재구축 — 상태·attempt 만 (신규 실행 의미론).
-        let rebuilt_orders = engine
-            .rebuild(journal)
-            .map_err(RecoveryError::Rebuild)?;
+        let rebuilt_orders = engine.rebuild(journal).map_err(RecoveryError::Rebuild)?;
 
-        Ok(RecoveryReport { released, consumed, journal_verified, rebuilt_orders })
+        Ok(RecoveryReport {
+            released,
+            consumed,
+            journal_verified,
+            rebuilt_orders,
+        })
     }
 
     /// (M7 T58 astra r4) **스캔 없는** 재구축 — 회복 코디네이터가 전역
@@ -79,9 +82,7 @@ impl RecoveryRunner {
         let journal_verified = journal
             .verify_chain()
             .map_err(|e| RecoveryError::Ledger(format!("{e:?}")))?;
-        let rebuilt_orders = engine
-            .rebuild(journal)
-            .map_err(RecoveryError::Rebuild)?;
+        let rebuilt_orders = engine.rebuild(journal).map_err(RecoveryError::Rebuild)?;
         Ok(RecoveryReport {
             released: Vec::new(),
             consumed: Vec::new(),

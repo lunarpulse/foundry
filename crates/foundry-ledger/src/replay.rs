@@ -52,6 +52,59 @@ pub struct ReplayedOrder {
     pub last_seq: i64,
 }
 
+/// Domain-transition verifier for a cursor already grouped by (order_id,
+/// seq). The caller must independently verify the complete seq-ordered S1
+/// hash chain first. Unlike `replay`, this retains only the current order's
+/// lifecycle state and emits no materialized lifecycle history.
+pub(crate) struct GroupedOrderVerifier {
+    current_order_id: Option<String>,
+    current_order: Option<Order>,
+    lifecycle: u32,
+    rows_seen: usize,
+    peak_order_states: usize,
+}
+
+impl GroupedOrderVerifier {
+    pub(crate) fn new() -> Self {
+        Self {
+            current_order_id: None,
+            current_order: None,
+            lifecycle: 0,
+            rows_seen: 0,
+            peak_order_states: 0,
+        }
+    }
+
+    pub(crate) fn push(&mut self, row: &LedgerRow) -> Result<(), ReplayError> {
+        if self.current_order_id.as_deref() != Some(row.order_id.as_str()) {
+            self.current_order_id = Some(row.order_id.clone());
+            self.lifecycle = 0;
+            self.current_order = Some(new_order(row));
+        } else if row.from_state == "received" {
+            self.lifecycle = self.lifecycle.saturating_add(1);
+            self.current_order = Some(new_order(row));
+        }
+        let current = self
+            .current_order
+            .as_mut()
+            .expect("order initialized above");
+        apply_transition(current, row)?;
+        self.rows_seen = self.rows_seen.saturating_add(1);
+        self.peak_order_states = self
+            .peak_order_states
+            .max(usize::from(self.current_order.is_some()));
+        Ok(())
+    }
+
+    pub(crate) fn rows_seen(&self) -> usize {
+        self.rows_seen
+    }
+
+    pub(crate) fn peak_order_states(&self) -> usize {
+        self.peak_order_states
+    }
+}
+
 /// Display-string → OrderState (reverse of the Display impl; replaces the
 /// hardcoded 12-arm match tables — the kanban column list stays 1:1).
 pub fn state_from_display(s: &str) -> Option<OrderState> {
@@ -116,36 +169,32 @@ pub fn replay(
                 started_seq: r.seq,
                 last_seq: r.seq,
             });
-        let ev = decode_event(&r.event, &r.intent, cur.order.attempt());
-        // live lifecycle: enforce via the real state machine
-        let ev = match ev {
-            Some(ev) => ev,
-            None => {
-                return Err(ReplayError::UnknownSchemaVersion {
-                    at_seq: r.seq,
-                    detail: r.event.clone(),
-                });
-            }
-        };
-        let ea = event_attempt(&r.event).unwrap_or_else(|| cur.order.attempt().max(1));
-        match cur.order.transition(ev, ea) {
-            Ok(_) => {
-                cur.last_seq = r.seq;
-            }
-            Err(e) => {
-                return Err(ReplayError::IllegalRow {
-                    order_id: r.order_id.clone(),
-                    seq: r.seq,
-                    err: e.to_string(),
-                });
-            }
-        }
+        apply_transition(&mut cur.order, r)?;
+        cur.last_seq = r.seq;
     }
     let mut remaining: Vec<ReplayedOrder> = pending.into_values().collect();
     remaining.sort_by_key(|o| o.started_seq);
     out.extend(remaining);
     out.sort_by_key(|o| (o.started_seq, o.lifecycle));
     Ok(out)
+}
+
+fn apply_transition(order: &mut Order, row: &LedgerRow) -> Result<(), ReplayError> {
+    let ev = decode_event(&row.event, &row.intent, order.attempt()).ok_or_else(|| {
+        ReplayError::UnknownSchemaVersion {
+            at_seq: row.seq,
+            detail: row.event.clone(),
+        }
+    })?;
+    let attempt = event_attempt(&row.event).unwrap_or_else(|| order.attempt().max(1));
+    order
+        .transition(ev, attempt)
+        .map(|_| ())
+        .map_err(|err| ReplayError::IllegalRow {
+            order_id: row.order_id.clone(),
+            seq: row.seq,
+            err: err.to_string(),
+        })
 }
 
 fn lifecycle_count(done: &[ReplayedOrder], oid: &str) -> u32 {
@@ -202,7 +251,9 @@ pub(crate) fn decode_event(repr: &str, intent: &str, ctx_attempt: u32) -> Option
             reason: intent.to_string(),
         },
         "InspectionPassed" => OrderEvent::InspectionPassed,
-        "ReviewHeld" => OrderEvent::ReviewHeld { reason: intent.to_string() },
+        "ReviewHeld" => OrderEvent::ReviewHeld {
+            reason: intent.to_string(),
+        },
         "InspectionFailed" => OrderEvent::InspectionFailed {
             reason: intent.to_string(),
         },
@@ -338,6 +389,50 @@ mod tests {
         assert_eq!(out[0].order.state(), OrderState::Shipped);
         assert_eq!(out[1].order.state(), OrderState::Working);
         assert_eq!(out[1].lifecycle, 1);
+    }
+
+    #[test]
+    fn grouped_verifier_matches_replay_for_multiple_lifecycles_and_rejects_bad_events() {
+        let rows = vec![
+            row(1, "o-1:ts", "received", "queued", "Queued"),
+            row(2, "o-1:ts", "queued", "working", "DieStarted"),
+            row(
+                3,
+                "o-1:ts",
+                "working",
+                "review",
+                "DieSucceeded { attempt: 1 }",
+            ),
+            row(4, "o-1:ts", "review", "waiting", "InspectionPassed"),
+            row(
+                5,
+                "o-1:ts",
+                "waiting",
+                "publishing",
+                "Approved { intent: \"x\", artifact_digest: \"d\" }",
+            ),
+            row(
+                6,
+                "o-1:ts",
+                "publishing",
+                "shipped",
+                "PublishConfirmed { pr_url: \"https://x/1\" }",
+            ),
+            row(7, "o-1:ts", "received", "queued", "Queued"),
+            row(8, "o-1:ts", "queued", "working", "DieStarted"),
+        ];
+        let replayed = replay(&rows, ok_chain).unwrap();
+        let mut grouped = GroupedOrderVerifier::new();
+        for row in &rows {
+            grouped.push(row).unwrap();
+        }
+        assert_eq!(grouped.rows_seen(), rows.len());
+        assert_eq!(grouped.peak_order_states(), 1);
+        assert_eq!(replayed.len(), 2);
+        assert_eq!(replayed[1].lifecycle, 1);
+
+        let invalid = row(9, "o-1:ts", "working", "shipped", "NotAnOrderEvent");
+        assert!(grouped.push(&invalid).is_err());
     }
 
     #[test]

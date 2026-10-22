@@ -25,7 +25,7 @@
 //!   governance (T49a): CandidateSynthesize rides the intent/effect
 //!                    commit protocol — crash mid-synthesis leaves a
 //!                    detectable pending intent.
-use crate::budget_accounting::{Amount, BudgetError, BudgetLedger, BudgetEvent};
+use crate::budget_accounting::{Amount, BudgetError, BudgetEvent, BudgetLedger};
 use crate::bundles::{BundleProfile, BundleStore, CandidateBundle, DependencyPins, LessonSnapshot};
 use crate::evaluation_protocol::{EvaluationProtocol, Partition};
 use crate::governance_events::{GovernanceEvent, OpKind, Phase};
@@ -85,7 +85,14 @@ impl<'a> Synthesizer<'a> {
         governance: &'a mut Vec<GovernanceEvent>,
     ) -> Self {
         let gov_seq = governance.last().map(|e| e.seq).unwrap_or(0);
-        Synthesizer { lessons, protocol, budgets, bundles, governance, gov_seq }
+        Synthesizer {
+            lessons,
+            protocol,
+            budgets,
+            bundles,
+            governance,
+            gov_seq,
+        }
     }
 
     fn gov(&mut self, op: OpKind, phase: Phase, op_id: &str, payload: &str) {
@@ -118,7 +125,9 @@ impl<'a> Synthesizer<'a> {
         let mut out = Vec::new();
         for id in ids {
             let rec = self.lessons.store_get(id).ok_or_else(|| {
-                SynthesisError::BundleRule(format!("lesson {id} unknown — mutable references uninterpretable"))
+                SynthesisError::BundleRule(format!(
+                    "lesson {id} unknown — mutable references uninterpretable"
+                ))
             })?;
             match &rec.state {
                 LessonState::Active => {
@@ -171,7 +180,12 @@ impl<'a> Synthesizer<'a> {
             })?;
 
         // governance intent BEFORE the effect exists
-        self.gov(OpKind::CandidateSynthesize, Phase::Pending, &op_id, &payload);
+        self.gov(
+            OpKind::CandidateSynthesize,
+            Phase::Pending,
+            &op_id,
+            &payload,
+        );
 
         // 2. PROTOCOL (T48a): synthesis must not address the holdout.
         //    The request itself carries no manifests — but we prove
@@ -183,7 +197,12 @@ impl<'a> Synthesizer<'a> {
                 let err = SynthesisError::HoldoutNotAddressable {
                     detail: format!("prompt template references holdout manifest {d}"),
                 };
-                self.gov(OpKind::CandidateSynthesize, Phase::Aborted, &op_id, &payload);
+                self.gov(
+                    OpKind::CandidateSynthesize,
+                    Phase::Aborted,
+                    &op_id,
+                    &payload,
+                );
                 return Err(err);
             }
         }
@@ -193,11 +212,23 @@ impl<'a> Synthesizer<'a> {
 
         // 4. OUTPUT SCREEN (defense in depth): the assembled prompt is
         //    what ships — re-screen the concatenated content
-        let assembled = format!("{}{}", req.prompt_template, snapshots.iter().map(|s| s.content.as_str()).collect::<String>());
+        let assembled = format!(
+            "{}{}",
+            req.prompt_template,
+            snapshots
+                .iter()
+                .map(|s| s.content.as_str())
+                .collect::<String>()
+        );
         for d in &holdouts {
             if assembled.contains(d.as_str()) {
                 let err = SynthesisError::OutputContaminated { digest: d.clone() };
-                self.gov(OpKind::CandidateSynthesize, Phase::Aborted, &op_id, &payload);
+                self.gov(
+                    OpKind::CandidateSynthesize,
+                    Phase::Aborted,
+                    &op_id,
+                    &payload,
+                );
                 return Err(err);
             }
         }
@@ -205,8 +236,16 @@ impl<'a> Synthesizer<'a> {
         // 5. SPEND SETTLEMENT FIRST (T44a): reject overspend BEFORE the
         //    bundle ships — an aborted synthesis must leave no artifact
         if actual_spend > req.quoted_spend {
-            let err = SynthesisError::SpendExceedsReservation { used: actual_spend, reserved: req.quoted_spend };
-            self.gov(OpKind::CandidateSynthesize, Phase::Aborted, &op_id, &payload);
+            let err = SynthesisError::SpendExceedsReservation {
+                used: actual_spend,
+                reserved: req.quoted_spend,
+            };
+            self.gov(
+                OpKind::CandidateSynthesize,
+                Phase::Aborted,
+                &op_id,
+                &payload,
+            );
             return Err(err);
         }
 
@@ -220,7 +259,12 @@ impl<'a> Synthesizer<'a> {
             pins,
         )
         .map_err(|e| {
-            self.gov(OpKind::CandidateSynthesize, Phase::Aborted, &op_id, &payload);
+            self.gov(
+                OpKind::CandidateSynthesize,
+                Phase::Aborted,
+                &op_id,
+                &payload,
+            );
             SynthesisError::BundleRule(format!("{e:?}"))
         })?;
         let digest = self.bundles.put(bundle);
@@ -229,8 +273,16 @@ impl<'a> Synthesizer<'a> {
             .expect("commit <= reservation is structurally admitted");
 
         // governance effect: the candidate exists
-        self.gov(OpKind::CandidateSynthesize, Phase::Committed, &op_id, &payload);
-        Ok(SynthesisOutcome { bundle_digest: digest, actual_spend })
+        self.gov(
+            OpKind::CandidateSynthesize,
+            Phase::Committed,
+            &op_id,
+            &payload,
+        );
+        Ok(SynthesisOutcome {
+            bundle_digest: digest,
+            actual_spend,
+        })
     }
 }
 
@@ -269,21 +321,36 @@ mod tests {
             holdout_digests: BTreeSet::new(),
         };
         let _ = mk("L1", "prefer map_err over unwrap");
-        s.seal(mk("L1", "prefer map_err over unwrap"), "sha").unwrap();
+        s.seal(mk("L1", "prefer map_err over unwrap"), "sha")
+            .unwrap();
         s.seal(mk("L2", "keep diffs minimal"), "sha").unwrap();
         s
     }
 
-    fn setup() -> (LessonStore, EvaluationProtocol, BudgetLedger, BundleStore, Vec<GovernanceEvent>) {
+    fn setup() -> (
+        LessonStore,
+        EvaluationProtocol,
+        BudgetLedger,
+        BundleStore,
+        Vec<GovernanceEvent>,
+    ) {
         let mut b = BudgetLedger::new();
-        let e = BudgetEvent::SetLimit { scope: vec!["factory".into(), "casting".into(), "lineage-s1".into()], amount: Amount::pts(500) };
+        let e = BudgetEvent::SetLimit {
+            scope: vec!["factory".into(), "casting".into(), "lineage-s1".into()],
+            amount: Amount::pts(500),
+        };
         b.apply(e.clone()).unwrap();
         b.journal.push(e);
         (lessons(), protocol(), b, BundleStore::default(), Vec::new())
     }
 
     fn profile() -> BundleProfile {
-        BundleProfile { model: "deepseek-v4".into(), temperature: Some(0.0), seed: Some(7), max_output_tokens: 4096 }
+        BundleProfile {
+            model: "deepseek-v4".into(),
+            temperature: Some(0.0),
+            seed: Some(7),
+            max_output_tokens: 4096,
+        }
     }
 
     fn pins() -> DependencyPins {
@@ -315,7 +382,10 @@ mod tests {
         let bundle = bs.get_verified(&out.bundle_digest).unwrap();
         assert_eq!(bundle.lessons.len(), 2);
         // budget settled to ACTUALS: 60 of 100 quoted
-        assert_eq!(b.available(&["factory", "casting", "lineage-s1"]), Some(440));
+        assert_eq!(
+            b.available(&["factory", "casting", "lineage-s1"]),
+            Some(440)
+        );
         // governance: pending + committed with identical payload
         let kinds: Vec<_> = g.iter().map(|e| (e.op, e.phase)).collect();
         assert!(kinds.contains(&(OpKind::CandidateSynthesize, Phase::Pending)));
@@ -327,7 +397,12 @@ mod tests {
     fn no_budget_no_synthesis() {
         let (l, p, mut b, mut bs, mut g) = setup();
         // exhaust the lineage first
-        b.try_reserve("other/run", &["factory", "casting", "lineage-s1", "run-other"], Amount::pts(500)).unwrap();
+        b.try_reserve(
+            "other/run",
+            &["factory", "casting", "lineage-s1", "run-other"],
+            Amount::pts(500),
+        )
+        .unwrap();
         let mut synth = Synthesizer::new(&l, &p, &mut b, &mut bs, &mut g);
         let mut r = req();
         r.run = "run-s2".into();
@@ -343,16 +418,25 @@ mod tests {
         // revoke L2 through the store's own path
         struct NoIndex;
         impl crate::lessons::BundleIndex for NoIndex {
-            fn lessons_of_candidate(&self, _: &str) -> Vec<String> { vec![] }
-            fn token_binding(&self, _: &str) -> Option<String> { None }
-            fn active_candidates(&self) -> Vec<String> { vec![] }
+            fn lessons_of_candidate(&self, _: &str) -> Vec<String> {
+                vec![]
+            }
+            fn token_binding(&self, _: &str) -> Option<String> {
+                None
+            }
+            fn active_candidates(&self) -> Vec<String> {
+                vec![]
+            }
         }
         let mut l2 = l;
         l2.revoke("L2", "obsolete", &NoIndex, &[], &[]).unwrap();
         let mut synth = Synthesizer::new(&l2, &p, &mut b, &mut bs, &mut g);
         let err = synth.synthesize(&req(), pins(), 10).unwrap_err();
         let detail = format!("{err:?}");
-        assert!(matches!(err, SynthesisError::BundleRule(m) if m.contains("revoked")), "fail loud, not silent skip: {detail}");
+        assert!(
+            matches!(err, SynthesisError::BundleRule(m) if m.contains("revoked")),
+            "fail loud, not silent skip: {detail}"
+        );
     }
 
     #[test]
@@ -388,7 +472,10 @@ mod tests {
         let mut synth = Synthesizer::new(&l, &p, &mut b, &mut bs, &mut g);
         assert!(matches!(
             synth.synthesize(&req(), pins(), 101),
-            Err(SynthesisError::SpendExceedsReservation { used: 101, reserved: 100 })
+            Err(SynthesisError::SpendExceedsReservation {
+                used: 101,
+                reserved: 100
+            })
         ));
         // reservation still held by the pending op — recovery (T49a)
         // aborts it; nothing shipped

@@ -13,7 +13,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use foundry_domain::ports::{NotifyEvent, Notifier, PortError, PortResult};
+use foundry_domain::ports::{Notifier, NotifyEvent, PortError, PortResult};
 
 // ─── 전송 결과 ────────────────────────────────────────────────
 
@@ -172,7 +172,12 @@ impl<R: EventRenderer, E: PlatformBodyEncoder> WebhookNotifier<R, E> {
     }
 
     /// 테스트 시임: 이미 만들어진 Client 주입(생성 카운트 검증용).
-    pub fn with_client(webhook_url: Option<String>, renderer: R, encoder: E, c: reqwest::blocking::Client) -> Self {
+    pub fn with_client(
+        webhook_url: Option<String>,
+        renderer: R,
+        encoder: E,
+        c: reqwest::blocking::Client,
+    ) -> Self {
         Self {
             webhook_url,
             renderer,
@@ -364,11 +369,21 @@ mod tests {
         let tmp = tmpdir("v2");
         let mut n = DiscordNotifier::from_env_at(tmp.join("notifier.env"));
         assert_eq!(n.send("hi"), NotifyOutcome::Disabled);
-        n.notify(NotifyEvent::FurnaceHold { order_id: "o-1".into(), digest: "abc123".into() })
-            .ok();
-        n.notify(NotifyEvent::Shipped { order_id: "o-1".into(), pr_url: "https://x/pr/1".into() })
-            .ok();
-        n.notify(NotifyEvent::Failed { order_id: "o-1".into(), reason: "boom".into() }).ok();
+        n.notify(NotifyEvent::FurnaceHold {
+            order_id: "o-1".into(),
+            digest: "abc123".into(),
+        })
+        .ok();
+        n.notify(NotifyEvent::Shipped {
+            order_id: "o-1".into(),
+            pr_url: "https://x/pr/1".into(),
+        })
+        .ok();
+        n.notify(NotifyEvent::Failed {
+            order_id: "o-1".into(),
+            reason: "boom".into(),
+        })
+        .ok();
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -381,7 +396,10 @@ mod tests {
         )
         .unwrap();
         let n = DiscordNotifier::from_env_at(tmp.join("notifier.env"));
-        assert_eq!(n.webhook_url(), Some("https://discord.com/api/webhooks/1/x"));
+        assert_eq!(
+            n.webhook_url(),
+            Some("https://discord.com/api/webhooks/1/x")
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -458,7 +476,11 @@ mod tests {
         let mut n = DiscordNotifier::with_client(None, DiscordRenderer, DiscordEncoder, c);
         assert_eq!(n.client_state_tag(), "ready");
         for _ in 0..3 {
-            n.notify(NotifyEvent::Shipped { order_id: "o".into(), pr_url: "u".into() }).ok();
+            n.notify(NotifyEvent::Shipped {
+                order_id: "o".into(),
+                pr_url: "u".into(),
+            })
+            .ok();
         }
         assert_eq!(n.client_state_tag(), "ready");
     }
@@ -466,11 +488,13 @@ mod tests {
     #[test]
     fn lifecycle_drained_rejects_then_double_drain_noop() {
         let c = reqwest::blocking::Client::builder().build().unwrap();
-        let mut n =
-            DiscordNotifier::with_client(None, DiscordRenderer, DiscordEncoder, c);
+        let mut n = DiscordNotifier::with_client(None, DiscordRenderer, DiscordEncoder, c);
         n.drain();
         assert_eq!(n.client_state_tag(), "drained");
-        let e = n.notify(NotifyEvent::Shipped { order_id: "o".into(), pr_url: "u".into() });
+        let e = n.notify(NotifyEvent::Shipped {
+            order_id: "o".into(),
+            pr_url: "u".into(),
+        });
         assert!(e.is_err());
         n.drain(); // 이중 drain no-op
         assert_eq!(n.client_state_tag(), "drained");
@@ -488,7 +512,11 @@ mod tests {
     fn lifecycle_disabled_never_builds_client() {
         // Fresh + 웹훅 None → Disabled 반환, Client 생성 없음(상태 Fresh 유지).
         let mut n = DiscordNotifier::new(None, DiscordRenderer, DiscordEncoder);
-        n.notify(NotifyEvent::Shipped { order_id: "o".into(), pr_url: "u".into() }).unwrap();
+        n.notify(NotifyEvent::Shipped {
+            order_id: "o".into(),
+            pr_url: "u".into(),
+        })
+        .unwrap();
         assert_eq!(n.client_state_tag(), "fresh");
     }
 }
@@ -585,8 +613,11 @@ mod fanout_tests {
     #[test]
     fn console_notifier_renders_without_resources() {
         let mut c = ConsoleNotifier;
-        c.notify(NotifyEvent::FurnaceHold { order_id: "o".into(), digest: "d".into() })
-            .unwrap();
+        c.notify(NotifyEvent::FurnaceHold {
+            order_id: "o".into(),
+            digest: "d".into(),
+        })
+        .unwrap();
         c.drain(); // no-op
     }
 }

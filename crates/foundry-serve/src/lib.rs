@@ -6,21 +6,29 @@
 //! knows which ledger state it is looking at. No orders table — the
 //! journal==state invariant is structural, not maintained.
 
+pub mod approval_service;
 pub mod approve;
-pub mod audit_report;
 pub mod approve_v2;
+pub mod artifact_http;
+pub mod audit_report;
+pub mod auth_http;
+pub mod export_http;
 pub mod fake_noop;
 pub mod health;
 pub mod http;
 pub mod identity;
-pub mod review_hold;
 pub mod policy_http;
-pub mod serve_wiring;
 pub mod privacy;
 pub mod read_guard;
+pub mod review_hold;
 pub mod scope;
+pub mod scope_http;
+pub mod serve_wiring;
 use foundry_ledger::{LedgerRow, SqliteLedger};
-use foundry_line::{line::Line, DieStageExecutor, PackReviewHost, UnavailableStageExecutor, InspectingReviewRun, durable_review_run};
+use foundry_line::{
+    DieStageExecutor, InspectingReviewRun, PackReviewHost, UnavailableStageExecutor,
+    durable_review_run, line::Line,
+};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -125,7 +133,9 @@ pub type AppLine =
 /// literal tilde silently points at a nonexistent file (astra 3rd).
 fn foundry_ledger_path() -> std::path::PathBuf {
     let raw = std::env::var("FOUNDRY_LEDGER").unwrap_or_else(|_| "~/.foundry/ledger.db".into());
-    if let Some(rest) = raw.strip_prefix("~/") && let Ok(home) = std::env::var("HOME") {
+    if let Some(rest) = raw.strip_prefix("~/")
+        && let Ok(home) = std::env::var("HOME")
+    {
         return std::path::PathBuf::from(home).join(rest);
     }
     std::path::PathBuf::from(raw)
@@ -144,7 +154,7 @@ pub struct ServeState {
     /// decisions on already-executed orders.
     pub line: Arc<AppLine>,
 
-/// M5.2 T60b: the governance half — pipeline, apply layer,
+    /// M5.2 T60b: the governance half — pipeline, apply layer,
     /// durable coordinator. ONE instance; the /api/policy/apply
     /// handler is the only production borrower.
     pub policy: policy_http::PolicyState,
@@ -163,22 +173,47 @@ impl ServeState {
             Arc::new(fake_noop::AllowHumanPolicy),
         );
         if let Ok(pack) = std::env::var("FOUNDRY_REVIEW_PACK") {
-            let tuple_path = std::env::var("FOUNDRY_TUPLES").unwrap_or_else(|_| "~/.foundry/tuples.db".into());
+            let tuple_path =
+                std::env::var("FOUNDRY_TUPLES").unwrap_or_else(|_| "~/.foundry/tuples.db".into());
             let tuple_path = if let Some(rest) = tuple_path.strip_prefix("~/") {
-                std::env::var("HOME").map(PathBuf::from).unwrap_or_default().join(rest)
-            } else { PathBuf::from(tuple_path) };
+                std::env::var("HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_default()
+                    .join(rest)
+            } else {
+                PathBuf::from(tuple_path)
+            };
             let tuples: Arc<dyn foundry_exec::TupleStore> = Arc::new(
-                foundry_exec::SqliteTupleStore::open(&tuple_path).map_err(|e| format!("tuple store: {e:?}"))?
+                foundry_exec::SqliteTupleStore::open(&tuple_path)
+                    .map_err(|e| format!("tuple store: {e:?}"))?,
             );
             line.set_tuple_store(tuples.clone());
             let host_db = PackReviewHost::default_db_path();
-            let executor: Box<dyn foundry_line::StageExecutor> = match (std::env::var("FOUNDRY_DIE_BINARY"), std::env::var("FOUNDRY_REPO_PATH")) {
+            let executor: Box<dyn foundry_line::StageExecutor> = match (
+                std::env::var("FOUNDRY_DIE_BINARY"),
+                std::env::var("FOUNDRY_REPO_PATH"),
+            ) {
                 (Ok(binary), Ok(repo)) => {
-                    let profile = std::env::var("FOUNDRY_DIE_PROFILE").unwrap_or_else(|_| "coding".into());
-                    let timeout_secs = std::env::var("FOUNDRY_DIE_TIMEOUT").ok().and_then(|v| v.parse().ok()).unwrap_or(600);
-                    let default_sessions = host_db.parent().unwrap_or(std::path::Path::new(".")).join("sessions");
-                    let session_root = std::env::var("FOUNDRY_SESSION_ROOT").map(PathBuf::from).unwrap_or(default_sessions);
-                    Box::new(DieStageExecutor::new(PathBuf::from(binary), profile, timeout_secs, PathBuf::from(repo), session_root))
+                    let profile =
+                        std::env::var("FOUNDRY_DIE_PROFILE").unwrap_or_else(|_| "coding".into());
+                    let timeout_secs = std::env::var("FOUNDRY_DIE_TIMEOUT")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(600);
+                    let default_sessions = host_db
+                        .parent()
+                        .unwrap_or(std::path::Path::new("."))
+                        .join("sessions");
+                    let session_root = std::env::var("FOUNDRY_SESSION_ROOT")
+                        .map(PathBuf::from)
+                        .unwrap_or(default_sessions);
+                    Box::new(DieStageExecutor::new(
+                        PathBuf::from(binary),
+                        profile,
+                        timeout_secs,
+                        PathBuf::from(repo),
+                        session_root,
+                    ))
                 }
                 _ => Box::new(UnavailableStageExecutor),
             };
@@ -204,15 +239,14 @@ impl ServeState {
         let pipeline = foundry_watch::retro::InsightPipeline::with_reader(
             foundry_watch::retro::QueryCatalog::frozen_v1(),
             foundry_watch::evaluation_protocol::frozen_policy_graph(),
-            std::sync::Arc::new(foundry_watch::evidence_recompute::LedgerEvidenceReader::new(
-                foundry_ledger_path(),
-            )),
+            std::sync::Arc::new(
+                foundry_watch::evidence_recompute::LedgerEvidenceReader::new(foundry_ledger_path()),
+            ),
         );
-        let gov_path = std::env::var("FOUNDRY_GOVERNANCE_DB")
-            .unwrap_or_else(|_| {
-                let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-                format!("{home}/.foundry/governance.db")
-            });
+        let gov_path = std::env::var("FOUNDRY_GOVERNANCE_DB").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            format!("{home}/.foundry/governance.db")
+        });
         let coordinator = foundry_watch::coordinator::GovernanceCoordinator::open(
             std::path::Path::new(&gov_path),
         )
@@ -224,7 +258,9 @@ impl ServeState {
             line: Arc::new(line),
             policy: policy_http::PolicyState {
                 pipeline: tokio::sync::Mutex::new(pipeline),
-                layer: tokio::sync::Mutex::new(foundry_watch::policy_apply::PolicyApplicationLayer::new()),
+                layer: tokio::sync::Mutex::new(
+                    foundry_watch::policy_apply::PolicyApplicationLayer::new(),
+                ),
                 coordinator: tokio::sync::Mutex::new(coordinator),
                 proposer: "serve".into(),
             },

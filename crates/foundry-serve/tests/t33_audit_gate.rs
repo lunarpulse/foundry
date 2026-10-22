@@ -1,24 +1,48 @@
 //! T33 integration: the evidence-envelope machinery runs against the
 //! REAL production ledger (157 rows, M1 history) — generation,
 //! deterministic recompute, extension legality, tamper detection.
-use foundry_ledger::LedgerRow;
+use foundry_domain::ports::Ledger;
+use foundry_domain::{ActorId, ActorKind, OrderEvent, OrderState};
+use foundry_ledger::{LedgerRow, SqliteLedger};
 use foundry_serve::audit_report::{self, CastingFacts, VerifyError, VerifyOutcome};
 
-fn real_ledger_rows() -> Vec<LedgerRow> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/cosmo".into());
-    let path = format!("{home}/.foundry/ledger.db");
-    if !std::path::Path::new(&path).exists() {
-        panic!("production ledger not found at {path} — run on the foundry host");
+fn audit_fixture_rows() -> Vec<LedgerRow> {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir =
+        std::env::temp_dir().join(format!("foundry-t33-audit-{}-{nonce}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("ledger.db");
+    let mut ledger = SqliteLedger::open(&path).unwrap();
+    let actor = ActorId {
+        kind: ActorKind::Human,
+        source: "fixture".into(),
+        id: "audit-test".into(),
+    };
+    for n in 0..100 {
+        ledger
+            .append(
+                &format!("audit-{n}"),
+                &OrderEvent::Queued,
+                OrderState::Received,
+                OrderState::Queued,
+                &actor,
+                chrono::Utc::now(),
+            )
+            .unwrap();
     }
-    let ledger = foundry_ledger::SqliteLedger::open(std::path::Path::new(&path)).unwrap();
     let rows = ledger.read_all().unwrap();
-    assert!(ledger.verify_chain().unwrap(), "production chain must verify");
+    assert!(ledger.verify_chain().unwrap(), "fixture chain must verify");
+    drop(ledger);
+    std::fs::remove_dir_all(dir).unwrap();
     rows
 }
 
 #[test]
 fn production_report_generates_and_verifies() {
-    let rows = real_ledger_rows();
+    let rows = audit_fixture_rows();
     let casting = CastingFacts::default();
     let report = audit_report::generate(&rows, &casting).unwrap();
     assert_eq!(report.envelope.prefix_len, rows.len() as i64);
@@ -34,16 +58,26 @@ fn production_report_generates_and_verifies() {
     // metrics sanity: as-of counts sum to the number of distinct orders
     let distinct: std::collections::HashSet<_> = rows.iter().map(|r| r.order_id.clone()).collect();
     let sum: u64 = report.metrics.state_counts_asof.values().sum();
-    assert_eq!(sum as usize, distinct.len(), "as-of counts == distinct orders");
+    assert_eq!(
+        sum as usize,
+        distinct.len(),
+        "as-of counts == distinct orders"
+    );
 }
 
 #[test]
 fn production_report_tamper_detected() {
-    let rows = real_ledger_rows();
+    let rows = audit_fixture_rows();
     let casting = CastingFacts::default();
     let mut report = audit_report::generate(&rows, &casting).unwrap();
     // bump a state count without touching the ledger
-    let key = report.metrics.state_counts_asof.keys().next().cloned().unwrap();
+    let key = report
+        .metrics
+        .state_counts_asof
+        .keys()
+        .next()
+        .cloned()
+        .unwrap();
     *report.metrics.state_counts_asof.get_mut(&key).unwrap() += 100;
     assert!(matches!(
         audit_report::verify(&report, &rows, &casting),
@@ -52,7 +86,13 @@ fn production_report_tamper_detected() {
     // forged digest (self-consistent but wrong vs ledger)
     let clean = audit_report::generate(&rows, &casting).unwrap();
     let mut forged = clean.clone();
-    let key = forged.metrics.state_counts_asof.keys().next().cloned().unwrap();
+    let key = forged
+        .metrics
+        .state_counts_asof
+        .keys()
+        .next()
+        .cloned()
+        .unwrap();
     *forged.metrics.state_counts_asof.get_mut(&key).unwrap() += 100;
     // attacker recomputes digest over tampered metrics
     // (self-consistency passes; ledger recompute catches it)
@@ -62,7 +102,7 @@ fn production_report_tamper_detected() {
 
 #[test]
 fn production_prefix_tamper_detected() {
-    let rows = real_ledger_rows();
+    let rows = audit_fixture_rows();
     let casting = CastingFacts::default();
     let report = audit_report::generate(&rows, &casting).unwrap();
     // mutate one covered row's content in memory (simulating a DB edit)

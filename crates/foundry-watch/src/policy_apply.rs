@@ -18,8 +18,8 @@
 //! and scored on schedule; proposer track records update via the
 //! FROZEN weight rule (T48a derive_weights) — repeated misses
 //! degrade a proposer's standing, repeated hits raise it.
-use crate::evaluation_protocol::{derive_weights, PolicyClass, PolicyGraph};
-use crate::governance_events::{verify_stream, GovernanceEvent, OpKind, Phase};
+use crate::evaluation_protocol::{PolicyClass, PolicyGraph, derive_weights};
+use crate::governance_events::{GovernanceEvent, OpKind, Phase, verify_stream};
 use crate::retro::{InsightPipeline, Prediction, ProposalStrength};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -141,15 +141,22 @@ impl PolicyApplicationLayer {
         // authority (C1 matrix: Owner only — approvers review orders,
         // they do not change factory policy)
         if cmd.role != Role::Owner {
-            return Err(ApplyError::NotAuthorized { approver: cmd.approver.clone() });
+            return Err(ApplyError::NotAuthorized {
+                approver: cmd.approver.clone(),
+            });
         }
         // single-use BEFORE anything else (replay resistance)
         if self.used_op_ids.contains(&cmd.op_id) {
-            return Err(ApplyError::Replayed { op_id: cmd.op_id.clone() });
+            return Err(ApplyError::Replayed {
+                op_id: cmd.op_id.clone(),
+            });
         }
         // expiry
         if now > cmd.expires_at {
-            return Err(ApplyError::Expired { at: now, expires: cmd.expires_at });
+            return Err(ApplyError::Expired {
+                at: now,
+                expires: cmd.expires_at,
+            });
         }
         // the proposal must be filed and Supported. Since T54w the
         // canonical digest binds the COMPLETE content (diff, target,
@@ -164,31 +171,62 @@ impl PolicyApplicationLayer {
                 cmd.base_policy_version,
             );
             canonical.as_deref() == Some(cmd.proposal_digest.as_str())
-                || Self::digest_of(&[&r.insight_id, &r.evidence.result_digest]) == cmd.proposal_digest
+                || Self::digest_of(&[&r.insight_id, &r.evidence.result_digest])
+                    == cmd.proposal_digest
         });
-        let record = found.ok_or_else(|| ApplyError::NoSuchSupportedProposal { digest: cmd.proposal_digest.clone() })?;
+        let record = found.ok_or_else(|| ApplyError::NoSuchSupportedProposal {
+            digest: cmd.proposal_digest.clone(),
+        })?;
         let target = record.proposal.as_ref().unwrap().target.clone();
         let fields = record.proposal.as_ref().unwrap().changes.clone();
         // stale-base: review happened against an older policy version
         if cmd.base_policy_version != self.policy_version {
-            return Err(ApplyError::StaleBase { cmd_base: cmd.base_policy_version, current: self.policy_version });
+            return Err(ApplyError::StaleBase {
+                cmd_base: cmd.base_policy_version,
+                current: self.policy_version,
+            });
         }
         // C-P1 routing: behavior-affecting targets never apply here
-        let node = graph.nodes.get(&target).expect("admissible targets are classified (T50a gate)");
+        let node = graph
+            .nodes
+            .get(&target)
+            .expect("admissible targets are classified (T50a gate)");
         if node.class == PolicyClass::CandidateAffecting {
             return Err(ApplyError::CandidateAffectingNeedsM3 { target });
         }
 
         // intent -> effect
         let payload = Self::digest_of(&[&cmd.proposal_digest, &target]);
-        self.gov(OpKind::PolicyApplication, Phase::Pending, &cmd.op_id, &payload);
+        self.gov(
+            OpKind::PolicyApplication,
+            Phase::Pending,
+            &cmd.op_id,
+            &payload,
+        );
         self.policy_version += 1;
-        let applied = AppliedPolicy { target, fields, applied_by_op: cmd.op_id.clone() };
+        let applied = AppliedPolicy {
+            target,
+            fields,
+            applied_by_op: cmd.op_id.clone(),
+        };
         self.applied.insert(cmd.op_id.clone(), applied.clone());
         // pre-register the prediction this application is accountable to
         let due = parse_window(&cmd.prediction.window);
-        self.registered.insert(cmd.op_id.clone(), (proposer.to_string(), cmd.prediction.clone(), now + due, false));
-        self.gov(OpKind::PolicyApplication, Phase::Committed, &cmd.op_id, &payload);
+        self.registered.insert(
+            cmd.op_id.clone(),
+            (
+                proposer.to_string(),
+                cmd.prediction.clone(),
+                now + due,
+                false,
+            ),
+        );
+        self.gov(
+            OpKind::PolicyApplication,
+            Phase::Committed,
+            &cmd.op_id,
+            &payload,
+        );
         self.used_op_ids.insert(cmd.op_id.clone());
         Ok(applied)
     }
@@ -215,14 +253,27 @@ impl PolicyApplicationLayer {
                 Some(false) => ScoreOutcome::Miss,
             };
             let payload = Self::digest_of(&[&op_id, &prediction.metric]);
-            self.gov(OpKind::PredictionScore, Phase::Pending, &format!("score:{op_id}"), &payload);
+            self.gov(
+                OpKind::PredictionScore,
+                Phase::Pending,
+                &format!("score:{op_id}"),
+                &payload,
+            );
             if !matches!(outcome, ScoreOutcome::Pending) {
-                self.track.entry(proposer).or_default().push(matches!(outcome, ScoreOutcome::Hit));
+                self.track
+                    .entry(proposer)
+                    .or_default()
+                    .push(matches!(outcome, ScoreOutcome::Hit));
             }
             if let Some((_, _, _, scored)) = self.registered.get_mut(&op_id) {
                 *scored = true;
             }
-            self.gov(OpKind::PredictionScore, Phase::Committed, &format!("score:{op_id}"), &payload);
+            self.gov(
+                OpKind::PredictionScore,
+                Phase::Committed,
+                &format!("score:{op_id}"),
+                &payload,
+            );
             out.push((op_id, outcome));
         }
         out
@@ -235,12 +286,21 @@ impl PolicyApplicationLayer {
 
     /// Owner rollback: restores the previous policy version, removes
     /// the applied entry, and is itself an audited operation.
-    pub fn rollback(&mut self, op_id: &str, approver_role: Role, reason: &str) -> Result<u32, ApplyError> {
+    pub fn rollback(
+        &mut self,
+        op_id: &str,
+        approver_role: Role,
+        reason: &str,
+    ) -> Result<u32, ApplyError> {
         if approver_role != Role::Owner {
-            return Err(ApplyError::NotAuthorized { approver: "rollback".into() });
+            return Err(ApplyError::NotAuthorized {
+                approver: "rollback".into(),
+            });
         }
         if !self.applied.contains_key(op_id) {
-            return Err(ApplyError::RollbackInvalid { op_id: op_id.to_string() });
+            return Err(ApplyError::RollbackInvalid {
+                op_id: op_id.to_string(),
+            });
         }
         let payload = Self::digest_of(&[op_id, reason]);
         let rb_op = format!("rollback:{op_id}");
@@ -275,7 +335,11 @@ impl PolicyApplicationLayer {
 fn parse_window(window: &str) -> u64 {
     // "next-2-retro-windows" -> 2 windows; windows are opaque here,
     // the scheduler maps them to wall time. Fixed mapping for tests:
-    if let Some(n) = window.strip_prefix("next-").and_then(|w| w.split('-').next()).and_then(|n| n.parse::<u64>().ok()) {
+    if let Some(n) = window
+        .strip_prefix("next-")
+        .and_then(|w| w.split('-').next())
+        .and_then(|n| n.parse::<u64>().ok())
+    {
         n * 3600
     } else {
         3600
@@ -314,7 +378,9 @@ mod tests {
             evidence: e,
             proposal: Some(PolicyDiff {
                 target: "poll_interval".into(),
-                changes: [("max_retries".to_string(), "2".to_string())].into_iter().collect(),
+                changes: [("max_retries".to_string(), "2".to_string())]
+                    .into_iter()
+                    .collect(),
             }),
             prediction: Some(Prediction {
                 metric: "retry_rate_by_task_class".into(),
@@ -355,7 +421,15 @@ mod tests {
     fn happy_owner_apply_bumps_version_and_registers_prediction() {
         let p = pipeline_with_poll(20);
         let mut l = PolicyApplicationLayer::new();
-        let applied = l.apply(&owner_cmd("op-1"), &p, &frozen_policy_graph(), "agent-7", 200).unwrap();
+        let applied = l
+            .apply(
+                &owner_cmd("op-1"),
+                &p,
+                &frozen_policy_graph(),
+                "agent-7",
+                200,
+            )
+            .unwrap();
         assert_eq!(applied.target, "poll_interval");
         assert_eq!(l.policy_version, 1);
         assert!(l.governance_ok());
@@ -369,14 +443,18 @@ mod tests {
         let mut l = PolicyApplicationLayer::new();
         let mut c = owner_cmd("op-2");
         c.role = Role::Approver; // order-approvers cannot change policy
-        assert!(matches!(l.apply(&c, &p, &frozen_policy_graph(), "a", 200), Err(ApplyError::NotAuthorized { .. })));
+        assert!(matches!(
+            l.apply(&c, &p, &frozen_policy_graph(), "a", 200),
+            Err(ApplyError::NotAuthorized { .. })
+        ));
     }
 
     #[test]
     fn replay_refused() {
         let p = pipeline_with_poll(20);
         let mut l = PolicyApplicationLayer::new();
-        l.apply(&owner_cmd("op-3"), &p, &frozen_policy_graph(), "a", 200).unwrap();
+        l.apply(&owner_cmd("op-3"), &p, &frozen_policy_graph(), "a", 200)
+            .unwrap();
         assert!(matches!(
             l.apply(&owner_cmd("op-3"), &p, &frozen_policy_graph(), "a", 300),
             Err(ApplyError::Replayed { .. })
@@ -397,13 +475,17 @@ mod tests {
     fn stale_base_refused() {
         let p = pipeline_with_poll(20);
         let mut l = PolicyApplicationLayer::new();
-        l.apply(&owner_cmd("op-5"), &p, &frozen_policy_graph(), "a", 200).unwrap();
+        l.apply(&owner_cmd("op-5"), &p, &frozen_policy_graph(), "a", 200)
+            .unwrap();
         // a SECOND command reviewed against the OLD version is stale
         let mut c = owner_cmd("op-6");
         c.base_policy_version = 0; // policy is now at 1
         assert!(matches!(
             l.apply(&c, &p, &frozen_policy_graph(), "a", 300),
-            Err(ApplyError::StaleBase { cmd_base: 0, current: 1 })
+            Err(ApplyError::StaleBase {
+                cmd_base: 0,
+                current: 1
+            })
         ));
     }
 
@@ -446,8 +528,18 @@ mod tests {
             insight_id: "I2".into(),
             claim: "route X vetoes less".into(),
             evidence: e,
-            proposal: Some(PolicyDiff { target: "model_routing".into(), changes: [("route".to_string(), "X".to_string())].into_iter().collect() }),
-            prediction: Some(Prediction { metric: "guardrail_veto_rate_by_profile".into(), direction: "down".into(), threshold: "< 0.1".into(), window: "next-1-retro-windows".into() }),
+            proposal: Some(PolicyDiff {
+                target: "model_routing".into(),
+                changes: [("route".to_string(), "X".to_string())]
+                    .into_iter()
+                    .collect(),
+            }),
+            prediction: Some(Prediction {
+                metric: "guardrail_veto_rate_by_profile".into(),
+                direction: "down".into(),
+                threshold: "< 0.1".into(),
+                window: "next-1-retro-windows".into(),
+            }),
             n: 20,
         })
         .unwrap();
@@ -468,13 +560,22 @@ mod tests {
     fn scoring_hits_and_misses_move_track_records() {
         let p = pipeline_with_poll(20);
         let mut l = PolicyApplicationLayer::new();
-        l.apply(&owner_cmd("op-10"), &p, &frozen_policy_graph(), "agent-good", 200).unwrap();
+        l.apply(
+            &owner_cmd("op-10"),
+            &p,
+            &frozen_policy_graph(),
+            "agent-good",
+            200,
+        )
+        .unwrap();
         let mut c11 = owner_cmd("op-11");
         c11.base_policy_version = 1;
-        l.apply(&c11, &p, &frozen_policy_graph(), "agent-good", 200).unwrap();
+        l.apply(&c11, &p, &frozen_policy_graph(), "agent-good", 200)
+            .unwrap();
         let mut c12 = owner_cmd("op-12");
         c12.base_policy_version = 2;
-        l.apply(&c12, &p, &frozen_policy_graph(), "agent-bad", 200).unwrap();
+        l.apply(&c12, &p, &frozen_policy_graph(), "agent-bad", 200)
+            .unwrap();
         // windows due at 200 + 2*3600. The result stub keys on the
         // threshold so each agent's prediction is distinguishable:
         // agent-good registered twice (same prediction), agent-bad the
@@ -493,18 +594,36 @@ mod tests {
             let mut c = owner_cmd(&format!("op-bad-{i}"));
             c.prediction.window = "next-1-retro-windows".into();
             c.base_policy_version = l.policy_version;
-            l.apply(&c, &pipeline_with_poll(20), &frozen_policy_graph(), "agent-bad", 200).unwrap();
+            l.apply(
+                &c,
+                &pipeline_with_poll(20),
+                &frozen_policy_graph(),
+                "agent-bad",
+                200,
+            )
+            .unwrap();
         }
         l.score_due(900_000, |pred| Some(pred.metric == "nope")); // all miss
         let w2 = l.proposer_weights();
-        assert!(w2["agent-bad"] <= 0.1 + 1e-9, "repeated failure floors the proposer: {}", w2["agent-bad"]);
+        assert!(
+            w2["agent-bad"] <= 0.1 + 1e-9,
+            "repeated failure floors the proposer: {}",
+            w2["agent-bad"]
+        );
     }
 
     #[test]
     fn pending_windows_change_nothing() {
         let p = pipeline_with_poll(20);
         let mut l = PolicyApplicationLayer::new();
-        l.apply(&owner_cmd("op-20"), &p, &frozen_policy_graph(), "agent-x", 200).unwrap();
+        l.apply(
+            &owner_cmd("op-20"),
+            &p,
+            &frozen_policy_graph(),
+            "agent-x",
+            200,
+        )
+        .unwrap();
         // before due: nothing scored
         assert!(l.score_due(300, |_| Some(true)).is_empty());
         // at due but evidence absent: Pending, NO reputation effect
@@ -517,8 +636,11 @@ mod tests {
     fn rollback_restores_and_audits() {
         let p = pipeline_with_poll(20);
         let mut l = PolicyApplicationLayer::new();
-        l.apply(&owner_cmd("op-30"), &p, &frozen_policy_graph(), "a", 200).unwrap();
-        let v = l.rollback("op-30", Role::Owner, "prediction missed badly").unwrap();
+        l.apply(&owner_cmd("op-30"), &p, &frozen_policy_graph(), "a", 200)
+            .unwrap();
+        let v = l
+            .rollback("op-30", Role::Owner, "prediction missed badly")
+            .unwrap();
         assert_eq!(v, 2, "rollback bumps the version (forward-only ledger)");
         assert!(l.applied.is_empty());
         assert!(l.governance_ok());

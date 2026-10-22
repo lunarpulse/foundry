@@ -2,10 +2,10 @@
 //! through the scope guard. "Authenticate reads as well as writes"
 //! (review #4). Public read of the board was an M1-M3 convenience —
 //! organization deployments require a session.
-use axum::extract::{Query, State};
-use axum::http::{header, StatusCode};
-use axum::response::IntoResponse;
 use axum::Json;
+use axum::extract::{Query, State};
+use axum::http::{StatusCode, header};
+use axum::response::IntoResponse;
 use std::sync::Arc;
 
 use crate::identity::AuthenticatedUser;
@@ -34,7 +34,11 @@ pub fn scope_denied(e: ScopeError) -> axum::response::Response {
         ScopeError::Unauthenticated => StatusCode::UNAUTHORIZED,
         _ => StatusCode::FORBIDDEN,
     };
-    (code, Json(serde_json::json!({"error": crate::privacy::sanitize_error(&e.to_string())}))).into_response()
+    (
+        code,
+        Json(serde_json::json!({"error": crate::privacy::sanitize_error(&e.to_string())})),
+    )
+        .into_response()
 }
 
 // ---- guarded wrappers over ServeState reads ----
@@ -123,9 +127,5 @@ pub async fn verify_handler(
             return scope_denied(e);
         }
     }
-    (
-        [(header::CACHE_CONTROL, "no-store")],
-        Json(st.verify()),
-    )
-        .into_response()
+    ([(header::CACHE_CONTROL, "no-store")], Json(st.verify())).into_response()
 }

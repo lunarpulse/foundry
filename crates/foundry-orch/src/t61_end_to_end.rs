@@ -11,36 +11,63 @@
 //!    후 **전체 재구축** — 로그·원장·저널에서 상태 재생, 체인 검증.
 //! 5. **전체 재구축 동등**: 재구축 오케스트레이션 로그가 원본과 동일.
 
-use std::collections::BTreeSet;
 use crate::chainer::{Chainer, ChainerError, SizingVerdict};
 use crate::refusal::{RefusalCode, RemediationKind};
 use crate::stream::{Stream, StreamRuntime};
 use crate::{OrchestrationKind, OrchestrationLog};
 use foundry_domain::order::{ExternalRef, Order};
 use foundry_domain::{OrderEvent, OrderState};
+use foundry_exec::{
+    ArtifactLocation, ArtifactTuple, ArtifactTupleKey, Attempt as ExecAttempt, EmitReceipt,
+    Generation, ImmutableCommit, OrderId as ExecOrderId, PortError as ExecPortError, Recorded,
+    TupleStore,
+};
 use foundry_workflow::Outcome;
-use foundry_exec::{ArtifactLocation, ArtifactTuple, ArtifactTupleKey, Attempt as ExecAttempt, EmitReceipt, Generation, ImmutableCommit, OrderId as ExecOrderId, PortError as ExecPortError, Recorded, TupleStore};
+use std::collections::BTreeSet;
 use std::sync::Mutex;
 
 #[derive(Default)]
 struct ReviewTuples(Mutex<(Vec<ArtifactTuple>, Vec<EmitReceipt>)>);
 impl TupleStore for ReviewTuples {
     fn record(&self, tuple: &ArtifactTuple) -> Result<Recorded, ExecPortError> {
-        self.0.lock().unwrap().0.push(tuple.clone()); Ok(Recorded)
+        self.0.lock().unwrap().0.push(tuple.clone());
+        Ok(Recorded)
     }
-    fn latest(&self, order: &ExecOrderId, attempt: ExecAttempt) -> Result<Option<ArtifactTuple>, ExecPortError> {
-        Ok(self.0.lock().unwrap().0.iter().filter(|t| &t.order == order && t.attempt == attempt)
-            .max_by_key(|t| (t.run, t.generation)).cloned())
+    fn latest(
+        &self,
+        order: &ExecOrderId,
+        attempt: ExecAttempt,
+    ) -> Result<Option<ArtifactTuple>, ExecPortError> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .0
+            .iter()
+            .filter(|t| &t.order == order && t.attempt == attempt)
+            .max_by_key(|t| (t.run, t.generation))
+            .cloned())
     }
-    fn latest_promoted(&self, order: &ExecOrderId, attempt: ExecAttempt) -> Result<Option<ArtifactTuple>, ExecPortError> {
+    fn latest_promoted(
+        &self,
+        order: &ExecOrderId,
+        attempt: ExecAttempt,
+    ) -> Result<Option<ArtifactTuple>, ExecPortError> {
         let rows = self.0.lock().unwrap();
-        Ok(rows.0.iter().filter(|t| &t.order == order && t.attempt == attempt
-            && rows.1.iter().any(|r| r.key == t.key()))
-            .max_by_key(|t| (t.run, t.generation)).cloned())
+        Ok(rows
+            .0
+            .iter()
+            .filter(|t| {
+                &t.order == order && t.attempt == attempt && rows.1.iter().any(|r| r.key == t.key())
+            })
+            .max_by_key(|t| (t.run, t.generation))
+            .cloned())
     }
     fn promote(&self, key: &ArtifactTupleKey, receipt: &EmitReceipt) -> Result<(), ExecPortError> {
         let mut rows = self.0.lock().unwrap();
-        if receipt.key != *key || !rows.0.iter().any(|t| t.key() == *key) { return Err(ExecPortError::MissingEmitReceipt); }
+        if receipt.key != *key || !rows.0.iter().any(|t| t.key() == *key) {
+            return Err(ExecPortError::MissingEmitReceipt);
+        }
         rows.1.push(receipt.clone());
         Ok(())
     }
@@ -49,12 +76,20 @@ impl TupleStore for ReviewTuples {
 fn review_tuples(order: &str, digest: &str) -> std::sync::Arc<ReviewTuples> {
     let store = std::sync::Arc::new(ReviewTuples::default());
     let tuple = ArtifactTuple {
-        order: ExecOrderId(order.into()), attempt: ExecAttempt(1), run: foundry_exec::RunId(1),
-        generation: Generation(0), immutable_commit: ImmutableCommit(digest.into()),
-        artifact_location: ArtifactLocation("review.log".into()), generations: Vec::new(),
+        order: ExecOrderId(order.into()),
+        attempt: ExecAttempt(1),
+        run: foundry_exec::RunId(1),
+        generation: Generation(0),
+        immutable_commit: ImmutableCommit(digest.into()),
+        artifact_location: ArtifactLocation("review.log".into()),
+        generations: Vec::new(),
     };
     store.record(&tuple).unwrap();
-    let receipt = EmitReceipt { key: tuple.key(), event: "publish".into(), at: chrono::Utc::now() };
+    let receipt = EmitReceipt {
+        key: tuple.key(),
+        event: "publish".into(),
+        at: chrono::Utc::now(),
+    };
     store.promote(&tuple.key(), &receipt).unwrap();
     store
 }
@@ -88,12 +123,16 @@ fn autonomous_to_gate(rt: &StreamRuntime, sid: &str, oid: &str, exec: &str) {
         OrderEvent::InspectionPassed,
     ] {
         let att = eng.order(oid).unwrap().attempt().max(1);
-        let rows = foundry_ledger::SqliteLedger::open(&e.journal()).unwrap().read_all().unwrap();
+        let rows = foundry_ledger::SqliteLedger::open(&e.journal())
+            .unwrap()
+            .read_all()
+            .unwrap();
         let ctx = crate::test_support::replay_ctx(oid, &rows);
         let ro: &'static mut foundry_ledger::SqliteLedger = Box::leak(Box::new(
             foundry_ledger::SqliteLedger::open(&e.journal()).unwrap(),
         ));
-        eng.dispatch_replay_ctx(oid, exec, &ev, att, &ctx, ro).unwrap();
+        eng.dispatch_replay_ctx(oid, exec, &ev, att, &ctx, ro)
+            .unwrap();
     }
     assert_eq!(eng.order(oid).unwrap().state(), OrderState::FurnaceHold);
 }
@@ -108,19 +147,27 @@ fn ship_ticket(rt: &StreamRuntime, sid: &str, oid: &str, grant_id: &str, ap_db: 
     let mut hook = foundry_workflow::ApprovalLedgerAdapter(ap);
     let e = rt.stream(sid).unwrap();
     let mut eng = e.engine_if_unfenced().unwrap();
-    let grant = foundry_workflow::GrantRef { grant_id: grant_id.into() };
+    let grant = foundry_workflow::GrantRef {
+        grant_id: grant_id.into(),
+    };
     let out = eng
         .dispatch_live(
             oid,
             "t61",
-            &OrderEvent::Approved { intent: "ship".into(), artifact_digest: format!("dig-{oid}") },
+            &OrderEvent::Approved {
+                intent: "ship".into(),
+                artifact_digest: format!("dig-{oid}"),
+            },
             1,
             Some(&grant),
             &mut hook,
         )
         .unwrap();
     assert_eq!(out, Outcome::Applied);
-    let rows = foundry_ledger::SqliteLedger::open(&e.journal()).unwrap().read_all().unwrap();
+    let rows = foundry_ledger::SqliteLedger::open(&e.journal())
+        .unwrap()
+        .read_all()
+        .unwrap();
     let ctx = crate::test_support::replay_ctx(oid, &rows);
     let ro: &'static mut foundry_ledger::SqliteLedger = Box::leak(Box::new(
         foundry_ledger::SqliteLedger::open(&e.journal()).unwrap(),
@@ -128,7 +175,9 @@ fn ship_ticket(rt: &StreamRuntime, sid: &str, oid: &str, grant_id: &str, ap_db: 
     eng.dispatch_replay_ctx(
         oid,
         "t61",
-        &OrderEvent::PublishConfirmed { pr_url: "https://pr/t61".into() },
+        &OrderEvent::PublishConfirmed {
+            pr_url: "https://pr/t61".into(),
+        },
         1,
         &ctx,
         ro,
@@ -152,12 +201,12 @@ fn t61_end_to_end_reentry_bypass_crash_rebuild() {
     .unwrap();
     let rt = StreamRuntime::new(orch);
     let orch = rt.orch.clone();
-    rt.add_stream(Stream::new_with_root("s-sizing", &d, "bmad-epic-build").unwrap()).unwrap();
-    rt.add_stream(Stream::new_with_root("s-epic", &d, "bmad-epic-build").unwrap()).unwrap();
-    rt.bind_approval_ledger(
-        foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
-    )
-    .unwrap();
+    rt.add_stream(Stream::new_with_root("s-sizing", &d, "bmad-epic-build").unwrap())
+        .unwrap();
+    rt.add_stream(Stream::new_with_root("s-epic", &d, "bmad-epic-build").unwrap())
+        .unwrap();
+    rt.bind_approval_ledger(foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap())
+        .unwrap();
 
     // ── (2) 우회 시도 #1 — 미선언 unsized-spawn (dispatch 정문에서 거부).
     let byp1 = rt.dispatch("rogue-0", mkorder("rogue-0", true));
@@ -170,9 +219,13 @@ fn t61_end_to_end_reentry_bypass_crash_rebuild() {
     let digest = crate::chainer::sizing_digest("approved", "bmad-epic-build", "plan-epic");
     {
         let mut ap = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
-        ap.issue_grant("sizing-sz-1", "tok-human", &serde_json::json!({
-            "order_id": "sz-1", "intent": "sizing", "artifact_digest": digest, "root_scope": "",
-        }))
+        ap.issue_grant(
+            "sizing-sz-1",
+            "tok-human",
+            &serde_json::json!({
+                "order_id": "sz-1", "intent": "sizing", "artifact_digest": digest, "root_scope": "",
+            }),
+        )
         .unwrap();
     }
     {
@@ -181,12 +234,17 @@ fn t61_end_to_end_reentry_bypass_crash_rebuild() {
         let mut hook = foundry_workflow::ApprovalLedgerAdapter(
             foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
         );
-        let grant = foundry_workflow::GrantRef { grant_id: "sizing-sz-1".into() };
+        let grant = foundry_workflow::GrantRef {
+            grant_id: "sizing-sz-1".into(),
+        };
         let out = eng
             .dispatch_live(
                 "sz-1",
                 "t61-sz",
-                &OrderEvent::Approved { intent: "sizing".into(), artifact_digest: digest.clone() },
+                &OrderEvent::Approved {
+                    intent: "sizing".into(),
+                    artifact_digest: digest.clone(),
+                },
                 1,
                 Some(&grant),
                 &mut hook,
@@ -216,7 +274,10 @@ fn t61_end_to_end_reentry_bypass_crash_rebuild() {
     )
     .unwrap();
     let byp2 = rt.dispatch("t-1", mkorder("t-1", false));
-    assert!(byp2.is_err(), "bypass2: unsized spawn refused before binding");
+    assert!(
+        byp2.is_err(),
+        "bypass2: unsized spawn refused before binding"
+    );
 
     // 거부 레코드 확인 — UnsizedSpawn. **원 요청(t-1)의 거부** 선택.
     let refusal_seq = orch.read_all().unwrap()
@@ -230,7 +291,11 @@ fn t61_end_to_end_reentry_bypass_crash_rebuild() {
     let ch = Chainer::new(&orch, &ap_ref);
     let (pid, kind) = ch.propose_remediation(refusal_seq).unwrap();
     assert!(pid.starts_with("rem-"));
-    assert_eq!(kind, RemediationKind::RunSizing, "UnsizedSpawn -> RunSizing");
+    assert_eq!(
+        kind,
+        RemediationKind::RunSizing,
+        "UnsizedSpawn -> RunSizing"
+    );
     // 스팸 재발행 거부.
     assert!(matches!(
         ch.propose_remediation(refusal_seq),
@@ -248,7 +313,8 @@ fn t61_end_to_end_reentry_bypass_crash_rebuild() {
         vec![(rem_order_id.clone(), "s-sizing".into())],
     )
     .unwrap();
-    rt.dispatch(&rem_order_id, mkorder(&rem_order_id, true)).unwrap();
+    rt.dispatch(&rem_order_id, mkorder(&rem_order_id, true))
+        .unwrap();
     autonomous_to_gate(&rt, "s-sizing", &rem_order_id, "t61-rw");
     {
         let mut ap2 = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
@@ -263,21 +329,31 @@ fn t61_end_to_end_reentry_bypass_crash_rebuild() {
         let mut hook = foundry_workflow::ApprovalLedgerAdapter(
             foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
         );
-        let grant = foundry_workflow::GrantRef { grant_id: format!("sizing-{rem_order_id}") };
+        let grant = foundry_workflow::GrantRef {
+            grant_id: format!("sizing-{rem_order_id}"),
+        };
         let out = eng
             .dispatch_live(
                 &rem_order_id,
                 "t61-rw",
-                &OrderEvent::Approved { intent: "sizing".into(), artifact_digest: digest.clone() },
+                &OrderEvent::Approved {
+                    intent: "sizing".into(),
+                    artifact_digest: digest.clone(),
+                },
                 1,
                 Some(&grant),
                 &mut hook,
             )
             .unwrap();
-        assert_eq!(out, Outcome::Applied, "remediation work order approved live");
+        assert_eq!(
+            out,
+            Outcome::Applied,
+            "remediation work order approved live"
+        );
     }
     // 재디에이션 작업 완결 — rem 작업 승인(새 증거)으로 preset_bound 결속.
-    ch.bind_preset_from_ledger(&rem_order_id, "bmad-epic-build", "plan-epic").unwrap();
+    ch.bind_preset_from_ledger(&rem_order_id, "bmad-epic-build", "plan-epic")
+        .unwrap();
 
     // 재입장 — **같은 원 요청(t-1)을 같은 정문(dispatch)으로 재시도**,
     // 전량 재평가(선언·바인딩·목적지) 통과.
@@ -292,7 +368,14 @@ fn t61_end_to_end_reentry_bypass_crash_rebuild() {
     .unwrap();
     // A 고쳐도 B — 미선언 주문의 재입장은 여전히 거부(DeclarationMissing).
     assert!(matches!(
-        ch.reenter("t-undeclared", "ext:x", Some(&rem_order_id), Some(&digest), "plan-epic", "bmad-epic-build"),
+        ch.reenter(
+            "t-undeclared",
+            "ext:x",
+            Some(&rem_order_id),
+            Some(&digest),
+            "plan-epic",
+            "bmad-epic-build"
+        ),
         Err(ChainerError::DeclarationMissing { .. })
     ));
 
@@ -301,10 +384,13 @@ fn t61_end_to_end_reentry_bypass_crash_rebuild() {
     let rem_ref_seq = orch.read_all().unwrap().iter()
         .find(|r| matches!(&r.kind, OrchestrationKind::Refusal { refused_request, .. } if refused_request == &rem_order_id))
         .unwrap().seq;
-    assert!(matches!(
-        ch.propose_remediation(rem_ref_seq),
-        Err(ChainerError::RemediationDepth { .. })
-    ), "remediation of a remediation refused (depth 1)");
+    assert!(
+        matches!(
+            ch.propose_remediation(rem_ref_seq),
+            Err(ChainerError::RemediationDepth { .. })
+        ),
+        "remediation of a remediation refused (depth 1)"
+    );
 
     // ── (5) 방화벽 — 종단에서도 재생 Approved 거부 (t-1 게이트에서).
     rt.dispatch("t-1", mkorder("t-1", false)).unwrap();
@@ -319,14 +405,21 @@ fn t61_end_to_end_reentry_bypass_crash_rebuild() {
             OrderEvent::InspectionPassed,
         ] {
             let att = eng.order("t-1").unwrap().attempt().max(1);
-            let jrows = foundry_ledger::SqliteLedger::open(&e.journal()).unwrap().read_all().unwrap();
+            let jrows = foundry_ledger::SqliteLedger::open(&e.journal())
+                .unwrap()
+                .read_all()
+                .unwrap();
             let ctx = crate::test_support::replay_ctx("t-1", &jrows);
             let ro: &'static mut foundry_ledger::SqliteLedger = Box::leak(Box::new(
                 foundry_ledger::SqliteLedger::open(&e.journal()).unwrap(),
             ));
-            eng.dispatch_replay_ctx("t-1", "t61", &ev, att, &ctx, ro).unwrap();
+            eng.dispatch_replay_ctx("t-1", "t61", &ev, att, &ctx, ro)
+                .unwrap();
         }
-        let jrows = foundry_ledger::SqliteLedger::open(&e.journal()).unwrap().read_all().unwrap();
+        let jrows = foundry_ledger::SqliteLedger::open(&e.journal())
+            .unwrap()
+            .read_all()
+            .unwrap();
         let ctx = crate::test_support::replay_ctx("t-1", &jrows);
         let ro: &'static mut foundry_ledger::SqliteLedger = Box::leak(Box::new(
             foundry_ledger::SqliteLedger::open(&e.journal()).unwrap(),
@@ -334,13 +427,19 @@ fn t61_end_to_end_reentry_bypass_crash_rebuild() {
         let fw = eng.dispatch_replay_ctx(
             "t-1",
             "t61",
-            &OrderEvent::Approved { intent: "ship".into(), artifact_digest: "d".into() },
+            &OrderEvent::Approved {
+                intent: "ship".into(),
+                artifact_digest: "d".into(),
+            },
             1,
             &ctx,
             ro,
         );
         assert!(
-            matches!(fw, Err(foundry_workflow::EngineError::AuthorizationRefused { .. })),
+            matches!(
+                fw,
+                Err(foundry_workflow::EngineError::AuthorizationRefused { .. })
+            ),
             "end-to-end firewall holds"
         );
     }
@@ -358,7 +457,10 @@ fn t61_end_to_end_reentry_bypass_crash_rebuild() {
     rt.dispatch("t-4", mkorder("t-4", false)).unwrap();
     ship_ticket(&rt, "s-epic", "t-4", "g-t4", &d.join("ap.db"));
     for t in ["t-1", "t-2", "t-3", "t-4"] {
-        assert!(rt.stream("s-epic").unwrap().order_shipped(t).unwrap(), "{t} shipped");
+        assert!(
+            rt.stream("s-epic").unwrap().order_shipped(t).unwrap(),
+            "{t} shipped"
+        );
     }
 
     // ── (7) 크래시 — SIGKILL 창 내 사망은 SQLite 자체 크래시 회복이
@@ -379,10 +481,8 @@ fn t61_end_to_end_reentry_bypass_crash_rebuild() {
     // 스트림 재구축 — 저널 replay 로 엔진 상태 복원.
     let rt2 = StreamRuntime::new(OrchestrationLog::open(&d.join("orch.db")).unwrap());
     rt2.add_stream(Stream::new("s-epic", &d).unwrap()).unwrap();
-    rt2.bind_approval_ledger(
-        foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
-    )
-    .unwrap();
+    rt2.bind_approval_ledger(foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap())
+        .unwrap();
     {
         let e = rt2.stream("s-epic").unwrap();
         let mut rebuilt = e.rebuilt_engine().unwrap();
@@ -395,7 +495,12 @@ fn t61_end_to_end_reentry_bypass_crash_rebuild() {
         // 재구축 엔진은 출하 4티켓 상태를 재생.
         let shipped: Vec<_> = ["t-1", "t-2", "t-3", "t-4"]
             .into_iter()
-            .filter(|t| rebuilt.order(t).map(|o| o.state() == OrderState::Shipped).unwrap_or(false))
+            .filter(|t| {
+                rebuilt
+                    .order(t)
+                    .map(|o| o.state() == OrderState::Shipped)
+                    .unwrap_or(false)
+            })
             .collect();
         assert_eq!(shipped.len(), 4, "rebuild replays all four shipped");
     }
@@ -420,10 +525,13 @@ fn t61_end_to_end_reentry_bypass_crash_rebuild() {
     assert!(
         rows2.len() == rows.len() || rows2.len() == rows.len() + 1,
         "rebuild sees identical log (or +1 reentry-audit row): {} vs {}",
-        rows2.len(), rows.len()
+        rows2.len(),
+        rows.len()
     );
     // (M7.1 MAJOR-3) 재입장 결과가 로그에 기록됐다.
-    assert!(rows2.iter().any(|r| matches!(&r.kind, OrchestrationKind::ReentryAdmitted { order, .. } if order == "t-1")));
+    assert!(rows2.iter().any(
+        |r| matches!(&r.kind, OrchestrationKind::ReentryAdmitted { order, .. } if order == "t-1")
+    ));
 }
 
 /// (M7.1 리뷰 B2) 스트림 루트 결속 — 다른 루트로 결속된 사이징 승인을
@@ -439,27 +547,33 @@ fn t61_stream_root_binding_mismatch_refused() {
     )
     .unwrap();
     let rt = StreamRuntime::new(OrchestrationLog::open(&d.join("orch.db")).unwrap());
-    rt.add_stream(Stream::new_with_root("s-root", &d, "bmad-quickloop").unwrap()).unwrap();
-    rt.bind_approval_ledger(
-        foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
-    )
-    .unwrap();
+    rt.add_stream(Stream::new_with_root("s-root", &d, "bmad-quickloop").unwrap())
+        .unwrap();
+    rt.bind_approval_ledger(foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap())
+        .unwrap();
     // 사이징 승인·결속 — 다른 루트(feature-prd)로.
     let orch = rt.orch.clone();
     let digest = crate::chainer::sizing_digest("approved", "bmad-feature-prd", "plan-sizing");
     {
         let mut ap = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
-        ap.issue_grant("sizing-sz-r", "tok-r", &serde_json::json!({
-            "order_id": "sz-r", "intent": "sizing", "artifact_digest": digest, "root_scope": "",
-        }))
+        ap.issue_grant(
+            "sizing-sz-r",
+            "tok-r",
+            &serde_json::json!({
+                "order_id": "sz-r", "intent": "sizing", "artifact_digest": digest, "root_scope": "",
+            }),
+        )
         .unwrap();
         let sr = ap.reserve_grant("sizing-sz-r", &serde_json::json!({
             "order_id": "sz-r", "intent": "sizing", "artifact_digest": digest, "root_scope": "",
         }), "rb", 1).unwrap();
-        ap.begin_apply("sizing-sz-r", "rb", 1, sr.fence_token).unwrap();
-        ap.finalize_grant("sizing-sz-r", "rb", 1, sr.fence_token).unwrap();
+        ap.begin_apply("sizing-sz-r", "rb", 1, sr.fence_token)
+            .unwrap();
+        ap.finalize_grant("sizing-sz-r", "rb", 1, sr.fence_token)
+            .unwrap();
         let ch = Chainer::new(&orch, &ap);
-        ch.bind_preset_from_ledger("sz-r", "bmad-feature-prd", "plan-sizing").unwrap();
+        ch.bind_preset_from_ledger("sz-r", "bmad-feature-prd", "plan-sizing")
+            .unwrap();
     }
     // 부트스트랩 dispatch — 스트림 루트(quickloop)와 결속 루트
     // (feature-prd) 불일치 → 거부.
@@ -475,7 +589,13 @@ fn t61_remediation_depth1_in_end_to_end_context() {
     let ap = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
     // 원 요청 거부 + 재디에이션 제안(연결 행 append).
     crate::refusal::record_refusal(&orch, RefusalCode::UnsizedSpawn, "req-1", None).unwrap();
-    let seq0 = orch.read_all().unwrap().iter().find(|r| matches!(&r.kind, OrchestrationKind::Refusal { .. })).unwrap().seq;
+    let seq0 = orch
+        .read_all()
+        .unwrap()
+        .iter()
+        .find(|r| matches!(&r.kind, OrchestrationKind::Refusal { .. }))
+        .unwrap()
+        .seq;
     let ch0 = Chainer::new(&orch, &ap);
     let (rem_pid, _) = ch0.propose_remediation(seq0).unwrap();
     // **그 재디에이션 작업 주문 자신**의 거부 — 같은 pid 주문.
@@ -509,31 +629,41 @@ fn t61_advance_to_gate_entry_point() {
     let mut ap = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
     {
         let digest = crate::chainer::sizing_digest("approved", "bmad-quickloop", "plan-g");
-        ap.issue_grant("sizing-sz-g", "tok-g", &serde_json::json!({
-            "order_id": "sz-g", "intent": "sizing", "artifact_digest": digest, "root_scope": "",
-        }))
+        ap.issue_grant(
+            "sizing-sz-g",
+            "tok-g",
+            &serde_json::json!({
+                "order_id": "sz-g", "intent": "sizing", "artifact_digest": digest, "root_scope": "",
+            }),
+        )
         .unwrap();
         let sr = ap.reserve_grant("sizing-sz-g", &serde_json::json!({
             "order_id": "sz-g", "intent": "sizing", "artifact_digest": digest, "root_scope": "",
         }), "g", 1).unwrap();
-        ap.begin_apply("sizing-sz-g", "g", 1, sr.fence_token).unwrap();
-        ap.finalize_grant("sizing-sz-g", "g", 1, sr.fence_token).unwrap();
+        ap.begin_apply("sizing-sz-g", "g", 1, sr.fence_token)
+            .unwrap();
+        ap.finalize_grant("sizing-sz-g", "g", 1, sr.fence_token)
+            .unwrap();
         let ch = Chainer::new(&orch, &ap);
-        ch.bind_preset_from_ledger("sz-g", "bmad-quickloop", "plan-g").unwrap();
+        ch.bind_preset_from_ledger("sz-g", "bmad-quickloop", "plan-g")
+            .unwrap();
     }
     let rt = StreamRuntime::new(OrchestrationLog::open(&d.join("orch.db")).unwrap());
     rt.set_tuple_store(review_tuples("t-g1", "gate-digest"));
-    rt.add_stream(Stream::new_with_root("s-g", &d, "bmad-quickloop").unwrap()).unwrap();
-    rt.bind_approval_ledger(
-        foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
-    )
-    .unwrap();
+    rt.add_stream(Stream::new_with_root("s-g", &d, "bmad-quickloop").unwrap())
+        .unwrap();
+    rt.bind_approval_ledger(foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap())
+        .unwrap();
     let mut no_evidence = mkorder("t-g2", true);
     no_evidence.artifact_digest = Some("no-tuple".into());
     rt.dispatch("t-g2", no_evidence).unwrap();
     assert!(rt.advance_to_gate("s-g", "t-g2", "exec-g").is_err());
     let no_evidence_rows = rt.stream("s-g").unwrap().journal_rows().unwrap();
-    assert!(!no_evidence_rows.iter().any(|r| r.order_id == "t-g2" && r.event.contains("InspectionPassed")));
+    assert!(
+        !no_evidence_rows
+            .iter()
+            .any(|r| r.order_id == "t-g2" && r.event.contains("InspectionPassed"))
+    );
     let mut order = mkorder("t-g1", true);
     order.artifact_digest = Some("gate-digest".into());
     rt.dispatch("t-g1", order).unwrap();
@@ -542,9 +672,14 @@ fn t61_advance_to_gate_entry_point() {
     assert_eq!(st, OrderState::FurnaceHold, "order at the approval gate");
     // 저널에 진행 이벤트가 실렸다.
     let e = rt.stream("s-g").unwrap();
-    let rows = foundry_ledger::SqliteLedger::open(e.journal()).unwrap().read_all().unwrap();
-    assert!(rows.iter().any(|r| r.event.contains("InspectionPassed")),
-        "gate-reaching events journaled");
+    let rows = foundry_ledger::SqliteLedger::open(e.journal())
+        .unwrap()
+        .read_all()
+        .unwrap();
+    assert!(
+        rows.iter().any(|r| r.event.contains("InspectionPassed")),
+        "gate-reaching events journaled"
+    );
 }
 
 /// (M7.1 리뷰 MAJOR-4) 중복 디스패치 거부가 **영구 거부 레지스트리**에
@@ -569,17 +704,19 @@ fn t61_duplicate_dispatch_refusal_recorded() {
         let sr = ap.reserve_grant("sizing-sz-dd", &serde_json::json!({
             "order_id": "sz-dd", "intent": "sizing", "artifact_digest": digest, "root_scope": "",
         }), "dd", 1).unwrap();
-        ap.begin_apply("sizing-sz-dd", "dd", 1, sr.fence_token).unwrap();
-        ap.finalize_grant("sizing-sz-dd", "dd", 1, sr.fence_token).unwrap();
+        ap.begin_apply("sizing-sz-dd", "dd", 1, sr.fence_token)
+            .unwrap();
+        ap.finalize_grant("sizing-sz-dd", "dd", 1, sr.fence_token)
+            .unwrap();
         let ch = Chainer::new(&orch, &ap);
-        ch.bind_preset_from_ledger("sz-dd", "bmad-quickloop", "plan-dd").unwrap();
+        ch.bind_preset_from_ledger("sz-dd", "bmad-quickloop", "plan-dd")
+            .unwrap();
     }
     let rt = StreamRuntime::new(OrchestrationLog::open(&d.join("orch.db")).unwrap());
-    rt.add_stream(Stream::new_with_root("s-dd", &d, "bmad-quickloop").unwrap()).unwrap();
-    rt.bind_approval_ledger(
-        foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
-    )
-    .unwrap();
+    rt.add_stream(Stream::new_with_root("s-dd", &d, "bmad-quickloop").unwrap())
+        .unwrap();
+    rt.bind_approval_ledger(foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap())
+        .unwrap();
     rt.dispatch("t-dd", mkorder("t-dd", true)).unwrap();
     // 중복 — 거부 + 영구 기록.
     let dup = rt.dispatch("t-dd", mkorder("t-dd", true));
@@ -601,22 +738,41 @@ fn t61_false_drain_claim_not_trusted() {
     let ap_db = d.join("ap.db");
     let mut ap = foundry_approval::ApprovalLedger::open(&ap_db).unwrap();
     // 잔여 예약 — grant가 'issued' 상태로 예약 존재.
-    ap.issue_grant("sizing-x", "tok-x", &serde_json::json!({
-        "order_id": "o-x", "intent": "sizing", "artifact_digest": "dx", "root_scope": "",
-    }))
+    ap.issue_grant(
+        "sizing-x",
+        "tok-x",
+        &serde_json::json!({
+            "order_id": "o-x", "intent": "sizing", "artifact_digest": "dx", "root_scope": "",
+        }),
+    )
     .unwrap();
-    ap.reserve_grant("sizing-x", &serde_json::json!({
-        "order_id": "o-x", "intent": "sizing", "artifact_digest": "dx", "root_scope": "",
-    }), "ex-x", 1).unwrap();
+    ap.reserve_grant(
+        "sizing-x",
+        &serde_json::json!({
+            "order_id": "o-x", "intent": "sizing", "artifact_digest": "dx", "root_scope": "",
+        }),
+        "ex-x",
+        1,
+    )
+    .unwrap();
     let orch = OrchestrationLog::open(&d.join("orch.db")).unwrap();
     let rt = StreamRuntime::new(OrchestrationLog::open(&d.join("orch.db")).unwrap());
     let coord = crate::stream::RecoveryCoordinator::new(&rt, 2);
     // 거짓 보고 — 즉시 완료 주장.
-    let out = coord.recover(&["sizing-x".to_string()], || {
-        ["sizing-x".to_string()].into_iter().collect::<BTreeSet<_>>()
-    }, &ap_db);
+    let out = coord.recover(
+        &["sizing-x".to_string()],
+        || {
+            ["sizing-x".to_string()]
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+        },
+        &ap_db,
+    );
     assert!(
-        matches!(out, crate::stream::RecoveryOutcome::AbortedWithoutScan { .. }),
+        matches!(
+            out,
+            crate::stream::RecoveryOutcome::AbortedWithoutScan { .. }
+        ),
         "false drain claim rejected by ledger cross-check: {out:?}"
     );
     let _ = orch;
@@ -644,20 +800,22 @@ fn t61_post_rebuild_redispatch_refused() {
         let sr = ap.reserve_grant("sizing-sz-rd", &serde_json::json!({
             "order_id": "sz-rd", "intent": "sizing", "artifact_digest": digest, "root_scope": "",
         }), "rd", 1).unwrap();
-        ap.begin_apply("sizing-sz-rd", "rd", 1, sr.fence_token).unwrap();
-        ap.finalize_grant("sizing-sz-rd", "rd", 1, sr.fence_token).unwrap();
+        ap.begin_apply("sizing-sz-rd", "rd", 1, sr.fence_token)
+            .unwrap();
+        ap.finalize_grant("sizing-sz-rd", "rd", 1, sr.fence_token)
+            .unwrap();
         let ch = Chainer::new(&orch, &ap);
-        ch.bind_preset_from_ledger("sz-rd", "bmad-quickloop", "plan-rd").unwrap();
+        ch.bind_preset_from_ledger("sz-rd", "bmad-quickloop", "plan-rd")
+            .unwrap();
     }
     // 1세대 런타임 — dispatch + 게이트 진행(저널에 행 생김).
     let rt = StreamRuntime::new(OrchestrationLog::open(&d.join("orch.db")).unwrap());
     let tuples = review_tuples("t-rd", "gate-digest");
     rt.set_tuple_store(tuples.clone());
-    rt.add_stream(Stream::new_with_root("s-rd", &d, "bmad-quickloop").unwrap()).unwrap();
-    rt.bind_approval_ledger(
-        foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
-    )
-    .unwrap();
+    rt.add_stream(Stream::new_with_root("s-rd", &d, "bmad-quickloop").unwrap())
+        .unwrap();
+    rt.bind_approval_ledger(foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap())
+        .unwrap();
     let mut order = mkorder("t-rd", true);
     order.artifact_digest = Some("gate-digest".into());
     rt.dispatch("t-rd", order).unwrap();
@@ -665,14 +823,16 @@ fn t61_post_rebuild_redispatch_refused() {
     // 크래시 — 같은 저널로 2세대 런타임(dispatched 세트 공백).
     let rt2 = StreamRuntime::new(OrchestrationLog::open(&d.join("orch.db")).unwrap());
     rt2.set_tuple_store(tuples);
-    rt2.add_stream(Stream::new_with_root("s-rd", &d, "bmad-quickloop").unwrap()).unwrap();
-    rt2.bind_approval_ledger(
-        foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
-    )
-    .unwrap();
+    rt2.add_stream(Stream::new_with_root("s-rd", &d, "bmad-quickloop").unwrap())
+        .unwrap();
+    rt2.bind_approval_ledger(foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap())
+        .unwrap();
     // 재디스패치 — 저널 증거로 거부.
     let dup = rt2.dispatch("t-rd", mkorder("t-rd", true));
-    assert!(dup.is_err(), "post-rebuild redispatch refused via journal evidence");
+    assert!(
+        dup.is_err(),
+        "post-rebuild redispatch refused via journal evidence"
+    );
 }
 
 /// (M7.1 재리뷰 r2) 라이브 핸드오프 정문 — 2단계: prepare(제안 행+매니페
@@ -691,54 +851,74 @@ fn t61_live_handoff_front_door() {
     let mut ap = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
     {
         let digest = crate::chainer::sizing_digest("approved", "bmad-epic-build", "plan-h");
-        ap.issue_grant("sizing-sz-h", "tok-h", &serde_json::json!({
-            "order_id": "sz-h", "intent": "sizing", "artifact_digest": digest, "root_scope": "",
-        }))
+        ap.issue_grant(
+            "sizing-sz-h",
+            "tok-h",
+            &serde_json::json!({
+                "order_id": "sz-h", "intent": "sizing", "artifact_digest": digest, "root_scope": "",
+            }),
+        )
         .unwrap();
         let sr = ap.reserve_grant("sizing-sz-h", &serde_json::json!({
             "order_id": "sz-h", "intent": "sizing", "artifact_digest": digest, "root_scope": "",
         }), "h", 1).unwrap();
-        ap.begin_apply("sizing-sz-h", "h", 1, sr.fence_token).unwrap();
-        ap.finalize_grant("sizing-sz-h", "h", 1, sr.fence_token).unwrap();
+        ap.begin_apply("sizing-sz-h", "h", 1, sr.fence_token)
+            .unwrap();
+        ap.finalize_grant("sizing-sz-h", "h", 1, sr.fence_token)
+            .unwrap();
         let ch = Chainer::new(&orch, &ap);
-        ch.bind_preset_from_ledger("sz-h", "bmad-epic-build", "plan-h").unwrap();
+        ch.bind_preset_from_ledger("sz-h", "bmad-epic-build", "plan-h")
+            .unwrap();
     }
     let rt = StreamRuntime::new(OrchestrationLog::open(&d.join("orch.db")).unwrap());
-    rt.add_stream(Stream::new_with_root("s-h", &d, "bmad-epic-build").unwrap()).unwrap();
-    rt.bind_approval_ledger(
-        foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
-    )
-    .unwrap();
+    rt.add_stream(Stream::new_with_root("s-h", &d, "bmad-epic-build").unwrap())
+        .unwrap();
+    rt.bind_approval_ledger(foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap())
+        .unwrap();
     rt.dispatch("t-h1", mkorder("t-h1", false)).unwrap();
     rt.dispatch("t-h2", mkorder("t-h2", false)).unwrap();
     // ① 준비 — 제안 행 + 매니페스트.
     let (manifest, _encoded) = rt.prepare_handoff("t-h1", "t-h2", "art-h").unwrap();
     let mut ap2 = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
     // ② 위조 — 잘못된 매니페스트: 사전 검증에서 거부(미소비 유지).
-    ap2.issue_grant("handoff-bad", "tok-bad", &serde_json::json!({
-        "order_id": "t-h1", "dest_order_id": "t-h2", "intent": "handoff",
-        "artifact_digest": "art-h", "handoff_manifest": "forged", "root_scope": "",
-    }))
+    ap2.issue_grant(
+        "handoff-bad",
+        "tok-bad",
+        &serde_json::json!({
+            "order_id": "t-h1", "dest_order_id": "t-h2", "intent": "handoff",
+            "artifact_digest": "art-h", "handoff_manifest": "forged", "root_scope": "",
+        }),
+    )
     .unwrap();
     let refused = rt.dispatch_handoff("t-h1", "t-h2", "art-h", "handoff-bad");
-    assert!(refused.is_err(), "forged-manifest handoff refused pre-consume");
+    assert!(
+        refused.is_err(),
+        "forged-manifest handoff refused pre-consume"
+    );
     // ③ 정품 — 매니페스트 결속 그랜트 소비(CONSUMED).
-    ap2.issue_grant("handoff-ok", "tok-ho", &serde_json::json!({
-        "order_id": "t-h1", "dest_order_id": "t-h2", "intent": "handoff",
-        "artifact_digest": "art-h", "handoff_manifest": manifest, "root_scope": "",
-    }))
+    ap2.issue_grant(
+        "handoff-ok",
+        "tok-ho",
+        &serde_json::json!({
+            "order_id": "t-h1", "dest_order_id": "t-h2", "intent": "handoff",
+            "artifact_digest": "art-h", "handoff_manifest": manifest, "root_scope": "",
+        }),
+    )
     .unwrap();
     rt.dispatch_handoff("t-h1", "t-h2", "art-h", "handoff-ok")
         .unwrap_or_else(|e| panic!("live handoff front door: {e}"));
     let ap_check = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
     let g = ap_check.get_grant("handoff-ok").unwrap();
-    assert!(g.state == foundry_approval::GrantState::Consumed,
-        "handoff grant consumed via verify→consume→confirm");
+    assert!(
+        g.state == foundry_approval::GrantState::Consumed,
+        "handoff grant consumed via verify→consume→confirm"
+    );
     let gbad = ap_check.get_grant("handoff-bad").unwrap();
-    assert!(gbad.state != foundry_approval::GrantState::Consumed,
-        "forged grant left unconsumed");
+    assert!(
+        gbad.state != foundry_approval::GrantState::Consumed,
+        "forged grant left unconsumed"
+    );
 }
-
 
 /// (r3 MAJOR-1) 소비 후 재시도 멱등 — CONSUMED 그랜트로 정문 재호출이
 /// AlreadyConsumed 에러 없이 성공(confirm 재수행).
@@ -749,7 +929,10 @@ fn t61_handoff_retry_after_consumption_idempotent() {
     orch.declare_plan(
         "plan-hr",
         vec![("t-r1".into(), vec![]), ("t-r2".into(), vec![])],
-        vec![("t-r1".into(), "s-hr".into()), ("t-r2".into(), "s-hr".into())],
+        vec![
+            ("t-r1".into(), "s-hr".into()),
+            ("t-r2".into(), "s-hr".into()),
+        ],
     )
     .unwrap();
     let mut ap = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
@@ -762,32 +945,38 @@ fn t61_handoff_retry_after_consumption_idempotent() {
         let sr = ap.reserve_grant("sizing-sz-hr", &serde_json::json!({
             "order_id": "sz-hr", "intent": "sizing", "artifact_digest": digest, "root_scope": "",
         }), "hr", 1).unwrap();
-        ap.begin_apply("sizing-sz-hr", "hr", 1, sr.fence_token).unwrap();
-        ap.finalize_grant("sizing-sz-hr", "hr", 1, sr.fence_token).unwrap();
+        ap.begin_apply("sizing-sz-hr", "hr", 1, sr.fence_token)
+            .unwrap();
+        ap.finalize_grant("sizing-sz-hr", "hr", 1, sr.fence_token)
+            .unwrap();
         let ch = Chainer::new(&orch, &ap);
-        ch.bind_preset_from_ledger("sz-hr", "bmad-epic-build", "plan-hr").unwrap();
+        ch.bind_preset_from_ledger("sz-hr", "bmad-epic-build", "plan-hr")
+            .unwrap();
     }
     let rt = StreamRuntime::new(OrchestrationLog::open(&d.join("orch.db")).unwrap());
-    rt.add_stream(Stream::new_with_root("s-hr", &d, "bmad-epic-build").unwrap()).unwrap();
-    rt.bind_approval_ledger(
-        foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
-    )
-    .unwrap();
+    rt.add_stream(Stream::new_with_root("s-hr", &d, "bmad-epic-build").unwrap())
+        .unwrap();
+    rt.bind_approval_ledger(foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap())
+        .unwrap();
     rt.dispatch("t-r1", mkorder("t-r1", false)).unwrap();
     rt.dispatch("t-r2", mkorder("t-r2", false)).unwrap();
     let (manifest, _enc) = rt.prepare_handoff("t-r1", "t-r2", "art-hr").unwrap();
     let mut ap2 = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
-    ap2.issue_grant("ho-hr", "tok-ho2", &serde_json::json!({
-        "order_id": "t-r1", "dest_order_id": "t-r2", "intent": "handoff",
-        "artifact_digest": "art-hr", "handoff_manifest": manifest, "root_scope": "",
-    }))
+    ap2.issue_grant(
+        "ho-hr",
+        "tok-ho2",
+        &serde_json::json!({
+            "order_id": "t-r1", "dest_order_id": "t-r2", "intent": "handoff",
+            "artifact_digest": "art-hr", "handoff_manifest": manifest, "root_scope": "",
+        }),
+    )
     .unwrap();
     // 1차 소비.
-    rt.dispatch_handoff("t-r1", "t-r2", "art-hr", "ho-hr").unwrap();
+    rt.dispatch_handoff("t-r1", "t-r2", "art-hr", "ho-hr")
+        .unwrap();
     // 재시도 — CONSUMED 면 멱등 성공이어야 한다(AlreadyConsumed 아님).
     rt.dispatch_handoff("t-r1", "t-r2", "art-hr", "ho-hr")
         .unwrap_or_else(|e| panic!("retry after consumption must be idempotent: {e}"));
     let ap_check = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
-    assert!(ap_check.get_grant("ho-hr").unwrap().state
-        == foundry_approval::GrantState::Consumed);
+    assert!(ap_check.get_grant("ho-hr").unwrap().state == foundry_approval::GrantState::Consumed);
 }

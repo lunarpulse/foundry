@@ -5,14 +5,14 @@
 //!
 //! 이 크레이트는 게이트 전용 — 프로덕션 코드를 포함하지 않는다.
 
+pub mod aprime_crash;
 pub mod common;
-pub mod g3_approval_fixture;
+pub mod dprime_identity;
+pub mod full_cycle;
 pub mod g13_activation;
 pub mod g14_failure_mapping;
 pub mod g16_oracle;
 pub mod g17_cursor;
-pub mod aprime_crash;
-pub mod dprime_identity;
+pub mod g3_approval_fixture;
 pub mod preset_pin;
-pub mod full_cycle;
 pub mod scale_presets;

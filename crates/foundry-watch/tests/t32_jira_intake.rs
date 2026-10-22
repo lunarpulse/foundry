@@ -20,7 +20,10 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 fn tmpdir() -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("t32-int-{}", std::process::id()));

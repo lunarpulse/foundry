@@ -22,9 +22,9 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use foundry_exec::SqliteTupleStore;
 use serde::Deserialize;
 use std::sync::Arc;
-use foundry_exec::SqliteTupleStore;
 
 #[derive(Deserialize)]
 pub struct ApproveBody {
@@ -59,11 +59,16 @@ pub async fn approve(
         }
     };
 
-    let tuple_path = std::env::var("FOUNDRY_TUPLES").unwrap_or_else(|_| "~/.foundry/tuples.db".into());
+    let tuple_path =
+        std::env::var("FOUNDRY_TUPLES").unwrap_or_else(|_| "~/.foundry/tuples.db".into());
     let tuple_path = expand_tilde(&tuple_path);
     let tuples = match SqliteTupleStore::open(&tuple_path) {
         Ok(store) => Arc::new(store),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"tuple store unavailable","detail":format!("{e:?}")}))).into_response(),
+        Err(e) => return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error":"tuple store unavailable","detail":format!("{e:?}")})),
+        )
+            .into_response(),
     };
     st.line.set_tuple_store(tuples.clone());
 
@@ -79,7 +84,11 @@ pub async fn approve(
             )
                 .into_response();
         }
-        match foundry_line::rehydrate::rehydrate(&st.ledger, std::path::Path::new("/tmp"), tuples.as_ref()) {
+        match foundry_line::rehydrate::rehydrate(
+            &st.ledger,
+            std::path::Path::new("/tmp"),
+            tuples.as_ref(),
+        ) {
             Ok(orders) => {
                 for o in orders {
                     st.line.submit(o).await;
@@ -153,7 +162,9 @@ pub async fn approve(
 
 fn expand_tilde(raw: &str) -> std::path::PathBuf {
     if let Some(rest) = raw.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") { return std::path::PathBuf::from(home).join(rest); }
+        if let Ok(home) = std::env::var("HOME") {
+            return std::path::PathBuf::from(home).join(rest);
+        }
     }
     raw.into()
 }

@@ -18,13 +18,12 @@
 //! takes a session TOKEN; the role is looked up. The CLI path can
 //! still construct an ApplyCommand directly, but ONLY after
 //! `authenticate_cli` resolves a real session (no ambient owner).
-use foundry_watch::bundles::BundleStore;
+use crate::identity::{Identity, IdentityError};
 use foundry_watch::command_binding::{HardenedApply, HardenedError};
 use foundry_watch::coordinator::GovernanceCoordinator;
 use foundry_watch::governance_events::GovernanceEvent;
 use foundry_watch::policy_apply::{ApplyCommand, ApplyError, PolicyApplicationLayer, Role};
 use foundry_watch::retro::InsightPipeline;
-use crate::identity::{Identity, IdentityError};
 
 #[derive(Debug)]
 pub enum ServeWiringError {
@@ -32,7 +31,9 @@ pub enum ServeWiringError {
     Unauthenticated(String),
     /// authenticated but the CURRENT role is not Owner (demotion
     /// applies instantly to live sessions)
-    Forbidden { current_role: String },
+    Forbidden {
+        current_role: String,
+    },
     Binding(HardenedError),
     Apply(ApplyError),
     Coordinator(foundry_watch::coordinator::CoordinatorError),
@@ -75,7 +76,9 @@ pub fn apply_policy_via_serve(
     //    A demoted owner's live session fails HERE, instantly.
     let current_role = role_of(&user.role);
     if current_role != Role::Owner {
-        return Err(ServeWiringError::Forbidden { current_role: format!("{:?}", user.role) });
+        return Err(ServeWiringError::Forbidden {
+            current_role: format!("{:?}", user.role),
+        });
     }
 
     // 3. BINDING (T54w): digest must equal the canonical digest of
@@ -103,7 +106,13 @@ pub fn apply_policy_via_serve(
     })?;
 
     // 5. APPLY (T50b): owner authority, single-use, expiry.
-    let applied = match layer.apply(&cmd, pipeline, &foundry_watch::evaluation_protocol::frozen_policy_graph(), proposer, now) {
+    let applied = match layer.apply(
+        &cmd,
+        pipeline,
+        &foundry_watch::evaluation_protocol::frozen_policy_graph(),
+        proposer,
+        now,
+    ) {
         Ok(a) => a,
         Err(e) => {
             // the intent is durable but the effect failed: journal the
@@ -145,12 +154,17 @@ pub fn apply_policy_via_serve(
 
 /// CLI authentication bridge: the CLI cannot mint owner authority —
 /// it must present a session token that resolves to a CURRENT owner.
-pub fn authenticate_cli(identity: &mut Identity, session_token: &str) -> Result<String, ServeWiringError> {
+pub fn authenticate_cli(
+    identity: &mut Identity,
+    session_token: &str,
+) -> Result<String, ServeWiringError> {
     let user = identity
         .resolve_session(session_token)
         .map_err(|e: IdentityError| ServeWiringError::Unauthenticated(format!("{e}")))?;
     if role_of(&user.role) != Role::Owner {
-        return Err(ServeWiringError::Forbidden { current_role: format!("{:?}", user.role) });
+        return Err(ServeWiringError::Forbidden {
+            current_role: format!("{:?}", user.role),
+        });
     }
     Ok(user.username)
 }
@@ -167,19 +181,21 @@ fn role_of(r: &crate::identity::Role) -> Role {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use foundry_watch::retro::{EvidenceEnvelope, InsightRecord, PolicyDiff, Prediction, QueryCatalog};
+    use foundry_watch::retro::{
+        EvidenceEnvelope, InsightRecord, PolicyDiff, Prediction, QueryCatalog,
+    };
     use std::collections::BTreeMap;
 
     struct FastHasher;
     impl crate::identity::PasswordHasher for FastHasher {
-        fn hash(&self, p: &str) -> String {
+        fn hash(&self, p: &str) -> Result<String, String> {
             use sha2::Digest as _;
             let mut h = sha2::Sha512::new();
             h.update(p.as_bytes());
-            format!("fast${:x}", h.finalize())
+            Ok(format!("fast${:x}", h.finalize()))
         }
-        fn verify(&self, p: &str, hash: &str) -> bool {
-            self.hash(p) == hash
+        fn verify(&self, p: &str, hash: &str) -> Result<bool, String> {
+            Ok(self.hash(p)? == hash)
         }
     }
 
@@ -192,13 +208,19 @@ mod tests {
         let path = dir.join("id.db");
         let _ = std::fs::remove_file(&path);
         let mut id = Identity::open(&path).unwrap();
-        id.bootstrap_owner("owner-1", "correct horse battery staple", &FastHasher).unwrap();
-        let tok = id.login("owner-1", "correct horse battery staple", &FastHasher, 3600).unwrap();
+        id.bootstrap_owner("owner-1", "correct horse battery staple", &FastHasher)
+            .unwrap();
+        let tok = id
+            .login("owner-1", "correct horse battery staple", &FastHasher, 3600)
+            .unwrap();
         (id, tok)
     }
 
     fn pipeline() -> InsightPipeline {
-        let mut p = InsightPipeline::new(QueryCatalog::frozen_v1(), foundry_watch::evaluation_protocol::frozen_policy_graph());
+        let mut p = InsightPipeline::new(
+            QueryCatalog::frozen_v1(),
+            foundry_watch::evaluation_protocol::frozen_policy_graph(),
+        );
         let mut e = EvidenceEnvelope {
             ledger_prefix_len: 1,
             ledger_prefix_head_hash: "h".into(),
@@ -221,7 +243,9 @@ mod tests {
             evidence: e,
             proposal: Some(PolicyDiff {
                 target: "poll_interval".into(),
-                changes: [("max_retries".to_string(), "2".to_string())].into_iter().collect(),
+                changes: [("max_retries".to_string(), "2".to_string())]
+                    .into_iter()
+                    .collect(),
             }),
             prediction: Some(Prediction {
                 metric: "retry_rate_by_task_class".into(),
@@ -260,9 +284,23 @@ mod tests {
         let mut layer = PolicyApplicationLayer::new();
         let mut coord = GovernanceCoordinator::open_in_memory().unwrap();
         let d = HardenedApply::command_digest_for(&p, "I1", 0).unwrap();
-        let out = apply_policy_via_serve(&mut id, &p, &mut layer, &mut coord, &tok, &owner_cmd(d), "agent-1", 10).unwrap();
+        let out = apply_policy_via_serve(
+            &mut id,
+            &p,
+            &mut layer,
+            &mut coord,
+            &tok,
+            &owner_cmd(d),
+            "agent-1",
+            10,
+        )
+        .unwrap();
         assert!(out.contains("policy_version=1"));
-        assert_eq!(coord.head().unwrap().1, 2, "activation pair on the durable journal");
+        assert_eq!(
+            coord.head().unwrap().1,
+            2,
+            "activation pair on the durable journal"
+        );
         assert_eq!(coord.restart_state().unwrap().clean, true);
     }
 
@@ -273,15 +311,34 @@ mod tests {
         // the LAST owner — create a second owner first, then disable
         // owner-1 (whose session is live).
         let actor = id.resolve_session(&tok).unwrap();
-        id.create_user(&actor, "owner-2", "pw2", crate::identity::Role::Owner, &FastHasher).unwrap();
+        id.create_user(
+            &actor,
+            "owner-2",
+            "pw2",
+            crate::identity::Role::Owner,
+            &FastHasher,
+        )
+        .unwrap();
         id.set_disabled(&actor, "owner-1", true).unwrap();
         let p = pipeline();
         let mut layer = PolicyApplicationLayer::new();
         let mut coord = GovernanceCoordinator::open_in_memory().unwrap();
         let d = HardenedApply::command_digest_for(&p, "I1", 0).unwrap();
-        let err = apply_policy_via_serve(&mut id, &p, &mut layer, &mut coord, &tok, &owner_cmd(d), "a", 10).unwrap_err();
-        assert!(matches!(err, ServeWiringError::Unauthenticated(_)),
-            "disabled owner's live session refused at authentication");
+        let err = apply_policy_via_serve(
+            &mut id,
+            &p,
+            &mut layer,
+            &mut coord,
+            &tok,
+            &owner_cmd(d),
+            "a",
+            10,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ServeWiringError::Unauthenticated(_)),
+            "disabled owner's live session refused at authentication"
+        );
         assert_eq!(coord.head().unwrap().1, 0, "nothing journaled on refusal");
     }
 
@@ -289,13 +346,32 @@ mod tests {
     fn observer_session_cannot_apply() {
         let (mut id, owner_tok) = identity_with_owner();
         let actor = id.resolve_session(&owner_tok).unwrap();
-        id.create_user(&actor, "obs-1", "pw", crate::identity::Role::Observer, &FastHasher).unwrap();
+        id.create_user(
+            &actor,
+            "obs-1",
+            "pw",
+            crate::identity::Role::Observer,
+            &FastHasher,
+        )
+        .unwrap();
         let tok = id.login("obs-1", "pw", &FastHasher, 3600).unwrap();
         let p = pipeline();
         let mut layer = foundry_watch::policy_apply::PolicyApplicationLayer::new();
-        let mut coord = foundry_watch::coordinator::GovernanceCoordinator::open_in_memory().unwrap();
-        let d = foundry_watch::command_binding::HardenedApply::command_digest_for(&p, "I1", 0).unwrap();
-        let err = apply_policy_via_serve(&mut id, &p, &mut layer, &mut coord, &tok, &owner_cmd(d), "a", 10).unwrap_err();
+        let mut coord =
+            foundry_watch::coordinator::GovernanceCoordinator::open_in_memory().unwrap();
+        let d =
+            foundry_watch::command_binding::HardenedApply::command_digest_for(&p, "I1", 0).unwrap();
+        let err = apply_policy_via_serve(
+            &mut id,
+            &p,
+            &mut layer,
+            &mut coord,
+            &tok,
+            &owner_cmd(d),
+            "a",
+            10,
+        )
+        .unwrap_err();
         assert!(matches!(err, ServeWiringError::Forbidden { .. }));
         assert_eq!(coord.head().unwrap().1, 0);
     }
@@ -308,9 +384,17 @@ mod tests {
         let mut coord = GovernanceCoordinator::open_in_memory().unwrap();
         let mut cmd = owner_cmd("prop-deadbeef".into());
         cmd.approver = "owner-1".into();
-        let err = apply_policy_via_serve(&mut id, &p, &mut layer, &mut coord, &tok, &cmd, "a", 10).unwrap_err();
-        assert!(matches!(err, ServeWiringError::Binding(HardenedError::ContentMismatch { .. })));
-        assert_eq!(coord.head().unwrap().1, 0, "no journal entries for a refused command");
+        let err = apply_policy_via_serve(&mut id, &p, &mut layer, &mut coord, &tok, &cmd, "a", 10)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ServeWiringError::Binding(HardenedError::ContentMismatch { .. })
+        ));
+        assert_eq!(
+            coord.head().unwrap().1,
+            0,
+            "no journal entries for a refused command"
+        );
         assert_eq!(layer.policy_version, 0, "no policy change");
     }
 
@@ -318,7 +402,9 @@ mod tests {
     fn cli_requires_a_real_session() {
         let (mut id, _) = identity_with_owner();
         assert!(authenticate_cli(&mut id, "not-a-session").is_err());
-        let tok = id.login("owner-1", "correct horse battery staple", &FastHasher, 3600).unwrap();
+        let tok = id
+            .login("owner-1", "correct horse battery staple", &FastHasher, 3600)
+            .unwrap();
         let account = authenticate_cli(&mut id, &tok).unwrap();
         assert_eq!(account, "owner-1");
     }
@@ -330,9 +416,29 @@ mod tests {
         let mut layer = PolicyApplicationLayer::new();
         let mut coord = GovernanceCoordinator::open_in_memory().unwrap();
         let d = HardenedApply::command_digest_for(&p, "I1", 0).unwrap();
-        apply_policy_via_serve(&mut id, &p, &mut layer, &mut coord, &tok, &owner_cmd(d.clone()), "a", 10).unwrap();
+        apply_policy_via_serve(
+            &mut id,
+            &p,
+            &mut layer,
+            &mut coord,
+            &tok,
+            &owner_cmd(d.clone()),
+            "a",
+            10,
+        )
+        .unwrap();
         // second application of the SAME op: single-use refusal
-        let err = apply_policy_via_serve(&mut id, &p, &mut layer, &mut coord, &tok, &owner_cmd(d), "a", 20).unwrap_err();
+        let err = apply_policy_via_serve(
+            &mut id,
+            &p,
+            &mut layer,
+            &mut coord,
+            &tok,
+            &owner_cmd(d),
+            "a",
+            20,
+        )
+        .unwrap_err();
         // the second attempt fails closed — stale base (policy moved
         // to v1) fires before the replay check here; BOTH are the
         // single-use family. Assert the closed failure precisely:
@@ -344,7 +450,11 @@ mod tests {
             ),
             "fail-closed either way, got: {err:?}"
         );
-        assert_eq!(coord.head().unwrap().1, 2, "only the FIRST activation is journaled");
+        assert_eq!(
+            coord.head().unwrap().1,
+            2,
+            "only the FIRST activation is journaled"
+        );
     }
 
     #[test]
@@ -354,16 +464,36 @@ mod tests {
         let mut layer = PolicyApplicationLayer::new();
         let mut coord = GovernanceCoordinator::open_in_memory().unwrap();
         let d = HardenedApply::command_digest_for(&p, "I1", 0).unwrap();
-        apply_policy_via_serve(&mut id, &p, &mut layer, &mut coord, &tok, &owner_cmd(d), "a", 10).unwrap();
+        apply_policy_via_serve(
+            &mut id,
+            &p,
+            &mut layer,
+            &mut coord,
+            &tok,
+            &owner_cmd(d),
+            "a",
+            10,
+        )
+        .unwrap();
         let stream = coord.replay().unwrap();
         assert_eq!(stream.len(), 2);
         // seq order: Pending BEFORE Committed — write-ahead governance
-        assert!(matches!(stream[0].phase, foundry_watch::governance_events::Phase::Pending));
-        assert!(matches!(stream[1].phase, foundry_watch::governance_events::Phase::Committed));
+        assert!(matches!(
+            stream[0].phase,
+            foundry_watch::governance_events::Phase::Pending
+        ));
+        assert!(matches!(
+            stream[1].phase,
+            foundry_watch::governance_events::Phase::Committed
+        ));
         assert_eq!(stream[0].seq, 1);
         assert_eq!(stream[1].seq, 2);
         // timestamps are server-clock (not a shared constant)
-        assert!(!stream[0].at.starts_with("2026-10-08T00:00:00"), "N5: real event time, got {}", stream[0].at);
+        assert!(
+            !stream[0].at.starts_with("2026-10-08T00:00:00"),
+            "N5: real event time, got {}",
+            stream[0].at
+        );
     }
 
     #[test]
@@ -378,7 +508,10 @@ mod tests {
         apply_policy_via_serve(&mut id, &p, &mut layer, &mut coord, &tok, &cmd, "a", 10).unwrap();
         // the journal records the SESSION user, not the forged string
         let stream = coord.replay().unwrap();
-        assert!(stream.iter().all(|e| e.actor.contains("owner-1")), "actor is the session principal");
+        assert!(
+            stream.iter().all(|e| e.actor.contains("owner-1")),
+            "actor is the session principal"
+        );
     }
 
     #[test]
@@ -395,8 +528,13 @@ mod tests {
         let _ = apply_policy_via_serve(&mut id, &p, &mut layer, &mut coord, &tok, &cmd, "a", 10);
         let stream = coord.replay().unwrap();
         assert_eq!(stream.len(), 2, "Pending + Aborted pair");
-        assert!(matches!(stream[1].phase, foundry_watch::governance_events::Phase::Aborted),
-            "failed effect closes the pair with Aborted — recovery never auto-retries");
+        assert!(
+            matches!(
+                stream[1].phase,
+                foundry_watch::governance_events::Phase::Aborted
+            ),
+            "failed effect closes the pair with Aborted — recovery never auto-retries"
+        );
         let rs = coord.restart_state().unwrap();
         assert!(rs.clean, "no dangling pending after the abort");
     }

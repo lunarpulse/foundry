@@ -11,8 +11,14 @@ fn carry_over_deducts_settlement_from_carried_funds() {
     };
     assert_eq!(budget.carry_over().carried_nano, 1);
 
-    let exhausted = Budget { settled_nano: 13, ..budget };
-    assert_eq!(reserve(&exhausted.carry_over(), 1), ReservationOutcome::Exhausted);
+    let exhausted = Budget {
+        settled_nano: 13,
+        ..budget
+    };
+    assert_eq!(
+        reserve(&exhausted.carry_over(), 1),
+        ReservationOutcome::Exhausted
+    );
 }
 
 #[test]
@@ -34,7 +40,11 @@ fn carry_over_preserves_available_budget_at_boundaries() {
     for reserved_nano in values {
         for settled_nano in values {
             for carried_nano in values {
-                let budget = Budget { reserved_nano, settled_nano, carried_nano };
+                let budget = Budget {
+                    reserved_nano,
+                    settled_nano,
+                    carried_nano,
+                };
                 assert_eq!(
                     reserve(&budget, 0),
                     reserve(&budget.carry_over(), 0),
@@ -73,7 +83,8 @@ fn receipt_wrapper_rejects_unknown_fields_inside_an_outcome() {
         cursor: None,
         next_activation: None,
         receipts: vec![Receipt::Session(session_receipt(None))],
-    }).unwrap();
+    })
+    .unwrap();
     value["receipts"][0]["unrecognized"] = serde_json::json!(true);
     assert!(serde_json::from_value::<ExecutionOutcome>(value).is_err());
 }

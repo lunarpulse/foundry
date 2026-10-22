@@ -1,24 +1,35 @@
 //! 게이트 공용 픽스처 — 엔진·원장·저널·주문·컨텍스트 팩토리.
 
+use foundry_domain::OrderState;
 use foundry_domain::order::{ExternalRef, Order, OrderEvent};
 use foundry_domain::ports::{ActorId, ActorKind};
-use foundry_domain::OrderState;
 use foundry_ledger::SqliteLedger;
 use foundry_workflow::WorkflowEngine;
 
 pub fn actor(tag: &str) -> ActorId {
-    ActorId { kind: ActorKind::Agent, source: "gate".into(), id: tag.into() }
+    ActorId {
+        kind: ActorKind::Agent,
+        source: "gate".into(),
+        id: tag.into(),
+    }
 }
 
 /// FurnaceHold 에 도달한 주문 — 승인 게이트 검증의 표준 시작 상태.
 pub fn furnace_order(id: &str) -> Order {
-    let mut o = Order::new(id.to_string(), ExternalRef::cron("src", "ref"), chrono::Utc::now());
+    let mut o = Order::new(
+        id.to_string(),
+        ExternalRef::cron("src", "ref"),
+        chrono::Utc::now(),
+    );
     o.force_state_for_test(OrderState::FurnaceHold, 1);
     o
 }
 
 pub fn approval_event(intent: &str, digest: &str) -> OrderEvent {
-    OrderEvent::Approved { intent: intent.into(), artifact_digest: digest.into() }
+    OrderEvent::Approved {
+        intent: intent.into(),
+        artifact_digest: digest.into(),
+    }
 }
 
 /// 게이트 표준 엔진 (frozen_v1·여유 예산).
@@ -54,7 +65,10 @@ pub fn replay_event(
 /// 이 주문의 직전 커밋 행을 가리키는 재생 컨텍스트 — 신뢰 경로:
 /// 행이 있으면 커밋먼트 경유 **발급**(issue_replay_cursor), 없으면
 /// **제네시스**(유일 부트스트랩).
-pub fn replay_ctx_for(order: &str, rows: &[foundry_ledger::sqlite::LedgerRow]) -> foundry_workflow::replay::ReplayContext {
+pub fn replay_ctx_for(
+    order: &str,
+    rows: &[foundry_ledger::sqlite::LedgerRow],
+) -> foundry_workflow::replay::ReplayContext {
     let last_mine = rows.iter().filter(|r| r.order_id == order).next_back();
     let c = terminal_commitment_from(rows);
     let cursor = match last_mine {
@@ -65,7 +79,9 @@ pub fn replay_ctx_for(order: &str, rows: &[foundry_ledger::sqlite::LedgerRow]) -
     foundry_workflow::replay::ReplayContext { cursor }
 }
 
-pub fn terminal_commitment_from(rows: &[foundry_ledger::sqlite::LedgerRow]) -> foundry_workflow::replay::TerminalCommitment {
+pub fn terminal_commitment_from(
+    rows: &[foundry_ledger::sqlite::LedgerRow],
+) -> foundry_workflow::replay::TerminalCommitment {
     foundry_workflow::replay::TerminalCommitment {
         max_seq: rows.last().map(|r| r.seq).unwrap_or(0),
         count: rows.len() as i64,

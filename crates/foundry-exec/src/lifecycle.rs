@@ -83,7 +83,9 @@ where
     /// its binding or recover its result; new activations wait for the prior binding.
     pub fn run(&mut self, intent: ExecutionIntent) -> Result<RunStep, LifecycleError> {
         if let Some(ledger) = self.attempt_ledger {
-            ledger.consume(&intent.order, intent.attempt, intent.run).map_err(LifecycleError::AttemptBudget)?;
+            ledger
+                .consume(&intent.order, intent.attempt, intent.run)
+                .map_err(LifecycleError::AttemptBudget)?;
         }
         let key = (intent.order.clone(), intent.attempt, intent.run);
         if let Some(recorded) = self.intents.get(&key, intent.activation) {
@@ -126,7 +128,9 @@ where
         intent: ExecutionIntent,
         ledger: &dyn AttemptLedger,
     ) -> Result<RunStep, LifecycleError> {
-        ledger.consume(&intent.order, intent.attempt, intent.run).map_err(LifecycleError::AttemptBudget)?;
+        ledger
+            .consume(&intent.order, intent.attempt, intent.run)
+            .map_err(LifecycleError::AttemptBudget)?;
         self.run(intent)
     }
 
@@ -193,9 +197,14 @@ where
         key: &IntentKey,
         intent: &ExecutionIntent,
     ) -> Result<ExecutionOutcome, LifecycleError> {
-        self.faults.fire(CrashPoint::W1).map_err(LifecycleError::Crash)?;
+        self.faults
+            .fire(CrashPoint::W1)
+            .map_err(LifecycleError::Crash)?;
         self.intents.mark_started(key, intent.activation);
-        let result = self.host.try_dispatch(intent).map_err(LifecycleError::Host)?;
+        let result = self
+            .host
+            .try_dispatch(intent)
+            .map_err(LifecycleError::Host)?;
         self.bind_result(intent, result)
     }
 
@@ -205,7 +214,9 @@ where
         result: DispatchResult,
     ) -> Result<ExecutionOutcome, LifecycleError> {
         let outcome = outcome_from(intent, result);
-        self.faults.fire(CrashPoint::W2).map_err(LifecycleError::Crash)?;
+        self.faults
+            .fire(CrashPoint::W2)
+            .map_err(LifecycleError::Crash)?;
         self.outcomes.commit(&outcome);
         Ok(outcome)
     }

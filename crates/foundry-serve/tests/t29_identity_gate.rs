@@ -19,11 +19,11 @@ static APPROVAL_TUPLE_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_ne
 
 struct FastHasher;
 impl PasswordHasher for FastHasher {
-    fn hash(&self, p: &str) -> String {
-        format!("fast${p}")
+    fn hash(&self, p: &str) -> Result<String, String> {
+        Ok(format!("fast${p}"))
     }
-    fn verify(&self, p: &str, hash: &str) -> bool {
-        self.hash(p) == hash
+    fn verify(&self, p: &str, hash: &str) -> Result<bool, String> {
+        Ok(self.hash(p)? == hash)
     }
 }
 
@@ -88,10 +88,7 @@ async fn setup_with_users(tag: &str) -> Arc<ServeState> {
 }
 
 fn approval_tuple_store(tag: &str) -> SqliteTupleStore {
-    let dir = std::env::temp_dir().join(format!(
-        "t29-tuples-{tag}-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("t29-tuples-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let tuple_path = dir.join("tuples.db");
@@ -253,7 +250,6 @@ async fn legacy_actor_cannot_authenticate() {
     assert!(ok, "legacy actor tokens never authenticate");
 }
 
-
 #[tokio::test(flavor = "multi_thread")]
 async fn identity_errors_precede_tuple_store_failure() {
     let _tuple_env = APPROVAL_TUPLE_ENV.lock().await;
@@ -266,12 +262,30 @@ async fn identity_errors_precede_tuple_store_failure() {
     let st = setup_with_users("unavailable").await;
     let app = || Router::new().merge(foundry_serve::http::router(st.clone()));
     assert_eq!(req(app(), None, "go").await.0, StatusCode::UNAUTHORIZED);
-    assert_eq!(req(app(), Some("invalid-session"), "go").await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        req(app(), Some("invalid-session"), "go").await.0,
+        StatusCode::UNAUTHORIZED
+    );
     let observer = login(&st, "obs").await;
-    assert_eq!(req(app(), Some(&observer), "go").await.0, StatusCode::FORBIDDEN);
+    assert_eq!(
+        req(app(), Some(&observer), "go").await.0,
+        StatusCode::FORBIDDEN
+    );
     let owner = login(&st, "root").await;
-    assert_eq!(req(app(), Some(&owner), "go").await.0, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(st.line.get("o-29").await.unwrap().state(), OrderState::FurnaceHold);
-    assert!(!st.ledger.read_all().unwrap().iter().any(|r| r.to_state == "publishing"));
+    assert_eq!(
+        req(app(), Some(&owner), "go").await.0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+        st.line.get("o-29").await.unwrap().state(),
+        OrderState::FurnaceHold
+    );
+    assert!(
+        !st.ledger
+            .read_all()
+            .unwrap()
+            .iter()
+            .any(|r| r.to_state == "publishing")
+    );
     unsafe { std::env::set_var("FOUNDRY_TUPLES", valid_path) };
 }

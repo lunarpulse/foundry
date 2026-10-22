@@ -5,8 +5,8 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use foundry_serve::ServeState;
-use std::sync::Arc;
 use http_body_util::BodyExt;
+use std::sync::Arc;
 use tower::ServiceExt; // for .oneshot
 
 static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -81,7 +81,11 @@ async fn route_rejects_garbage_session() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "unknown session -> 401");
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "unknown session -> 401"
+    );
 }
 
 #[tokio::test]
@@ -101,5 +105,8 @@ async fn route_rejects_malformed_body() {
         )
         .await
         .unwrap();
-    assert!(resp.status() != StatusCode::OK, "malformed body must not succeed");
+    assert!(
+        resp.status() != StatusCode::OK,
+        "malformed body must not succeed"
+    );
 }

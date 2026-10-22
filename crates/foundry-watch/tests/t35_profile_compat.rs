@@ -8,8 +8,8 @@
 //!      with one — extensions grant no new authority
 use foundry_domain::casting::{CastingRun, CastingState, Verdict};
 use foundry_domain::ports::{ActorId, ActorKind, ApprovalToken};
-use foundry_watch::dry_die::CandidateProfile;
 use foundry_watch::benchmark::{CompareReport, Metrics};
+use foundry_watch::dry_die::CandidateProfile;
 use foundry_watch::judging::{self, JudgeInput, JudgingPolicy};
 use foundry_watch::profile_ext::{ProfileExtensions, ReproClass};
 
@@ -58,8 +58,26 @@ fn judging_unchanged_with_extensions_present() {
     // guardrail axis: regression -> immediate Reject
     let input = JudgeInput {
         report: CompareReport {
-            baseline: Metrics { metric_version: 1, cohort_size: 10, max_event_schema_version: 2, shipped: 10, failed: 0, rejected_noop: 0, attempts_total: 10, cost: foundry_watch::benchmark::CostSums::default() },
-            current: Metrics { metric_version: 1, cohort_size: 10, max_event_schema_version: 2, shipped: 9, failed: 1, rejected_noop: 0, attempts_total: 10, cost: foundry_watch::benchmark::CostSums::default() },
+            baseline: Metrics {
+                metric_version: 1,
+                cohort_size: 10,
+                max_event_schema_version: 2,
+                shipped: 10,
+                failed: 0,
+                rejected_noop: 0,
+                attempts_total: 10,
+                cost: foundry_watch::benchmark::CostSums::default(),
+            },
+            current: Metrics {
+                metric_version: 1,
+                cohort_size: 10,
+                max_event_schema_version: 2,
+                shipped: 9,
+                failed: 1,
+                rejected_noop: 0,
+                attempts_total: 10,
+                cost: foundry_watch::benchmark::CostSums::default(),
+            },
             shipped_delta: -1,
             failed_delta: 1,
             rejected_delta: 0,
@@ -69,14 +87,36 @@ fn judging_unchanged_with_extensions_present() {
         shipped_to_failed_regressions: 1,
     };
     let out = judging::judge(&policy, &input);
-    assert_eq!(out.verdict, Verdict::Reject, "regression still refuses with extensions present");
+    assert_eq!(
+        out.verdict,
+        Verdict::Reject,
+        "regression still refuses with extensions present"
+    );
 
     // clean candidate, full coverage, no serious failures -> not auto-promoted either:
     // primary axis requires a declared improvement, which this input lacks
     let clean = JudgeInput {
         report: CompareReport {
-            baseline: Metrics { metric_version: 1, cohort_size: 10, max_event_schema_version: 2, shipped: 10, failed: 0, rejected_noop: 0, attempts_total: 10, cost: foundry_watch::benchmark::CostSums::default() },
-            current: Metrics { metric_version: 1, cohort_size: 10, max_event_schema_version: 2, shipped: 10, failed: 0, rejected_noop: 0, attempts_total: 10, cost: foundry_watch::benchmark::CostSums::default() },
+            baseline: Metrics {
+                metric_version: 1,
+                cohort_size: 10,
+                max_event_schema_version: 2,
+                shipped: 10,
+                failed: 0,
+                rejected_noop: 0,
+                attempts_total: 10,
+                cost: foundry_watch::benchmark::CostSums::default(),
+            },
+            current: Metrics {
+                metric_version: 1,
+                cohort_size: 10,
+                max_event_schema_version: 2,
+                shipped: 10,
+                failed: 0,
+                rejected_noop: 0,
+                attempts_total: 10,
+                cost: foundry_watch::benchmark::CostSums::default(),
+            },
             shipped_delta: 0,
             failed_delta: 0,
             rejected_delta: 0,
@@ -97,7 +137,13 @@ fn repro_class_grants_no_authority() {
     // descriptive metadata. Authority stays with the human token.
     let mut run = make_run();
     run.transition(CastingState::Running, None).unwrap();
-    run.transition(CastingState::Judged { verdict: Verdict::Promote }, None).unwrap();
+    run.transition(
+        CastingState::Judged {
+            verdict: Verdict::Promote,
+        },
+        None,
+    )
+    .unwrap();
     let ext = ProfileExtensions {
         repro_class: ReproClass::NondeterministicContract,
         ..ProfileExtensions::gpt_6_luna()
@@ -105,7 +151,10 @@ fn repro_class_grants_no_authority() {
     // no token -> refused, class notwithstanding
     assert!(run.transition(CastingState::Promoted, None).is_err());
     // with token -> allowed (the ONLY door; unchanged by T35)
-    assert!(run.transition(CastingState::Promoted, Some(&token())).is_ok());
+    assert!(
+        run.transition(CastingState::Promoted, Some(&token()))
+            .is_ok()
+    );
     let _ = ext;
 }
 
@@ -114,7 +163,11 @@ fn token() -> ApprovalToken {
         order_id: "o".into(),
         intent: "i".into(),
         artifact_digest: "d".into(),
-        actor: ActorId { kind: ActorKind::Human, source: "t".into(), id: "u".into() },
+        actor: ActorId {
+            kind: ActorKind::Human,
+            source: "t".into(),
+            id: "u".into(),
+        },
         granted_at: chrono::Utc::now(),
     }
 }

@@ -3,16 +3,21 @@
 //! watch is the single writer (critique #4); attempt numbers fence stale
 //! Dies (#3); audit appends share the SQLite transaction with the state
 //! write (#5); operation_id idempotency guards publishing (#2).
-pub mod error;
 pub mod die_executor;
+pub mod error;
 pub mod line;
+pub mod product;
 pub mod rehydrate;
 pub mod review_host;
 
-pub use error::LineError;
 pub use die_executor::DieStageExecutor;
+pub use error::LineError;
 pub use line::{Line, LineConfig, backoff_delay};
-pub use review_host::{InspectingReviewRun, BinaryProvenance, PackReviewHost, StageExecutor, StageOutput, StageTask, SqliteReviewLog, SqliteReviewSink, SqliteIntentLog, UnavailableStageExecutor, durable_review_run};
+pub use review_host::{
+    BinaryProvenance, InspectingReviewRun, PackReviewHost, SqliteIntentLog, SqliteReviewLog,
+    SqliteReviewSink, StageExecutor, StageOutput, StageTask, UnavailableStageExecutor,
+    durable_review_run,
+};
 
 /// (Notifier v2.7) publish 결과 영수증 — 상태 + PR URL(Unknown이면 None).
 #[derive(Debug, Clone)]

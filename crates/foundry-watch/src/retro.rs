@@ -116,20 +116,42 @@ impl EvidenceEnvelope {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum InsightError {
-    UnregisteredQuery { id: String },
-    InconsistentEvidence { expected: String, got: String },
+    UnregisteredQuery {
+        id: String,
+    },
+    InconsistentEvidence {
+        expected: String,
+        got: String,
+    },
     /// evidence cohort smaller than the query's minimum N — the
     /// insight is RECORDABLE as observation but carries NO proposal
-    BelowMinN { n: usize, min: usize },
+    BelowMinN {
+        n: usize,
+        min: usize,
+    },
     /// gate 18: the proposal targets the protected closure
-    ProtectedTarget { target: String, detail: String },
+    ProtectedTarget {
+        target: String,
+        detail: String,
+    },
     /// free text claiming to be an insight without an envelope
     NoEvidence,
     /// T55w: independent recomputation against the trusted source
-    ResultMismatch { claimed: String, recomputed: String },
-    LedgerHeadMismatch { claimed: String, authoritative: String },
-    CorpusMismatch { claimed: String, authoritative: String },
-    RecomputeRefused { detail: String },
+    ResultMismatch {
+        claimed: String,
+        recomputed: String,
+    },
+    LedgerHeadMismatch {
+        claimed: String,
+        authoritative: String,
+    },
+    CorpusMismatch {
+        claimed: String,
+        authoritative: String,
+    },
+    RecomputeRefused {
+        detail: String,
+    },
     /// prediction not falsifiable (no metric, no direction, no window)
     UnfalsifiablePrediction,
 }
@@ -188,12 +210,18 @@ pub struct InsightPipeline {
     insights: Vec<InsightRecord>,
     /// T55w trusted-source reader; None = unit scope (self-
     /// consistency only). Production ingestion installs one.
-    pub(crate) reader: Option<std::sync::Arc<dyn crate::evidence_recompute::EvidenceReader + Send + Sync>>,
+    pub(crate) reader:
+        Option<std::sync::Arc<dyn crate::evidence_recompute::EvidenceReader + Send + Sync>>,
 }
 
 impl InsightPipeline {
     pub fn new(catalog: QueryCatalog, policy_graph: PolicyGraph) -> Self {
-        InsightPipeline { catalog, policy_graph, insights: Vec::new(), reader: None }
+        InsightPipeline {
+            catalog,
+            policy_graph,
+            insights: Vec::new(),
+            reader: None,
+        }
     }
 
     /// Ingest an insight. Every C-R1/C-E1 gate fires HERE, before the
@@ -213,7 +241,11 @@ impl InsightPipeline {
         // 2. the query must be in the finite catalog — arbitrary
         //    analysis code never enters through the evidence door
         let min_n = match self.catalog.get(&rec.evidence.query_id) {
-            None => return Err(InsightError::UnregisteredQuery { id: rec.evidence.query_id.clone() }),
+            None => {
+                return Err(InsightError::UnregisteredQuery {
+                    id: rec.evidence.query_id.clone(),
+                });
+            }
             Some(q) => q.min_n,
         };
         // 3. gate 18 at ingestion: a proposal targeting the protected
@@ -221,7 +253,10 @@ impl InsightPipeline {
         //    insight is not even filed as evidence
         if let Some(prop) = &rec.proposal {
             if let Err(detail) = self.policy_graph.proposal_admissible(&prop.target) {
-                return Err(InsightError::ProtectedTarget { target: prop.target.clone(), detail });
+                return Err(InsightError::ProtectedTarget {
+                    target: prop.target.clone(),
+                    detail,
+                });
             }
         }
         // 4. proposal eligibility requires N >= the query's minimum
@@ -260,7 +295,9 @@ impl InsightPipeline {
     pub fn proposals(&self) -> Vec<&InsightRecord> {
         self.insights
             .iter()
-            .filter(|i| i.proposal.is_some() && i.strength(&self.catalog) == ProposalStrength::Supported)
+            .filter(|i| {
+                i.proposal.is_some() && i.strength(&self.catalog) == ProposalStrength::Supported
+            })
             .collect()
     }
 
@@ -288,7 +325,8 @@ mod tests {
             cohort: "all orders in window incl. failed/cancelled".into(),
             exclusions: vec![],
             denominator: "all attempts".into(),
-            missing_data_policy: "missing -> excluded from numerator AND denominator, count reported".into(),
+            missing_data_policy:
+                "missing -> excluded from numerator AND denominator, count reported".into(),
             policy_version: 1,
             protocol_digest: "evproto-x".into(),
             result_payload: payload.into(),
@@ -302,10 +340,15 @@ mod tests {
         InsightRecord {
             insight_id: id.into(),
             claim: "dep-bump retries run 3x hot".into(),
-            evidence: envelope("retry_rate_by_task_class", r#"{"dep_bump":0.41,"other":0.12}"#),
+            evidence: envelope(
+                "retry_rate_by_task_class",
+                r#"{"dep_bump":0.41,"other":0.12}"#,
+            ),
             proposal: target.map(|t| PolicyDiff {
                 target: t.into(),
-                changes: [("max_retries".to_string(), "2".to_string())].into_iter().collect(),
+                changes: [("max_retries".to_string(), "2".to_string())]
+                    .into_iter()
+                    .collect(),
             }),
             prediction: target.map(|_| Prediction {
                 metric: "retry_rate_by_task_class".into(),
@@ -352,7 +395,12 @@ mod tests {
         let mut p = InsightPipeline::new(QueryCatalog::frozen_v1(), frozen_policy_graph());
         // the astra attack shapes: cohort editing, history reset,
         // metric redefinition — all closure nodes
-        for target in ["cohort_definitions", "source_history_ledger", "metric_definitions", "judging_policy"] {
+        for target in [
+            "cohort_definitions",
+            "source_history_ledger",
+            "metric_definitions",
+            "judging_policy",
+        ] {
             let r = rec("Ix", 20, Some(target));
             assert!(
                 matches!(p.ingest(r), Err(InsightError::ProtectedTarget { .. })),
@@ -375,12 +423,23 @@ mod tests {
     fn unfalsifiable_prediction_refused() {
         let mut p = InsightPipeline::new(QueryCatalog::frozen_v1(), frozen_policy_graph());
         let mut r = rec("I5", 20, Some("poll_interval"));
-        r.prediction = Some(Prediction { metric: "".into(), direction: "better".into(), threshold: "".into(), window: "".into() });
-        assert!(matches!(p.ingest(r), Err(InsightError::UnfalsifiablePrediction)));
+        r.prediction = Some(Prediction {
+            metric: "".into(),
+            direction: "better".into(),
+            threshold: "".into(),
+            window: "".into(),
+        });
+        assert!(matches!(
+            p.ingest(r),
+            Err(InsightError::UnfalsifiablePrediction)
+        ));
         // and a proposal with NO prediction at all
         let mut r2 = rec("I6", 20, Some("poll_interval"));
         r2.prediction = None;
-        assert!(matches!(p.ingest(r2), Err(InsightError::UnfalsifiablePrediction)));
+        assert!(matches!(
+            p.ingest(r2),
+            Err(InsightError::UnfalsifiablePrediction)
+        ));
     }
 
     #[test]

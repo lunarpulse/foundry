@@ -19,6 +19,7 @@ tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 chrono.workspace = true
+httpdate = "=1.0.3"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }

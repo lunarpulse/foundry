@@ -19,8 +19,10 @@
 //! (`apply()` then `journal.push()` as separate calls): here, an
 //! append that fails leaves NO state change, and state changes ride
 //! the same transaction.
-use crate::governance_events::{recover, verify_stream, GovernanceEvent, OpKind, Phase, GOVERNANCE_SCHEMA_VERSION};
-use rusqlite::{params, Connection, OptionalExtension};
+use crate::governance_events::{
+    GOVERNANCE_SCHEMA_VERSION, GovernanceEvent, OpKind, Phase, recover, verify_stream,
+};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 
 #[derive(Debug)]
@@ -33,7 +35,10 @@ pub enum CoordinatorError {
     StreamInvalid(String),
     /// schema newer than this binary understands — explicit, never
     /// silent (astra: unsupported schema must be reported)
-    SchemaTooNew { got: u32, supported: u32 },
+    SchemaTooNew {
+        got: u32,
+        supported: u32,
+    },
 }
 
 pub struct GovernanceCoordinator {
@@ -117,7 +122,8 @@ impl GovernanceCoordinator {
         let seq: i64 = tx
             .query_row("SELECT last_insert_rowid()", [], |r| r.get(0))
             .map_err(|e| CoordinatorError::Db(e.to_string()))?;
-        tx.commit().map_err(|e| CoordinatorError::Db(e.to_string()))?;
+        tx.commit()
+            .map_err(|e| CoordinatorError::Db(e.to_string()))?;
         ev.seq = seq;
         Ok(seq)
     }
@@ -147,12 +153,27 @@ impl GovernanceCoordinator {
             let (seq, schema_version, op, phase, op_id, payload_digest, actor, at) =
                 r.map_err(|e| CoordinatorError::Db(e.to_string()))?;
             if schema_version > GOVERNANCE_SCHEMA_VERSION {
-                return Err(CoordinatorError::SchemaTooNew { got: schema_version, supported: GOVERNANCE_SCHEMA_VERSION });
+                return Err(CoordinatorError::SchemaTooNew {
+                    got: schema_version,
+                    supported: GOVERNANCE_SCHEMA_VERSION,
+                });
             }
-            let op = parse_op(&op).ok_or_else(|| CoordinatorError::StreamInvalid(format!("unknown op '{op}' at seq {seq}")))?;
-            let phase = parse_phase(&phase)
-                .ok_or_else(|| CoordinatorError::StreamInvalid(format!("unknown phase '{phase}' at seq {seq}")))?;
-            out.push(GovernanceEvent { schema_version, seq, op, phase, op_id, payload_digest, actor, at });
+            let op = parse_op(&op).ok_or_else(|| {
+                CoordinatorError::StreamInvalid(format!("unknown op '{op}' at seq {seq}"))
+            })?;
+            let phase = parse_phase(&phase).ok_or_else(|| {
+                CoordinatorError::StreamInvalid(format!("unknown phase '{phase}' at seq {seq}"))
+            })?;
+            out.push(GovernanceEvent {
+                schema_version,
+                seq,
+                op,
+                phase,
+                op_id,
+                payload_digest,
+                actor,
+                at,
+            });
         }
         Ok(out)
     }
@@ -185,16 +206,22 @@ impl GovernanceCoordinator {
         let clean = states
             .iter()
             .all(|s| !matches!(s, crate::governance_events::OpState::Pending { .. }));
-        Ok(RestartState { clean, pending_count: pending.len(), recovery_decisions: recoveries })
+        Ok(RestartState {
+            clean,
+            pending_count: pending.len(),
+            recovery_decisions: recoveries,
+        })
     }
 
     /// The authoritative head checkpoint: (last seq, count). Downstream
     /// audit pinning (T57w) references this against external records.
     pub fn head(&self) -> Result<(i64, i64), CoordinatorError> {
         self.conn
-            .query_row("SELECT COALESCE(MAX(seq),0), COUNT(*) FROM governance", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+            .query_row(
+                "SELECT COALESCE(MAX(seq),0), COUNT(*) FROM governance",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .map_err(|e| CoordinatorError::Db(e.to_string()))
     }
 
@@ -278,9 +305,17 @@ mod tests {
     #[test]
     fn coordinator_owns_the_sequence() {
         let mut c = GovernanceCoordinator::open_in_memory().unwrap();
-        let s1 = c.append(ev(OpKind::LessonSeal, Phase::Pending, "seal:L1", "h1")).unwrap();
-        let s2 = c.append(ev(OpKind::LessonSeal, Phase::Committed, "seal:L1", "h1")).unwrap();
-        assert_eq!((s1, s2), (1, 2), "database assigns contiguous seq, caller value ignored");
+        let s1 = c
+            .append(ev(OpKind::LessonSeal, Phase::Pending, "seal:L1", "h1"))
+            .unwrap();
+        let s2 = c
+            .append(ev(OpKind::LessonSeal, Phase::Committed, "seal:L1", "h1"))
+            .unwrap();
+        assert_eq!(
+            (s1, s2),
+            (1, 2),
+            "database assigns contiguous seq, caller value ignored"
+        );
         let stream = c.replay().unwrap();
         assert_eq!(stream.len(), 2);
         assert!(stream.iter().all(|e| e.seq <= 2));
@@ -291,9 +326,17 @@ mod tests {
     fn restart_reconstructs_state_and_surfaces_pending() {
         let mut c = GovernanceCoordinator::open_in_memory().unwrap();
         // a complete op and a dangling intent
-        c.append(ev(OpKind::LessonSeal, Phase::Pending, "seal:A", "h")).unwrap();
-        c.append(ev(OpKind::LessonSeal, Phase::Committed, "seal:A", "h")).unwrap();
-        c.append(ev(OpKind::PolicyApplication, Phase::Pending, "apply:B", "h2")).unwrap();
+        c.append(ev(OpKind::LessonSeal, Phase::Pending, "seal:A", "h"))
+            .unwrap();
+        c.append(ev(OpKind::LessonSeal, Phase::Committed, "seal:A", "h"))
+            .unwrap();
+        c.append(ev(
+            OpKind::PolicyApplication,
+            Phase::Pending,
+            "apply:B",
+            "h2",
+        ))
+        .unwrap();
         let rs = c.restart_state().unwrap();
         assert_eq!(rs.pending_count, 1);
         assert!(!rs.clean);
@@ -310,8 +353,20 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         {
             let mut c = GovernanceCoordinator::open(&path).unwrap();
-            c.append(ev(OpKind::CandidateSynthesize, Phase::Pending, "synth:X", "p")).unwrap();
-            c.append(ev(OpKind::CandidateSynthesize, Phase::Committed, "synth:X", "p")).unwrap();
+            c.append(ev(
+                OpKind::CandidateSynthesize,
+                Phase::Pending,
+                "synth:X",
+                "p",
+            ))
+            .unwrap();
+            c.append(ev(
+                OpKind::CandidateSynthesize,
+                Phase::Committed,
+                "synth:X",
+                "p",
+            ))
+            .unwrap();
             assert_eq!(c.head().unwrap(), (2, 2));
         }
         // "restart": a new process opens the same file
@@ -336,9 +391,25 @@ mod tests {
         let mut seqs = Vec::new();
         for i in 0..10 {
             if i % 2 == 0 {
-                seqs.push(a.append(ev(OpKind::BudgetReserve, Phase::Pending, &format!("r{i}"), "h")).unwrap());
+                seqs.push(
+                    a.append(ev(
+                        OpKind::BudgetReserve,
+                        Phase::Pending,
+                        &format!("r{i}"),
+                        "h",
+                    ))
+                    .unwrap(),
+                );
             } else {
-                seqs.push(b.append(ev(OpKind::BudgetReserve, Phase::Pending, &format!("r{i}"), "h")).unwrap());
+                seqs.push(
+                    b.append(ev(
+                        OpKind::BudgetReserve,
+                        Phase::Pending,
+                        &format!("r{i}"),
+                        "h",
+                    ))
+                    .unwrap(),
+                );
             }
         }
         let mut unique = seqs.clone();
@@ -347,7 +418,10 @@ mod tests {
         assert_eq!(unique.len(), 10, "no sequence collisions across writers");
         let stream = a.replay().unwrap();
         assert_eq!(stream.len(), 10);
-        assert!(verify_stream(&stream).is_ok(), "interleaved appends form a valid stream");
+        assert!(
+            verify_stream(&stream).is_ok(),
+            "interleaved appends form a valid stream"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -365,9 +439,19 @@ mod tests {
     #[test]
     fn op_terminal_is_the_idempotency_guard() {
         let mut c = GovernanceCoordinator::open_in_memory().unwrap();
-        c.append(ev(OpKind::PredictionScore, Phase::Pending, "score:1", "h")).unwrap();
+        c.append(ev(OpKind::PredictionScore, Phase::Pending, "score:1", "h"))
+            .unwrap();
         assert!(!c.op_terminal("score:1").unwrap());
-        c.append(ev(OpKind::PredictionScore, Phase::Committed, "score:1", "h")).unwrap();
-        assert!(c.op_terminal("score:1").unwrap(), "retry after commit sees terminal state");
+        c.append(ev(
+            OpKind::PredictionScore,
+            Phase::Committed,
+            "score:1",
+            "h",
+        ))
+        .unwrap();
+        assert!(
+            c.op_terminal("score:1").unwrap(),
+            "retry after commit sees terminal state"
+        );
     }
 }

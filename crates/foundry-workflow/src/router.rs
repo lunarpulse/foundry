@@ -30,7 +30,6 @@
 //! 선언이 소유한다(사이즈 라우팅: 인테이크 부트스트랩 → 인간 사이징
 //! 게이트 → preset_bound → 발행).
 
-
 use crate::dsl::{RouteRule, RoutingRules};
 use serde::{Deserialize, Serialize};
 
@@ -55,23 +54,37 @@ pub enum RouteError {
 /// * 소스 패턴 문법 타당 (와일드카드 `*`는 접두/접미 1회씩만).
 /// * default_route가 후보 집합에 존재.
 /// * (오류 아님) 규칙 우선순위: 목록 순서 — 첫 매칭 승리. 문서에 명시.
-pub fn validate_routing(rules: &RoutingRules, known_workflows: &[String]) -> Result<(), Vec<RouteError>> {
+pub fn validate_routing(
+    rules: &RoutingRules,
+    known_workflows: &[String],
+) -> Result<(), Vec<RouteError>> {
     let mut errors = Vec::new();
     for r in &rules.rules {
         if !known_workflows.contains(&r.workflow_id) {
-            errors.push(RouteError::UnknownWorkflowRef { workflow_id: r.workflow_id.clone() });
+            errors.push(RouteError::UnknownWorkflowRef {
+                workflow_id: r.workflow_id.clone(),
+            });
         }
         if let Err(reason) = check_pattern(&r.source_pattern) {
-            errors.push(RouteError::BadPattern { pattern: r.source_pattern.clone(), reason });
+            errors.push(RouteError::BadPattern {
+                pattern: r.source_pattern.clone(),
+                reason,
+            });
         }
     }
     if let Err(reason) = check_pattern(&default_source_of(rules)) {
         let _ = reason; // default는 패턴 아님 — 스킵
     }
     if !known_workflows.contains(&rules.default_route) {
-        errors.push(RouteError::UnknownWorkflowRef { workflow_id: rules.default_route.clone() });
+        errors.push(RouteError::UnknownWorkflowRef {
+            workflow_id: rules.default_route.clone(),
+        });
     }
-    if errors.is_empty() { Ok(()) } else { Err(errors) }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
 }
 
 /// 패턴 문법 — `prefix*`, `*suffix`, `정확히일치` 만 허용.
@@ -191,10 +204,14 @@ impl Router {
         new_workflow_id: &str,
     ) -> Result<ReroutePlan, RouteError> {
         if order_terminal {
-            return Err(RouteError::RerouteTerminal { order_id: order_id.into() });
+            return Err(RouteError::RerouteTerminal {
+                order_id: order_id.into(),
+            });
         }
         if !human_token_present {
-            return Err(RouteError::RerouteUnauthorized { order_id: order_id.into() });
+            return Err(RouteError::RerouteUnauthorized {
+                order_id: order_id.into(),
+            });
         }
         // 새 대상도 현재 테이블이 아는 워크플로여야 (dangling 방지).
         let known = self
@@ -204,7 +221,9 @@ impl Router {
             .any(|r| r.workflow_id == new_workflow_id)
             || self.rules.default_route == new_workflow_id;
         if !known {
-            return Err(RouteError::UnknownWorkflowRef { workflow_id: new_workflow_id.into() });
+            return Err(RouteError::UnknownWorkflowRef {
+                workflow_id: new_workflow_id.into(),
+            });
         }
         Ok(ReroutePlan {
             order_id: order_id.into(),
@@ -231,16 +250,30 @@ mod tests {
     fn table() -> RoutingRules {
         RoutingRules {
             rules: vec![
-                RouteRule { source_pattern: "github:*".into(), workflow_id: "wf-gh".into() },
-                RouteRule { source_pattern: "cron:5m".into(), workflow_id: "wf-cron5".into() },
-                RouteRule { source_pattern: "*webhook".into(), workflow_id: "wf-hook".into() },
+                RouteRule {
+                    source_pattern: "github:*".into(),
+                    workflow_id: "wf-gh".into(),
+                },
+                RouteRule {
+                    source_pattern: "cron:5m".into(),
+                    workflow_id: "wf-cron5".into(),
+                },
+                RouteRule {
+                    source_pattern: "*webhook".into(),
+                    workflow_id: "wf-hook".into(),
+                },
             ],
             default_route: "wf-default".into(),
         }
     }
 
     fn known() -> Vec<String> {
-        vec!["wf-gh".into(), "wf-cron5".into(), "wf-hook".into(), "wf-default".into()]
+        vec![
+            "wf-gh".into(),
+            "wf-cron5".into(),
+            "wf-hook".into(),
+            "wf-default".into(),
+        ]
     }
 
     // 검증 — dangling 참조·나쁜 패턴·나쁜 default 거부.
@@ -251,12 +284,18 @@ mod tests {
         let mut t = table();
         t.rules[0].workflow_id = "wf-ghost".into();
         let errs = validate_routing(&t, &known()).unwrap_err();
-        assert!(errs.iter().any(|e| matches!(e, RouteError::UnknownWorkflowRef { .. })));
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, RouteError::UnknownWorkflowRef { .. }))
+        );
         // 내부 와일드카드
         let mut t = table();
         t.rules[1].source_pattern = "a*b*c".into();
         let errs = validate_routing(&t, &known()).unwrap_err();
-        assert!(errs.iter().any(|e| matches!(e, RouteError::BadPattern { .. })));
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, RouteError::BadPattern { .. }))
+        );
         // default도 dangling이면 거부
         let mut t = table();
         t.default_route = "wf-nowhere".into();
@@ -282,12 +321,24 @@ mod tests {
         // 첫 매칭 승리: 두 규칙이 같은 소스에 걸리면 인덱스 순.
         let t = RoutingRules {
             rules: vec![
-                RouteRule { source_pattern: "x:*".into(), workflow_id: "wf-first".into() },
-                RouteRule { source_pattern: "x:y".into(), workflow_id: "wf-second".into() },
+                RouteRule {
+                    source_pattern: "x:*".into(),
+                    workflow_id: "wf-first".into(),
+                },
+                RouteRule {
+                    source_pattern: "x:y".into(),
+                    workflow_id: "wf-second".into(),
+                },
             ],
             default_route: "wf-default".into(),
         };
-        let r2 = Router::new(t, &{ let mut k = known(); k.push("wf-first".into()); k.push("wf-second".into()); k }).unwrap();
+        let r2 = Router::new(t, &{
+            let mut k = known();
+            k.push("wf-first".into());
+            k.push("wf-second".into());
+            k
+        })
+        .unwrap();
         assert_eq!(r2.route("x:y").workflow_id, "wf-first");
     }
 
@@ -305,7 +356,10 @@ mod tests {
         assert!(js.contains("\"matched_rule\":0"));
         // 규칙 추가 → digest 변화 → 구 결정과 새 결정의 rules_digest 상이.
         let mut t2 = table();
-        t2.rules.push(RouteRule { source_pattern: "slack:*".into(), workflow_id: "wf-slack".into() });
+        t2.rules.push(RouteRule {
+            source_pattern: "slack:*".into(),
+            workflow_id: "wf-slack".into(),
+        });
         let mut k = known();
         k.push("wf-slack".into());
         let r2 = Router::new(t2, &k).unwrap();

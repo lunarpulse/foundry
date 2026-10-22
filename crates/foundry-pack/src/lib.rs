@@ -1659,10 +1659,7 @@ struct Env<'a> {
 // Both static cap validation and runtime routing share boolean evaluation and
 // count_lt comparison. Their environments differ deliberately: cap validation
 // supplies one hypothetical counter; runtime routing supplies actual counters.
-fn eval_boolean(
-    expr: &Expr,
-    predicate: &impl Fn(&str, &[Expr]) -> Option<bool>,
-) -> Option<bool> {
+fn eval_boolean(expr: &Expr, predicate: &impl Fn(&str, &[Expr]) -> Option<bool>) -> Option<bool> {
     match expr {
         Expr::Bool(value) => Some(*value),
         Expr::Not(inner) => eval_boolean(inner, predicate).map(|value| !value),
@@ -1695,14 +1692,13 @@ fn eval_count_lt(args: &[Expr], lookup: impl Fn(&str) -> Option<u64>) -> Option<
 fn eval(e: &Expr, x: &Env<'_>) -> bool {
     eval_boolean(e, &|name, args| {
         Some(match name {
-            "count_lt" => eval_count_lt(args, |counter| {
-                (counter == x.counter).then_some(x.value)
-            }).unwrap_or(false),
+            "count_lt" => eval_count_lt(args, |counter| (counter == x.counter).then_some(x.value))
+                .unwrap_or(false),
             "any_in" => {
                 if let [Expr::Ident(_), Expr::List(values)] = args {
-                    values.iter().any(|value| {
-                        matches!(value, Expr::String(s) if x.verdicts.contains(s))
-                    })
+                    values
+                        .iter()
+                        .any(|value| matches!(value, Expr::String(s) if x.verdicts.contains(s)))
                 } else {
                     false
                 }
@@ -1712,7 +1708,8 @@ fn eval(e: &Expr, x: &Env<'_>) -> bool {
             "budget_exhausted" => x.budget,
             _ => false,
         })
-    }).unwrap_or(false)
+    })
+    .unwrap_or(false)
 }
 
 /// Evaluate a counter-only condition. Missing runtime evidence is unknown, even
@@ -1741,17 +1738,32 @@ mod unit_tests {
     fn runtime_conditions_preserve_unknown_evidence_under_negation() {
         let counters = BTreeMap::from([("c".into(), 1)]);
         for condition in [
-            "timeout()", "!timeout()", "!has_findings(any)",
-            "!any_in(verdicts, [\"patch\"])", "budget_exhausted() || true",
-            "!count_lt(missing, 2)", "count_lt()", "any_in()",
+            "timeout()",
+            "!timeout()",
+            "!has_findings(any)",
+            "!any_in(verdicts, [\"patch\"])",
+            "budget_exhausted() || true",
+            "!count_lt(missing, 2)",
+            "count_lt()",
+            "any_in()",
             "count_lt(c, 2, 3)",
         ] {
             let expr = parse_expr(condition).unwrap();
-            assert_eq!(eval_condition_checked(&expr, &counters), None, "{condition}");
+            assert_eq!(
+                eval_condition_checked(&expr, &counters),
+                None,
+                "{condition}"
+            );
             assert!(!eval_condition(&expr, &counters), "{condition}");
         }
-        assert_eq!(eval_condition_checked(&parse_expr("false && timeout()").unwrap(), &counters), Some(false));
-        assert_eq!(eval_condition_checked(&parse_expr("true || timeout()").unwrap(), &counters), Some(true));
+        assert_eq!(
+            eval_condition_checked(&parse_expr("false && timeout()").unwrap(), &counters),
+            Some(false)
+        );
+        assert_eq!(
+            eval_condition_checked(&parse_expr("true || timeout()").unwrap(), &counters),
+            Some(true)
+        );
     }
 
     #[test]
@@ -1759,8 +1771,14 @@ mod unit_tests {
         let verdicts = BTreeSet::new();
         for value in [0, 1, 2, u64::MAX] {
             for bound in [0, 1, 2, u64::MAX] {
-                let env = Env { counter: "c", value, verdicts: &verdicts,
-                    findings: false, timeout: false, budget: false };
+                let env = Env {
+                    counter: "c",
+                    value,
+                    verdicts: &verdicts,
+                    findings: false,
+                    timeout: false,
+                    budget: false,
+                };
                 let counters = BTreeMap::from([("c".into(), value)]);
                 for condition in [
                     format!("count_lt(c, {bound})"),
@@ -1768,15 +1786,24 @@ mod unit_tests {
                     format!("false || (count_lt(c, {bound}) && true)"),
                 ] {
                     let expr = parse_expr(&condition).unwrap();
-                    assert_eq!(eval_condition_checked(&expr, &counters), Some(eval(&expr, &env)));
+                    assert_eq!(
+                        eval_condition_checked(&expr, &counters),
+                        Some(eval(&expr, &env))
+                    );
                 }
             }
         }
         // Static validation probes a hypothetical counter. Other references
         // intentionally evaluate false there; runtime requires an actual value.
         let expr = parse_expr("count_lt(other, 2)").unwrap();
-        let env = Env { counter: "c", value: 0, verdicts: &verdicts,
-            findings: false, timeout: false, budget: false };
+        let env = Env {
+            counter: "c",
+            value: 0,
+            verdicts: &verdicts,
+            findings: false,
+            timeout: false,
+            budget: false,
+        };
         assert!(!eval(&expr, &env));
         assert_eq!(eval_condition_checked(&expr, &BTreeMap::new()), None);
         assert!(!eval_condition(&expr, &BTreeMap::new()));

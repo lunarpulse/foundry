@@ -198,7 +198,12 @@ pub fn entry_for(code: RefusalCode) -> RefusalEntry {
             RemediationKind::Escalate,
         ),
     };
-    RefusalEntry { code, reason_text, acceptance_condition, remediation }
+    RefusalEntry {
+        code,
+        reason_text,
+        acceptance_condition,
+        remediation,
+    }
 }
 
 /// OrchError → 코드 매핑 — 저장소 오류를 인간 대면 코드로.
@@ -209,7 +214,9 @@ pub fn code_for_orch_error(e: &crate::OrchError) -> Option<RefusalCode> {
         // (astra r1 M4 정정) 발행 시점의 UndeclaredOrder 는 unsized-spawn
         // 계약 위반(사이징 결속 없는 발행)이 본질 — 동일 코드로 매핑.
         // DuplicateOrder/StreamMismatch 도 발행 규율 위반의 변형.
-        E::UndeclaredOrder { .. } | E::DuplicateOrder { .. } | E::StreamMismatch { .. } => UnsizedSpawn,
+        E::UndeclaredOrder { .. } | E::DuplicateOrder { .. } | E::StreamMismatch { .. } => {
+            UnsizedSpawn
+        }
         E::MissingPredecessor { .. } => MissingPredecessor,
         E::Cycle { .. } => DeclarationCycle,
         E::DuplicateDeclaration { .. } => DuplicateDeclaration,
@@ -274,7 +281,10 @@ mod tests {
             all_codes_exhaustive().into_iter().collect();
         let manual: std::collections::HashSet<RefusalCode> =
             RefusalCode::VARIANTS.iter().copied().collect();
-        assert_eq!(exhaustive, manual, "VARIANTS and exhaustive match must agree");
+        assert_eq!(
+            exhaustive, manual,
+            "VARIANTS and exhaustive match must agree"
+        );
     }
 
     /// (astra r3 M4) README 실배선 — presets/README.md 의 거부 코드 진단
@@ -284,7 +294,10 @@ mod tests {
         let rows = readme_diagnostic_rows();
         assert_eq!(rows.len(), all_codes_exhaustive().len());
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("presets/README.md");
         let md = std::fs::read_to_string(&path).unwrap();
         for r in &rows {
@@ -313,13 +326,8 @@ mod tests {
         p.push(format!("foundry-refusal-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&p);
         let log = crate::OrchestrationLog::open(&p).unwrap();
-        let row = record_refusal(
-            &log,
-            RefusalCode::UnsizedSpawn,
-            "req-42",
-            Some("prop-1"),
-        )
-        .unwrap();
+        let row =
+            record_refusal(&log, RefusalCode::UnsizedSpawn, "req-42", Some("prop-1")).unwrap();
         if let OrchestrationKind::Refusal {
             refusal_code,
             reason_text,

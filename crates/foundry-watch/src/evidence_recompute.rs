@@ -49,7 +49,12 @@ pub trait EvidenceReader {
 pub struct PermissiveReader;
 
 impl EvidenceReader for PermissiveReader {
-    fn run_query(&self, _q: &str, _p: &BTreeMap<String, String>, _l: u64) -> Result<String, String> {
+    fn run_query(
+        &self,
+        _q: &str,
+        _p: &BTreeMap<String, String>,
+        _l: u64,
+    ) -> Result<String, String> {
         Err("permissive reader cannot recompute — install a real reader".into())
     }
     fn ledger_head_at(&self, _l: u64) -> Result<String, String> {
@@ -120,7 +125,8 @@ impl EvidenceReader for LedgerEvidenceReader {
                         // canonical JSON emits "type":"die_succeeded"
                         // (snake_case tag) — accept BOTH spellings
                         // (astra 5th round MEDIUM: the fallback shape)
-                        let hit = |h: &str| h.contains("DieSucceeded") || h.contains("die_succeeded");
+                        let hit =
+                            |h: &str| h.contains("DieSucceeded") || h.contains("die_succeeded");
                         let hay: String = if hit(ev) {
                             ev.clone()
                         } else {
@@ -155,12 +161,17 @@ impl EvidenceReader for LedgerEvidenceReader {
                     )
                     .map_err(|e| e.to_string())?;
                 if any_rows == 0 {
-                    return Err("retry_rate: no ledger rows in prefix — reader cannot certify".into());
+                    return Err(
+                        "retry_rate: no ledger rows in prefix — reader cannot certify".into(),
+                    );
                 }
                 let _ = rows;
                 let total = attempts.len() as f64;
                 let retries = attempts.iter().filter(|a| **a > 1).count() as f64;
-                let task_class = params.get("task_class").cloned().unwrap_or_else(|| "all".into());
+                let task_class = params
+                    .get("task_class")
+                    .cloned()
+                    .unwrap_or_else(|| "all".into());
                 let rate = if total > 0.0 { retries / total } else { 0.0 };
                 Ok(format!(r#"{{"{}":{:.4}}}"#, task_class, rate))
             }
@@ -276,7 +287,12 @@ mod tests {
         corpus: String,
     }
     impl EvidenceReader for RealSource {
-        fn run_query(&self, q: &str, params: &BTreeMap<String, String>, _l: u64) -> Result<String, String> {
+        fn run_query(
+            &self,
+            q: &str,
+            params: &BTreeMap<String, String>,
+            _l: u64,
+        ) -> Result<String, String> {
             match q {
                 "retry_rate_by_task_class" => {
                     let class = params.get("task_class").cloned().unwrap_or_default();
@@ -324,7 +340,9 @@ mod tests {
             evidence: e,
             proposal: Some(PolicyDiff {
                 target: "poll_interval".into(),
-                changes: [("max_retries".to_string(), "2".to_string())].into_iter().collect(),
+                changes: [("max_retries".to_string(), "2".to_string())]
+                    .into_iter()
+                    .collect(),
             }),
             prediction: Some(Prediction {
                 metric: "retry_rate_by_task_class".into(),
@@ -338,20 +356,27 @@ mod tests {
 
     #[test]
     fn honest_evidence_recomputes() {
-        let src = RealSource { head: "real-head".into(), corpus: "real-corpus".into() };
+        let src = RealSource {
+            head: "real-head".into(),
+            corpus: "real-corpus".into(),
+        };
         let p = InsightPipeline::with_reader(
             QueryCatalog::frozen_v1(),
             frozen_policy_graph(),
             std::sync::Arc::new(src),
         );
-        p.recompute_evidence(&honest_envelope()).expect("honest evidence matches the source");
+        p.recompute_evidence(&honest_envelope())
+            .expect("honest evidence matches the source");
     }
 
     #[test]
     fn forged_self_consistent_envelope_fails() {
         // THE astra B4 attack: every field fabricated, digest correctly
         // computed over the fabrication — perfectly self-consistent.
-        let src = RealSource { head: "real-head".into(), corpus: "real-corpus".into() };
+        let src = RealSource {
+            head: "real-head".into(),
+            corpus: "real-corpus".into(),
+        };
         let p = InsightPipeline::with_reader(
             QueryCatalog::frozen_v1(),
             frozen_policy_graph(),
@@ -361,7 +386,10 @@ mod tests {
         let mut forged = honest_envelope();
         forged.result_payload = r#"{"dep_bump":0.02}"#.into(); // flattering fabrication
         forged.result_digest = forged.compute_result_digest();
-        assert!(forged.self_consistent(), "the fabrication IS self-consistent");
+        assert!(
+            forged.self_consistent(),
+            "the fabrication IS self-consistent"
+        );
         assert!(matches!(
             p.recompute_evidence(&forged),
             Err(InsightError::ResultMismatch { claimed, recomputed, .. })
@@ -371,7 +399,10 @@ mod tests {
 
     #[test]
     fn fabricated_ledger_head_fails() {
-        let src = RealSource { head: "real-head".into(), corpus: "real-corpus".into() };
+        let src = RealSource {
+            head: "real-head".into(),
+            corpus: "real-corpus".into(),
+        };
         let p = InsightPipeline::with_reader(
             QueryCatalog::frozen_v1(),
             frozen_policy_graph(),
@@ -388,7 +419,10 @@ mod tests {
 
     #[test]
     fn stale_corpus_snapshot_fails() {
-        let src = RealSource { head: "real-head".into(), corpus: "real-corpus".into() };
+        let src = RealSource {
+            head: "real-head".into(),
+            corpus: "real-corpus".into(),
+        };
         let p = InsightPipeline::with_reader(
             QueryCatalog::frozen_v1(),
             frozen_policy_graph(),
@@ -411,14 +445,22 @@ mod tests {
         let p = InsightPipeline::new(QueryCatalog::frozen_v1(), frozen_policy_graph());
         assert!(p.recompute_evidence(&honest_envelope()).is_ok());
         let pr = PermissiveReader;
-        assert!(pr.corpus_digest().is_err(), "the permissive reader cannot answer");
+        assert!(
+            pr.corpus_digest().is_err(),
+            "the permissive reader cannot answer"
+        );
     }
 
     #[test]
     fn reader_error_fails_closed() {
         struct Broken;
         impl EvidenceReader for Broken {
-            fn run_query(&self, _: &str, _: &BTreeMap<String, String>, _: u64) -> Result<String, String> {
+            fn run_query(
+                &self,
+                _: &str,
+                _: &BTreeMap<String, String>,
+                _: u64,
+            ) -> Result<String, String> {
                 Err("ledger unavailable".into())
             }
             fn ledger_head_at(&self, _: u64) -> Result<String, String> {

@@ -1,6 +1,6 @@
 # Usage
 
-Run `foundry help` or `foundry <command> --help` for the built CLI's live help. The product has 13 commands plus Clap's `help`. **Required** means no default; values shown as defaults are taken from the command definition. `run`, `approve`, `watch`, and `serve` can write state or contact external systems; examples below identify their preconditions and expected result.
+Run `foundry help` or `foundry <command> --help` for the built CLI's live help. **Required** means no default; values shown as defaults are taken from the command definition. `run`, `approve`, `watch`, and `serve` can write state or contact external systems; examples below identify their preconditions and expected result.
 
 ## Command reference
 
@@ -9,8 +9,8 @@ Run `foundry help` or `foundry <command> --help` for the built CLI's live help. 
 | `deploy-profile` | `--check`, `--units`, `--readme` (all flags, default off). |
 | `validate` | `[path]` (optional; default `foundry.yaml`). |
 | `run` | `--id <ID>` (optional, generated if absent); `--task <TASK>` (**required**); `--die <DIE>` (default empty, fake harness); `--blueprint <BLUEPRINT>` (default `foundry.yaml`). |
-| `approve` | `--order <ORDER>` and `--intent <INTENT>` (**required**); `--db <DB>` (default `~/.foundry/ledger.db`). Success records human approval and then invokes publish; there is no standalone `publish` command. |
-| `watch` | `--once` (false); `--every <SECONDS>` (300); `--repo <OWNER/NAME>` (`lunarpulse/contextmesh-rs`); `--die <DIE>` (empty=fake); `--auto-approve <INTENT>` (empty/off); `--notify-mode <MODE>` (`discord`). `--once` still calls GitHub. |
+| `approve` | `--order <ORDER>` and `--intent <INTENT>` (**required**); `--db <DB>` (default `~/.foundry/ledger.db`). This remains a legacy local-actor path and is not wired to ProductStore sessions; do not treat it as the B1 product approval flow. It records approval and then invokes publish. |
+| `watch` | `--once` (false); `--every <SECONDS>` (300); `--repo <OWNER/NAME>` (`lunarpulse/contextmesh-rs`); `--die <DIE>` (empty=fake); deprecated `--auto-approve <INTENT>` (any non-empty value is rejected); `--notify-mode <MODE>` (`discord`). `--once` still calls GitHub. |
 | `show` | `--order <ORDER>` (**required**); `--db <DB>` (`~/.foundry/ledger.db`). Despite the help text, this currently checks ledger chain integrity and does not show order details. |
 | `status` | `--db <DB>` (`~/.foundry/ledger.db`). |
 | `doctor` | `--db <DB>` (`~/.foundry/ledger.db`). |
@@ -19,6 +19,12 @@ Run `foundry help` or `foundry <command> --help` for the built CLI's live help. 
 | `corpus` | `--db <DB>` (`~/.foundry/ledger.db`); `--out <PATH>` (`~/.foundry/corpus`). |
 | `reconcile` | `--db <DB>` (`~/.foundry/ledger.db`); `--apply` (false; requests mirror catch-up, attempts writer lock acquisition). |
 | `serve` | `--db <DB>` (`~/.foundry/ledger.db`); `--bind <ADDRESS>` (`127.0.0.1:7700`). It serves mutation endpoints as well as reads. |
+| `product-bootstrap` | `--db`, `--installation-id`, `--database-id`; optional `--manifest <JSON>`. Reads actor ID then password from stdin. No manifest means zero sources/grants and enforced deny-by-default scope. |
+| `product-login` | `--db`, installation/database IDs, `--session-file`. Reads actor ID and password from stdin; writes a mode-0600 bearer file. |
+| `product-account` | Database IDs, `--session-file`, `--actor`, `--role`. Reads the new account password from bounded stdin; current Owner required. |
+| `product-scope` | `--action sources|configure-source|grants|grant|revoke`, database IDs, `--session-file`; mutations require expected revision and request key. |
+| `product-migrate-scope` | Database IDs and reviewed finite `--manifest`; local maintenance after old processes stop. |
+| `product-reset`, `product-grant`, `product-approve`, `product-review`, `product-watch` | ProductAtomicV1 local credential, approval, review, and intake operations described below. |
 | `help` | Clap help command; accepts command-path arguments, e.g. `foundry help watch`. |
 
 ### Example commands and effects
@@ -28,8 +34,9 @@ Run `foundry help` or `foundry <command> --help` for the built CLI's live help. 
 | `foundry validate /tmp/example.yaml` | Local valid YAML and built binary; 0 if valid, 1 on parse/validation or file error. |
 | `foundry deploy-profile --units` | Prints systemd units; 0. Review hardcoded user/paths before use; output was not installed. `--check` checks declared boundaries and credential permission metadata (0/1); no action flag returns 2. Priority when combined: check, units, readme. |
 | `foundry run --task dep:serde` | Writes default ledger/mirror, possible tuple DB and `/tmp/foundry-die-<order>-<attempt>/`. With pack unset and no matching review tuple, fake work reaches terminal Failed for missing review runner, yet exits 0. Port/setup/validation errors can return 1 or panic. No publish call here. Not run. |
-| `foundry approve --order ID --intent "reviewed" --db /tmp/ledger.db` | Existing FurnaceHold order, matching promoted tuple, recoverable artifact/workdir and writable ledger; fixed local human actor, no login. Records approval then publishes. Usually 0 if both calls return Ok, 1 on error; 0 alone does not prove Shipped for all publisher outcomes. Not run. |
-| `foundry watch --once --repo owner/name --notify-mode console` | Public GitHub API reachable; existing writable ledger parent, isolated tuple paths and single writer. Writes ledger/mirror/lock; startup GC may archive/delete existing Die workdirs. Default Discord mode may send notifications; nonempty auto-approve intent in once mode also approves/publishes. Tick Ok returns 0 even if individual orders fail or auto-publish errors are logged; intake error returns 1. Not run. |
+| `foundry approve --order ID --intent "reviewed" --db /tmp/ledger.db` | Legacy path only: fixed local human actor, no login, and not ProductStore-backed. Not accepted as the B1 product approval path. |
+| `foundry watch --once --repo owner/name --notify-mode console` | Public GitHub API reachable; existing writable ledger parent, isolated tuple paths and single writer. Writes ledger/mirror/lock; startup GC may archive/delete existing Die workdirs. Default Discord mode may send notifications. A non-empty `--auto-approve` is rejected. Tick Ok returns 0 even if individual orders fail; intake error returns 1. Not run. |
+| `foundry product-watch --once --db <product.db> --installation-id <id> --database-id <id> --repo owner/name --repository-id <stable-id>` | ProductAtomicV1 database with an enabled `github-primary` source binding matching API origin and stable repository ID. Fetches at most five 100-item pages, persists snapshots/cursor, and locally acknowledges only after the matching admission receipt is durable; intake sends GET requests only and never removes labels. `--private --credential-ref ENV_NAME` resolves a token from that environment variable at runtime. Unsupported work remains visibly waiting; this command does not run arbitrary issue bodies. Production configuration requires HTTPS; loopback HTTP is an explicit fake-server test setting and is not exposed by this command. |
 | `foundry show --order ID --db /tmp/ledger.db` | Opens SQLite read/write and may initialize an absent ledger; verifies the entire chain, does not check whether ID exists. 0 for valid chain, 1 otherwise. Not run. |
 | `foundry status --db /tmp/ledger.db` | Reports height/mirror/state counts and disk usage. Uses `SqliteLedger::open`, which can create/initialize the DB despite the read-only help label. 0 after reporting, 1 if open fails; not a full integrity gate. Not run. |
 | `foundry doctor --db /tmp/ledger.db` | Opens/initializes ledger; reads chain/mirror, credential file metadata (not values), disk use. 0 checks pass, 1 unhealthy, 2 cannot open ledger. Not run. |
@@ -42,7 +49,7 @@ Run `foundry help` or `foundry <command> --help` for the built CLI's live help. 
 
 Use the local, offline validation example in [Getting started](getting-started.md#validate-a-blueprint) as the only end-to-end CLI example executed for this document batch. Do not infer that the other commands are offline-safe from the absence of a visible network flag.
 
-The checked release build, help paths and extracted YAML validation are the observed results. Installation and operational examples above are source-based guidance, not successful executions in this batch. Current intake does not send a GitHub token: private repository access is not wired. `watch --auto-approve` is measurement automation with a recorded intent, not an interactive human decision, and is used only in the once branch; the continuous daemon branch ignores this option and `notify-mode`.
+The checked release build, help paths and extracted YAML validation are the observed results. Installation and operational examples above are source-based guidance, not successful executions in this batch. Legacy `watch` does not send a GitHub token; ProductAtomicV1 `product-watch` can resolve a private connector token from a named environment variable. `watch --auto-approve` is disabled and returns an error; it cannot synthesize a human approval.
 
 ## Configuration and environment
 
@@ -92,6 +99,16 @@ All 13 rows are settings read by product source, not a claim that all are requir
 
 ## Approval, publish, and promotion
 
+### ProductAtomicV1 checkpoint interface
+
+The explicit product server mode is `foundry serve --product --db <path>`. It requires `FOUNDRY_INSTALLATION_ID` and `FOUNDRY_DATABASE_ID`, refuses to open a standalone ledger file, and refuses ProductAtomicV1 databases whose explicit scope policy is not active. Initialize its first Owner locally with `foundry product-bootstrap --db <path> --installation-id <id> --database-id <id> [--manifest <path>]` and provide exactly two stdin lines: actor ID, then password. TTY input and extra lines are rejected so the password is not entered through argv or an echoed prompt. The optional strict JSON manifest is bounded to 64 KiB and lists finite source instances and grants. An empty manifest still activates enforced scope.
+
+Product mode also registers source/grant administration and scoped order reads. `GET/POST /api/product/sources` queries/configures source instances. `GET/POST /api/product/scope/grants` queries/grants and `/api/product/scope/grants/revoke` revokes. Owner-only administration returns revisions and source IDs, not order payloads/counts. `GET /api/product/orders` returns up to 100 visible rows and accepts `after=<last-visible-order-id>` plus optional `limit=1..100`; it never returns a global total. `GET /api/product/orders/{id}` returns a sanitized scoped view and uses the same not-found response for foreign and unknown orders. Role ceiling and explicit source capability are both required. Owners have no implicit data access and cannot remotely expand their own grants. Product mode still has no policy or product publish routes; ordinary `serve` / `approve` remain on legacy StandaloneV1 integration.
+
+The other product routes are `/api/product/login`, `/api/product/logout`, `/api/product/session`, `/api/product/accounts`, `/api/product/accounts/{actor_id}/authority`, `/api/product/approval-grants`, `/api/product/orders/{id}/approve`, `/api/product/review/holds`, per-order hold query/accept routes, `/api/product/review/operations/{operation_id}`, `/api/product/export`, and `/api/product/audit`. Account creation and authority changes require a current Owner. Login throttles after five failures in five minutes for five minutes. Keep bearer and grant tokens in memory; login/grant responses are `no-store`. Approval requires an `Idempotency-Key` header and current promoted tuple coordinates/digests. Review hold reads require ReadReview; decisions require ResolveReviewHold plus a current role ceiling. A committed decision returns its receipt and progress phase; `202 Accepted` means the decision is durable but continuation is incomplete or requires recovery. Export requires `export_evidence`; audit requires `read_operational_audit` and neither can be inferred from `read_order`. Both select current-authenticated evidence and provenance in one ProductStore transaction. They use fresh per-request HMAC pseudonyms and local ordinals; their digest covers the public projection and is not a proof of the raw S1 chain. `limit` defaults to 100 and accepts 1..100. A response with `coverage=page` and `has_more=true` is a truncated first page; there is no continuation cursor yet. Audit reports S1 coverage plus explicit unavailable reasons for unmounted sources, not complete cross-system evidence or organization-wide security audit authority.
+
+`foundry product-login` takes bounded stdin lines for actor ID and password and writes a bearer to a new mode-0600 `--session-file`. `product-account` reads a new password from stdin under a current Owner session. `product-scope --action sources` lists source generations; `configure-source` takes connector, canonical repository identity, query, expected source revision and request key. `grants` queries one subject/source; `grant` and `revoke` take a capability, expected scope revision and request key. Capability values are `read_order`, `read_review`, `resolve_review_hold`, `approve_order`, `read_artifact`, `export_evidence`, `read_operational_audit`, and `publish_approved`. `foundry product-grant` reads a private session file and writes the one-time grant token to `--token-file`. `foundry product-approve` reads private session and grant files and requires source revision, attempt, run, generation, artifact/tuple digests, intent, and idempotency key. `foundry product-review --action holds` lists holds visible under current grants; progress and decision calls recheck current scope. `foundry product-reset` is local-only and invalidates existing sessions. No secret is accepted through argv, and product approval does not publish. See [the B1 product contract checkpoint](design/b1-product-contract.md) for remaining integrations.
+
 Human approval is a Furnace decision recorded against an order. The CLI `approve` command then calls `line.publish()` after approval succeeds. Publish operates on a git branch/remote path and may contact GitHub; the configured publisher's owner/repository/base are fixed in `build_line()` and are not selected by `watch --repo`. Therefore `watch --repo` does not configure the later publish destination. There is no independent CLI `publish` command.
 
 The fixed destination is `lunarpulse/foundary-demo`, base `main`. Publishing requires a nonempty token at `~/.foundry/gh_token` with repository Contents and Pull requests write access, plus `/tmp/foundry-die-<order>-<attempt>/repo` whose HEAD matches the approved digest. It checks out `foundry/<sanitized-order>`, pushes the branch, looks up an open PR and may create one. These are external and local git side effects; a failed later step does not undo an earlier push. HTTP approval uses a bearer session and `Approve` capability, consumes the token then calls `line.approve()` separately; it does not invoke publish. These operations were not executed here.
@@ -102,9 +119,9 @@ S6 tuple promotion records that emitted evidence is authorized for downstream co
 
 ## Review holds
 
-These routes require `Authorization: Bearer <session-token>` and `ResolveReviewHold` (Owner or Approver; Observer is refused). This is an integration prerequisite: `Identity::bootstrap_owner` and `Identity::login` exist as library methods, but no current product CLI command or HTTP route provisions users or logs in. A fresh `serve` cannot supply a token through the shipped operator interface; existing integration code must provision the same identity DB and obtain the session. Do not invent a login endpoint or default password. The current password hasher is a SHA-512-based placeholder, and these handlers have no scope guard; see [Architecture](architecture.md#organization-and-trust-boundaries).
+Legacy `/api/orders/.../review/hold/...` routes still require `Authorization: Bearer <session-token>` and `ResolveReviewHold` from the StandaloneV1 identity store. Product mode uses separate `/api/product/review/holds` and `/api/product/orders/{order}/review/holds/{hold}/accept` routes backed by ProductStore, with actor-bound progress at `/api/product/review/operations/{operation}`. The product UI holds its bearer in page memory only. Product route scope is the current enabled ProductStore source binding; legacy handlers retain their separate legacy scope limitations. See [Architecture](architecture.md#organization-and-trust-boundaries).
 
-The order must be in `FurnaceHold` with a recoverable review run, the same configured pack/digest, host DB, tuple DB and session/workdir evidence. Configure `FOUNDRY_REVIEW_PACK`; resume that executes stages also needs the binary/repository pair, source provenance, git and writable session/work directories. There is no shipped hold-discovery API or CLI. Integration tooling must obtain the latest hold instance ID and allowed `resume_targets` from the durable review host (not from the order ID alone). For example, a read-only SQLite inspection of a consistent host snapshot can use:
+The order must be in `FurnaceHold` with a ProductStore-backed review run and exact admission/source binding. Configure `FOUNDRY_REVIEW_PACK` plus distinct `FOUNDRY_PRODUCT_ARTIFACT_ROOT`, `FOUNDRY_PRODUCT_SESSION_ROOT`, and `FOUNDRY_PRODUCT_CLAIM_ROOT`. Resume that executes stages also needs the binary/repository pair, source provenance, git and writable session/work directories. Product holds are discovered from the authenticated hold list or `foundry product-review --action holds`; clients must use the returned hold instance ID, allowed targets, and expectation rather than infer coordinates from the order ID. Legacy standalone hold integrations are unchanged and remain separate.
 
 ```sql
 SELECT hold_instance_id, resume_targets, deadline, status
@@ -126,6 +143,33 @@ Success is HTTP 200 JSON `{"order_id":"ID","state":"STATE"}`; inspect state rath
 Resolution checks the latest held instance within a SQLite transaction; it is separate from the subsequent order/evidence update. In particular, commit-fail/abort may already be persisted before the re-entry returns a nonpassing-result error (HTTP 500). Preserve the response and inspect durable state before retrying; retries of a consumed instance are not guaranteed idempotent. The public routes do not expose the separate library `HoldOperation` API. CLI `run`/`watch` have no corresponding hold-resolution options.
 
 ## Replay, recovery, and troubleshooting
+
+### Product service credentials
+
+After ProductAtomicV1 scope setup, an authenticated Owner can provision a source-bound watch/review service. Use finite RFC3339 expiry values and protect the generated credential file:
+
+```sh
+foundry product-service --action configure \
+  --db ~/.foundry/ledger.db --installation-id INSTALL --database-id DATABASE \
+  --session-file ~/.foundry/owner.session --service-id github-review \
+  --expected-revision 0 --request-key service-config-1 \
+  --lease-until 2026-10-19T00:00:00Z \
+  --source-instance github-primary-generation-1 \
+  --actions intake_read,admit_delivery,ack_delivery,drive_review
+
+foundry product-service --action issue \
+  --db ~/.foundry/ledger.db --installation-id INSTALL --database-id DATABASE \
+  --session-file ~/.foundry/owner.session --service-id github-review \
+  --expected-revision 1 --request-key service-credential-1 \
+  --expires-at 2026-10-18T12:00:00Z \
+  --credential-file ~/.foundry/github-review.credential
+
+foundry product-watch --once --db ~/.foundry/ledger.db \
+  --installation-id INSTALL --database-id DATABASE --repo acme/project \
+  --repository-id 42 --service-file ~/.foundry/github-review.credential
+```
+
+The examples use placeholder IDs and dates; choose future finite timestamps for the configured service lease and credential expiry. Credential issuance is one time: retries with the same request key cannot return the plaintext. If private-file creation fails, rotate with a new request key and path. `product-service --action revoke` invalidates current service contexts. The GitHub API token remains separate and is resolved from the configured environment-variable reference for private repositories.
 
 - `show --order ID` verifies the ledger chain; it is not an order detail view. If verification returns broken or the database cannot open, investigate the selected ledger path and preserve it for diagnosis.
 - `doctor --db PATH` runs chain, mirror, credential metadata, and disk checks. `status` reports operational status. `reconcile` defaults to dry run; apply writes the mirror. Stop other writers first: watch may continue if its lock file cannot open, run/approve/serve do not use this OS lock, and reconcile's lock handle is dropped before mirror rebuild. The current implementation does not provide a blanket cross-process repair lock.

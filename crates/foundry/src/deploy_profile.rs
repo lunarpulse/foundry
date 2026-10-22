@@ -83,15 +83,13 @@ pub fn check_profile() -> CheckOutcome {
     let b = boundary();
 
     // structural: forbidden sets
-    let forbidden_cast = [
-        "identity.db",
-        "gh_token",
-        "notifier.env",
-        "die.env",
-    ];
+    let forbidden_cast = ["identity.db", "gh_token", "notifier.env", "die.env"];
     for (role, files) in &b {
         for f in files {
-            let name = f.file_name().map(|x| x.to_string_lossy().to_string()).unwrap_or_default();
+            let name = f
+                .file_name()
+                .map(|x| x.to_string_lossy().to_string())
+                .unwrap_or_default();
             if *role == Role::Cast && forbidden_cast.iter().any(|x| name.contains(x)) {
                 v.push(format!("BOUNDARY VIOLATION: cast may not access {name}"));
             }
@@ -107,7 +105,11 @@ pub fn check_profile() -> CheckOutcome {
                 use std::os::unix::fs::PermissionsExt;
                 let mode = meta.permissions().mode() & 0o777;
                 if mode != 0o600 {
-                    v.push(format!("PERMISSION: {} has mode {:o}, expected 600", p.display(), mode));
+                    v.push(format!(
+                        "PERMISSION: {} has mode {:o}, expected 600",
+                        p.display(),
+                        mode
+                    ));
                 }
             }
         }
@@ -243,7 +245,10 @@ mod tests {
         for f in cast_files {
             let name = f.file_name().unwrap().to_string_lossy();
             assert!(
-                !name.contains("gh_token") && !name.contains("identity") && !name.contains("notifier") && !name.contains("die.env"),
+                !name.contains("gh_token")
+                    && !name.contains("identity")
+                    && !name.contains("notifier")
+                    && !name.contains("die.env"),
                 "cast boundary leak: {name}"
             );
         }
@@ -288,6 +293,9 @@ mod tests {
         let r = readme();
         assert!(r.contains("Single OS user"));
         assert!(r.contains("TLS"));
-        assert!(r.contains("backed") && r.contains("TOGETHER"), "backup coupling documented");
+        assert!(
+            r.contains("backed") && r.contains("TOGETHER"),
+            "backup coupling documented"
+        );
     }
 }

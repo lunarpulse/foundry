@@ -30,8 +30,12 @@ fn t61_kill9_mid_append_rolls_back() {
     // 부모: 정상 행 적립.
     {
         let log = OrchestrationLog::open(&db).unwrap();
-        log.declare_plan("p0", vec![("o-0".into(), vec![])], vec![("o-0".into(), "s".into())])
-            .unwrap();
+        log.declare_plan(
+            "p0",
+            vec![("o-0".into(), vec![])],
+            vec![("o-0".into(), "s".into())],
+        )
+        .unwrap();
     }
     // 별도 테스트 프로세스에서 훅을 실행한다. 테스트 스레드에서 fork하면
     // 다른 동시 테스트가 보유한 SQLite 내부 락을 상속해 대기할 수 있다.

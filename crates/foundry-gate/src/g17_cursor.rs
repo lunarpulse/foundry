@@ -4,16 +4,20 @@
 //! seq ⑤재정렬 ⑥커밋먼트 범위 밖 발급 거부.
 
 use crate::common::{actor, file_journal, terminal_commitment, terminal_commitment_from};
-use foundry_domain::order::{ExternalRef, Order};
 use foundry_domain::OrderEvent;
+use foundry_domain::order::{ExternalRef, Order};
 use foundry_domain::ports::Ledger as _;
 use foundry_ledger::SqliteLedger;
-use foundry_workflow::replay::{issue_replay_cursor, CursorError};
 use foundry_workflow::WorkflowEngine;
+use foundry_workflow::replay::{CursorError, issue_replay_cursor};
 
 /// 저널에 시나리오 행 심기 — 고정 시계 (도메인 직접 경로).
 fn seed(journal: &mut SqliteLedger) {
-    let mut o = Order::new("g17-o".into(), ExternalRef::cron("s", "r"), chrono::Utc::now());
+    let mut o = Order::new(
+        "g17-o".into(),
+        ExternalRef::cron("s", "r"),
+        chrono::Utc::now(),
+    );
     let a = actor("g17");
     let mut clock = 0i64;
     for ev in [
@@ -123,7 +127,10 @@ fn g17_case6_issuance_outside_commitment_refused() {
     };
     assert!(matches!(
         issue_replay_cursor(&all, &commit, "g17-o", 3),
-        Err(CursorError::OutsideTrustedScope { requested: 3, committed: 2 })
+        Err(CursorError::OutsideTrustedScope {
+            requested: 3,
+            committed: 2
+        })
     ));
 }
 
@@ -142,7 +149,10 @@ fn g17_historical_cursor_seq_below_max_issues_and_replays() {
     let (_, cseq, crowd, cpind) = c.parts();
     assert_eq!(cseq, 1);
     assert_eq!(crowd, rows[0].hash, "row digest binds row 1");
-    assert_eq!(cpind, rows[0].hash, "cursor-position pin (chain head AT seq 1)");
+    assert_eq!(
+        cpind, rows[0].hash,
+        "cursor-position pin (chain head AT seq 1)"
+    );
     // 역사 커서로 재생 — 결속 대조도 통과해야 (행 1 존재·해시 일치·핀 일치).
     let mut e = WorkflowEngine::embedded_default();
     let mut o = foundry_domain::order::Order::new(
@@ -155,15 +165,22 @@ fn g17_historical_cursor_seq_below_max_issues_and_replays() {
     e.acquire("g17-o", "ex").unwrap();
     let ctx = foundry_workflow::replay::ReplayContext { cursor: c };
     let out = e.dispatch_replay_ctx(
-        "g17-o", "ex",
-        &foundry_domain::OrderEvent::Queued, 1, &ctx, &journal,
+        "g17-o",
+        "ex",
+        &foundry_domain::OrderEvent::Queued,
+        1,
+        &ctx,
+        &journal,
     );
     assert_eq!(
         out.unwrap(),
         foundry_workflow::Outcome::Applied,
         "historical cursor replays successfully"
     );
-    assert_eq!(e.order("g17-o").unwrap().state(), foundry_domain::OrderState::Queued);
+    assert_eq!(
+        e.order("g17-o").unwrap().state(),
+        foundry_domain::OrderState::Queued
+    );
     let _ = &mut o;
 }
 
@@ -212,5 +229,8 @@ fn g17_issued_cursor_replays_and_rebuilds() {
     let mut fresh = WorkflowEngine::embedded_default();
     let n = fresh.rebuild(&journal).unwrap();
     assert_eq!(n, 1, "one order rebuilt");
-    assert_eq!(fresh.order("g17-o").unwrap().state(), foundry_domain::OrderState::Inspecting);
+    assert_eq!(
+        fresh.order("g17-o").unwrap().state(),
+        foundry_domain::OrderState::Inspecting
+    );
 }

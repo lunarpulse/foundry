@@ -16,13 +16,12 @@
 //! * **StepId 계약**: v3 문서의 steps는 StepId(비어있지 않음·문서 내
 //!   유일) 필수.
 
-use crate::dsl::{engine_registry, merkle_root, InterpretError, PolicyLevel, WorkflowDoc};
-use foundry_domain::workflow_encoding::{
-    guard_satisfied, EdgeEvent, EdgeTarget, EmbeddedWorkflow, Guard,
-};
+use crate::dsl::{InterpretError, PolicyLevel, WorkflowDoc, engine_registry, merkle_root};
 use foundry_domain::OrderState;
+use foundry_domain::workflow_encoding::{
+    EdgeEvent, EdgeTarget, EmbeddedWorkflow, Guard, guard_satisfied,
+};
 use serde::{Deserialize, Serialize};
-
 
 /// 검증 진단 — 오류/경고 2종만 (플랜 v6 C-W4a 수용 규칙).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -35,10 +34,16 @@ pub enum Diagnostic {
 
 impl Diagnostic {
     fn err(code: &str, detail: impl Into<String>) -> Self {
-        Diagnostic::Error { code: code.into(), detail: detail.into() }
+        Diagnostic::Error {
+            code: code.into(),
+            detail: detail.into(),
+        }
     }
     fn warn(code: &str, detail: impl Into<String>) -> Self {
-        Diagnostic::Warning { code: code.into(), detail: detail.into() }
+        Diagnostic::Warning {
+            code: code.into(),
+            detail: detail.into(),
+        }
     }
 }
 
@@ -54,7 +59,10 @@ pub const POLICY_SCHEMA_VERSIONS: &[u32] = &[1];
 
 /// **검증기** — 작성 시 1회 전수 검사. 성공은 런타임 권위 부여가 아니다:
 /// 런타임 인가는 도메인 승인 원장(T53a)이 소유한다.
-pub fn validate(doc: &WorkflowDoc, encoding: &EmbeddedWorkflow) -> Result<ValidationOutcome, Vec<Diagnostic>> {
+pub fn validate(
+    doc: &WorkflowDoc,
+    encoding: &EmbeddedWorkflow,
+) -> Result<ValidationOutcome, Vec<Diagnostic>> {
     let mut errors: Vec<Diagnostic> = Vec::new();
     let mut warnings: Vec<Diagnostic> = Vec::new();
 
@@ -62,7 +70,10 @@ pub fn validate(doc: &WorkflowDoc, encoding: &EmbeddedWorkflow) -> Result<Valida
     if doc.schema_version != 3 {
         return Err(vec![Diagnostic::err(
             "schema_version",
-            format!("validator targets schema v3; got v{} (v1/v2 go through frozen interpreters)", doc.schema_version),
+            format!(
+                "validator targets schema v3; got v{} (v1/v2 go through frozen interpreters)",
+                doc.schema_version
+            ),
         )]);
     }
 
@@ -89,17 +100,26 @@ pub fn validate(doc: &WorkflowDoc, encoding: &EmbeddedWorkflow) -> Result<Valida
     let mut seen_ids: Vec<&str> = Vec::new();
     for (i, st) in doc.body.steps.iter().enumerate() {
         if st.id.trim().is_empty() {
-            errors.push(Diagnostic::err("step_id_empty", format!("step[{i}] has an empty StepId")));
+            errors.push(Diagnostic::err(
+                "step_id_empty",
+                format!("step[{i}] has an empty StepId"),
+            ));
         }
         if seen_ids.contains(&st.id.as_str()) {
-            errors.push(Diagnostic::err("step_id_duplicate", format!("StepId '{}' is used more than once", st.id)));
+            errors.push(Diagnostic::err(
+                "step_id_duplicate",
+                format!("StepId '{}' is used more than once", st.id),
+            ));
         }
         seen_ids.push(st.id.as_str());
         // 이벤트명 타당성 — 내장 부호화에 존재하는 패밀리인가.
         if event_family_from_name(&st.event).is_none() {
             errors.push(Diagnostic::err(
                 "unknown_event",
-                format!("step[{}] ('{}') names event '{}' which does not exist in the encoding", i, st.id, st.event),
+                format!(
+                    "step[{}] ('{}') names event '{}' which does not exist in the encoding",
+                    i, st.id, st.event
+                ),
             ));
         }
     }
@@ -108,7 +128,10 @@ pub fn validate(doc: &WorkflowDoc, encoding: &EmbeddedWorkflow) -> Result<Valida
     let mut skill_ids: Vec<&str> = Vec::new();
     for s in &doc.skills {
         if skill_ids.contains(&s.id.as_str()) {
-            errors.push(Diagnostic::err("skill_id_duplicate", format!("skill id '{}' declared twice", s.id)));
+            errors.push(Diagnostic::err(
+                "skill_id_duplicate",
+                format!("skill id '{}' declared twice", s.id),
+            ));
         }
         skill_ids.push(s.id.as_str());
     }
@@ -117,7 +140,10 @@ pub fn validate(doc: &WorkflowDoc, encoding: &EmbeddedWorkflow) -> Result<Valida
     validate_policy(doc, encoding, &mut errors, &mut warnings);
 
     if errors.is_empty() {
-        Ok(ValidationOutcome { doc_digest: merkle_root(doc), warnings })
+        Ok(ValidationOutcome {
+            doc_digest: merkle_root(doc),
+            warnings,
+        })
     } else {
         Err(errors)
     }
@@ -230,7 +256,10 @@ fn validate_policy(
         if !step_ids.contains(&rule.node_ref.as_str()) {
             errors.push(Diagnostic::err(
                 "node_ref_unresolved",
-                format!("policy node_ref '{}' does not match any StepId in body.steps", rule.node_ref),
+                format!(
+                    "policy node_ref '{}' does not match any StepId in body.steps",
+                    rule.node_ref
+                ),
             ));
         }
     }
@@ -240,7 +269,10 @@ fn validate_policy(
         if refs.contains(&rule.node_ref.as_str()) {
             errors.push(Diagnostic::err(
                 "node_ref_duplicate",
-                format!("policy declares multiple rules for node '{}'", rule.node_ref),
+                format!(
+                    "policy declares multiple rules for node '{}'",
+                    rule.node_ref
+                ),
             ));
         }
         refs.push(&rule.node_ref);
@@ -271,7 +303,10 @@ fn validate_policy(
     }
 
     // 경고(예): 스킬이 승인 권한을 요구하는데 정책이 Prepare 없음 — advisory.
-    let has_prepare = policy.approvals.iter().any(|r| r.level == PolicyLevel::Prepare);
+    let has_prepare = policy
+        .approvals
+        .iter()
+        .any(|r| r.level == PolicyLevel::Prepare);
     if !has_prepare && !policy.approvals.is_empty() {
         warnings.push(Diagnostic::warn(
             "policy_without_prepare",
@@ -309,7 +344,11 @@ const GATE_FAMILIES: &[EdgeEvent] = &[
 /// **전부** 게이트 패밀리(승인 소비 또는 안전한 종단)인지 확인한다.
 /// 유한 상태공간+방문 집합 → 종결.
 /// 프로덕션 코드 — force_state_for_test 없이 순수 (엣지, 가드) 그래프 분석.
-fn prepare_placement_ok(doc: &WorkflowDoc, encoding: &EmbeddedWorkflow, node_ref: &str) -> PreparePlacement {
+fn prepare_placement_ok(
+    doc: &WorkflowDoc,
+    encoding: &EmbeddedWorkflow,
+    node_ref: &str,
+) -> PreparePlacement {
     // node_ref 미해결이면 이미 node_ref_unresolved 오류가 push되었다 —
     // 분석은 skip (panic 없이).
     let Some(idx) = doc.body.steps.iter().position(|s| s.id == node_ref) else {
@@ -363,7 +402,10 @@ fn prepare_placement_ok(doc: &WorkflowDoc, encoding: &EmbeddedWorkflow, node_ref
             .edges
             .iter()
             .filter(|e| e.from == s)
-            .filter(|e| (1u32..=foundry_domain::order::MAX_ATTEMPTS).any(|a| probes_satisfy_guard(&e.guard, &e.event, a)))
+            .filter(|e| {
+                (1u32..=foundry_domain::order::MAX_ATTEMPTS)
+                    .any(|a| probes_satisfy_guard(&e.guard, &e.event, a))
+            })
             .collect();
         if satisfiable.is_empty() {
             // 출발 엣지 없음 = 게이트 없음 — Prepare는 잘못된 배치.
@@ -388,17 +430,31 @@ fn probe_events(fam: EdgeEvent, base: u32) -> Vec<foundry_domain::OrderEvent> {
         EdgeEvent::Queued => vec![OrderEvent::Queued],
         EdgeEvent::DieStarted => vec![OrderEvent::DieStarted],
         EdgeEvent::DieSucceeded => vec![OrderEvent::DieSucceeded { attempt: base }],
-        EdgeEvent::DieFailed => vec![OrderEvent::DieFailed { attempt: base, reason: format!("err-{base}") }],
+        EdgeEvent::DieFailed => vec![OrderEvent::DieFailed {
+            attempt: base,
+            reason: format!("err-{base}"),
+        }],
         EdgeEvent::InspectionPassed => vec![OrderEvent::InspectionPassed],
-        EdgeEvent::ReviewHeld => vec![OrderEvent::ReviewHeld { reason: "review held".into() }],
+        EdgeEvent::ReviewHeld => vec![OrderEvent::ReviewHeld {
+            reason: "review held".into(),
+        }],
         EdgeEvent::InspectionFailed => vec![
-            OrderEvent::InspectionFailed { reason: format!("no-op-{base}") },
-            OrderEvent::InspectionFailed { reason: format!("real-{base}") },
+            OrderEvent::InspectionFailed {
+                reason: format!("no-op-{base}"),
+            },
+            OrderEvent::InspectionFailed {
+                reason: format!("real-{base}"),
+            },
         ],
-        EdgeEvent::Approved => vec![OrderEvent::Approved { intent: "i".into(), artifact_digest: "d".into() }],
+        EdgeEvent::Approved => vec![OrderEvent::Approved {
+            intent: "i".into(),
+            artifact_digest: "d".into(),
+        }],
         EdgeEvent::Rejected => vec![OrderEvent::Rejected { intent: "i".into() }],
         EdgeEvent::PublishConfirmed => vec![OrderEvent::PublishConfirmed { pr_url: "u".into() }],
-        EdgeEvent::PublishUnknown => vec![OrderEvent::PublishUnknown { operation_id: "o".into() }],
+        EdgeEvent::PublishUnknown => vec![OrderEvent::PublishUnknown {
+            operation_id: "o".into(),
+        }],
         EdgeEvent::CancelRequested => vec![OrderEvent::CancelRequested { reason: "r".into() }],
         EdgeEvent::Canceled => vec![OrderEvent::Canceled { reason: "r".into() }],
         EdgeEvent::CancelConfirmed => vec![OrderEvent::CancelConfirmed],
@@ -407,7 +463,9 @@ fn probe_events(fam: EdgeEvent, base: u32) -> Vec<foundry_domain::OrderEvent> {
 
 /// 가드가 (시도 a에서) 만족 가능한 프로브를 갖는가 — event는 참조로.
 fn probes_satisfy_guard(g: &Guard, event: &EdgeEvent, a: u32) -> bool {
-    probe_events(event.clone(), a).iter().any(|e| guard_satisfied(g, e, a))
+    probe_events(event.clone(), a)
+        .iter()
+        .any(|e| guard_satisfied(g, e, a))
 }
 
 // ============================================================================
@@ -420,8 +478,8 @@ fn probes_satisfy_guard(g: &Guard, event: &EdgeEvent, a: u32) -> bool {
 mod tests {
     use super::*;
     use crate::dsl::{
-        interpreter_v1, merkle_root, PolicyApproval, PolicyDoc, PolicyLevel, RoutingRules,
-        RouteRule, SkillKind, SkillRef, StepSpec, WorkflowBody, WorkflowDoc,
+        PolicyApproval, PolicyDoc, PolicyLevel, RouteRule, RoutingRules, SkillKind, SkillRef,
+        StepSpec, WorkflowBody, WorkflowDoc, interpreter_v1, merkle_root,
     };
     use foundry_domain::workflow_encoding::EmbeddedWorkflow;
 
@@ -432,19 +490,35 @@ mod tests {
             body: WorkflowBody {
                 encoding_digest: EmbeddedWorkflow::frozen_v1().digest(),
                 steps: vec![
-                    StepSpec { id: "s1".into(), event: "Queued".into(), skill: Some("die".into()) },
-                    StepSpec { id: "s2".into(), event: "DieStarted".into(), skill: Some("die".into()) },
+                    StepSpec {
+                        id: "s1".into(),
+                        event: "Queued".into(),
+                        skill: Some("die".into()),
+                    },
+                    StepSpec {
+                        id: "s2".into(),
+                        event: "DieStarted".into(),
+                        skill: Some("die".into()),
+                    },
                 ],
             },
-            skills: vec![
-                SkillRef { id: "die".into(), digest: "sk-die-abc".into(), kind: SkillKind::Role },
-            ],
+            skills: vec![SkillRef {
+                id: "die".into(),
+                digest: "sk-die-abc".into(),
+                kind: SkillKind::Role,
+            }],
             routing: RoutingRules {
-                rules: vec![RouteRule { source_pattern: "cron:*".into(), workflow_id: "order-pipeline-v3".into() }],
+                rules: vec![RouteRule {
+                    source_pattern: "cron:*".into(),
+                    workflow_id: "order-pipeline-v3".into(),
+                }],
                 default_route: "order-pipeline-v3".into(),
             },
             policy_digest: String::new(),
-            policy: Some(PolicyDoc { schema_version: 1, approvals: vec![] }),
+            policy: Some(PolicyDoc {
+                schema_version: 1,
+                approvals: vec![],
+            }),
             review_pack: None,
         }
     }
@@ -455,21 +529,36 @@ mod tests {
     #[test]
     fn t55_bmad_pool_preset_validates() {
         let manifest = env!("CARGO_MANIFEST_DIR");
-        let path = std::path::Path::new(manifest).parent().unwrap().parent().unwrap()
+        let path = std::path::Path::new(manifest)
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("presets/bmad-intake-pool.v3.json");
-        let doc = crate::dsl::load_preset(&path)
-            .unwrap_or_else(|e| panic!("preset must load: {e}"));
+        let doc =
+            crate::dsl::load_preset(&path).unwrap_or_else(|e| panic!("preset must load: {e}"));
         assert_eq!(doc.id, "bmad-intake-pool");
-        assert_eq!(doc.body.steps.len(), 5, "4 BMad role steps + advisory review + ship gate");
+        assert_eq!(
+            doc.body.steps.len(),
+            5,
+            "4 BMad role steps + advisory review + ship gate"
+        );
         assert_eq!(doc.skills.len(), 5);
         // 검증 통과 — 오류 0.
         let out = validate(&doc, &EmbeddedWorkflow::frozen_v1())
             .unwrap_or_else(|errs| panic!("preset must validate: {errs:?}"));
-        assert!(out.warnings.is_empty(), "no warnings expected: {:?}", out.warnings);
+        assert!(
+            out.warnings.is_empty(),
+            "no warnings expected: {:?}",
+            out.warnings
+        );
         // 정책 — ship-gate 노드 Prepare (도메인 승인 게이트와 정합).
         let pol = doc.policy.as_ref().expect("v3 embeds policy");
         assert_eq!(pol.approvals.len(), 1);
-        assert_eq!(pol.approvals[0].node_ref, "intake-review", "Prepare sits on the last autonomous step before the FurnaceHold approval gate");
+        assert_eq!(
+            pol.approvals[0].node_ref, "intake-review",
+            "Prepare sits on the last autonomous step before the FurnaceHold approval gate"
+        );
         assert!(matches!(pol.approvals[0].level, PolicyLevel::Prepare));
         // 스킬 카탈로그 — BMad 5역할. role: analyst/architect/dev(+pm 미배선),
         // advisory: review (저널 권한 없음 — 스텝 배선도 없음).
@@ -484,7 +573,11 @@ mod tests {
     #[test]
     fn t55_preset_false_digest_declaration_refused() {
         let manifest = env!("CARGO_MANIFEST_DIR");
-        let path = std::path::Path::new(manifest).parent().unwrap().parent().unwrap()
+        let path = std::path::Path::new(manifest)
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("presets/bmad-intake-pool.v3.json");
         let raw = std::fs::read_to_string(&path).unwrap();
         let tampered = raw.replace("\"enc-frozen-v1\"", "\"wf-emb-deadbeef\"");
@@ -500,14 +593,21 @@ mod tests {
     #[test]
     fn t55_bmad_pool_preset_waive_injection_rejected() {
         let manifest = env!("CARGO_MANIFEST_DIR");
-        let path = std::path::Path::new(manifest).parent().unwrap().parent().unwrap()
+        let path = std::path::Path::new(manifest)
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("presets/bmad-intake-pool.v3.json");
         let mut doc = crate::dsl::load_preset(&path).unwrap();
         let pol = doc.policy.as_mut().unwrap();
         pol.approvals[0].level = PolicyLevel::Waive;
         let errs = validate(&doc, &EmbeddedWorkflow::frozen_v1()).unwrap_err();
-        assert!(errs.iter().any(|d| matches!(d, Diagnostic::Error { code, .. } if code.contains("waive"))),
-            "waive must be refused: {errs:?}");
+        assert!(
+            errs.iter()
+                .any(|d| matches!(d, Diagnostic::Error { code, .. } if code.contains("waive"))),
+            "waive must be refused: {errs:?}"
+        );
     }
 
     // (1) 정상 v3 문서 — 검증 통과 (경고 없음).
@@ -526,11 +626,15 @@ mod tests {
         let mut d = v3_doc();
         d.policy = Some(PolicyDoc {
             schema_version: 1,
-            approvals: vec![PolicyApproval { node_ref: "s2".into(), level: PolicyLevel::Waive }],
+            approvals: vec![PolicyApproval {
+                node_ref: "s2".into(),
+                level: PolicyLevel::Waive,
+            }],
         });
         let errs = validate(&d, &enc).unwrap_err();
         assert!(
-            errs.iter().any(|e| matches!(e, Diagnostic::Error { code, .. } if code == "waive_forbidden")),
+            errs.iter()
+                .any(|e| matches!(e, Diagnostic::Error { code, .. } if code == "waive_forbidden")),
             "Waive must be a hard error: {errs:?}"
         );
     }
@@ -543,7 +647,10 @@ mod tests {
         let mut json = serde_json::to_value(&v3_doc()).unwrap();
         json["body"]["secret_backdoor"] = serde_json::json!(true);
         let doc: Result<WorkflowDoc, _> = serde_json::from_value(json);
-        assert!(doc.is_err(), "unknown fields in v3 docs must be REJECTED, not discarded");
+        assert!(
+            doc.is_err(),
+            "unknown fields in v3 docs must be REJECTED, not discarded"
+        );
         let _ = enc;
     }
 
@@ -554,10 +661,17 @@ mod tests {
         let mut d = v3_doc();
         d.policy = Some(PolicyDoc {
             schema_version: 1,
-            approvals: vec![PolicyApproval { node_ref: "ghost-step".into(), level: PolicyLevel::Prepare }],
+            approvals: vec![PolicyApproval {
+                node_ref: "ghost-step".into(),
+                level: PolicyLevel::Prepare,
+            }],
         });
         let errs = validate(&d, &enc).unwrap_err();
-        assert!(errs.iter().any(|e| matches!(e, Diagnostic::Error { code, .. } if code == "node_ref_unresolved")));
+        assert!(
+            errs.iter().any(
+                |e| matches!(e, Diagnostic::Error { code, .. } if code == "node_ref_unresolved")
+            )
+        );
     }
 
     // (4) StepId 계약 — 빈 id·중복 id 거부.
@@ -568,12 +682,19 @@ mod tests {
         let mut d = v3_doc();
         d.body.steps[1].id = "  ".into();
         let errs = validate(&d, &enc).unwrap_err();
-        assert!(errs.iter().any(|e| matches!(e, Diagnostic::Error { code, .. } if code == "step_id_empty")));
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, Diagnostic::Error { code, .. } if code == "step_id_empty"))
+        );
         // 중복 id
         let mut d = v3_doc();
         d.body.steps[1].id = "s1".into();
         let errs = validate(&d, &enc).unwrap_err();
-        assert!(errs.iter().any(|e| matches!(e, Diagnostic::Error { code, .. } if code == "step_id_duplicate")));
+        assert!(
+            errs.iter().any(
+                |e| matches!(e, Diagnostic::Error { code, .. } if code == "step_id_duplicate")
+            )
+        );
     }
 
     // (5) 존재하지 않는 이벤트명 거부.
@@ -583,7 +704,10 @@ mod tests {
         let mut d = v3_doc();
         d.body.steps[1].event = "SelfDestruct".into();
         let errs = validate(&d, &enc).unwrap_err();
-        assert!(errs.iter().any(|e| matches!(e, Diagnostic::Error { code, .. } if code == "unknown_event")));
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, Diagnostic::Error { code, .. } if code == "unknown_event"))
+        );
     }
 
     // (6) Prepare 혼합 분기 — 승인 없이 진행 가능한 갈래가 하나라도 있으면 오류.
@@ -596,11 +720,16 @@ mod tests {
         let mut d = v3_doc();
         d.policy = Some(PolicyDoc {
             schema_version: 1,
-            approvals: vec![PolicyApproval { node_ref: "s2".into(), level: PolicyLevel::Prepare }],
+            approvals: vec![PolicyApproval {
+                node_ref: "s2".into(),
+                level: PolicyLevel::Prepare,
+            }],
         });
         let errs = validate(&d, &enc).unwrap_err();
         assert!(
-            errs.iter().any(|e| matches!(e, Diagnostic::Error { code, .. } if code == "prepare_mixed_branches")),
+            errs.iter().any(
+                |e| matches!(e, Diagnostic::Error { code, .. } if code == "prepare_mixed_branches")
+            ),
             "Prepare after DieStarted (reaching Working) must be a mixed-branch error: {errs:?}"
         );
     }
@@ -614,17 +743,40 @@ mod tests {
         let enc = EmbeddedWorkflow::frozen_v1();
         let mut d = v3_doc();
         d.body.steps = vec![
-            StepSpec { id: "q".into(), event: "Queued".into(), skill: Some("die".into()) },
-            StepSpec { id: "w".into(), event: "DieStarted".into(), skill: Some("die".into()) },
-            StepSpec { id: "d".into(), event: "DieSucceeded".into(), skill: Some("die".into()) },
-            StepSpec { id: "p".into(), event: "InspectionPassed".into(), skill: None },
+            StepSpec {
+                id: "q".into(),
+                event: "Queued".into(),
+                skill: Some("die".into()),
+            },
+            StepSpec {
+                id: "w".into(),
+                event: "DieStarted".into(),
+                skill: Some("die".into()),
+            },
+            StepSpec {
+                id: "d".into(),
+                event: "DieSucceeded".into(),
+                skill: Some("die".into()),
+            },
+            StepSpec {
+                id: "p".into(),
+                event: "InspectionPassed".into(),
+                skill: None,
+            },
         ];
         d.policy = Some(PolicyDoc {
             schema_version: 1,
-            approvals: vec![PolicyApproval { node_ref: "p".into(), level: PolicyLevel::Prepare }],
+            approvals: vec![PolicyApproval {
+                node_ref: "p".into(),
+                level: PolicyLevel::Prepare,
+            }],
         });
         let out = validate(&d, &enc);
-        assert!(out.is_ok(), "legal Prepare (reaching FurnaceHold) must pass: {:?}", out.err());
+        assert!(
+            out.is_ok(),
+            "legal Prepare (reaching FurnaceHold) must pass: {:?}",
+            out.err()
+        );
     }
 
     // (8) v1/v2 문서는 검증기 대상 아님 — 동결 인터프리터 경로 유지.
@@ -636,7 +788,10 @@ mod tests {
         // v1 문서는 policy_digest 참조 — 기존 구조. 검증기는 v3만.
         d.policy = None;
         let errs = validate(&d, &enc).unwrap_err();
-        assert!(errs.iter().any(|e| matches!(e, Diagnostic::Error { code, .. } if code == "schema_version")));
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, Diagnostic::Error { code, .. } if code == "schema_version"))
+        );
         // 그리고 v1 인터프리터로는 여전히 해석된다 (레거시 재생 불변).
         assert!(interpreter_v1::interpret(&d, &enc).is_ok());
     }
@@ -652,7 +807,9 @@ mod tests {
         });
         let errs = validate(&d, &enc).unwrap_err();
         assert!(
-            errs.iter().any(|e| matches!(e, Diagnostic::Error { code, .. } if code == "bad_route_pattern")),
+            errs.iter().any(
+                |e| matches!(e, Diagnostic::Error { code, .. } if code == "bad_route_pattern")
+            ),
             "{errs:?}"
         );
     }
@@ -662,13 +819,23 @@ mod tests {
     fn t54_policy_schema_version_checked() {
         let enc = EmbeddedWorkflow::frozen_v1();
         let mut d = v3_doc();
-        d.policy = Some(PolicyDoc { schema_version: 99, approvals: vec![] });
+        d.policy = Some(PolicyDoc {
+            schema_version: 99,
+            approvals: vec![],
+        });
         let errs = validate(&d, &enc).unwrap_err();
-        assert!(errs.iter().any(|e| matches!(e, Diagnostic::Error { code, .. } if code == "policy_schema_version")));
+        assert!(errs.iter().any(
+            |e| matches!(e, Diagnostic::Error { code, .. } if code == "policy_schema_version")
+        ));
         let mut d = v3_doc();
-        d.policy = Some(PolicyDoc { schema_version: 0, approvals: vec![] });
+        d.policy = Some(PolicyDoc {
+            schema_version: 0,
+            approvals: vec![],
+        });
         let errs = validate(&d, &enc).unwrap_err();
-        assert!(errs.iter().any(|e| matches!(e, Diagnostic::Error { code, .. } if code == "policy_schema_version")));
+        assert!(errs.iter().any(
+            |e| matches!(e, Diagnostic::Error { code, .. } if code == "policy_schema_version")
+        ));
     }
 
     // (astra T54 MAJOR 2) v1 문서에 policy 주입 + policy_digest 변경 —
@@ -681,17 +848,32 @@ mod tests {
         let base = merkle_root(&d);
         // policy 주입 (버전 1이므로 리프는 policy_digest 그대로)
         let mut with_policy = d.clone();
-        with_policy.policy = Some(PolicyDoc { schema_version: 1, approvals: vec![] });
-        assert_eq!(merkle_root(&with_policy), base, "v1 leaf selection must IGNORE injected policy (version governs)");
+        with_policy.policy = Some(PolicyDoc {
+            schema_version: 1,
+            approvals: vec![],
+        });
+        assert_eq!(
+            merkle_root(&with_policy),
+            base,
+            "v1 leaf selection must IGNORE injected policy (version governs)"
+        );
         // policy_digest를 바꾸면 root 변화 (리프가 실제로 policy_digest임을 증명)
         let mut changed = d.clone();
         changed.policy_digest = "pol-CHANGED".into();
-        assert_ne!(merkle_root(&changed), base, "v1 policy_digest change must change root");
+        assert_ne!(
+            merkle_root(&changed),
+            base,
+            "v1 policy_digest change must change root"
+        );
         // 조합 공격 (astra T54-r2): policy가 주입된 상태에서 policy_digest까지
         // 바꾸면 — 버전이 지배하므로 리프는 policy_digest → base와 달라야.
         let mut combo = with_policy.clone();
         combo.policy_digest = "pol-CHANGED".into();
-        assert_ne!(merkle_root(&combo), base, "combined policy-injection + digest-change must NOT reproduce the base root");
+        assert_ne!(
+            merkle_root(&combo),
+            base,
+            "combined policy-injection + digest-change must NOT reproduce the base root"
+        );
     }
 
     // (astra T54 MAJOR 3) 게이트 의미론 — Rejected는 안전한 종단으로 인정되고
@@ -704,14 +886,33 @@ mod tests {
         // 합법: FurnaceHold 도달 (출구 Approved/Rejected 전부 게이트)
         let mut d = v3_doc();
         d.body.steps = vec![
-            StepSpec { id: "q".into(), event: "Queued".into(), skill: Some("die".into()) },
-            StepSpec { id: "w".into(), event: "DieStarted".into(), skill: Some("die".into()) },
-            StepSpec { id: "d".into(), event: "DieSucceeded".into(), skill: Some("die".into()) },
-            StepSpec { id: "p".into(), event: "InspectionPassed".into(), skill: None },
+            StepSpec {
+                id: "q".into(),
+                event: "Queued".into(),
+                skill: Some("die".into()),
+            },
+            StepSpec {
+                id: "w".into(),
+                event: "DieStarted".into(),
+                skill: Some("die".into()),
+            },
+            StepSpec {
+                id: "d".into(),
+                event: "DieSucceeded".into(),
+                skill: Some("die".into()),
+            },
+            StepSpec {
+                id: "p".into(),
+                event: "InspectionPassed".into(),
+                skill: None,
+            },
         ];
         d.policy = Some(PolicyDoc {
             schema_version: 1,
-            approvals: vec![PolicyApproval { node_ref: "p".into(), level: PolicyLevel::Prepare }],
+            approvals: vec![PolicyApproval {
+                node_ref: "p".into(),
+                level: PolicyLevel::Prepare,
+            }],
         });
         assert!(validate(&d, &enc).is_ok());
     }

@@ -237,7 +237,8 @@ pub fn merkle_root(doc: &WorkflowDoc) -> String {
     // 고정된다. v3에 policy가 없으면(구조 오류) 직렬화로는 불가능하지만
     // 방어적으로 빈 문자열 → root가 policy_digest=None과 구별됨.
     let policy_s = match doc.schema_version {
-        3 => doc.policy
+        3 => doc
+            .policy
             .as_ref()
             .map(|p| serde_json::to_string(p).unwrap())
             .unwrap_or_default(),
@@ -272,9 +273,15 @@ pub mod interpreter_v1 {
     pub const VERSION: u32 = 1;
 
     /// v1 해석: 구조 검증 + 부호화 결속 + role/advisory 구조 차단.
-    pub fn interpret(doc: &WorkflowDoc, loaded_encoding: &EmbeddedWorkflow) -> Result<CompiledWorkflow, InterpretError> {
+    pub fn interpret(
+        doc: &WorkflowDoc,
+        loaded_encoding: &EmbeddedWorkflow,
+    ) -> Result<CompiledWorkflow, InterpretError> {
         if doc.schema_version != VERSION {
-            return Err(InterpretError::UnknownSchemaVersion { got: doc.schema_version, known: vec![VERSION] });
+            return Err(InterpretError::UnknownSchemaVersion {
+                got: doc.schema_version,
+                known: vec![VERSION],
+            });
         }
         // 부호화 결속: 본문이 지정한 digest가 실제 로딩된 부호화와 일치
         if doc.body.encoding_digest != loaded_encoding.digest() {
@@ -286,9 +293,11 @@ pub mod interpreter_v1 {
         // 스킬 참조 무결성 + advisory 구조 차단
         for st in &doc.body.steps {
             if let Some(sk) = &st.skill {
-                let r = doc.skills.iter().find(|s| &s.id == sk).ok_or_else(|| InterpretError::UnknownSkillRef {
-                    step_event: st.event.clone(),
-                    skill: sk.clone(),
+                let r = doc.skills.iter().find(|s| &s.id == sk).ok_or_else(|| {
+                    InterpretError::UnknownSkillRef {
+                        step_event: st.event.clone(),
+                        skill: sk.clone(),
+                    }
                 })?;
                 // v1 규칙: 저널 이벤트를 발행하는 스텝(상태머신 전이)에는
                 // advisory 스킬 배선 불가 — advisory는 산출물만.
@@ -299,7 +308,10 @@ pub mod interpreter_v1 {
         }
         // C-W3: default_route는 이 워크플로 자신을 가리켜야 (암묵 폴백 금지)
         if doc.routing.default_route != doc.id {
-            return Err(InterpretError::DefaultRouteMismatch { expected: doc.id.clone(), got: doc.routing.default_route.clone() });
+            return Err(InterpretError::DefaultRouteMismatch {
+                expected: doc.id.clone(),
+                got: doc.routing.default_route.clone(),
+            });
         }
         Ok(CompiledWorkflow {
             doc_digest: merkle_root(doc),
@@ -329,7 +341,10 @@ pub mod engine_registry {
     }
 
     /// 버전 디스패치 — 각 버전의 동결 인터프리터로.
-    pub fn interpret(doc: &WorkflowDoc, loaded_encoding: &EmbeddedWorkflow) -> Result<CompiledWorkflow, InterpretError> {
+    pub fn interpret(
+        doc: &WorkflowDoc,
+        loaded_encoding: &EmbeddedWorkflow,
+    ) -> Result<CompiledWorkflow, InterpretError> {
         match doc.schema_version {
             1 => interpreter_v1::interpret(doc, loaded_encoding),
             2 => {
@@ -345,7 +360,10 @@ pub mod engine_registry {
                 for st in &doc.body.steps {
                     if let Some(sk) = &st.skill {
                         let r = doc.skills.iter().find(|s| &s.id == sk).ok_or_else(|| {
-                            InterpretError::UnknownSkillRef { step_event: st.event.clone(), skill: sk.clone() }
+                            InterpretError::UnknownSkillRef {
+                                step_event: st.event.clone(),
+                                skill: sk.clone(),
+                            }
                         })?;
                         if r.kind == SkillKind::Advisory {
                             return Err(InterpretError::AdvisoryInRoleSlot { skill: sk.clone() });
@@ -353,7 +371,10 @@ pub mod engine_registry {
                     }
                 }
                 if doc.routing.default_route != doc.id {
-                    return Err(InterpretError::DefaultRouteMismatch { expected: doc.id.clone(), got: doc.routing.default_route.clone() });
+                    return Err(InterpretError::DefaultRouteMismatch {
+                        expected: doc.id.clone(),
+                        got: doc.routing.default_route.clone(),
+                    });
                 }
                 Ok(CompiledWorkflow {
                     doc_digest: merkle_root(doc),
@@ -377,7 +398,10 @@ pub mod engine_registry {
                 for st in &doc.body.steps {
                     if let Some(sk) = &st.skill {
                         let r = doc.skills.iter().find(|s| &s.id == sk).ok_or_else(|| {
-                            InterpretError::UnknownSkillRef { step_event: st.event.clone(), skill: sk.clone() }
+                            InterpretError::UnknownSkillRef {
+                                step_event: st.event.clone(),
+                                skill: sk.clone(),
+                            }
                         })?;
                         if r.kind == SkillKind::Advisory {
                             return Err(InterpretError::AdvisoryInRoleSlot { skill: sk.clone() });
@@ -385,7 +409,10 @@ pub mod engine_registry {
                     }
                 }
                 if doc.routing.default_route != doc.id {
-                    return Err(InterpretError::DefaultRouteMismatch { expected: doc.id.clone(), got: doc.routing.default_route.clone() });
+                    return Err(InterpretError::DefaultRouteMismatch {
+                        expected: doc.id.clone(),
+                        got: doc.routing.default_route.clone(),
+                    });
                 }
                 Ok(CompiledWorkflow {
                     doc_digest: merkle_root(doc),
@@ -412,7 +439,10 @@ pub mod engine_registry {
                 for st in &doc.body.steps {
                     if let Some(sk) = &st.skill {
                         let r = doc.skills.iter().find(|s| &s.id == sk).ok_or_else(|| {
-                            InterpretError::UnknownSkillRef { step_event: st.event.clone(), skill: sk.clone() }
+                            InterpretError::UnknownSkillRef {
+                                step_event: st.event.clone(),
+                                skill: sk.clone(),
+                            }
                         })?;
                         if r.kind == SkillKind::Advisory {
                             return Err(InterpretError::AdvisoryInRoleSlot { skill: sk.clone() });
@@ -420,7 +450,10 @@ pub mod engine_registry {
                     }
                 }
                 if doc.routing.default_route != doc.id {
-                    return Err(InterpretError::DefaultRouteMismatch { expected: doc.id.clone(), got: doc.routing.default_route.clone() });
+                    return Err(InterpretError::DefaultRouteMismatch {
+                        expected: doc.id.clone(),
+                        got: doc.routing.default_route.clone(),
+                    });
                 }
                 Ok(CompiledWorkflow {
                     doc_digest: merkle_root(doc),
@@ -431,7 +464,10 @@ pub mod engine_registry {
                     review_pack: Some(pack_digest),
                 })
             }
-            got => Err(InterpretError::UnknownSchemaVersion { got, known: known_versions() }),
+            got => Err(InterpretError::UnknownSchemaVersion {
+                got,
+                known: known_versions(),
+            }),
         }
     }
 }
@@ -440,7 +476,10 @@ pub mod engine_registry {
 /// 스냅샷의 재계산 digest와 대조. 로더는 스냅샷 적재 시점의 digest를,
 /// 이 함수는 디스패치 직전의 live digest를 받아 워크플로 결속값과
 /// 비교한다 — 사이에 팩 파일이 바뀌면 거부.
-pub fn verify_pack_binding(doc: &WorkflowDoc, live_pack_digest: &str) -> Result<(), InterpretError> {
+pub fn verify_pack_binding(
+    doc: &WorkflowDoc,
+    live_pack_digest: &str,
+) -> Result<(), InterpretError> {
     match &doc.review_pack {
         None => Err(InterpretError::MissingReviewPack),
         Some(r) if r.pack_digest == live_pack_digest => Ok(()),
@@ -463,17 +502,40 @@ mod tests {
             body: WorkflowBody {
                 encoding_digest: EmbeddedWorkflow::frozen_v1().digest(),
                 steps: vec![
-                    StepSpec { id: String::new(), event: "Queued".into(), skill: Some("die".into()) },
-                    StepSpec { id: String::new(), event: "DieStarted".into(), skill: Some("die".into()) },
-                    StepSpec { id: String::new(), event: "InspectionPassed".into(), skill: Some("inspector".into()) },
+                    StepSpec {
+                        id: String::new(),
+                        event: "Queued".into(),
+                        skill: Some("die".into()),
+                    },
+                    StepSpec {
+                        id: String::new(),
+                        event: "DieStarted".into(),
+                        skill: Some("die".into()),
+                    },
+                    StepSpec {
+                        id: String::new(),
+                        event: "InspectionPassed".into(),
+                        skill: Some("inspector".into()),
+                    },
                 ],
             },
             skills: vec![
-                SkillRef { id: "die".into(), digest: "sk-die-abc".into(), kind: SkillKind::Role },
-                SkillRef { id: "inspector".into(), digest: "sk-insp-def".into(), kind: SkillKind::Role },
+                SkillRef {
+                    id: "die".into(),
+                    digest: "sk-die-abc".into(),
+                    kind: SkillKind::Role,
+                },
+                SkillRef {
+                    id: "inspector".into(),
+                    digest: "sk-insp-def".into(),
+                    kind: SkillKind::Role,
+                },
             ],
             routing: RoutingRules {
-                rules: vec![RouteRule { source_pattern: "cron:*".into(), workflow_id: "order-pipeline".into() }],
+                rules: vec![RouteRule {
+                    source_pattern: "cron:*".into(),
+                    workflow_id: "order-pipeline".into(),
+                }],
                 default_route: "order-pipeline".into(),
             },
             policy_digest: "pol-001".into(),
@@ -489,15 +551,26 @@ mod tests {
         let base = merkle_root(&sample_doc());
         // 본문
         let mut d = sample_doc();
-        d.body.steps.push(StepSpec { id: String::new(), event: "Canceled".into(), skill: None });
+        d.body.steps.push(StepSpec {
+            id: String::new(),
+            event: "Canceled".into(),
+            skill: None,
+        });
         assert_ne!(merkle_root(&d), base, "body change must change root");
         // 스킬 digest (본문 불변!)
         let mut d = sample_doc();
         d.skills[0].digest = "sk-die-TAMPERED".into();
-        assert_ne!(merkle_root(&d), base, "skill digest change must change root");
+        assert_ne!(
+            merkle_root(&d),
+            base,
+            "skill digest change must change root"
+        );
         // 라우팅
         let mut d = sample_doc();
-        d.routing.rules.push(RouteRule { source_pattern: "github:*".into(), workflow_id: "other".into() });
+        d.routing.rules.push(RouteRule {
+            source_pattern: "github:*".into(),
+            workflow_id: "other".into(),
+        });
         assert_ne!(merkle_root(&d), base, "routing change must change root");
         // 정책
         let mut d = sample_doc();
@@ -529,19 +602,31 @@ mod tests {
         // 부호화 불일치
         let mut d = sample_doc();
         d.body.encoding_digest = "wf-emb-deadbeef".into();
-        assert!(matches!(interpreter_v1::interpret(&d, &enc), Err(InterpretError::EncodingMismatch { .. })));
+        assert!(matches!(
+            interpreter_v1::interpret(&d, &enc),
+            Err(InterpretError::EncodingMismatch { .. })
+        ));
         // 없는 스킬 참조
         let mut d = sample_doc();
         d.body.steps[0].skill = Some("ghost".into());
-        assert!(matches!(interpreter_v1::interpret(&d, &enc), Err(InterpretError::UnknownSkillRef { .. })));
+        assert!(matches!(
+            interpreter_v1::interpret(&d, &enc),
+            Err(InterpretError::UnknownSkillRef { .. })
+        ));
         // advisory가 role 슬롯에
         let mut d = sample_doc();
         d.skills[0].kind = SkillKind::Advisory;
-        assert!(matches!(interpreter_v1::interpret(&d, &enc), Err(InterpretError::AdvisoryInRoleSlot { .. })));
+        assert!(matches!(
+            interpreter_v1::interpret(&d, &enc),
+            Err(InterpretError::AdvisoryInRoleSlot { .. })
+        ));
         // default_route 불일치 (암묵 폴백 금지)
         let mut d = sample_doc();
         d.routing.default_route = "somewhere-else".into();
-        assert!(matches!(interpreter_v1::interpret(&d, &enc), Err(InterpretError::DefaultRouteMismatch { .. })));
+        assert!(matches!(
+            interpreter_v1::interpret(&d, &enc),
+            Err(InterpretError::DefaultRouteMismatch { .. })
+        ));
     }
 
     /// **G7 (r2 재작)**: 골든은 **리터럴 상수**다 — merkle_root()를 다시
@@ -556,18 +641,27 @@ mod tests {
         let doc = sample_doc();
         // 동결된 골든 리터럴 (실측 기록 — 코드 재계산 아님)
         // T33 ADDENDUM 24/29/31: intentional pin update after embedded edge additions.
-        const GOLDEN_V1_ROOT: &str = "wf-root-58023c9e74af689335440e3b3069b6d8bf3a18ec446ff581b6dce8a4df488afb";
+        const GOLDEN_V1_ROOT: &str =
+            "wf-root-58023c9e74af689335440e3b3069b6d8bf3a18ec446ff581b6dce8a4df488afb";
         const GOLDEN_PLAN_LEN: usize = 3;
         const GOLDEN_FIRST_STEP_EVENT: &str = "Queued";
         const GOLDEN_DEFAULT_ROUTE: &str = "order-pipeline";
         const GOLDEN_ENCODING_DIGEST_PREFIX: &str = "wf-emb-";
         // v2 엔진 레지스트리에서 v1 문서 재생
         let by_v2 = engine_registry::interpret(&doc, &enc).unwrap();
-        assert_eq!(by_v2.doc_digest, GOLDEN_V1_ROOT, "replay must reproduce the FROZEN literal root");
+        assert_eq!(
+            by_v2.doc_digest, GOLDEN_V1_ROOT,
+            "replay must reproduce the FROZEN literal root"
+        );
         assert_eq!(by_v2.plan.len(), GOLDEN_PLAN_LEN);
         assert_eq!(by_v2.plan[0].event, GOLDEN_FIRST_STEP_EVENT);
         assert_eq!(by_v2.routing.default_route, GOLDEN_DEFAULT_ROUTE);
-        assert!(by_v2.encoding.digest().starts_with(GOLDEN_ENCODING_DIGEST_PREFIX));
+        assert!(
+            by_v2
+                .encoding
+                .digest()
+                .starts_with(GOLDEN_ENCODING_DIGEST_PREFIX)
+        );
         // v1 직접 해석과도 일치
         let by_v1 = interpreter_v1::interpret(&doc, &enc).unwrap();
         assert_eq!(by_v2.doc_digest, by_v1.doc_digest);
@@ -583,7 +677,10 @@ mod tests {
         let mut d = sample_doc();
         d.schema_version = 2;
         let by_v2doc = engine_registry::interpret(&d, &enc).unwrap();
-        assert_ne!(by_v2doc.doc_digest, GOLDEN_V1_ROOT, "version identity must change the root");
+        assert_ne!(
+            by_v2doc.doc_digest, GOLDEN_V1_ROOT,
+            "version identity must change the root"
+        );
     }
 }
 
@@ -606,11 +703,20 @@ mod t29b_tests {
                     skill: Some("lens".into()),
                 }],
             },
-            skills: vec![SkillRef { id: "lens".into(), digest: "sk-x".into(), kind: SkillKind::Role }],
-            routing: RoutingRules { rules: vec![], default_route: "m8-review".into() },
+            skills: vec![SkillRef {
+                id: "lens".into(),
+                digest: "sk-x".into(),
+                kind: SkillKind::Role,
+            }],
+            routing: RoutingRules {
+                rules: vec![],
+                default_route: "m8-review".into(),
+            },
             policy_digest: String::new(),
             policy: None,
-            review_pack: Some(ReviewPackRef { pack_digest: "pack-abc".into() }),
+            review_pack: Some(ReviewPackRef {
+                pack_digest: "pack-abc".into(),
+            }),
         }
     }
 
@@ -620,7 +726,9 @@ mod t29b_tests {
         let d = v4_doc();
         let r1 = merkle_root(&d);
         let mut d2 = d.clone();
-        d2.review_pack = Some(ReviewPackRef { pack_digest: "pack-tampered".into() });
+        d2.review_pack = Some(ReviewPackRef {
+            pack_digest: "pack-tampered".into(),
+        });
         assert_ne!(r1, merkle_root(&d2), "review-pack leaf must be covered");
     }
 
@@ -633,16 +741,32 @@ mod t29b_tests {
             id: "m8-review".into(),
             body: WorkflowBody {
                 encoding_digest: EmbeddedWorkflow::frozen_v1().digest(),
-                steps: vec![StepSpec { id: "s1".into(), event: "Queued".into(), skill: Some("lens".into()) }],
+                steps: vec![StepSpec {
+                    id: "s1".into(),
+                    event: "Queued".into(),
+                    skill: Some("lens".into()),
+                }],
             },
-            skills: vec![SkillRef { id: "lens".into(), digest: "sk-x".into(), kind: SkillKind::Role }],
-            routing: RoutingRules { rules: vec![], default_route: "m8-review".into() },
+            skills: vec![SkillRef {
+                id: "lens".into(),
+                digest: "sk-x".into(),
+                kind: SkillKind::Role,
+            }],
+            routing: RoutingRules {
+                rules: vec![],
+                default_route: "m8-review".into(),
+            },
             policy_digest: String::new(),
             policy: Some(PolicyDoc {
                 schema_version: 1,
-                approvals: vec![PolicyApproval { node_ref: "s1".into(), level: PolicyLevel::Prepare }],
+                approvals: vec![PolicyApproval {
+                    node_ref: "s1".into(),
+                    level: PolicyLevel::Prepare,
+                }],
             }),
-            review_pack: Some(ReviewPackRef { pack_digest: "pack-abc".into() }),
+            review_pack: Some(ReviewPackRef {
+                pack_digest: "pack-abc".into(),
+            }),
         };
         // v3 pin — T33 ADDENDUM 24/29/31 내장 엣지 추가로 인한 의도적 갱신
         // (review_pack 주입에도 불변:
@@ -676,7 +800,10 @@ mod t29b_tests {
         }
         let mut bare = d;
         bare.review_pack = None;
-        assert!(matches!(verify_pack_binding(&bare, "pack-abc"), Err(InterpretError::MissingReviewPack)));
+        assert!(matches!(
+            verify_pack_binding(&bare, "pack-abc"),
+            Err(InterpretError::MissingReviewPack)
+        ));
     }
 
     /// 게이트 1d: v4 해석 — 팩 부재 거부·정상 문서는 팩 digest 전달.
@@ -710,7 +837,10 @@ mod t29b_tests {
     #[test]
     fn v4_serialization_contract() {
         let s4 = canonical_json(&v4_doc());
-        assert!(s4.contains("review_pack"), "v4 must serialize the binding: {s4}");
+        assert!(
+            s4.contains("review_pack"),
+            "v4 must serialize the binding: {s4}"
+        );
         let mut d3 = v4_doc();
         d3.schema_version = 3;
         d3.review_pack = None;

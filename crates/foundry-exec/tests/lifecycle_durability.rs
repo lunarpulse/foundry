@@ -3,12 +3,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{TimeZone, Utc};
+use foundry_exec::types::Generation;
 use foundry_exec::{
     ActivationRef, Attempt, CrashPoint, DispatchHost, DispatchResult, Epoch, ExecutionIntent,
     ExecutionOutcome, Executor, FaultInjector, IntentLog, OrderId, OutcomeStore, Receipt,
     ResumeAction, RunId, SessionReceipt,
 };
-use foundry_exec::types::Generation;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 type Key = (OrderId, Attempt, RunId);
@@ -19,7 +19,9 @@ impl TestDir {
     fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join("test-data").join(format!(
-            "durability-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed),
+            "durability-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
         ));
         fs::create_dir_all(&path).unwrap();
         Self(path)
@@ -29,10 +31,15 @@ impl TestDir {
 impl Drop for TestDir {
     fn drop(&mut self) {
         use std::io::Write;
-        let mut inventory = fs::OpenOptions::new().create(true).append(true)
-            .open(std::env::temp_dir().join("runtime-temporaries.txt")).unwrap();
+        let mut inventory = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(std::env::temp_dir().join("runtime-temporaries.txt"))
+            .unwrap();
         for entry in fs::read_dir(&self.0).unwrap() {
-            inventory.write_all(format!("{} (deleted)\n", entry.unwrap().path().display()).as_bytes()).unwrap();
+            inventory
+                .write_all(format!("{} (deleted)\n", entry.unwrap().path().display()).as_bytes())
+                .unwrap();
         }
         fs::remove_dir_all(&self.0).unwrap();
     }
@@ -50,14 +57,22 @@ fn write<T: Serialize>(path: &Path, value: &T) {
     let temporary = path.with_extension("pending");
     {
         use std::io::Write;
-        let mut inventory = std::fs::OpenOptions::new().create(true).append(true)
-            .open(std::env::temp_dir().join("runtime-temporaries.txt")).unwrap();
-        inventory.write_all(format!("{} (rename temporary)\n", temporary.display()).as_bytes()).unwrap();
+        let mut inventory = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(std::env::temp_dir().join("runtime-temporaries.txt"))
+            .unwrap();
+        inventory
+            .write_all(format!("{} (rename temporary)\n", temporary.display()).as_bytes())
+            .unwrap();
     }
     fs::write(&temporary, serde_json::to_vec(value).unwrap()).unwrap();
     File::open(&temporary).unwrap().sync_all().unwrap();
     fs::rename(&temporary, path).unwrap();
-    File::open(path.parent().unwrap()).unwrap().sync_all().unwrap();
+    File::open(path.parent().unwrap())
+        .unwrap()
+        .sync_all()
+        .unwrap();
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -77,25 +92,37 @@ impl IntentLog for DiskIntentLog {
 
     fn mark_started(&mut self, key: &Key, activation: u64) {
         let mut state: Intents = read(&self.0);
-        assert!(state.rows.iter().any(|intent| intent_key(intent) == *key
-            && intent.activation == activation));
+        assert!(
+            state
+                .rows
+                .iter()
+                .any(|intent| intent_key(intent) == *key && intent.activation == activation)
+        );
         state.started.push((key.clone(), activation));
         write(&self.0, &state);
     }
 
     fn latest(&self, key: &Key) -> Option<ExecutionIntent> {
         let state: Intents = read(&self.0);
-        state.rows.into_iter().rev().find(|intent| intent_key(intent) == *key)
+        state
+            .rows
+            .into_iter()
+            .rev()
+            .find(|intent| intent_key(intent) == *key)
     }
 
     fn get(&self, key: &Key, activation: u64) -> Option<ExecutionIntent> {
         let state: Intents = read(&self.0);
-        state.rows.into_iter().find(|intent| intent_key(intent) == *key
-            && intent.activation == activation)
+        state
+            .rows
+            .into_iter()
+            .find(|intent| intent_key(intent) == *key && intent.activation == activation)
     }
 
     fn is_started(&self, key: &Key, activation: u64) -> bool {
-        read::<Intents>(&self.0).started.contains(&(key.clone(), activation))
+        read::<Intents>(&self.0)
+            .started
+            .contains(&(key.clone(), activation))
     }
 }
 
@@ -104,8 +131,9 @@ struct DiskOutcomeStore(PathBuf);
 impl OutcomeStore for DiskOutcomeStore {
     fn commit(&mut self, outcome: &ExecutionOutcome) {
         let mut rows: Vec<ExecutionOutcome> = read(&self.0);
-        if !rows.iter().any(|row| row.intent_key == outcome.intent_key
-            && row.activation == outcome.activation)
+        if !rows
+            .iter()
+            .any(|row| row.intent_key == outcome.intent_key && row.activation == outcome.activation)
         {
             rows.push(outcome.clone());
             write(&self.0, &rows);
@@ -113,12 +141,15 @@ impl OutcomeStore for DiskOutcomeStore {
     }
 
     fn latest(&self, key: &Key) -> Option<ExecutionOutcome> {
-        read::<Vec<ExecutionOutcome>>(&self.0).into_iter().rev()
+        read::<Vec<ExecutionOutcome>>(&self.0)
+            .into_iter()
+            .rev()
             .find(|row| row.intent_key == *key)
     }
 
     fn get(&self, key: &Key, activation: u64) -> Option<ExecutionOutcome> {
-        read::<Vec<ExecutionOutcome>>(&self.0).into_iter()
+        read::<Vec<ExecutionOutcome>>(&self.0)
+            .into_iter()
             .find(|row| row.intent_key == *key && row.activation == activation)
     }
 }
@@ -140,7 +171,10 @@ impl DispatchHost for DiskHost {
     fn dispatch(&mut self, intent: &ExecutionIntent) -> DispatchResult {
         // Observe the actual durable files at the external-effect boundary.
         let log = DiskIntentLog(self.intents_path.clone());
-        assert_eq!(log.get(&intent_key(intent), intent.activation), Some(intent.clone()));
+        assert_eq!(
+            log.get(&intent_key(intent), intent.activation),
+            Some(intent.clone())
+        );
         assert!(log.is_started(&intent_key(intent), intent.activation));
         let result = expected(intent);
         let mut state: HostState = read(&self.path);
@@ -155,7 +189,9 @@ impl DispatchHost for DiskHost {
     }
 
     fn recover_result(&mut self, intent: &ExecutionIntent) -> Option<DispatchResult> {
-        read::<HostState>(&self.path).results.into_iter()
+        read::<HostState>(&self.path)
+            .results
+            .into_iter()
             .find(|row| row.intent_key == intent_key(intent) && row.activation == intent.activation)
             .map(dispatch_result)
     }
@@ -209,7 +245,10 @@ fn ports(path: &Path) -> (DiskIntentLog, DiskHost, DiskOutcomeStore) {
     let intents_path = path.join("intents.json");
     (
         DiskIntentLog(intents_path.clone()),
-        DiskHost { path: path.join("host.json"), intents_path },
+        DiskHost {
+            path: path.join("host.json"),
+            intents_path,
+        },
         DiskOutcomeStore(path.join("outcomes.json")),
     )
 }
@@ -223,7 +262,10 @@ fn all_ports_reopen_after_w1_and_w2_and_bind_the_complete_outcome_once() {
         {
             let (mut log, mut host, mut store) = ports(&dir.0);
             let mut executor = Executor::with_faults(
-                &mut log, &mut host, &mut store, FaultInjector::armed_at(point),
+                &mut log,
+                &mut host,
+                &mut store,
+                FaultInjector::armed_at(point),
             );
             assert!(executor.run(work.clone()).is_err());
             assert!(executor.outcome(&key).is_none());
@@ -233,20 +275,33 @@ fn all_ports_reopen_after_w1_and_w2_and_bind_the_complete_outcome_once() {
         {
             let (mut log, mut host, mut store) = ports(&dir.0);
             let mut executor = Executor::new(&mut log, &mut host, &mut store);
-            assert_eq!(executor.resume(&key), match point {
-                CrashPoint::W1 => ResumeAction::ReDispatch,
-                CrashPoint::W2 => ResumeAction::ReBind,
-                CrashPoint::W3 | CrashPoint::W4 | CrashPoint::W5 => unreachable!("this test covers W1/W2"),
-            });
+            assert_eq!(
+                executor.resume(&key),
+                match point {
+                    CrashPoint::W1 => ResumeAction::ReDispatch,
+                    CrashPoint::W2 => ResumeAction::ReBind,
+                    CrashPoint::W3 | CrashPoint::W4 | CrashPoint::W5 =>
+                        unreachable!("this test covers W1/W2"),
+                }
+            );
             assert_eq!(executor.outcome(&key), Some(expected(&work)));
-            assert_eq!(executor.resume(&key), ResumeAction::AlreadyBound(expected(&work)));
+            assert_eq!(
+                executor.resume(&key),
+                ResumeAction::AlreadyBound(expected(&work))
+            );
             assert_eq!(executor.dispatch_count(), 1);
         }
         let (log, mut host, store) = ports(&dir.0);
         assert!(log.is_started(&key, work.activation));
         assert_eq!(store.latest(&key), Some(expected(&work)));
-        assert_eq!(host.recover_result(&work), Some(dispatch_result(expected(&work))));
-        assert_eq!(host.recover_result(&work), Some(dispatch_result(expected(&work))));
+        assert_eq!(
+            host.recover_result(&work),
+            Some(dispatch_result(expected(&work)))
+        );
+        assert_eq!(
+            host.recover_result(&work),
+            Some(dispatch_result(expected(&work)))
+        );
         assert_eq!(host.dispatch_count(), 1);
     }
 }
@@ -270,5 +325,9 @@ fn failed_durable_intent_write_stops_before_any_host_effect() {
 #[test]
 fn b3a_fixture_uses_configured_temp_directory() {
     let dir = TestDir::new();
-    assert!(dir.0.starts_with(std::env::temp_dir()), "fixture escaped TMPDIR: {}", dir.0.display());
+    assert!(
+        dir.0.starts_with(std::env::temp_dir()),
+        "fixture escaped TMPDIR: {}",
+        dir.0.display()
+    );
 }

@@ -46,7 +46,9 @@ pub fn emit_once<S: EmitSink, L: EmitLog>(
     tuple: &ArtifactTuple,
     presented_epoch: Epoch,
 ) -> EmitOutcome {
-    emit_with(sink, log, tuple, presented_epoch, |sink, tuple| sink.publish(tuple))
+    emit_with(sink, log, tuple, presented_epoch, |sink, tuple| {
+        sink.publish(tuple)
+    })
 }
 
 pub(crate) fn emit_named<S: EmitSink, L: EmitLog>(

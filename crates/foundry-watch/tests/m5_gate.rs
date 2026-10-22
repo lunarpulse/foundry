@@ -2,24 +2,18 @@
 //! 19 items + sub-gates). Each item is a PROOF, not a checkbox: the
 //! scenario actually runs and the adversarial property is observed.
 //! Pattern inherited from m4_gate.rs (M4, 16/16).
-use std::collections::BTreeMap;
 use sha2::Digest;
+use std::collections::BTreeMap;
 
 use foundry_watch::budget_accounting::{Amount, BudgetError, BudgetEvent, BudgetLedger};
 use foundry_watch::bundles::{BundleProfile, BundleStore, CandidateBundle, DependencyPins};
-use foundry_watch::evaluation_protocol::{
-    frozen_policy_graph, frozen_protocol_v1, Partition,
-};
-use foundry_watch::governance_events::{
-    recover, verify_stream, GovernanceEvent, OpKind, Phase,
-};
+use foundry_watch::evaluation_protocol::{Partition, frozen_policy_graph, frozen_protocol_v1};
+use foundry_watch::governance_events::{GovernanceEvent, OpKind, Phase, recover, verify_stream};
 use foundry_watch::integration_eval::{
     FinalEvaluationInput, IntegrationGate, IntegrationVerdict, ItemResult,
 };
 use foundry_watch::lessons::{ApprovalRef, BundleIndex, LessonSealInput, LessonStore};
-use foundry_watch::model_proxy::{
-    cast_container_spec, docker_argv, ProxyError, ProxyRequest,
-};
+use foundry_watch::model_proxy::{ProxyError, ProxyRequest, cast_container_spec, docker_argv};
 use foundry_watch::policy_apply::{ApplyCommand, PolicyApplicationLayer, Role};
 use foundry_watch::retro::{
     EvidenceEnvelope, InsightError, InsightPipeline, InsightRecord, PolicyDiff, Prediction,
@@ -74,9 +68,15 @@ fn pins() -> DependencyPins {
 
 struct NoBundles;
 impl BundleIndex for NoBundles {
-    fn lessons_of_candidate(&self, _: &str) -> Vec<String> { vec![] }
-    fn token_binding(&self, _: &str) -> Option<String> { None }
-    fn active_candidates(&self) -> Vec<String> { vec![] }
+    fn lessons_of_candidate(&self, _: &str) -> Vec<String> {
+        vec![]
+    }
+    fn token_binding(&self, _: &str) -> Option<String> {
+        None
+    }
+    fn active_candidates(&self) -> Vec<String> {
+        vec![]
+    }
 }
 
 // ---- gate items -------------------------------------------------------
@@ -85,7 +85,8 @@ fn g1_scope_closure_single_org() -> bool {
     // T30 single-org contract unchanged: inventory declares it, M5
     // adds no second-org path (astra #18 — M5 promises no A/B split)
     let inv = foundry_watch::inventory::state_inventory();
-    inv.iter().any(|s| s.name.contains("order scope assignments"))
+    inv.iter()
+        .any(|s| s.name.contains("order scope assignments"))
 }
 
 fn g2_governance_stream_valid() -> bool {
@@ -108,8 +109,10 @@ fn g3_crash_recovery_deterministic() -> bool {
         at: "t".into(),
     };
     let r = recover(&e, 2);
-    r.phase == Phase::Aborted
-        && { let _ = &mut s; true }
+    r.phase == Phase::Aborted && {
+        let _ = &mut s;
+        true
+    }
 }
 
 fn g4_eval_protocol_frozen() -> bool {
@@ -128,9 +131,14 @@ fn g5_holdout_isolation() -> bool {
 
 fn g6_transitive_ban() -> bool {
     let g = frozen_policy_graph();
-    ["judging_policy", "cohort_definitions", "source_history_ledger", "metric_definitions"]
-        .iter()
-        .all(|t| g.proposal_admissible(t).is_err())
+    [
+        "judging_policy",
+        "cohort_definitions",
+        "source_history_ledger",
+        "metric_definitions",
+    ]
+    .iter()
+    .all(|t| g.proposal_admissible(t).is_err())
 }
 
 fn g6a_lesson_authority_boundary() -> bool {
@@ -157,7 +165,12 @@ fn g7_bundle_immutability() -> bool {
     let mut st = BundleStore::default();
     let b = CandidateBundle::build(
         "c",
-        BundleProfile { model: "m".into(), temperature: Some(0.0), seed: Some(1), max_output_tokens: 8 },
+        BundleProfile {
+            model: "m".into(),
+            temperature: Some(0.0),
+            seed: Some(1),
+            max_output_tokens: 8,
+        },
         "p",
         vec![],
         pins(),
@@ -165,12 +178,11 @@ fn g7_bundle_immutability() -> bool {
     .unwrap();
     let d = st.put(b);
     // consumption re-verify + token-digest binding
-    st.get_verified(&d).is_ok()
-        && {
-            let mut st2 = st.clone_for_test();
-            st2.issue_token(&d, "t1").unwrap();
-            st2.consume_token("t1", &d).is_ok() && st2.consume_token("t1", &d).is_err()
-        }
+    st.get_verified(&d).is_ok() && {
+        let mut st2 = st.clone_for_test();
+        st2.issue_token(&d, "t1").unwrap();
+        st2.consume_token("t1", &d).is_ok() && st2.consume_token("t1", &d).is_err()
+    }
 }
 
 fn g8_proxy_narrow_egress() -> bool {
@@ -184,10 +196,22 @@ fn g8_proxy_narrow_egress() -> bool {
         }],
         |_| Ok(()),
     );
-    let r = ProxyRequest { provider: "deepseek".into(), body: "{}".into(), run: "r".into(), budget_scope: vec![] };
+    let r = ProxyRequest {
+        provider: "deepseek".into(),
+        body: "{}".into(),
+        run: "r".into(),
+        budget_scope: vec![],
+    };
     p.validate(&r).is_ok()
-        && matches!(p.screen_egress("deepseek", "https://evil.io"), Err(ProxyError::OffOrigin { .. }))
-        && p.validate(&ProxyRequest { provider: "other".into(), ..r.clone() }).is_err()
+        && matches!(
+            p.screen_egress("deepseek", "https://evil.io"),
+            Err(ProxyError::OffOrigin { .. })
+        )
+        && p.validate(&ProxyRequest {
+            provider: "other".into(),
+            ..r.clone()
+        })
+        .is_err()
 }
 
 fn g8a_cast_boundary_no_credentials() -> bool {
@@ -202,7 +226,10 @@ fn g9_synth_guards() -> bool {
     // revoked lesson: fail loud; holdout prompt: refused (T47)
     let (l, p) = (lesson_store(), protocol());
     let mut b = BudgetLedger::new();
-    let lim = BudgetEvent::SetLimit { scope: vec!["factory".into()], amount: Amount::pts(1000) };
+    let lim = BudgetEvent::SetLimit {
+        scope: vec!["factory".into()],
+        amount: Amount::pts(1000),
+    };
     b.apply(lim.clone()).unwrap();
     b.journal.push(lim);
     let mut bs = BundleStore::default();
@@ -212,7 +239,12 @@ fn g9_synth_guards() -> bool {
         run: "r".into(),
         lineage: vec!["factory".into()],
         candidate_id: "c".into(),
-        base_profile: BundleProfile { model: "m".into(), temperature: Some(0.0), seed: Some(1), max_output_tokens: 8 },
+        base_profile: BundleProfile {
+            model: "m".into(),
+            temperature: Some(0.0),
+            seed: Some(1),
+            max_output_tokens: 8,
+        },
         prompt_template: "like m-hold-1".into(), // contamination
         lesson_ids: vec!["L1".into()],
         quoted_spend: 10,
@@ -228,7 +260,12 @@ fn g10_transfer_required() -> bool {
     let d = {
         let b = CandidateBundle::build(
             "c",
-            BundleProfile { model: "m".into(), temperature: Some(0.0), seed: Some(1), max_output_tokens: 8 },
+            BundleProfile {
+                model: "m".into(),
+                temperature: Some(0.0),
+                seed: Some(1),
+                max_output_tokens: 8,
+            },
             "p",
             vec![],
             pins(),
@@ -242,7 +279,11 @@ fn g10_transfer_required() -> bool {
         bundle_digest: d.clone(),
         items: ["m-hold-1", "m-hold-2", "m-hold-3"]
             .iter()
-            .map(|m| ItemResult { manifest: (*m).into(), passed: pass, output_excerpt: "o".into() })
+            .map(|m| ItemResult {
+                manifest: (*m).into(),
+                passed: pass,
+                output_excerpt: "o".into(),
+            })
             .collect(),
         new_serious_failure_classes: vec![],
         shipped_to_failed_regressions: 0,
@@ -258,7 +299,12 @@ fn g11a_adaptive_leakage() -> bool {
     let d = {
         let b = CandidateBundle::build(
             "c",
-            BundleProfile { model: "m".into(), temperature: Some(0.0), seed: Some(1), max_output_tokens: 8 },
+            BundleProfile {
+                model: "m".into(),
+                temperature: Some(0.0),
+                seed: Some(1),
+                max_output_tokens: 8,
+            },
             "p",
             vec![],
             pins(),
@@ -270,7 +316,11 @@ fn g11a_adaptive_leakage() -> bool {
     let mut gate = IntegrationGate::new(&p, &bs, &mut g);
     let mut i = FinalEvaluationInput {
         bundle_digest: d,
-        items: vec![ItemResult { manifest: "m-hold-1".into(), passed: true, output_excerpt: "as in m-hold-2".into() }],
+        items: vec![ItemResult {
+            manifest: "m-hold-1".into(),
+            passed: true,
+            output_excerpt: "as in m-hold-2".into(),
+        }],
         new_serious_failure_classes: vec![],
         shipped_to_failed_regressions: 0,
         holdout_coverage: 1.0,
@@ -350,13 +400,21 @@ fn small_rec(n: usize) -> InsightRecord {
 
 fn g13a_resource_accounting() -> bool {
     let mut l = BudgetLedger::new();
-    let lim = BudgetEvent::SetLimit { scope: vec!["factory".into()], amount: Amount::pts(100) };
+    let lim = BudgetEvent::SetLimit {
+        scope: vec!["factory".into()],
+        amount: Amount::pts(100),
+    };
     l.apply(lim.clone()).unwrap();
     l.journal.push(lim);
-    l.try_reserve("r1/a", &["factory", "run-r1"], Amount::pts(60)).unwrap();
+    l.try_reserve("r1/a", &["factory", "run-r1"], Amount::pts(60))
+        .unwrap();
     let over = matches!(
         l.try_reserve("r2/a", &["factory", "run-r2"], Amount::pts(60)),
-        Err(BudgetError::OverLimit { would: 120, limit: 100, .. })
+        Err(BudgetError::OverLimit {
+            would: 120,
+            limit: 100,
+            ..
+        })
     );
     let fresh_id = matches!(
         l.try_reserve("r1x/a", &["factory", "run-r1x"], Amount::pts(41)),
@@ -367,23 +425,44 @@ fn g13a_resource_accounting() -> bool {
 
 fn g13b_control_plane_survival() -> bool {
     let mut l = BudgetLedger::new();
-    l.apply(BudgetEvent::SetLimit { scope: vec!["factory".into()], amount: Amount::pts(100) }).unwrap();
-    l.apply(BudgetEvent::SetLimit { scope: vec!["factory".into(), "control".into()], amount: Amount::pts(10) }).unwrap();
-    l.try_reserve("w/a", &["factory", "casting", "run-w"], Amount::pts(90)).unwrap();
-    l.try_reserve("ctl/a", &["factory", "control", "auth"], Amount::pts(10)).is_ok()
+    l.apply(BudgetEvent::SetLimit {
+        scope: vec!["factory".into()],
+        amount: Amount::pts(100),
+    })
+    .unwrap();
+    l.apply(BudgetEvent::SetLimit {
+        scope: vec!["factory".into(), "control".into()],
+        amount: Amount::pts(10),
+    })
+    .unwrap();
+    l.try_reserve("w/a", &["factory", "casting", "run-w"], Amount::pts(90))
+        .unwrap();
+    l.try_reserve("ctl/a", &["factory", "control", "auth"], Amount::pts(10))
+        .is_ok()
 }
 
 fn g13c_cancellation_semantics() -> bool {
     let mut l = BudgetLedger::new();
-    let lim = BudgetEvent::SetLimit { scope: vec!["factory".into()], amount: Amount::pts(100) };
+    let lim = BudgetEvent::SetLimit {
+        scope: vec!["factory".into()],
+        amount: Amount::pts(100),
+    };
     l.apply(lim.clone()).unwrap();
     l.journal.push(lim);
-    l.try_reserve("r/a", &["factory", "run-r"], Amount::pts(10)).unwrap();
+    l.try_reserve("r/a", &["factory", "run-r"], Amount::pts(10))
+        .unwrap();
     // confirm-without-request refused; request fences; stale commit refused
-    let no_confirm = l.apply(BudgetEvent::CancelConfirmed { run: "r".into() }).is_err();
-    l.apply(BudgetEvent::CancelRequest { run: "r".into() }).unwrap();
+    let no_confirm = l
+        .apply(BudgetEvent::CancelConfirmed { run: "r".into() })
+        .is_err();
+    l.apply(BudgetEvent::CancelRequest { run: "r".into() })
+        .unwrap();
     let stale = matches!(
-        l.apply(BudgetEvent::Commit { id: "r/a".into(), used: Amount::pts(1), epoch: 0 }),
+        l.apply(BudgetEvent::Commit {
+            id: "r/a".into(),
+            used: Amount::pts(1),
+            epoch: 0
+        }),
         Err(BudgetError::StaleEpoch { .. })
     );
     no_confirm && stale
@@ -394,7 +473,10 @@ fn g17_policy_bypass_impossible() -> bool {
     let mut pipeline = InsightPipeline::new(QueryCatalog::frozen_v1(), frozen_policy_graph());
     let mut rec = small_rec(20);
     rec.evidence.query_id = "guardrail_veto_rate_by_profile".into();
-    rec.proposal = Some(PolicyDiff { target: "model_routing".into(), changes: Default::default() });
+    rec.proposal = Some(PolicyDiff {
+        target: "model_routing".into(),
+        changes: Default::default(),
+    });
     rec.prediction = Some(Prediction {
         metric: "guardrail_veto_rate_by_profile".into(),
         direction: "down".into(),
@@ -406,7 +488,7 @@ fn g17_policy_bypass_impossible() -> bool {
     let r = pipeline.proposals()[0];
     let mut h = sha2::Sha256::new();
     for part in [r.insight_id.as_str(), r.evidence.result_digest.as_str()] {
-            h.update(&(part.len() as u64).to_be_bytes());
+        h.update(&(part.len() as u64).to_be_bytes());
         h.update(part.as_bytes());
     }
     let digest = format!("pa-{:.16x}", h.finalize());
@@ -460,10 +542,13 @@ fn g17b_activation_atomicity() -> bool {
         issued_at: 1,
         expires_at: 9_000,
     };
-    l.apply(&cmd("a", 0), &pipeline, &frozen_policy_graph(), "x", 10).unwrap();
+    l.apply(&cmd("a", 0), &pipeline, &frozen_policy_graph(), "x", 10)
+        .unwrap();
     // replay + stale both fail-closed, journal stays valid
-    l.apply(&cmd("a", 0), &pipeline, &frozen_policy_graph(), "x", 20).is_err()
-        && l.apply(&cmd("b", 0), &pipeline, &frozen_policy_graph(), "x", 20).is_err()
+    l.apply(&cmd("a", 0), &pipeline, &frozen_policy_graph(), "x", 20)
+        .is_err()
+        && l.apply(&cmd("b", 0), &pipeline, &frozen_policy_graph(), "x", 20)
+            .is_err()
         && l.governance_ok()
 }
 
@@ -472,7 +557,10 @@ fn g18_no_self_judging() -> bool {
         // and the retro layer refuses the whole record at ingestion
         let mut p = InsightPipeline::new(QueryCatalog::frozen_v1(), frozen_policy_graph());
         let mut rec = small_rec(20);
-        rec.proposal = Some(PolicyDiff { target: "weight_update_rule".into(), changes: Default::default() });
+        rec.proposal = Some(PolicyDiff {
+            target: "weight_update_rule".into(),
+            changes: Default::default(),
+        });
         rec.evidence.result_digest = rec.evidence.compute_result_digest();
         matches!(p.ingest(rec), Err(InsightError::ProtectedTarget { .. })) && p.observations() == 0
     }
@@ -522,7 +610,9 @@ fn g14a_audit_completeness() -> bool {
     // covered exhaustively by t49b_e2e (properties A-D); this gate
     // item pins the cheap core: tamper + drop detection
     let j: Vec<GovernanceEvent> = lesson_store().governance_journal.clone();
-    if j.is_empty() { return false; }
+    if j.is_empty() {
+        return false;
+    }
     let mut t = j.clone();
     let last = t.len() - 1;
     let mut c: Vec<char> = t[last].payload_digest.chars().collect();
@@ -544,36 +634,101 @@ fn g16_regression() -> bool {
 #[test]
 fn m5_gate_19_items() {
     let items: Vec<(&str, bool)> = vec![
-        ("1 scope closure (single org, no A/B promise)", g1_scope_closure_single_org()),
-        ("2 governance stream valid (intent/effect)", g2_governance_stream_valid()),
-        ("3 crash recovery deterministic (fail-closed)", g3_crash_recovery_deterministic()),
-        ("4 eval protocol frozen (digest sensitivity)", g4_eval_protocol_frozen()),
-        ("5 holdout isolation (non-addressability)", g5_holdout_isolation()),
+        (
+            "1 scope closure (single org, no A/B promise)",
+            g1_scope_closure_single_org(),
+        ),
+        (
+            "2 governance stream valid (intent/effect)",
+            g2_governance_stream_valid(),
+        ),
+        (
+            "3 crash recovery deterministic (fail-closed)",
+            g3_crash_recovery_deterministic(),
+        ),
+        (
+            "4 eval protocol frozen (digest sensitivity)",
+            g4_eval_protocol_frozen(),
+        ),
+        (
+            "5 holdout isolation (non-addressability)",
+            g5_holdout_isolation(),
+        ),
         ("6 self-judgment ban (direct)", g6_transitive_ban()),
-        ("6a lesson authority boundary (seal refusals)", g6a_lesson_authority_boundary()),
-        ("7 bundle immutability + token-digest binding", g7_bundle_immutability()),
-        ("8 proxy narrow egress (type is the boundary)", g8_proxy_narrow_egress()),
-        ("8a cast boundary (no credentials, hardened)", g8a_cast_boundary_no_credentials()),
-        ("9 synthesis guards (contamination refused)", g9_synth_guards()),
-        ("10 transfer required (no memorization pass)", g10_transfer_required()),
-        ("11a adaptive leakage (echo aborts)", g11a_adaptive_leakage()),
-        ("12 insight evidence binding (catalog + N)", g12_insight_evidence_binding()),
-        ("13a resource accounting (no overcommit/evade)", g13a_resource_accounting()),
+        (
+            "6a lesson authority boundary (seal refusals)",
+            g6a_lesson_authority_boundary(),
+        ),
+        (
+            "7 bundle immutability + token-digest binding",
+            g7_bundle_immutability(),
+        ),
+        (
+            "8 proxy narrow egress (type is the boundary)",
+            g8_proxy_narrow_egress(),
+        ),
+        (
+            "8a cast boundary (no credentials, hardened)",
+            g8a_cast_boundary_no_credentials(),
+        ),
+        (
+            "9 synthesis guards (contamination refused)",
+            g9_synth_guards(),
+        ),
+        (
+            "10 transfer required (no memorization pass)",
+            g10_transfer_required(),
+        ),
+        (
+            "11a adaptive leakage (echo aborts)",
+            g11a_adaptive_leakage(),
+        ),
+        (
+            "12 insight evidence binding (catalog + N)",
+            g12_insight_evidence_binding(),
+        ),
+        (
+            "13a resource accounting (no overcommit/evade)",
+            g13a_resource_accounting(),
+        ),
         ("13b control-plane survival", g13b_control_plane_survival()),
-        ("13c cancellation semantics (fence/linearize)", g13c_cancellation_semantics()),
-        ("14a audit completeness (tamper/drop)", g14a_audit_completeness()),
+        (
+            "13c cancellation semantics (fence/linearize)",
+            g13c_cancellation_semantics(),
+        ),
+        (
+            "14a audit completeness (tamper/drop)",
+            g14a_audit_completeness(),
+        ),
         ("16 M0-M4 regression (suite green)", g16_regression()),
-        ("17 policy bypass impossible (M3 route)", g17_policy_bypass_impossible()),
-        ("17b activation atomicity (replay/stale)", g17b_activation_atomicity()),
-        ("18 transitive ban at retro ingestion", g18_no_self_judging()),
-        ("19 prediction scoring (frozen weights)", g19_prediction_scoring()),
+        (
+            "17 policy bypass impossible (M3 route)",
+            g17_policy_bypass_impossible(),
+        ),
+        (
+            "17b activation atomicity (replay/stale)",
+            g17b_activation_atomicity(),
+        ),
+        (
+            "18 transitive ban at retro ingestion",
+            g18_no_self_judging(),
+        ),
+        (
+            "19 prediction scoring (frozen weights)",
+            g19_prediction_scoring(),
+        ),
     ];
     let mut pass = 0;
     for (name, ok) in &items {
         if *ok {
             pass += 1;
         }
-        println!("{} {} — {}", if *ok { "PASS" } else { "FAIL" }, name, if *ok { "" } else { "<-- GATE FAILURE" });
+        println!(
+            "{} {} — {}",
+            if *ok { "PASS" } else { "FAIL" },
+            name,
+            if *ok { "" } else { "<-- GATE FAILURE" }
+        );
     }
     println!("M5 GATE: {}/{} items pass", pass, items.len());
     assert!(items.iter().all(|(_, ok)| *ok), "M5 gate items failed");

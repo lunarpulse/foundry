@@ -9,14 +9,17 @@ use clap::{Parser, Subcommand};
 
 mod deploy_profile;
 use foundry_domain::ports::{
-    ApprovalToken, Decision, DieOutput, Gate, Harness, Ledger, Policy, PortResult, PublishOutcome,
+    ApprovalToken, Decision, DieOutput, Gate, Harness, Policy, PortResult, PublishOutcome,
     Publisher,
 };
 use foundry_domain::{ActorId, ActorKind, ExternalRef, Order};
 use foundry_harness_cli::CliHarness;
 use foundry_harness_cli::fake::FakeHarness;
 use foundry_ledger::SqliteLedger;
-use foundry_line::{Line, PackReviewHost, UnavailableStageExecutor, InspectingReviewRun, durable_review_run};
+use foundry_line::{
+    DieStageExecutor, InspectingReviewRun, Line, PackReviewHost, UnavailableStageExecutor,
+    durable_review_run,
+};
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex as TMutex;
@@ -87,13 +90,39 @@ enum Cmd {
         /// Die binary path (empty = fake harness)
         #[arg(long, default_value = "")]
         die: String,
-        /// M0 gate: auto-approve every FurnaceHold with this recorded intent
-        /// (gate measurement only — approval is still journalled immutably).
+        /// Deprecated synthetic approval mode. Non-empty values are rejected.
         #[arg(long, default_value = "")]
         auto_approve: String,
         /// notify channel: discord | console | all
         #[arg(long, default_value = "discord")]
         notify_mode: String,
+    },
+    /// ProductAtomicV1 durable GitHub intake (requires a preconfigured source binding).
+    ProductWatch {
+        #[arg(long)]
+        db: String,
+        #[arg(long)]
+        installation_id: String,
+        #[arg(long)]
+        database_id: String,
+        /// Private Foundry service credential file (independent of GitHub token).
+        #[arg(long)]
+        service_file: String,
+        #[arg(long, default_value = "lunarpulse/contextmesh-rs")]
+        repo: String,
+        #[arg(long)]
+        repository_id: String,
+        #[arg(long, default_value = "https://api.github.com")]
+        api_origin: String,
+        #[arg(long, default_value_t = false)]
+        private: bool,
+        /// Environment variable name holding the connector token; never a token value.
+        #[arg(long)]
+        credential_ref: Option<String>,
+        #[arg(long, default_value_t = false)]
+        once: bool,
+        #[arg(long, default_value_t = 300)]
+        every: u64,
     },
     /// Show order state + journal tail.
     Show {
@@ -157,6 +186,213 @@ enum Cmd {
         db: String,
         #[arg(long, default_value = "127.0.0.1:7700")]
         bind: String,
+        /// Serve the isolated ProductAtomicV1 authentication and approval API.
+        #[arg(long, default_value_t = false)]
+        product: bool,
+    },
+    /// Initialize the first ProductAtomicV1 Owner from two bounded stdin lines:
+    /// actor id, then password. Passwords are never accepted as argv values.
+    ProductBootstrap {
+        #[arg(long)]
+        db: String,
+        #[arg(long)]
+        installation_id: String,
+        #[arg(long)]
+        database_id: String,
+        /// Optional reviewed finite JSON source/grant manifest. Omission is
+        /// an explicit zero-source, zero-grant bootstrap.
+        #[arg(long)]
+        manifest: Option<String>,
+    },
+    /// Verify product credentials using bounded two-line stdin and save the
+    /// opaque bearer to a mode-0600 file.
+    ProductLogin {
+        #[arg(long)]
+        db: String,
+        #[arg(long)]
+        installation_id: String,
+        #[arg(long)]
+        database_id: String,
+        #[arg(long)]
+        session_file: String,
+    },
+    /// Local password recovery; deliberately unavailable over HTTP.
+    ProductReset {
+        #[arg(long)]
+        db: String,
+        #[arg(long)]
+        installation_id: String,
+        #[arg(long)]
+        database_id: String,
+    },
+    /// Create a non-Owner product account under the current Owner session.
+    /// The new account password is read from one bounded stdin line.
+    ProductAccount {
+        #[arg(long)]
+        db: String,
+        #[arg(long)]
+        installation_id: String,
+        #[arg(long)]
+        database_id: String,
+        #[arg(long)]
+        session_file: String,
+        #[arg(long)]
+        actor: String,
+        #[arg(long, value_parser = ["viewer", "operator", "approver"])]
+        role: String,
+    },
+    /// Issue a single-use approval grant; its token is written to a private file.
+    ProductGrant {
+        #[arg(long)]
+        db: String,
+        #[arg(long)]
+        installation_id: String,
+        #[arg(long)]
+        database_id: String,
+        #[arg(long)]
+        session_file: String,
+        #[arg(long)]
+        order: String,
+        #[arg(long)]
+        token_file: String,
+    },
+    /// Approve through ProductAtomicV1 using a private session and grant file.
+    ProductApprove {
+        #[arg(long)]
+        db: String,
+        #[arg(long)]
+        installation_id: String,
+        #[arg(long)]
+        database_id: String,
+        #[arg(long)]
+        session_file: String,
+        #[arg(long)]
+        order: String,
+        #[arg(long)]
+        grant_id: String,
+        #[arg(long)]
+        grant_file: String,
+        #[arg(long)]
+        expected_source_revision: i64,
+        #[arg(long)]
+        expected_attempt: i64,
+        #[arg(long)]
+        run_id: i64,
+        #[arg(long)]
+        generation: i64,
+        #[arg(long)]
+        artifact_digest: String,
+        #[arg(long)]
+        tuple_digest: String,
+        #[arg(long)]
+        intent: String,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// Query product holds/progress or accept an authenticated hold decision.
+    /// Resume requires the configured ProductAtomicV1 frozen-pack runtime.
+    ProductReview {
+        #[arg(long)]
+        db: String,
+        #[arg(long)]
+        installation_id: String,
+        #[arg(long)]
+        database_id: String,
+        #[arg(long)]
+        session_file: String,
+        #[arg(long, value_parser = ["holds", "progress", "resume", "commit-pass", "commit-fail", "abort"])]
+        action: String,
+        #[arg(long)]
+        order: Option<String>,
+        #[arg(long)]
+        hold: Option<String>,
+        #[arg(long)]
+        operation_id: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
+    /// Manage ProductAtomicV1 repository sources and scoped capabilities.
+    ProductScope {
+        #[arg(long, value_parser = ["sources", "configure-source", "grants", "grant", "revoke"])]
+        action: String,
+        #[arg(long)]
+        db: String,
+        #[arg(long)]
+        installation_id: String,
+        #[arg(long)]
+        database_id: String,
+        #[arg(long)]
+        session_file: String,
+        #[arg(long)]
+        connector: Option<String>,
+        #[arg(long)]
+        organization: Option<String>,
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        api_origin: Option<String>,
+        #[arg(long)]
+        repository_id: Option<String>,
+        #[arg(long)]
+        repository_locator: Option<String>,
+        #[arg(long)]
+        scope_query: Option<String>,
+        #[arg(long)]
+        enabled: Option<bool>,
+        #[arg(long)]
+        expected_revision: Option<i64>,
+        #[arg(long)]
+        subject: Option<String>,
+        #[arg(long)]
+        source_instance: Option<String>,
+        #[arg(long)]
+        capability: Option<String>,
+        #[arg(long)]
+        expected_scope_revision: Option<i64>,
+        #[arg(long)]
+        request_key: Option<String>,
+    },
+    /// Explicit stopped-process ProductAtomicV1 scope migration from a JSON manifest.
+    ProductMigrateScope {
+        #[arg(long)]
+        db: String,
+        #[arg(long)]
+        installation_id: String,
+        #[arg(long)]
+        database_id: String,
+        #[arg(long)]
+        manifest: String,
+    },
+    /// Owner-managed source/action scoped service authority.
+    ProductService {
+        #[arg(long, value_parser = ["configure", "revoke", "query", "issue", "rotate"])]
+        action: String,
+        #[arg(long)]
+        db: String,
+        #[arg(long)]
+        installation_id: String,
+        #[arg(long)]
+        database_id: String,
+        #[arg(long)]
+        session_file: String,
+        #[arg(long)]
+        service_id: String,
+        #[arg(long, default_value_t = 0)]
+        expected_revision: i64,
+        #[arg(long)]
+        request_key: String,
+        #[arg(long)]
+        lease_until: Option<String>,
+        #[arg(long)]
+        expires_at: Option<String>,
+        #[arg(long)]
+        source_instance: Option<String>,
+        #[arg(long)]
+        actions: Option<String>,
+        #[arg(long)]
+        credential_file: Option<String>,
     },
 }
 
@@ -203,6 +439,1202 @@ fn expand(p: &str) -> String {
     p.to_string()
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProductBootstrapManifest {
+    sources: Vec<foundry_ledger::ScopeSourceManifest>,
+    grants: Vec<foundry_ledger::ScopeGrantManifest>,
+}
+
+fn read_product_json<T: serde::de::DeserializeOwned>(path: &str) -> Result<T, ()> {
+    use std::io::Read;
+    const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
+    let file = std::fs::File::open(path).map_err(|_| ())?;
+    if file.metadata().map_err(|_| ())?.len() > MAX_MANIFEST_BYTES {
+        return Err(());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_MANIFEST_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ())?;
+    if bytes.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err(());
+    }
+    serde_json::from_slice(&bytes).map_err(|_| ())
+}
+
+fn product_bootstrap_cmd(
+    db: &str,
+    installation_id: &str,
+    database_id: &str,
+    manifest_path: Option<&str>,
+) -> i32 {
+    use std::io::{BufRead, IsTerminal};
+    let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        eprintln!(
+            "product bootstrap requires the documented two-line stdin protocol; interactive TTY input is disabled"
+        );
+        return 2;
+    }
+    let mut input = stdin.lock();
+    let mut actor = Vec::new();
+    let mut password = Vec::new();
+    let mut extra = Vec::new();
+    if input.read_until(b'\n', &mut actor).is_err()
+        || input.read_until(b'\n', &mut password).is_err()
+        || input.read_until(b'\n', &mut extra).is_err()
+        || actor.len() > 257
+        || password.len() > 1025
+        || !extra.is_empty()
+    {
+        eprintln!("product bootstrap input rejected");
+        return 2;
+    }
+    trim_line(&mut actor);
+    trim_line(&mut password);
+    let actor = match std::str::from_utf8(&actor) {
+        Ok(v) if !v.trim().is_empty() => v.to_owned(),
+        _ => {
+            eprintln!("product bootstrap input rejected");
+            return 2;
+        }
+    };
+    if password.is_empty() || password.len() > 1024 {
+        eprintln!("product bootstrap input rejected");
+        return 2;
+    }
+    let password = match String::from_utf8(password) {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("product bootstrap input rejected");
+            return 2;
+        }
+    };
+    let phc = match foundry_ledger::product_identity::ProductPasswordKdf::hash(&password) {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("product bootstrap credential processing failed");
+            return 1;
+        }
+    };
+    drop(password);
+    let manifest = match manifest_path {
+        Some(path) => match read_product_json::<ProductBootstrapManifest>(path) {
+            Ok(manifest) => manifest,
+            Err(()) => {
+                eprintln!("product bootstrap manifest rejected");
+                return 2;
+            }
+        },
+        None => ProductBootstrapManifest {
+            sources: Vec::new(),
+            grants: Vec::new(),
+        },
+    };
+    let mut store = match foundry_ledger::ProductStore::open(
+        std::path::Path::new(db),
+        foundry_ledger::ProductConfig {
+            installation_id: installation_id.into(),
+            database_id: database_id.into(),
+        },
+    ) {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("product database contract/configuration rejected");
+            return 1;
+        }
+    };
+    match store.bootstrap_owner_scoped(&actor, &phc, &manifest.sources, &manifest.grants) {
+        Ok(()) => {
+            println!("product Owner initialized: {actor}");
+            0
+        }
+        Err(_) => {
+            eprintln!("product Owner initialization rejected");
+            1
+        }
+    }
+}
+
+fn read_secret_line(label: &str) -> Result<String, ()> {
+    use std::io::{BufRead, IsTerminal, Read};
+    if std::io::stdin().is_terminal() {
+        eprintln!("{label} requires bounded stdin input");
+        return Err(());
+    }
+    let mut bytes = Vec::new();
+    if std::io::stdin()
+        .lock()
+        .take(1026)
+        .read_until(b'\n', &mut bytes)
+        .is_err()
+        || bytes.len() > 1024
+        || bytes.is_empty()
+    {
+        eprintln!("{label} input rejected");
+        return Err(());
+    }
+    trim_line(&mut bytes);
+    String::from_utf8(bytes).map_err(|_| {
+        eprintln!("{label} input rejected");
+        ()
+    })
+}
+
+fn private_file(path: &str, secret: &str) -> Result<(), ()> {
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(path).map_err(|_| ())?;
+    file.write_all(secret.as_bytes())
+        .and_then(|_| file.write_all(b"\n"))
+        .map_err(|_| ())
+}
+
+fn read_private(path: &str) -> Result<String, ()> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| ())?;
+    if metadata.len() > 1024 || !metadata.file_type().is_file() {
+        return Err(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(());
+        }
+    }
+    let value = std::fs::read_to_string(path).map_err(|_| ())?;
+    let value = value.trim_end_matches(['\r', '\n']).to_owned();
+    if value.is_empty() || value.len() > 1024 {
+        return Err(());
+    }
+    Ok(value)
+}
+
+fn product_config(installation_id: &str, database_id: &str) -> foundry_ledger::ProductConfig {
+    foundry_ledger::ProductConfig {
+        installation_id: installation_id.into(),
+        database_id: database_id.into(),
+    }
+}
+
+fn product_review_host(
+    db: &str,
+    installation_id: &str,
+    database_id: &str,
+) -> Result<Option<PackReviewHost>, String> {
+    let Ok(pack) = std::env::var("FOUNDRY_REVIEW_PACK") else {
+        return Ok(None);
+    };
+    let get_root = |name: &str| -> Result<std::path::PathBuf, String> {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| format!("{name} is required for product review continuation"))
+    };
+    let artifact_root = get_root("FOUNDRY_PRODUCT_ARTIFACT_ROOT")?;
+    let session_root = get_root("FOUNDRY_PRODUCT_SESSION_ROOT")?;
+    let claim_root = get_root("FOUNDRY_PRODUCT_CLAIM_ROOT")?;
+    let executor: Box<dyn foundry_line::StageExecutor> = match (
+        std::env::var("FOUNDRY_DIE_BINARY"),
+        std::env::var("FOUNDRY_REPO_PATH"),
+    ) {
+        (Ok(binary), Ok(repo)) if !binary.is_empty() && !repo.is_empty() => {
+            let profile = std::env::var("FOUNDRY_DIE_PROFILE").unwrap_or_else(|_| "coding".into());
+            let timeout = std::env::var("FOUNDRY_DIE_TIMEOUT")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(600);
+            Box::new(DieStageExecutor::new(
+                std::path::PathBuf::from(binary),
+                profile,
+                timeout,
+                std::path::PathBuf::from(repo),
+                session_root.clone(),
+            ))
+        }
+        _ => Box::new(UnavailableStageExecutor),
+    };
+    let store = foundry_ledger::ProductStore::open(
+        std::path::Path::new(db),
+        product_config(installation_id, database_id),
+    )
+    .map_err(|_| "product review database rejected".to_owned())?;
+    PackReviewHost::with_product_store(
+        &pack,
+        executor,
+        store,
+        artifact_root,
+        session_root,
+        claim_root,
+    )
+    .map(Some)
+    .map_err(|_| "product review runtime configuration rejected".to_owned())
+}
+
+fn product_login_cmd(
+    db: &str,
+    installation_id: &str,
+    database_id: &str,
+    session_file: &str,
+) -> i32 {
+    let actor = match read_secret_line("product login") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => return 2,
+    };
+    let password = match read_secret_line("product login") {
+        Ok(v) => v,
+        _ => return 2,
+    };
+    let mut store = match foundry_ledger::ProductStore::open(
+        std::path::Path::new(db),
+        product_config(installation_id, database_id),
+    ) {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("product database rejected");
+            return 1;
+        }
+    };
+    let session = match store.login(&actor, &password, chrono::Utc::now()) {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("product authentication failed");
+            return 1;
+        }
+    };
+    drop(password);
+    match private_file(session_file, session.bearer()) {
+        Ok(()) => {
+            println!("product session saved");
+            0
+        }
+        Err(()) => {
+            eprintln!("could not create private session file");
+            1
+        }
+    }
+}
+
+fn product_reset_cmd(db: &str, installation_id: &str, database_id: &str) -> i32 {
+    let actor = match read_secret_line("product reset") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => return 2,
+    };
+    let password = match read_secret_line("product reset") {
+        Ok(v) if !v.is_empty() => v,
+        _ => return 2,
+    };
+    let phc = match foundry_ledger::product_identity::ProductPasswordKdf::hash(&password) {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("product credential processing failed");
+            return 1;
+        }
+    };
+    drop(password);
+    let mut store = match foundry_ledger::ProductStore::open(
+        std::path::Path::new(db),
+        product_config(installation_id, database_id),
+    ) {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("product database rejected");
+            return 1;
+        }
+    };
+    match store.reset_credentials_local(&actor, &phc) {
+        Ok(()) => {
+            println!("product credential reset");
+            0
+        }
+        Err(_) => {
+            eprintln!("product credential reset rejected");
+            1
+        }
+    }
+}
+
+fn product_account_cmd(
+    db: &str,
+    installation_id: &str,
+    database_id: &str,
+    session_file: &str,
+    actor: &str,
+    role: &str,
+) -> i32 {
+    let bearer = match read_private(session_file) {
+        Ok(value) if value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()) => value,
+        _ => {
+            eprintln!("private session file rejected");
+            return 1;
+        }
+    };
+    let password = match read_secret_line("product account") {
+        Ok(value) => value,
+        Err(()) => return 2,
+    };
+    if actor.trim().is_empty() || actor.len() > 256 || password.len() < 12 {
+        eprintln!("product account input rejected");
+        return 2;
+    }
+    let phc = match foundry_ledger::product_identity::ProductPasswordKdf::hash(&password) {
+        Ok(phc) => phc,
+        Err(_) => {
+            eprintln!("product account credential processing failed");
+            return 1;
+        }
+    };
+    drop(password);
+    let mut store = match foundry_ledger::ProductStore::open(
+        std::path::Path::new(db),
+        product_config(installation_id, database_id),
+    ) {
+        Ok(store) => store,
+        Err(_) => {
+            eprintln!("product database rejected");
+            return 1;
+        }
+    };
+    match store.create_account(
+        &sha256_hex(bearer.as_bytes()),
+        actor,
+        role,
+        &phc,
+        chrono::Utc::now(),
+    ) {
+        Ok(()) => {
+            println!("product account created: {actor}");
+            0
+        }
+        Err(_) => {
+            eprintln!("product account creation unavailable");
+            1
+        }
+    }
+}
+
+fn product_grant_cmd(
+    db: &str,
+    installation_id: &str,
+    database_id: &str,
+    session_file: &str,
+    order: &str,
+    token_file: &str,
+) -> i32 {
+    use rand_core::RngCore as _;
+    let bearer = match read_private(session_file) {
+        Ok(v) => v,
+        Err(()) => {
+            eprintln!("private session file rejected");
+            return 1;
+        }
+    };
+    let digest = sha256_hex(bearer.as_bytes());
+    let mut token = [0u8; 32];
+    let mut id = [0u8; 16];
+    if rand_core::OsRng.try_fill_bytes(&mut token).is_err()
+        || rand_core::OsRng.try_fill_bytes(&mut id).is_err()
+    {
+        eprintln!("secure random source unavailable");
+        return 1;
+    }
+    let token = hex::encode(token);
+    let grant_id = hex::encode(id);
+    let token_digest = sha256_hex(token.as_bytes());
+    let mut store = match foundry_ledger::ProductStore::open(
+        std::path::Path::new(db),
+        product_config(installation_id, database_id),
+    ) {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("product database rejected");
+            return 1;
+        }
+    };
+    if !matches!(store.scope_policy_enforced(), Ok(true)) {
+        eprintln!("product scope setup or migration required");
+        return 1;
+    }
+    match store
+        .issue_approval_grant(&digest, &grant_id, &token_digest, order, chrono::Utc::now())
+        .and_then(|_| {
+            private_file(token_file, &token)
+                .map_err(|_| foundry_ledger::ProductError::Invariant("private token file rejected"))
+        }) {
+        Ok(()) => {
+            println!("approval grant: {grant_id}");
+            0
+        }
+        Err(_) => {
+            eprintln!("approval grant unavailable");
+            1
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn product_approve_cmd(
+    db: &str,
+    installation_id: &str,
+    database_id: &str,
+    session_file: &str,
+    order: String,
+    grant_id: String,
+    grant_file: &str,
+    expected_source_revision: i64,
+    expected_attempt: i64,
+    run_id: i64,
+    generation: i64,
+    artifact_digest: String,
+    tuple_digest: String,
+    intent_text: String,
+    request_key: String,
+) -> i32 {
+    let bearer = match read_private(session_file) {
+        Ok(v) if v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit()) => v,
+        _ => {
+            eprintln!("private session file rejected");
+            return 1;
+        }
+    };
+    let grant = match read_private(grant_file) {
+        Ok(v) if v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit()) => v,
+        _ => {
+            eprintln!("private grant file rejected");
+            return 1;
+        }
+    };
+    let digest = sha256_hex(bearer.as_bytes());
+    let approval = foundry_ledger::ProductApprovalIntent {
+        request_key,
+        grant_id,
+        token_digest: sha256_hex(grant.as_bytes()),
+        order_id: order,
+        expected_source_revision,
+        expected_attempt,
+        run_id,
+        generation,
+        artifact_digest,
+        tuple_digest,
+        intent: intent_text,
+        now: chrono::Utc::now(),
+    };
+    let mut store = match foundry_ledger::ProductStore::open(
+        std::path::Path::new(db),
+        product_config(installation_id, database_id),
+    ) {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("product database rejected");
+            return 1;
+        }
+    };
+    if !matches!(store.scope_policy_enforced(), Ok(true)) {
+        eprintln!("product scope setup or migration required");
+        return 1;
+    }
+    let result = store
+        .prepare_approval(&digest, &approval)
+        .and_then(|proof| store.approve_product(&digest, &approval, &proof));
+    match result {
+        Ok(receipt) => {
+            println!("approval recorded: {}", receipt.event_hash);
+            0
+        }
+        Err(_) => {
+            eprintln!("product approval unavailable");
+            1
+        }
+    }
+}
+
+fn product_review_cmd(
+    db: &str,
+    installation_id: &str,
+    database_id: &str,
+    session_file: &str,
+    action: &str,
+    order: Option<&str>,
+    hold_id: Option<&str>,
+    operation_id: Option<&str>,
+    target: Option<&str>,
+    request_key: Option<&str>,
+) -> i32 {
+    let bearer = match read_private(session_file) {
+        Ok(value) if value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()) => value,
+        _ => {
+            eprintln!("private session file rejected");
+            return 1;
+        }
+    };
+    let session = sha256_hex(bearer.as_bytes());
+    let mut store = match foundry_ledger::ProductStore::open(
+        std::path::Path::new(db),
+        product_config(installation_id, database_id),
+    ) {
+        Ok(store) => store,
+        Err(_) => {
+            eprintln!("product database rejected");
+            return 1;
+        }
+    };
+    if !matches!(store.scope_policy_enforced(), Ok(true)) {
+        eprintln!("product scope setup or migration required");
+        return 1;
+    }
+    match action {
+        "holds" => match store.list_product_review_holds(&session, chrono::Utc::now()) {
+            Ok(holds) => {
+                for hold in holds {
+                    println!(
+                        "order={} hold={} lifecycle={} attempt={} run={} activation={} revision={} targets={:?} deadline={}",
+                        hold.order_id,
+                        hold.hold_instance_id,
+                        hold.expectation.lifecycle,
+                        hold.expectation.attempt,
+                        hold.expectation.originating_run,
+                        hold.expectation.activation,
+                        hold.expectation.hold_revision,
+                        hold.allowed_targets,
+                        hold.deadline
+                    );
+                }
+                0
+            }
+            Err(_) => {
+                eprintln!("product holds unavailable");
+                1
+            }
+        },
+        "progress" => {
+            let Some(operation_id) = operation_id else {
+                eprintln!("--operation-id is required");
+                return 2;
+            };
+            match store.product_review_progress(&session, operation_id, chrono::Utc::now()) {
+                Ok(progress) => {
+                    println!(
+                        "operation={} phase={} revision={}",
+                        progress.receipt.operation_id, progress.phase, progress.progress_revision
+                    );
+                    0
+                }
+                Err(_) => {
+                    eprintln!("product review progress unavailable");
+                    1
+                }
+            }
+        }
+        "resume" | "commit-pass" | "commit-fail" | "abort" => {
+            let (Some(order), Some(hold_id), Some(request_key)) = (order, hold_id, request_key)
+            else {
+                eprintln!("--order, --hold and --idempotency-key are required");
+                return 2;
+            };
+            let decision = match action {
+                "resume" => match target
+                    .filter(|value| !value.trim().is_empty() && value.len() <= 256)
+                {
+                    Some(value) => foundry_ledger::ProductHoldDecision::Resume(value.to_owned()),
+                    None => {
+                        eprintln!("--target is required for resume");
+                        return 2;
+                    }
+                },
+                "commit-pass" => foundry_ledger::ProductHoldDecision::CommitPass,
+                "commit-fail" => foundry_ledger::ProductHoldDecision::CommitFail,
+                _ => foundry_ledger::ProductHoldDecision::Abort,
+            };
+            let holds = match store.list_product_review_holds(&session, chrono::Utc::now()) {
+                Ok(holds) => holds,
+                Err(_) => {
+                    eprintln!("product holds unavailable");
+                    return 1;
+                }
+            };
+            let Some(hold) = holds
+                .into_iter()
+                .find(|view| view.order_id == order && view.hold_instance_id == hold_id)
+            else {
+                eprintln!("product hold unavailable");
+                return 1;
+            };
+            let mut host = match product_review_host(db, installation_id, database_id) {
+                Ok(Some(host)) => host,
+                _ => {
+                    eprintln!("product review runtime unavailable");
+                    return 1;
+                }
+            };
+            if matches!(&decision, foundry_ledger::ProductHoldDecision::Resume(_))
+                && host.ensure_product_executor_available().is_err()
+            {
+                eprintln!("product review runtime unavailable");
+                return 1;
+            }
+            let receipt = match store.accept_product_review_hold(
+                &session,
+                order,
+                hold_id,
+                &hold.expectation,
+                request_key,
+                decision,
+                chrono::Utc::now(),
+            ) {
+                Ok(receipt) => receipt,
+                Err(_) => {
+                    eprintln!("product review decision unavailable");
+                    return 1;
+                }
+            };
+            let continuation = host.continue_accepted_product_hold(
+                &session,
+                &receipt.operation_id,
+                chrono::Utc::now(),
+            );
+            match store.product_review_progress(&session, &receipt.operation_id, chrono::Utc::now())
+            {
+                Ok(progress) => {
+                    println!(
+                        "decision accepted: operation={} phase={}",
+                        receipt.operation_id, progress.phase
+                    );
+                    if continuation.is_ok() { 0 } else { 1 }
+                }
+                Err(_) => {
+                    println!("decision accepted: operation={}", receipt.operation_id);
+                    1
+                }
+            }
+        }
+        _ => 2,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn product_scope_cmd(
+    action: &str,
+    db: &str,
+    installation_id: &str,
+    database_id: &str,
+    session_file: &str,
+    connector: Option<&str>,
+    organization: Option<&str>,
+    provider: Option<&str>,
+    api_origin: Option<&str>,
+    repository_id: Option<&str>,
+    repository_locator: Option<&str>,
+    scope_query: Option<&str>,
+    enabled: Option<bool>,
+    expected_revision: Option<i64>,
+    subject: Option<&str>,
+    source_instance: Option<&str>,
+    capability: Option<&str>,
+    expected_scope_revision: Option<i64>,
+    request_key: Option<&str>,
+) -> i32 {
+    let bearer = match read_private(session_file) {
+        Ok(value) if value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()) => value,
+        _ => {
+            eprintln!("private session file rejected");
+            return 1;
+        }
+    };
+    let session = sha256_hex(bearer.as_bytes());
+    let mut store = match foundry_ledger::ProductStore::open(
+        std::path::Path::new(db),
+        product_config(installation_id, database_id),
+    ) {
+        Ok(store) => store,
+        Err(_) => {
+            eprintln!("product database rejected");
+            return 1;
+        }
+    };
+    match action {
+        "sources" => match store.list_scoped_sources(&session, chrono::Utc::now()) {
+            Ok(sources) => {
+                for view in sources {
+                    println!(
+                        "connector={} source={} generation={} current={} enabled={} connector_revision={} source_instance_revision={} provider={} origin={} stable_repository_id={} api_owner={} api_repo={} scope={}",
+                        view.source.connector_id,
+                        view.source.source_instance_id,
+                        view.source.generation,
+                        view.current,
+                        view.source.enabled,
+                        view.connector_revision,
+                        view.source_instance_revision,
+                        view.source.identity.provider,
+                        view.source.identity.api_origin,
+                        view.source.identity.stable_repository_id,
+                        view.source.api_owner.as_deref().unwrap_or("unmapped"),
+                        view.source.api_repo.as_deref().unwrap_or("unmapped"),
+                        view.source.scope_query
+                    );
+                }
+                0
+            }
+            Err(_) => {
+                eprintln!("product source query unavailable");
+                1
+            }
+        },
+        "configure-source" => {
+            let required = (
+                connector,
+                organization,
+                provider,
+                api_origin,
+                repository_id,
+                repository_locator,
+                scope_query,
+                enabled,
+                expected_revision,
+                request_key,
+            );
+            let (
+                Some(connector),
+                Some(organization),
+                Some(provider),
+                Some(api_origin),
+                Some(repository_id),
+                Some(repository_locator),
+                Some(scope_query),
+                Some(enabled),
+                Some(expected_revision),
+                Some(request_key),
+            ) = required
+            else {
+                eprintln!("source configuration fields are required");
+                return 2;
+            };
+            let identity = match foundry_ledger::RepositoryIdentity::canonicalized(
+                organization,
+                provider,
+                api_origin,
+                repository_id,
+            ) {
+                Ok(identity) => identity,
+                Err(_) => {
+                    eprintln!("source identity rejected");
+                    return 2;
+                }
+            };
+            let Some((api_owner, api_repo)) = repository_locator.split_once('/') else {
+                eprintln!("repository locator must be OWNER/REPOSITORY");
+                return 2;
+            };
+            if api_owner.is_empty() || api_repo.is_empty() || api_repo.contains('/') {
+                eprintln!("repository locator rejected");
+                return 2;
+            }
+            match store.configure_scoped_source(
+                &session,
+                connector,
+                identity,
+                api_owner,
+                api_repo,
+                repository_locator,
+                scope_query,
+                enabled,
+                expected_revision,
+                request_key,
+                chrono::Utc::now(),
+            ) {
+                Ok(source) => match store.list_scoped_sources(&session, chrono::Utc::now()) {
+                    Ok(views) => {
+                        let revision = views
+                            .iter()
+                            .find(|view| {
+                                view.source.source_instance_id == source.source_instance_id
+                            })
+                            .map(|view| view.source_revision)
+                            .unwrap_or_default();
+                        println!(
+                            "source configured: {} generation={} source_revision={revision}",
+                            source.source_instance_id, source.generation
+                        );
+                        0
+                    }
+                    Err(_) => {
+                        eprintln!("source configured but revision query unavailable");
+                        1
+                    }
+                },
+                Err(_) => {
+                    eprintln!("source configuration unavailable");
+                    1
+                }
+            }
+        }
+        "grants" => {
+            let (Some(subject), Some(source_instance)) = (subject, source_instance) else {
+                eprintln!("--subject and --source-instance are required");
+                return 2;
+            };
+            match store.list_product_scope_grants(
+                &session,
+                subject,
+                source_instance,
+                chrono::Utc::now(),
+            ) {
+                Ok(grants) => {
+                    for grant in grants {
+                        println!(
+                            "subject={} source={} capability={} enabled={} grant_revision={} scope_revision={}",
+                            grant.actor_id,
+                            grant.source_instance_id,
+                            grant.capability.as_str(),
+                            grant.enabled,
+                            grant.grant_revision,
+                            grant.scope_revision
+                        );
+                    }
+                    0
+                }
+                Err(_) => {
+                    eprintln!("product grant query unavailable");
+                    1
+                }
+            }
+        }
+        "grant" | "revoke" => {
+            let (
+                Some(subject),
+                Some(source_instance),
+                Some(capability),
+                Some(expected_scope_revision),
+                Some(request_key),
+            ) = (
+                subject,
+                source_instance,
+                capability,
+                expected_scope_revision,
+                request_key,
+            )
+            else {
+                eprintln!(
+                    "--subject, --source-instance, --capability, --expected-scope-revision and --request-key are required"
+                );
+                return 2;
+            };
+            let capability = match foundry_ledger::ProductCapability::parse(capability) {
+                Ok(capability) => capability,
+                Err(_) => {
+                    eprintln!("product capability rejected");
+                    return 2;
+                }
+            };
+            let mutation = if action == "grant" {
+                foundry_ledger::ScopeMutation::Grant
+            } else {
+                foundry_ledger::ScopeMutation::Revoke
+            };
+            match store.change_product_scope(
+                &session,
+                subject,
+                source_instance,
+                capability,
+                mutation,
+                expected_scope_revision,
+                request_key,
+                chrono::Utc::now(),
+            ) {
+                Ok(receipt) => {
+                    println!(
+                        "scope {}: capability={} grant_revision={} scope_revision={}",
+                        action,
+                        receipt.capability.as_str(),
+                        receipt.grant_revision,
+                        receipt.scope_revision
+                    );
+                    0
+                }
+                Err(_) => {
+                    eprintln!("product scope change unavailable");
+                    1
+                }
+            }
+        }
+        _ => 2,
+    }
+}
+
+fn product_scope_migrate_cmd(
+    db: &str,
+    installation_id: &str,
+    database_id: &str,
+    manifest_path: &str,
+) -> i32 {
+    let manifest = match read_product_json::<foundry_ledger::ScopeMigrationManifest>(manifest_path)
+    {
+        Ok(manifest) => manifest,
+        Err(()) => {
+            eprintln!("product scope migration manifest rejected");
+            return 2;
+        }
+    };
+    match foundry_ledger::ProductStore::migrate_scope_v1(
+        std::path::Path::new(db),
+        &product_config(installation_id, database_id),
+        &manifest,
+        chrono::Utc::now(),
+    ) {
+        Ok(receipt) => {
+            println!(
+                "scope migration complete: verified={} quarantined={} sources={} grants={}",
+                receipt.verified_orders,
+                receipt.quarantined_orders,
+                receipt.source_instances,
+                receipt.grants
+            );
+            0
+        }
+        Err(_) => {
+            eprintln!(
+                "scope migration rejected; ensure all old product processes are stopped and the reviewed manifest is valid"
+            );
+            1
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn product_service_cmd(
+    action: &str,
+    db: &str,
+    installation: &str,
+    database: &str,
+    session_file: &str,
+    service_id: &str,
+    expected_revision: i64,
+    request_key: &str,
+    lease_raw: Option<&str>,
+    expires_raw: Option<&str>,
+    source_instance: Option<&str>,
+    actions_raw: Option<&str>,
+    credential_file: Option<&str>,
+) -> i32 {
+    let bearer = match read_private(session_file) {
+        Ok(v) if v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit()) => v,
+        _ => {
+            eprintln!("private session file rejected");
+            return 1;
+        }
+    };
+    let session = sha256_hex(bearer.as_bytes());
+    let mut store = match foundry_ledger::ProductStore::open(
+        std::path::Path::new(db),
+        product_config(installation, database),
+    ) {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("product database rejected");
+            return 1;
+        }
+    };
+    let now = chrono::Utc::now();
+    match action {
+        "query" => match store.list_product_services(&session, now) {
+            Ok(services) => {
+                for item in services.into_iter().filter(|s| s.service_id == service_id) {
+                    println!(
+                        "service {} revision={} credential_revision={} enabled={} lease_until={} grants={}",
+                        item.service_id,
+                        item.revision,
+                        item.credential_revision,
+                        item.enabled,
+                        item.lease_until,
+                        item.grants
+                            .iter()
+                            .map(|g| format!("{}:{}", g.source_instance_id, g.action.as_str()))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    );
+                }
+                0
+            }
+            Err(_) => {
+                eprintln!("service query unavailable");
+                1
+            }
+        },
+        "configure" | "revoke" => {
+            let grants = if action == "configure" {
+                let source = match source_instance {
+                    Some(v) => v,
+                    None => {
+                        eprintln!("service source instance required");
+                        return 2;
+                    }
+                };
+                let actions = match actions_raw {
+                    Some(v) => v,
+                    None => {
+                        eprintln!("service actions required");
+                        return 2;
+                    }
+                };
+                let mut grants = Vec::new();
+                for raw in actions.split(',') {
+                    let action = match raw.trim() {
+                        "intake_read" => foundry_ledger::ProductServiceAction::IntakeRead,
+                        "admit_delivery" => foundry_ledger::ProductServiceAction::AdmitDelivery,
+                        "ack_delivery" => foundry_ledger::ProductServiceAction::AckDelivery,
+                        "drive_review" => foundry_ledger::ProductServiceAction::DriveReview,
+                        _ => {
+                            eprintln!("service action rejected");
+                            return 2;
+                        }
+                    };
+                    grants.push(foundry_ledger::ProductServiceGrant {
+                        source_instance_id: source.to_owned(),
+                        action,
+                    });
+                }
+                grants
+            } else {
+                Vec::new()
+            };
+            let lease = if let Some(raw) = lease_raw {
+                match chrono::DateTime::parse_from_rfc3339(raw) {
+                    Ok(v) => v.with_timezone(&chrono::Utc),
+                    Err(_) => {
+                        eprintln!("service lease rejected");
+                        return 2;
+                    }
+                }
+            } else if action == "revoke" {
+                match store
+                    .list_product_services(&session, now)
+                    .ok()
+                    .and_then(|all| all.into_iter().find(|s| s.service_id == service_id))
+                {
+                    Some(s) => match chrono::DateTime::parse_from_rfc3339(&s.lease_until) {
+                        Ok(v) => v.with_timezone(&chrono::Utc),
+                        Err(_) => return 1,
+                    },
+                    None => {
+                        eprintln!("service unavailable");
+                        return 1;
+                    }
+                }
+            } else {
+                eprintln!("explicit service lease required");
+                return 2;
+            };
+            match store.manage_product_service(
+                &session,
+                service_id,
+                &grants,
+                action == "configure",
+                lease,
+                expected_revision,
+                request_key,
+                now,
+            ) {
+                Ok(r) => {
+                    println!(
+                        "service {} revision={} enabled={} lease_until={}",
+                        r.service_id, r.revision, r.enabled, r.lease_until
+                    );
+                    0
+                }
+                Err(_) => {
+                    eprintln!("service management rejected");
+                    1
+                }
+            }
+        }
+        "issue" | "rotate" => {
+            let path = match credential_file {
+                Some(p) => p,
+                None => {
+                    eprintln!("private service credential file required");
+                    return 2;
+                }
+            };
+            let expires =
+                match expires_raw.and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok()) {
+                    Some(v) => v.with_timezone(&chrono::Utc),
+                    None => {
+                        eprintln!("explicit service credential expiry required");
+                        return 2;
+                    }
+                };
+            let service = match store
+                .list_product_services(&session, now)
+                .ok()
+                .and_then(|all| all.into_iter().find(|s| s.service_id == service_id))
+            {
+                Some(s) => s,
+                None => {
+                    eprintln!("service unavailable");
+                    return 1;
+                }
+            };
+            if service.revision != expected_revision
+                || ((action == "issue") != (service.credential_revision == 0))
+            {
+                eprintln!("service credential operation conflicts with current revision");
+                return 1;
+            }
+            match store.issue_product_service_credential(
+                &session,
+                service_id,
+                expected_revision,
+                expires,
+                request_key,
+                now,
+            ) {
+                Ok(token) => match private_file(path, token.expose_once_to_file_writer()) {
+                    Ok(()) => {
+                        println!(
+                            "service credential saved privately; plaintext is not recoverable by request retry"
+                        );
+                        0
+                    }
+                    Err(()) => {
+                        eprintln!(
+                            "credential was issued but private file creation failed; rotate with a new request key and a new file path"
+                        );
+                        1
+                    }
+                },
+                Err(_) => {
+                    eprintln!("service credential issuance rejected");
+                    1
+                }
+            }
+        }
+        _ => 2,
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn trim_line(line: &mut Vec<u8>) {
+    if line.last() == Some(&b'\n') {
+        line.pop();
+    }
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+}
+
 type AppLine = Line<DigestGate, AnyHarness, SqliteLedger, foundry_watch::GithubPublisher>;
 
 fn human() -> ActorId {
@@ -227,7 +1659,11 @@ fn notify_event_order_id(e: &foundry_domain::ports::NotifyEvent) -> &str {
 async fn main() {
     let cli = Cli::parse();
     let code = match cli.cmd {
-        Cmd::DeployProfile { check, units, readme } => {
+        Cmd::DeployProfile {
+            check,
+            units,
+            readme,
+        } => {
             if check {
                 match deploy_profile::check_profile() {
                     deploy_profile::CheckOutcome::Ok => {
@@ -268,6 +1704,34 @@ async fn main() {
             auto_approve,
             notify_mode,
         } => watch_cmd(once, every, repo, die, auto_approve, notify_mode).await,
+        Cmd::ProductWatch {
+            db,
+            installation_id,
+            database_id,
+            service_file,
+            repo,
+            repository_id,
+            api_origin,
+            private,
+            credential_ref,
+            once,
+            every,
+        } => {
+            product_watch_cmd(
+                &expand(&db),
+                installation_id,
+                database_id,
+                &expand(&service_file),
+                repo,
+                repository_id,
+                api_origin,
+                private,
+                credential_ref,
+                once,
+                every,
+            )
+            .await
+        }
         Cmd::Show { order, db } => show(order, &expand(&db)).await,
         Cmd::Status { db } => status_cmd(&expand(&db)),
         Cmd::Doctor { db } => doctor_cmd(&expand(&db)),
@@ -296,15 +1760,70 @@ async fn main() {
         } => benchmark_cmd(baseline, compare, &expand(&corpus)),
         Cmd::Corpus { db, out } => corpus_cmd(&expand(&db), &expand(&out)),
         Cmd::Reconcile { db, apply } => reconcile_cmd(&expand(&db), apply).await,
-        Cmd::Serve { db, bind } => {
-            let state = std::sync::Arc::new(match foundry_serve::ServeState::new(&expand(&db)) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("✗ serve: {e}");
+        Cmd::Serve { db, bind, product } => {
+            let app = if product {
+                let installation_id = match std::env::var("FOUNDRY_INSTALLATION_ID") {
+                    Ok(v) if !v.trim().is_empty() => v,
+                    _ => {
+                        eprintln!("✗ product serve requires FOUNDRY_INSTALLATION_ID");
+                        std::process::exit(1);
+                    }
+                };
+                let database_id = match std::env::var("FOUNDRY_DATABASE_ID") {
+                    Ok(v) if !v.trim().is_empty() => v,
+                    _ => {
+                        eprintln!("✗ product serve requires FOUNDRY_DATABASE_ID");
+                        std::process::exit(1);
+                    }
+                };
+                let product_db = expand(&db);
+                let mut store = match foundry_ledger::ProductStore::open(
+                    std::path::Path::new(&product_db),
+                    product_config(&installation_id, &database_id),
+                ) {
+                    Ok(store) => store,
+                    Err(_) => {
+                        eprintln!("✗ product database contract/configuration rejected");
+                        std::process::exit(1);
+                    }
+                };
+                if !matches!(store.scope_policy_enforced(), Ok(true)) {
+                    eprintln!(
+                        "✗ product database scope is not active; run the local reviewed scope bootstrap or `product-migrate-scope` before serving"
+                    );
                     std::process::exit(1);
                 }
-            });
-            let app = foundry_serve::http::router(state);
+                if let Ok(artifact_root) = std::env::var("FOUNDRY_PRODUCT_ARTIFACT_ROOT")
+                    && !artifact_root.trim().is_empty()
+                    && store
+                        .configure_product_artifact_root(expand(&artifact_root))
+                        .is_err()
+                {
+                    eprintln!("✗ product artifact root configuration rejected");
+                    std::process::exit(1);
+                }
+                let state = match product_review_host(&product_db, &installation_id, &database_id) {
+                    Ok(Some(host)) => {
+                        foundry_serve::auth_http::ProductHttpState::with_review_host(store, host)
+                    }
+                    Ok(None) => foundry_serve::auth_http::ProductHttpState::new(store),
+                    Err(_) => {
+                        eprintln!("✗ product review runtime configuration rejected");
+                        std::process::exit(1);
+                    }
+                };
+                foundry_serve::http::product_router(state)
+            } else {
+                let state =
+                    std::sync::Arc::new(match foundry_serve::ServeState::new(&expand(&db)) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("✗ serve: {e}");
+                            std::process::exit(1);
+                        }
+                    });
+                foundry_serve::http::router(state)
+            };
             let listener = match tokio::net::TcpListener::bind(&bind).await {
                 Ok(l) => l,
                 Err(e) => {
@@ -312,7 +1831,7 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
-            println!("foundry-serve on http://{bind} (read-only)");
+            println!("foundry-serve on http://{bind}");
             match axum::serve(listener, app).await {
                 Ok(()) => 0,
                 Err(e) => {
@@ -321,6 +1840,203 @@ async fn main() {
                 }
             }
         }
+        Cmd::ProductBootstrap {
+            db,
+            installation_id,
+            database_id,
+            manifest,
+        } => {
+            let manifest = manifest.map(|path| expand(&path));
+            product_bootstrap_cmd(
+                &expand(&db),
+                &installation_id,
+                &database_id,
+                manifest.as_deref(),
+            )
+        }
+        Cmd::ProductLogin {
+            db,
+            installation_id,
+            database_id,
+            session_file,
+        } => product_login_cmd(
+            &expand(&db),
+            &installation_id,
+            &database_id,
+            &expand(&session_file),
+        ),
+        Cmd::ProductReset {
+            db,
+            installation_id,
+            database_id,
+        } => product_reset_cmd(&expand(&db), &installation_id, &database_id),
+        Cmd::ProductAccount {
+            db,
+            installation_id,
+            database_id,
+            session_file,
+            actor,
+            role,
+        } => product_account_cmd(
+            &expand(&db),
+            &installation_id,
+            &database_id,
+            &expand(&session_file),
+            &actor,
+            &role,
+        ),
+        Cmd::ProductGrant {
+            db,
+            installation_id,
+            database_id,
+            session_file,
+            order,
+            token_file,
+        } => product_grant_cmd(
+            &expand(&db),
+            &installation_id,
+            &database_id,
+            &expand(&session_file),
+            &order,
+            &expand(&token_file),
+        ),
+        Cmd::ProductApprove {
+            db,
+            installation_id,
+            database_id,
+            session_file,
+            order,
+            grant_id,
+            grant_file,
+            expected_source_revision,
+            expected_attempt,
+            run_id,
+            generation,
+            artifact_digest,
+            tuple_digest,
+            intent,
+            idempotency_key,
+        } => product_approve_cmd(
+            &expand(&db),
+            &installation_id,
+            &database_id,
+            &expand(&session_file),
+            order,
+            grant_id,
+            &expand(&grant_file),
+            expected_source_revision,
+            expected_attempt,
+            run_id,
+            generation,
+            artifact_digest,
+            tuple_digest,
+            intent,
+            idempotency_key,
+        ),
+        Cmd::ProductReview {
+            db,
+            installation_id,
+            database_id,
+            session_file,
+            action,
+            order,
+            hold,
+            operation_id,
+            target,
+            idempotency_key,
+        } => product_review_cmd(
+            &expand(&db),
+            &installation_id,
+            &database_id,
+            &expand(&session_file),
+            &action,
+            order.as_deref(),
+            hold.as_deref(),
+            operation_id.as_deref(),
+            target.as_deref(),
+            idempotency_key.as_deref(),
+        ),
+        Cmd::ProductScope {
+            action,
+            db,
+            installation_id,
+            database_id,
+            session_file,
+            connector,
+            organization,
+            provider,
+            api_origin,
+            repository_id,
+            repository_locator,
+            scope_query,
+            enabled,
+            expected_revision,
+            subject,
+            source_instance,
+            capability,
+            expected_scope_revision,
+            request_key,
+        } => product_scope_cmd(
+            &action,
+            &expand(&db),
+            &installation_id,
+            &database_id,
+            &expand(&session_file),
+            connector.as_deref(),
+            organization.as_deref(),
+            provider.as_deref(),
+            api_origin.as_deref(),
+            repository_id.as_deref(),
+            repository_locator.as_deref(),
+            scope_query.as_deref(),
+            enabled,
+            expected_revision,
+            subject.as_deref(),
+            source_instance.as_deref(),
+            capability.as_deref(),
+            expected_scope_revision,
+            request_key.as_deref(),
+        ),
+        Cmd::ProductMigrateScope {
+            db,
+            installation_id,
+            database_id,
+            manifest,
+        } => product_scope_migrate_cmd(
+            &expand(&db),
+            &installation_id,
+            &database_id,
+            &expand(&manifest),
+        ),
+        Cmd::ProductService {
+            action,
+            db,
+            installation_id,
+            database_id,
+            session_file,
+            service_id,
+            expected_revision,
+            request_key,
+            lease_until,
+            expires_at,
+            source_instance,
+            actions,
+            credential_file,
+        } => product_service_cmd(
+            &action,
+            &expand(&db),
+            &installation_id,
+            &database_id,
+            &expand(&session_file),
+            &service_id,
+            expected_revision,
+            &request_key,
+            lease_until.as_deref(),
+            expires_at.as_deref(),
+            source_instance.as_deref(),
+            actions.as_deref(),
+            credential_file.as_deref().map(|p| expand(p)).as_deref(),
+        ),
     };
     std::process::exit(code);
 }
@@ -459,11 +2175,16 @@ fn build_line(die: &str, ledger: SqliteLedger) -> Arc<AppLine> {
     );
     if let Ok(pack) = std::env::var("FOUNDRY_REVIEW_PACK") {
         let tuples: Arc<dyn foundry_exec::TupleStore> = Arc::new(
-            foundry_exec::SqliteTupleStore::open(tuple_db_path()).unwrap_or_else(|e| panic!("tuple store: {e:?}"))
+            foundry_exec::SqliteTupleStore::open(tuple_db_path())
+                .unwrap_or_else(|e| panic!("tuple store: {e:?}")),
         );
         line.set_tuple_store(tuples.clone());
-        let host = PackReviewHost::new(&pack, UnavailableStageExecutor, PackReviewHost::default_db_path())
-            .unwrap_or_else(|e| panic!("review host setup: {e:?}"));
+        let host = PackReviewHost::new(
+            &pack,
+            UnavailableStageExecutor,
+            PackReviewHost::default_db_path(),
+        )
+        .unwrap_or_else(|e| panic!("review host setup: {e:?}"));
         let runner = durable_review_run(host, PackReviewHost::default_db_path(), tuples)
             .unwrap_or_else(|e| panic!("review runner setup: {e}"));
         line = line.with_review_run(InspectingReviewRun::new(runner));
@@ -499,9 +2220,13 @@ async fn approve(order_id: String, intent: String, db: &str) -> i32 {
         };
         let tuples = match foundry_exec::SqliteTupleStore::open(tuple_db_path()) {
             Ok(store) => store,
-            Err(e) => { eprintln!("✗ tuple store open failed: {e:?}"); return 1; }
+            Err(e) => {
+                eprintln!("✗ tuple store open failed: {e:?}");
+                return 1;
+            }
         };
-        match foundry_line::rehydrate::rehydrate(&ledger_ro, std::path::Path::new("/tmp"), &tuples) {
+        match foundry_line::rehydrate::rehydrate(&ledger_ro, std::path::Path::new("/tmp"), &tuples)
+        {
             Ok(orders) => {
                 let n_waiting = orders
                     .iter()
@@ -580,6 +2305,127 @@ async fn show(order_id: String, db: &str) -> i32 {
     }
 }
 
+struct EnvSecretProvider;
+impl foundry_domain::ports::SecretProvider for EnvSecretProvider {
+    fn resolve(&self, name: &str) -> PortResult<String> {
+        if name.is_empty()
+            || name.len() > 128
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+        {
+            return Err(foundry_domain::ports::PortError::Permanent(
+                "credential reference rejected".into(),
+            ));
+        }
+        std::env::var(name).map_err(|_| {
+            foundry_domain::ports::PortError::Permanent("credential unavailable".into())
+        })
+    }
+}
+
+async fn product_watch_cmd(
+    db: &str,
+    installation_id: String,
+    database_id: String,
+    service_file: &str,
+    repo: String,
+    repository_id: String,
+    api_origin: String,
+    private: bool,
+    credential_ref: Option<String>,
+    once: bool,
+    every: u64,
+) -> i32 {
+    let (owner, name) = repo.split_once('/').unwrap_or((repo.as_str(), ""));
+    if owner.is_empty() || name.is_empty() || (private && credential_ref.is_none()) {
+        eprintln!("product watch configuration rejected");
+        return 2;
+    }
+    loop {
+        let db = db.to_string();
+        let installation = installation_id.clone();
+        let database = database_id.clone();
+        let service_file = service_file.to_owned();
+        let cfg = foundry_watch::intake::ProductGithubConfig {
+            connector_id: "github-primary".into(),
+            api_origin: api_origin.clone(),
+            owner: owner.into(),
+            repo: name.into(),
+            repository_id: repository_id.clone(),
+            private,
+            credential_ref: credential_ref.clone(),
+            allow_loopback_http: false,
+            max_pages_per_tick: 5,
+            now: chrono::Utc::now(),
+        };
+        let result = tokio::task::spawn_blocking(move || {
+            let mut store = foundry_ledger::ProductStore::open(
+                std::path::Path::new(&db),
+                foundry_ledger::ProductConfig {
+                    installation_id: installation,
+                    database_id: database,
+                },
+            )
+            .map_err(|_| "product database rejected")?;
+            if !matches!(store.scope_policy_enforced(), Ok(true)) {
+                return Err("product scope setup or migration required");
+            }
+            let token = read_private(&service_file)
+                .map_err(|_| "private service credential file rejected")?;
+            let service = store
+                .authenticate_product_service(
+                    &token,
+                    &cfg.connector_id,
+                    &cfg.api_origin,
+                    &cfg.repository_id,
+                    chrono::Utc::now(),
+                )
+                .map_err(|_| "product service authority rejected")?;
+            foundry_watch::intake_worker::product_github_tick(
+                &mut store,
+                &cfg,
+                &EnvSecretProvider,
+                chrono::Utc::now(),
+                1000,
+                &service,
+            )
+            .map_err(|_| "product intake tick failed")
+        })
+        .await;
+        match result {
+            Ok(Ok((poll, drain))) => println!(
+                "product intake: pages={} fetched={} admitted={} acknowledged={} retryable={} permanent={} work={}",
+                poll.pages,
+                poll.fetched,
+                drain.admitted,
+                drain.acknowledged,
+                drain.retryable_failures,
+                drain.permanent_failures,
+                match drain.work_claim {
+                    foundry_ledger::ProductWorkClaimResult::Empty => "empty",
+                    foundry_ledger::ProductWorkClaimResult::Unsupported { .. } =>
+                        "waiting-unsupported",
+                    foundry_ledger::ProductWorkClaimResult::Claimed(_) =>
+                        "claimed-awaiting-adapter",
+                }
+            ),
+            Ok(Err(error)) => {
+                eprintln!("{error}");
+                return 1;
+            }
+            Err(_) => {
+                eprintln!("product intake worker failed");
+                return 1;
+            }
+        }
+        if once {
+            return 0;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(every.max(1))).await;
+    }
+}
+
 async fn watch_cmd(
     once: bool,
     every: u64,
@@ -588,6 +2434,12 @@ async fn watch_cmd(
     auto_approve: String,
     notify_mode: String,
 ) -> i32 {
+    if !auto_approve.is_empty() {
+        eprintln!(
+            "✗ --auto-approve is disabled; approvals require an authenticated product session"
+        );
+        return 2;
+    }
     let (owner, name) = repo
         .split_once('/')
         .unwrap_or((repo.as_str(), "contextmesh-rs"));
@@ -625,8 +2477,8 @@ async fn watch_cmd(
                 Some(f)
             }
             Err(e) => {
-                eprintln!("! writer lock unavailable (continuing without): {e}");
-                None
+                eprintln!("✗ writer lock unavailable: {e}");
+                return 1;
             }
         }
     };
@@ -682,7 +2534,6 @@ async fn watch_cmd(
             source: "watch".into(),
             id: "foundry-watch".into(),
         };
-        use foundry_domain::ports::Notifier as _;
         // T13: Discord notifier — observation plane, never blocks the line.
         let mut notifier: Box<dyn foundry_domain::ports::Notifier> = match notify_mode.as_str() {
             "console" => Box::new(foundry_watch::discord_notifier::ConsoleNotifier),
@@ -733,47 +2584,6 @@ async fn watch_cmd(
                             reason: "see ledger".into(),
                         },
                     );
-                }
-                // M0 gate autopilot: approve + publish every FurnaceHold order
-                // in-process. The Approved event (intent + digest) is journalled
-                // immutably, so the human-approval RECORD is never skipped.
-                if !auto_approve.is_empty() {
-                    let human = human();
-                    let holds = line
-                        .ids_in_state(foundry_domain::OrderState::FurnaceHold)
-                        .await;
-                    for oid in holds {
-                        let digest = line
-                            .get(&oid)
-                            .await
-                            .and_then(|o| o.artifact_digest)
-                            .unwrap_or_default();
-                        let token = foundry_domain::ports::ApprovalToken {
-                            order_id: oid.clone(),
-                            intent: auto_approve.clone(),
-                            artifact_digest: digest.clone(),
-                            actor: human.clone(),
-                            granted_at: chrono::Utc::now(),
-                        };
-                        match line.approve(&oid, &token, &auto_approve, &human).await {
-                            Ok(_) => match line.publish(&oid, &human).await {
-                                Ok(st) => {
-                                    println!("{oid} → {:?}", st.state);
-                                    if st.state == foundry_domain::OrderState::Shipped {
-                                        notify(
-                                            &mut notifier,
-                                            foundry_domain::ports::NotifyEvent::Shipped {
-                                                order_id: oid.clone(),
-                                                pr_url: st.pr_url.clone().unwrap_or_default(),
-                                            },
-                                        );
-                                    }
-                                }
-                                Err(e) => eprintln!("✗ publish {oid}: {e:?}"),
-                            },
-                            Err(e) => eprintln!("✗ approve {oid}: {e:?}"),
-                        }
-                    }
                 }
                 0
             }
@@ -1102,7 +2912,9 @@ async fn casting_cmd(
         // bundle-<digest> routes load a verified bundle (projection,
         // consumption-verified); anything else is the legacy string
         // path, journaled as such and non-promotable (astra B1).
-        use foundry_watch::casting_wiring::{classify_profile_arg, legacy_profile, profile_from_bundle, ProfileSource};
+        use foundry_watch::casting_wiring::{
+            ProfileSource, classify_profile_arg, legacy_profile, profile_from_bundle,
+        };
 
         let (profile, route_record) = match classify_profile_arg(&profile_id) {
             ProfileSource::Bundle { digest } => {

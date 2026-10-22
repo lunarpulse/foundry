@@ -49,7 +49,11 @@ fn wait_for(path: &std::path::Path, timeout: Duration) -> bool {
 fn try_kill(pid: u32, grace_ms: u64) -> bool {
     // a REAL asynchronous kill racing the child's final append
     std::thread::sleep(Duration::from_millis(grace_ms));
-    Command::new("kill").args(["-9", &pid.to_string()]).status().map(|s| s.success()).unwrap_or(false)
+    Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 fn round(tag: &str, kill_after_ms: u64) -> (bool, usize, usize) {
@@ -70,7 +74,10 @@ fn round(tag: &str, kill_after_ms: u64) -> (bool, usize, usize) {
         .expect("spawn crash_child");
 
     // child writes its own pid first thing; wait for readiness
-    assert!(wait_for(&ready, Duration::from_secs(10)), "child never became ready ({tag})");
+    assert!(
+        wait_for(&ready, Duration::from_secs(10)),
+        "child never became ready ({tag})"
+    );
     let killed = try_kill(child.id(), kill_after_ms);
 
     // reap regardless
@@ -107,7 +114,10 @@ fn round(tag: &str, kill_after_ms: u64) -> (bool, usize, usize) {
         Some(e) => match e.phase {
             // crash landed between intent and effect: pending survives
             foundry_watch::governance_events::Phase::Pending => {
-                assert!(rs.pending_count >= 1, "({tag}) pending surfaced for recovery");
+                assert!(
+                    rs.pending_count >= 1,
+                    "({tag}) pending surfaced for recovery"
+                );
             }
             // the child completed before the kill landed: fully committed
             foundry_watch::governance_events::Phase::Committed => {}
@@ -134,7 +144,10 @@ fn round(tag: &str, kill_after_ms: u64) -> (bool, usize, usize) {
         })
         .unwrap();
     let expected_next = stream.last().map(|e| e.seq + 1).unwrap_or(1);
-    assert_eq!(next, expected_next, "({tag}) the journal continues at the right sequence");
+    assert_eq!(
+        next, expected_next,
+        "({tag}) the journal continues at the right sequence"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
     (killed, stream.len(), rs.pending_count)
@@ -153,7 +166,10 @@ fn real_sigkill_durability() {
             killed_count += 1;
         }
     }
-    assert!(killed_count >= 1, "at least one round must land a real SIGKILL");
+    assert!(
+        killed_count >= 1,
+        "at least one round must land a real SIGKILL"
+    );
 }
 
 #[test]
@@ -161,7 +177,10 @@ fn committed_facts_survive_wholesale() {
     // deterministic slow-kill: child completes fully; assert nothing
     // was lost and the stream is replay-clean
     let (killed, len, pending) = round("full", 400);
-    assert!(len >= 8, "3 pairs + final pair = 8 events minimum, got {len}");
+    assert!(
+        len >= 8,
+        "3 pairs + final pair = 8 events minimum, got {len}"
+    );
     assert_eq!(pending, 0, "a completed child leaves no pendings");
     let _ = killed;
 }

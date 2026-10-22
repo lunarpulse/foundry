@@ -61,9 +61,9 @@ pub fn map_failure(
     match (kind, order_state) {
         // 실행 노드 문맥 — Die 축의 기존 전이가 산다.
         (ExecutorErrorKind::Transient, OrderState::Working)
-        | (ExecutorErrorKind::Transient, OrderState::Queued) => {
-            FailureMapping::RetryViaDieFailed { reason: format!("executor-transient: {error}") }
-        }
+        | (ExecutorErrorKind::Transient, OrderState::Queued) => FailureMapping::RetryViaDieFailed {
+            reason: format!("executor-transient: {error}"),
+        },
         (ExecutorErrorKind::Permanent, OrderState::Working)
         | (ExecutorErrorKind::Permanent, OrderState::Queued)
         | (ExecutorErrorKind::Infrastructure, OrderState::Working)
@@ -71,7 +71,10 @@ pub fn map_failure(
             FailureMapping::ExhaustedViaDieFailed
         }
         // 나머지 상태: 합법적 실행-실패 엣지 없음 — 상태 발명 금지 → 래치.
-        _ => FailureMapping::Unmappable { node: node.into(), error: error.into() },
+        _ => FailureMapping::Unmappable {
+            node: node.into(),
+            error: error.into(),
+        },
     }
 }
 
@@ -95,17 +98,28 @@ impl WorkflowEngine {
         if self.halted_of(exec_id).is_some() {
             return Err(self.halted_error(exec_id));
         }
-        let state = self
-            .order(order_id)
-            .map(|o| o.state())
-            .ok_or_else(|| EngineError::LockHeld { order_id: order_id.into(), by: "<no-order>".into() })?;
+        let state =
+            self.order(order_id)
+                .map(|o| o.state())
+                .ok_or_else(|| EngineError::LockHeld {
+                    order_id: order_id.into(),
+                    by: "<no-order>".into(),
+                })?;
         let mapping = map_failure(kind, state, node, error);
         match mapping {
             FailureMapping::RetryViaDieFailed { reason } => {
-                let ev = OrderEvent::DieFailed { attempt: self.order(order_id).unwrap().attempt(), reason };
+                let ev = OrderEvent::DieFailed {
+                    attempt: self.order(order_id).unwrap().attempt(),
+                    reason,
+                };
                 // 내부 전이 경로 — 실행기 실패는 인가 대상이 아니고 재생
                 // 도 아니다 (T56 P1b: 재생은 커서 소유 경로만).
-                self.dispatch_inner(order_id, exec_id, &ev, self.order(order_id).unwrap().attempt())
+                self.dispatch_inner(
+                    order_id,
+                    exec_id,
+                    &ev,
+                    self.order(order_id).unwrap().attempt(),
+                )
             }
             FailureMapping::ExhaustedViaDieFailed => {
                 let att = self.order(order_id).unwrap().attempt();
@@ -119,10 +133,19 @@ impl WorkflowEngine {
                 self.dispatch_inner(order_id, exec_id, &ev, att)
             }
             FailureMapping::Unmappable { node, error } => {
-                let detail = format!("unmappable executor failure at node '{node}': {error} — no legal failure edge from {state:?}; order state UNCHANGED (no state invention)");
-                let cause = crate::HaltCause::UnmappableFailure { node: node.clone(), error: error.clone() };
+                let detail = format!(
+                    "unmappable executor failure at node '{node}': {error} — no legal failure edge from {state:?}; order state UNCHANGED (no state invention)"
+                );
+                let cause = crate::HaltCause::UnmappableFailure {
+                    node: node.clone(),
+                    error: error.clone(),
+                };
                 self.halt_with(exec_id, cause, detail);
-                Err(EngineError::UnmappableFailure { exec_id: exec_id.into(), node: node.into(), error: error.into() })
+                Err(EngineError::UnmappableFailure {
+                    exec_id: exec_id.into(),
+                    node: node.into(),
+                    error: error.into(),
+                })
             }
         }
     }
@@ -135,7 +158,11 @@ mod tests {
     use foundry_domain::{ExternalRef, Order};
 
     fn order_in(state: OrderState, attempt: u32) -> Order {
-        let mut o = Order::new("t55a-o".into(), ExternalRef::cron("a", "b"), Default::default());
+        let mut o = Order::new(
+            "t55a-o".into(),
+            ExternalRef::cron("a", "b"),
+            Default::default(),
+        );
         o.force_state_for_test(state, attempt);
         o
     }
@@ -152,10 +179,26 @@ mod tests {
     #[test]
     fn g14_retryable_maps_to_existing_backedge() {
         let mut e = engine_with(OrderState::Working, 1);
-        let out = e.report_executor_failure("t55a-o", "ex", &ExecutorErrorKind::Transient, "die", "timeout 30s").unwrap();
+        let out = e
+            .report_executor_failure(
+                "t55a-o",
+                "ex",
+                &ExecutorErrorKind::Transient,
+                "die",
+                "timeout 30s",
+            )
+            .unwrap();
         assert_eq!(out, Outcome::Applied);
-        assert_eq!(e.order("t55a-o").unwrap().state(), OrderState::Queued, "retry back-edge: Working -> Queued (existing transition)");
-        assert_eq!(e.order("t55a-o").unwrap().attempt(), 2, "attempt incremented by the DOMAIN, not the executor");
+        assert_eq!(
+            e.order("t55a-o").unwrap().state(),
+            OrderState::Queued,
+            "retry back-edge: Working -> Queued (existing transition)"
+        );
+        assert_eq!(
+            e.order("t55a-o").unwrap().attempt(),
+            2,
+            "attempt incremented by the DOMAIN, not the executor"
+        );
     }
 
     // G14 분기 2 — 소진: attempt=MAX에서 Permanent → DieFailed → Failed
@@ -163,9 +206,21 @@ mod tests {
     #[test]
     fn g14_exhausted_maps_to_existing_maxattempts_path() {
         let mut e = engine_with(OrderState::Working, foundry_domain::order::MAX_ATTEMPTS);
-        let out = e.report_executor_failure("t55a-o", "ex", &ExecutorErrorKind::Permanent, "die", "logic error").unwrap();
+        let out = e
+            .report_executor_failure(
+                "t55a-o",
+                "ex",
+                &ExecutorErrorKind::Permanent,
+                "die",
+                "logic error",
+            )
+            .unwrap();
         assert_eq!(out, Outcome::Applied);
-        assert_eq!(e.order("t55a-o").unwrap().state(), OrderState::Failed, "exhaustion: existing MaxAttempts path to Failed");
+        assert_eq!(
+            e.order("t55a-o").unwrap().state(),
+            OrderState::Failed,
+            "exhaustion: existing MaxAttempts path to Failed"
+        );
     }
 
     // G14 분기 3 — 매핑 불능: Received에서 실행기 오류 → 엔진 래치,
@@ -173,7 +228,13 @@ mod tests {
     #[test]
     fn g14_unmappable_latches_with_state_unchanged() {
         let mut e = engine_with(OrderState::Received, 0);
-        let r = e.report_executor_failure("t55a-o", "ex", &ExecutorErrorKind::Infrastructure, "setup", "sandbox crashed");
+        let r = e.report_executor_failure(
+            "t55a-o",
+            "ex",
+            &ExecutorErrorKind::Infrastructure,
+            "setup",
+            "sandbox crashed",
+        );
         match &r {
             Err(EngineError::UnmappableFailure { node, error, .. }) => {
                 assert_eq!(node, "setup");
@@ -181,9 +242,19 @@ mod tests {
             }
             other => panic!("expected UnmappableFailure, got {other:?}"),
         }
-        assert_eq!(e.order("t55a-o").unwrap().state(), OrderState::Received, "state UNCHANGED — no state invention");
+        assert_eq!(
+            e.order("t55a-o").unwrap().state(),
+            OrderState::Received,
+            "state UNCHANGED — no state invention"
+        );
         // 재보고 — 같은 사유 재생 (래치 규율).
-        let r2 = e.report_executor_failure("t55a-o", "ex", &ExecutorErrorKind::Transient, "setup", "different error");
+        let r2 = e.report_executor_failure(
+            "t55a-o",
+            "ex",
+            &ExecutorErrorKind::Transient,
+            "setup",
+            "different error",
+        );
         assert_eq!(r, r2, "latched exec replays the identical cause");
         // 저널 관점: 주문 상태가 아니라 실행이 정지 — 상태 변이 없음.
         assert_eq!(e.order("t55a-o").unwrap().state(), OrderState::Received);
@@ -197,7 +268,12 @@ mod tests {
         assert_eq!(m1, m2);
         // Inspecting은 검사기 축 — 실행기 매핑은 Unmappable (역할 분리).
         assert!(matches!(
-            map_failure(&ExecutorErrorKind::Transient, OrderState::Inspecting, "n", "e"),
+            map_failure(
+                &ExecutorErrorKind::Transient,
+                OrderState::Inspecting,
+                "n",
+                "e"
+            ),
             FailureMapping::Unmappable { .. }
         ));
         // 터미널 상태도 Unmappable.
@@ -219,9 +295,15 @@ mod tests {
         match r {
             // NoEdge: 부호화가 입장 불가 (E1 정상) — 도메인도 이 전이를
             // 갖지 않는다. 실행기가 상태를 억지로 바꾸지 않았다.
-            Ok(Outcome::NoEdge) | Err(EngineError::DomainRefusal { .. }) | Ok(Outcome::Refused { .. }) => {}
+            Ok(Outcome::NoEdge)
+            | Err(EngineError::DomainRefusal { .. })
+            | Ok(Outcome::Refused { .. }) => {}
             other => panic!("expected NoEdge/refusal for DieFailed-from-Queued, got {other:?}"),
         }
-        assert_eq!(e.order("t55a-o").unwrap().state(), OrderState::Queued, "state unchanged on domain refusal");
+        assert_eq!(
+            e.order("t55a-o").unwrap().state(),
+            OrderState::Queued,
+            "state unchanged on domain refusal"
+        );
     }
 }

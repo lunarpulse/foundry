@@ -8,8 +8,8 @@ use crate::common::{actor, terminal_commitment_from};
 use foundry_domain::order::ExternalRef;
 use foundry_domain::ports::Ledger as _;
 use foundry_domain::{OrderEvent, OrderState};
-use foundry_workflow::replay::{issue_replay_cursor, ReplayContext, VerifiedReplayCursor};
 use foundry_workflow::recovery::RecoveryRunner;
+use foundry_workflow::replay::{ReplayContext, VerifiedReplayCursor, issue_replay_cursor};
 use foundry_workflow::{ApprovalLedgerAdapter as LedgerHook, GrantRef, Outcome, WorkflowEngine};
 
 const ORDER: &str = "o-full";
@@ -41,13 +41,19 @@ fn full_cycle_preset_to_shipped_with_cursor_replay() {
 
     // ── 프리셋 로드·검증 (출하 조건).
     let preset_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent().unwrap().parent().unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
         .join("presets/bmad-intake-pool.v3.json");
     let doc = foundry_workflow::dsl::load_preset(&preset_path).unwrap();
-    assert!(foundry_workflow::validator::validate(
-        &doc,
-        &foundry_domain::workflow_encoding::EmbeddedWorkflow::frozen_v1(),
-    ).is_ok());
+    assert!(
+        foundry_workflow::validator::validate(
+            &doc,
+            &foundry_domain::workflow_encoding::EmbeddedWorkflow::frozen_v1(),
+        )
+        .is_ok()
+    );
 
     // ── 원장: 활성화 토큰 + 승인 grant (G13 결속은 별도 게이트).
     let mut ap = foundry_approval::ApprovalLedger::open(&ap_path).unwrap();
@@ -56,8 +62,9 @@ fn full_cycle_preset_to_shipped_with_cursor_replay() {
     ap.issue_grant(GRANT, "tok-grant", &sc()).unwrap();
 
     // ── 배선 엔진 — 전이마다 프로덕션 저널에 append.
-    let jr_static: &'static mut foundry_ledger::SqliteLedger =
-        Box::leak(Box::new(foundry_ledger::SqliteLedger::open(&jr_path).unwrap()));
+    let jr_static: &'static mut foundry_ledger::SqliteLedger = Box::leak(Box::new(
+        foundry_ledger::SqliteLedger::open(&jr_path).unwrap(),
+    ));
     let mut e = WorkflowEngine::embedded_default();
     e.set_ledger(jr_static, actor("full-cycle"));
     e.set_clock(chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap());
@@ -78,30 +85,67 @@ fn full_cycle_preset_to_shipped_with_cursor_replay() {
     let mut states_seen = vec![OrderState::Received];
     for ev in &autonomous {
         let att = e.order(ORDER).unwrap().attempt().max(1);
-        let rows = foundry_ledger::SqliteLedger::open(&jr_path).unwrap().read_all().unwrap();
-        e.dispatch_replay_ctx(ORDER, EXEC, ev, att, &replay_ctx(&rows), journal_of(&jr_path)).unwrap();
+        let rows = foundry_ledger::SqliteLedger::open(&jr_path)
+            .unwrap()
+            .read_all()
+            .unwrap();
+        e.dispatch_replay_ctx(
+            ORDER,
+            EXEC,
+            ev,
+            att,
+            &replay_ctx(&rows),
+            journal_of(&jr_path),
+        )
+        .unwrap();
         states_seen.push(e.order(ORDER).unwrap().state());
     }
     assert_eq!(e.order(ORDER).unwrap().state(), OrderState::FurnaceHold);
 
     // ── 인간 승인 게이트 — dispatch_live + grant.
     let mut hook = LedgerHook(ap);
-    let grant = GrantRef { grant_id: GRANT.into() };
-    let out = e.dispatch_live(
-        ORDER, EXEC,
-        &OrderEvent::Approved { intent: "ship".into(), artifact_digest: "dig-full".into() },
-        1, Some(&grant), &mut hook,
-    ).unwrap();
+    let grant = GrantRef {
+        grant_id: GRANT.into(),
+    };
+    let out = e
+        .dispatch_live(
+            ORDER,
+            EXEC,
+            &OrderEvent::Approved {
+                intent: "ship".into(),
+                artifact_digest: "dig-full".into(),
+            },
+            1,
+            Some(&grant),
+            &mut hook,
+        )
+        .unwrap();
     assert_eq!(out, Outcome::Applied);
     states_seen.push(OrderState::Publishing);
     assert_eq!(e.order(ORDER).unwrap().state(), OrderState::Publishing);
     // 원장 CONSUMED.
-    assert_eq!(hook.0.get_grant(GRANT).unwrap().state, foundry_approval::GrantState::Consumed);
+    assert_eq!(
+        hook.0.get_grant(GRANT).unwrap().state,
+        foundry_approval::GrantState::Consumed
+    );
     drop(hook);
 
     // ── 출하 확정.
-    let rows = foundry_ledger::SqliteLedger::open(&jr_path).unwrap().read_all().unwrap();
-    e.dispatch_replay_ctx(ORDER, EXEC, &OrderEvent::PublishConfirmed { pr_url: "https://pr/full".into() }, 1, &replay_ctx(&rows), journal_of(&jr_path)).unwrap();
+    let rows = foundry_ledger::SqliteLedger::open(&jr_path)
+        .unwrap()
+        .read_all()
+        .unwrap();
+    e.dispatch_replay_ctx(
+        ORDER,
+        EXEC,
+        &OrderEvent::PublishConfirmed {
+            pr_url: "https://pr/full".into(),
+        },
+        1,
+        &replay_ctx(&rows),
+        journal_of(&jr_path),
+    )
+    .unwrap();
     states_seen.push(OrderState::Shipped);
     assert_eq!(e.order(ORDER).unwrap().state(), OrderState::Shipped);
 
@@ -129,17 +173,32 @@ fn full_cycle_preset_to_shipped_with_cursor_replay() {
     );
     // 저널 to_state 열과 관측열이 동일 순서 (전이=관측 동순서 계약) —
     // 도메인 직렬화 명명(review/waiting) 그대로.
-    let jr_states: Vec<String> = foundry_ledger::SqliteLedger::open(&jr_path).unwrap()
-        .read_all().unwrap().iter().map(|r| r.to_state.clone()).collect();
+    let jr_states: Vec<String> = foundry_ledger::SqliteLedger::open(&jr_path)
+        .unwrap()
+        .read_all()
+        .unwrap()
+        .iter()
+        .map(|r| r.to_state.clone())
+        .collect();
     assert_eq!(applied_obs, jr_states, "observation order == journal order");
 
     // ── 저널 체인 green + 상태열·순서 단정.
-    let rows = foundry_ledger::SqliteLedger::open(&jr_path).unwrap().read_all().unwrap();
-    assert!(foundry_ledger::SqliteLedger::verify_rows(&rows), "chain verifies");
+    let rows = foundry_ledger::SqliteLedger::open(&jr_path)
+        .unwrap()
+        .read_all()
+        .unwrap();
+    assert!(
+        foundry_ledger::SqliteLedger::verify_rows(&rows),
+        "chain verifies"
+    );
     let expected_states = [
-        OrderState::Received, OrderState::Queued, OrderState::Working,
-        OrderState::Inspecting, OrderState::FurnaceHold,
-        OrderState::Publishing, OrderState::Shipped,
+        OrderState::Received,
+        OrderState::Queued,
+        OrderState::Working,
+        OrderState::Inspecting,
+        OrderState::FurnaceHold,
+        OrderState::Publishing,
+        OrderState::Shipped,
     ];
     assert_eq!(states_seen, expected_states, "state series exact");
     // 관측 순서 — to_state 열이 상태열과 동일 (전이 순서=관측 순서).
@@ -162,7 +221,10 @@ fn full_cycle_preset_to_shipped_with_cursor_replay() {
         .to_string()
     };
     let want: Vec<String> = expected_states[1..].iter().map(|s| name_of(*s)).collect();
-    assert_eq!(to_states, want, "observation order exact (journal to_state series)");
+    assert_eq!(
+        to_states, want,
+        "observation order exact (journal to_state series)"
+    );
 
     // ── 재시작 3단 — 회복·검증·재구축.
     let mut ap2 = foundry_approval::ApprovalLedger::open(&ap_path).unwrap();
@@ -171,18 +233,30 @@ fn full_cycle_preset_to_shipped_with_cursor_replay() {
     let report = RecoveryRunner::run(&mut ap2, &jr2, &mut fresh).unwrap();
     assert!(report.journal_verified);
     assert_eq!(report.rebuilt_orders, 1);
-    assert_eq!(fresh.order(ORDER).unwrap().state(), OrderState::Shipped, "rebuilt to terminal");
+    assert_eq!(
+        fresh.order(ORDER).unwrap().state(),
+        OrderState::Shipped,
+        "rebuilt to terminal"
+    );
 
     // ── 발급 커서 재생 — 상태 재구축 동일 (M1-M5 동등 인코딩).
     let commit = terminal_commitment_from(&rows);
     let cursor = issue_replay_cursor(&rows, &commit, ORDER, rows.last().unwrap().seq).unwrap();
     // 발급된 커서의 row_digest/pin/seq 는 실제 마지막 행과 일치 (발급 검증).
     let (coid, cseq, crowd, cpind) = cursor.parts();
-    assert_eq!(crowd, rows.last().unwrap().hash, "issued cursor binds the real row");
+    assert_eq!(
+        crowd,
+        rows.last().unwrap().hash,
+        "issued cursor binds the real row"
+    );
     assert_eq!(cpind, commit.chain_head);
     assert_eq!(coid, ORDER);
     assert_eq!(cseq, rows.last().unwrap().seq);
     let mut replayed = WorkflowEngine::embedded_default();
     replayed.rebuild(&jr2).unwrap();
-    assert_eq!(replayed.order(ORDER).unwrap().state(), fresh.order(ORDER).unwrap().state(), "replay rebuild equals restart rebuild");
+    assert_eq!(
+        replayed.order(ORDER).unwrap().state(),
+        fresh.order(ORDER).unwrap().state(),
+        "replay rebuild equals restart rebuild"
+    );
 }

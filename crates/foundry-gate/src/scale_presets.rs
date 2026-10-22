@@ -11,13 +11,16 @@ use crate::common::{actor, replay_ctx_for, terminal_commitment_from};
 use foundry_domain::order::{ExternalRef, Order};
 use foundry_domain::ports::Ledger as _;
 use foundry_domain::{OrderEvent, OrderState};
-use foundry_workflow::replay::ReplayContext;
 use foundry_workflow::recovery::RecoveryRunner;
+use foundry_workflow::replay::ReplayContext;
 use foundry_workflow::{ApprovalLedgerAdapter as LedgerHook, GrantRef, Outcome, WorkflowEngine};
 
 fn preset_path(name: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent().unwrap().parent().unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
         .join(format!("presets/{name}"))
 }
 
@@ -31,14 +34,20 @@ fn run_scale_preset(
 ) -> (OrderState, usize, OrderState, usize) {
     // (i) 검증.
     let doc = foundry_workflow::dsl::load_preset(&preset_path(preset_file)).unwrap();
-    assert!(foundry_workflow::validator::validate(
-        &doc,
-        &foundry_domain::workflow_encoding::EmbeddedWorkflow::frozen_v1(),
-    ).is_ok(), "{preset_file} must validate");
+    assert!(
+        foundry_workflow::validator::validate(
+            &doc,
+            &foundry_domain::workflow_encoding::EmbeddedWorkflow::frozen_v1(),
+        )
+        .is_ok(),
+        "{preset_file} must validate"
+    );
 
     // 저장소.
-    let ap_path = std::env::temp_dir().join(format!("scale-ap-{order_id}-{}.db", std::process::id()));
-    let jr_path = std::env::temp_dir().join(format!("scale-jr-{order_id}-{}.db", std::process::id()));
+    let ap_path =
+        std::env::temp_dir().join(format!("scale-ap-{order_id}-{}.db", std::process::id()));
+    let jr_path =
+        std::env::temp_dir().join(format!("scale-jr-{order_id}-{}.db", std::process::id()));
     let _ = std::fs::remove_file(&ap_path);
     let _ = std::fs::remove_file(&jr_path);
     let mut ap = foundry_approval::ApprovalLedger::open(&ap_path).unwrap();
@@ -47,12 +56,17 @@ fn run_scale_preset(
     })).unwrap();
 
     // (ii) 배선 엔진 — 완전한 라이프사이클.
-    let jr_static: &'static mut foundry_ledger::SqliteLedger =
-        Box::leak(Box::new(foundry_ledger::SqliteLedger::open(&jr_path).unwrap()));
+    let jr_static: &'static mut foundry_ledger::SqliteLedger = Box::leak(Box::new(
+        foundry_ledger::SqliteLedger::open(&jr_path).unwrap(),
+    ));
     let mut e = WorkflowEngine::embedded_default();
     e.set_ledger(jr_static, actor("scale"));
     e.set_clock(chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap());
-    let mut o = Order::new(order_id.into(), ExternalRef::cron("src", "ext"), chrono::Utc::now());
+    let mut o = Order::new(
+        order_id.into(),
+        ExternalRef::cron("src", "ext"),
+        chrono::Utc::now(),
+    );
     o.force_state_for_test(OrderState::Received, 1);
     e.enroll(o);
     e.acquire(order_id, exec_id).unwrap();
@@ -70,44 +84,108 @@ fn run_scale_preset(
     ];
     for ev in &autonomous {
         let att = e.order(order_id).unwrap().attempt().max(1);
-        let ctx: ReplayContext = replay_ctx_for(order_id, &foundry_ledger::SqliteLedger::open(&jr_path).unwrap().read_all().unwrap());
-        let jr_ro: &'static mut foundry_ledger::SqliteLedger =
-            Box::leak(Box::new(foundry_ledger::SqliteLedger::open(&jr_path).unwrap()));
-        e.dispatch_replay_ctx(order_id, exec_id, ev, att, &ctx, jr_ro).unwrap();
+        let ctx: ReplayContext = replay_ctx_for(
+            order_id,
+            &foundry_ledger::SqliteLedger::open(&jr_path)
+                .unwrap()
+                .read_all()
+                .unwrap(),
+        );
+        let jr_ro: &'static mut foundry_ledger::SqliteLedger = Box::leak(Box::new(
+            foundry_ledger::SqliteLedger::open(&jr_path).unwrap(),
+        ));
+        e.dispatch_replay_ctx(order_id, exec_id, ev, att, &ctx, jr_ro)
+            .unwrap();
     }
     // (iii) 인간 게이트 도달 — FurnaceHold.
     assert_eq!(e.order(order_id).unwrap().state(), OrderState::FurnaceHold);
 
     // (iv) 방화벽: 재생 경로로 Approved 발화 시도 — 거부.
-    let rows = foundry_ledger::SqliteLedger::open(&jr_path).unwrap().read_all().unwrap();
+    let rows = foundry_ledger::SqliteLedger::open(&jr_path)
+        .unwrap()
+        .read_all()
+        .unwrap();
     let ctx = replay_ctx_for(order_id, &rows);
-    let jr_ro: &'static mut foundry_ledger::SqliteLedger =
-        Box::leak(Box::new(foundry_ledger::SqliteLedger::open(&jr_path).unwrap()));
-    let fw = e.dispatch_replay_ctx(order_id, exec_id, &OrderEvent::Approved {
-        intent: "ship".into(), artifact_digest: "dig-scale".into(),
-    }, 1, &ctx, jr_ro);
-    assert!(matches!(fw, Err(foundry_workflow::EngineError::AuthorizationRefused { .. })),
-        "firewall holds at every scale");
-    assert_eq!(e.order(order_id).unwrap().state(), OrderState::FurnaceHold, "state frozen");
+    let jr_ro: &'static mut foundry_ledger::SqliteLedger = Box::leak(Box::new(
+        foundry_ledger::SqliteLedger::open(&jr_path).unwrap(),
+    ));
+    let fw = e.dispatch_replay_ctx(
+        order_id,
+        exec_id,
+        &OrderEvent::Approved {
+            intent: "ship".into(),
+            artifact_digest: "dig-scale".into(),
+        },
+        1,
+        &ctx,
+        jr_ro,
+    );
+    assert!(
+        matches!(
+            fw,
+            Err(foundry_workflow::EngineError::AuthorizationRefused { .. })
+        ),
+        "firewall holds at every scale"
+    );
+    assert_eq!(
+        e.order(order_id).unwrap().state(),
+        OrderState::FurnaceHold,
+        "state frozen"
+    );
 
     // 라이브 승인 → Publishing → 출하.
     let mut hook = LedgerHook(ap);
-    let out = e.dispatch_live(order_id, exec_id, &OrderEvent::Approved {
-        intent: "ship".into(), artifact_digest: "dig-scale".into(),
-    }, 1, Some(&GrantRef { grant_id: grant_id.into() }), &mut hook).unwrap();
+    let out = e
+        .dispatch_live(
+            order_id,
+            exec_id,
+            &OrderEvent::Approved {
+                intent: "ship".into(),
+                artifact_digest: "dig-scale".into(),
+            },
+            1,
+            Some(&GrantRef {
+                grant_id: grant_id.into(),
+            }),
+            &mut hook,
+        )
+        .unwrap();
     assert_eq!(out, Outcome::Applied);
-    let rows = foundry_ledger::SqliteLedger::open(&jr_path).unwrap().read_all().unwrap();
+    let rows = foundry_ledger::SqliteLedger::open(&jr_path)
+        .unwrap()
+        .read_all()
+        .unwrap();
     let ctx = replay_ctx_for(order_id, &rows);
-    let jr_ro: &'static mut foundry_ledger::SqliteLedger =
-        Box::leak(Box::new(foundry_ledger::SqliteLedger::open(&jr_path).unwrap()));
-    let ship_out = e.dispatch_replay_ctx(order_id, exec_id, &OrderEvent::PublishConfirmed { pr_url: "https://pr/scale".into() }, 1, &ctx, jr_ro);
+    let jr_ro: &'static mut foundry_ledger::SqliteLedger = Box::leak(Box::new(
+        foundry_ledger::SqliteLedger::open(&jr_path).unwrap(),
+    ));
+    let ship_out = e.dispatch_replay_ctx(
+        order_id,
+        exec_id,
+        &OrderEvent::PublishConfirmed {
+            pr_url: "https://pr/scale".into(),
+        },
+        1,
+        &ctx,
+        jr_ro,
+    );
     assert_eq!(ship_out.unwrap(), Outcome::Applied, "publish must apply");
     let final_state = e.order(order_id).unwrap().state();
     assert_eq!(final_state, OrderState::Shipped);
     // ship 이후 재계산 — 게이트·출하 전이 모두 포함.
-    let rows = foundry_ledger::SqliteLedger::open(&jr_path).unwrap().read_all().unwrap();
-    let obs = e.observations().iter().filter(|o| o.exec_id == exec_id && matches!(o.outcome, Outcome::Applied)).count();
-    assert_eq!(hook.0.get_grant(grant_id).unwrap().state, foundry_approval::GrantState::Consumed);
+    let rows = foundry_ledger::SqliteLedger::open(&jr_path)
+        .unwrap()
+        .read_all()
+        .unwrap();
+    let obs = e
+        .observations()
+        .iter()
+        .filter(|o| o.exec_id == exec_id && matches!(o.outcome, Outcome::Applied))
+        .count();
+    assert_eq!(
+        hook.0.get_grant(grant_id).unwrap().state,
+        foundry_approval::GrantState::Consumed
+    );
     drop(hook);
 
     // 재시작 3단 — 재구축 동일.
@@ -154,7 +232,10 @@ fn multi_preset_routing_selects_by_source() {
         ("bmad-intake-pool.v3.json", "bmad:*", "bmad-intake-pool"),
     ] {
         let doc = foundry_workflow::dsl::load_preset(&preset_path(file)).unwrap();
-        let found = doc.routing.rules.iter()
+        let found = doc
+            .routing
+            .rules
+            .iter()
             .find(|r| r.source_pattern == pattern && r.workflow_id == wf);
         assert!(found.is_some(), "{file} must route {pattern} -> {wf}");
     }

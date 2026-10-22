@@ -1,4 +1,4 @@
-use foundry_pack::{load_pack, EngineAction, GraphEngine, PackError, RunInput};
+use foundry_pack::{EngineAction, GraphEngine, PackError, RunInput, load_pack};
 use std::collections::BTreeMap;
 
 const PLAIN_DIGEST: &str = "48029eed0f940c61c7d7a01132234a5d81eb4c261a2ee34af4ea18d60f6fcf29";
@@ -29,9 +29,15 @@ fn plain_engine() -> (GraphEngine, foundry_pack::PackSnapshot) {
 #[test]
 fn plain_pack_loads_routes_and_runs_alongside_the_golden_pack_in_one_binary() {
     let (engine, pack) = plain_engine();
-    assert_eq!(pack.counters(), &BTreeMap::from([("fix_rounds".to_owned(), 0)]));
     assert_eq!(
-        pack.policy()["nodes"][0]["side_records"].as_array().unwrap()[0].as_str(),
+        pack.counters(),
+        &BTreeMap::from([("fix_rounds".to_owned(), 0)])
+    );
+    assert_eq!(
+        pack.policy()["nodes"][0]["side_records"]
+            .as_array()
+            .unwrap()[0]
+            .as_str(),
         Some("comments")
     );
 
@@ -40,31 +46,48 @@ fn plain_pack_loads_routes_and_runs_alongside_the_golden_pack_in_one_binary() {
     let mut state = engine.initial_state(BTreeMap::new());
     let mut review_visits = 0;
     let outcome = engine
-        .run_staged(&mut state, &run_input(&[], false), 32, |node, redrive, input| {
-            match (node, redrive) {
+        .run_staged(
+            &mut state,
+            &run_input(&[], false),
+            32,
+            |node, redrive, input| match (node, redrive) {
                 ("review", false) => {
                     review_visits += 1;
                     Ok(run_input(&["blocking"], true))
                 }
                 ("fix", true) => Ok(input.clone()),
                 _ => panic!("unexpected boundary: {node}, redrive={redrive}"),
-            }
-        })
+            },
+        )
         .unwrap();
     assert_eq!(review_visits, 2);
     assert_eq!(outcome.hold.as_ref().unwrap().node_id, "hold");
-    assert_eq!(outcome.hold.as_ref().unwrap().entry_counters["fix_rounds"], 1);
+    assert_eq!(
+        outcome.hold.as_ref().unwrap().entry_counters["fix_rounds"],
+        1
+    );
     assert_eq!(state.counters["fix_rounds"], 1);
-    assert_eq!(outcome.actions, vec![EngineAction::Bump { counter: "fix_rounds".into(), after: 1 }]);
+    assert_eq!(
+        outcome.actions,
+        vec![EngineAction::Bump {
+            counter: "fix_rounds".into(),
+            after: 1
+        }]
+    );
     assert!(outcome.destinations.contains(&"fix".to_owned()));
 
     // A clean confirmation emits InspectionPassed.
     let mut state = engine.initial_state(BTreeMap::new());
     let clean = engine
-        .run_staged(&mut state, &run_input(&[], false), 16, |node, redrive, _| {
-            assert_eq!((node, redrive), ("review", false));
-            Ok(run_input(&["clean"], false))
-        })
+        .run_staged(
+            &mut state,
+            &run_input(&[], false),
+            16,
+            |node, redrive, _| {
+                assert_eq!((node, redrive), ("review", false));
+                Ok(run_input(&["clean"], false))
+            },
+        )
         .unwrap();
     assert!(clean.terminal);
     assert!(clean.actions.contains(&EngineAction::Emit {
@@ -76,10 +99,15 @@ fn plain_pack_loads_routes_and_runs_alongside_the_golden_pack_in_one_binary() {
     // has published the configured comments side record.
     let mut state = engine.initial_state(BTreeMap::new());
     let nit = engine
-        .run_staged(&mut state, &run_input(&[], false), 16, |node, redrive, _| {
-            assert_eq!((node, redrive), ("review", false));
-            Ok(run_input(&["nit"], true))
-        })
+        .run_staged(
+            &mut state,
+            &run_input(&[], false),
+            16,
+            |node, redrive, _| {
+                assert_eq!((node, redrive), ("review", false));
+                Ok(run_input(&["nit"], true))
+            },
+        )
         .unwrap();
     assert_eq!(nit.hold.as_ref().unwrap().node_id, "commented");
 
@@ -88,7 +116,10 @@ fn plain_pack_loads_routes_and_runs_alongside_the_golden_pack_in_one_binary() {
     let budget = engine
         .run_staged(
             &mut state,
-            &RunInput { budget_exhausted: true, ..run_input(&[], false) },
+            &RunInput {
+                budget_exhausted: true,
+                ..run_input(&[], false)
+            },
             16,
             |_, _, _| panic!("exhausted budget must stop before dispatch"),
         )
@@ -98,7 +129,10 @@ fn plain_pack_loads_routes_and_runs_alongside_the_golden_pack_in_one_binary() {
     let mut state = engine.initial_state(BTreeMap::new());
     let invalid = engine
         .run_staged(&mut state, &run_input(&[], false), 16, |_, _, _| {
-            Err(PackError { code: "E_EXEC_VERIFY_INVALID", message: "invalid verify".into() })
+            Err(PackError {
+                code: "E_EXEC_VERIFY_INVALID",
+                message: "invalid verify".into(),
+            })
         })
         .unwrap();
     assert_eq!(invalid.hold.as_ref().unwrap().node_id, "hold");
@@ -112,10 +146,15 @@ fn plain_pack_loads_routes_and_runs_alongside_the_golden_pack_in_one_binary() {
     let golden_engine = GraphEngine::from_snapshot(&golden_pack).unwrap();
     let mut state = golden_engine.initial_state(BTreeMap::new());
     let golden_outcome = golden_engine
-        .run_staged(&mut state, &run_input(&[], false), 16, |node, redrive, input| {
-            assert_eq!((node, redrive), ("lenses", false));
-            Ok(input.clone())
-        })
+        .run_staged(
+            &mut state,
+            &run_input(&[], false),
+            16,
+            |node, redrive, input| {
+                assert_eq!((node, redrive), ("lenses", false));
+                Ok(input.clone())
+            },
+        )
         .unwrap();
     assert!(golden_outcome.terminal);
     assert!(golden_outcome.actions.contains(&EngineAction::Emit {

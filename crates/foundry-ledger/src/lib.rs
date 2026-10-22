@@ -18,8 +18,32 @@ pub(crate) mod vendor;
 pub mod casting_journal;
 pub mod event_json;
 pub mod mirror;
+pub mod product;
+pub mod product_identity;
+pub mod product_intake;
+pub mod product_scope;
 pub mod replay;
 pub mod sqlite;
 
 pub use mirror::{Mirror, MirrorLine, MirrorState};
+#[cfg(feature = "p2-test-support")]
+pub use product::P2ReviewPreparation;
+pub use product::{
+    AdmissionReceipt, ProductApprovalIntent, ProductApprovalReceipt, ProductArtifactContent,
+    ProductArtifactInfo, ProductClock, ProductConfig, ProductError, ProductHoldAcceptance,
+    ProductHoldDecision, ProductHoldExpectation, ProductPublishAuthorization,
+    ProductResultArtifactContent, ProductResultError, ProductResultExpectation, ProductResultInfo,
+    ProductReviewConfig, ProductServiceAction, ProductServiceContext, ProductServiceCredential,
+    ProductServiceGrant, ProductServiceReceipt, ProductServiceView, ProductStore, ProductWorkClaim,
+    ProductWorkClaimResult, SystemProductClock, product_host_result_digest,
+};
+#[cfg(feature = "p2-test-support")]
+pub use product::{ChargeBudgetObservation, ChargeBudgetObserver};
+pub use product_intake::{DueDelivery, ProductDelivery, ProductPollCursor};
+pub use product_scope::{
+    ProductCapability, RepositoryIdentity, ScopeGrantManifest, ScopeGrantReceipt, ScopeGrantView,
+    ScopeMigrationManifest, ScopeMigrationReceipt, ScopeMutation, ScopeMutationReceiptKind,
+    ScopeSourceManifest, ScopeSourceView, ScopedEvidenceSnapshot, ScopedOrderView,
+    VerifiedOrderProvenance,
+};
 pub use sqlite::{AuditEntry, LedgerRow, SqliteLedger};

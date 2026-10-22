@@ -32,8 +32,16 @@ fn main() {
 
     // 3 complete pairs
     for i in 0..3 {
-        c.append(ev(&format!("p{i}"), foundry_watch::governance_events::Phase::Pending)).unwrap();
-        c.append(ev(&format!("p{i}"), foundry_watch::governance_events::Phase::Committed)).unwrap();
+        c.append(ev(
+            &format!("p{i}"),
+            foundry_watch::governance_events::Phase::Pending,
+        ))
+        .unwrap();
+        c.append(ev(
+            &format!("p{i}"),
+            foundry_watch::governance_events::Phase::Committed,
+        ))
+        .unwrap();
     }
     std::fs::write(&ready, b"ready").unwrap();
 
@@ -41,9 +49,17 @@ fn main() {
     std::thread::sleep(std::time::Duration::from_millis(30));
 
     // final intent, then effect
-    c.append(ev("final", foundry_watch::governance_events::Phase::Pending)).unwrap();
+    c.append(ev(
+        "final",
+        foundry_watch::governance_events::Phase::Pending,
+    ))
+    .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(30));
-    c.append(ev("final", foundry_watch::governance_events::Phase::Committed)).unwrap();
+    c.append(ev(
+        "final",
+        foundry_watch::governance_events::Phase::Committed,
+    ))
+    .unwrap();
     std::fs::write(&done, b"done").unwrap();
 
     let _ = Command::new("true").status();

@@ -3,7 +3,7 @@
 use chrono::{DateTime, Utc};
 use foundry_domain::ports::{Ledger, PortError, PortResult};
 use foundry_domain::{ActorId, OrderEvent, OrderState};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -34,6 +34,27 @@ impl SqliteLedger {
         let db_path = path.to_path_buf();
         let conn = Connection::open(path)
             .map_err(|e| PortError::Permanent(format!("open ledger: {e}")))?;
+        let has_contract: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='foundry_contract')",
+            [], |r| r.get(0),
+        ).map_err(port_err)?;
+        if has_contract {
+            let contract: String = conn
+                .query_row(
+                    "SELECT contract FROM foundry_contract WHERE singleton=1",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(port_err)?;
+            if contract != "StandaloneV1" {
+                return Err(PortError::Permanent("ledger contract mismatch".into()));
+            }
+        } else {
+            let is_product: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='product_meta_v1')", [], |r| r.get(0)).map_err(port_err)?;
+            if is_product {
+                return Err(PortError::Permanent("ledger contract mismatch".into()));
+            }
+        }
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS ledger (
@@ -58,6 +79,8 @@ impl SqliteLedger {
               BEFORE DELETE ON ledger BEGIN
                 SELECT RAISE(ABORT, 'ledger is append-only');
             END;
+            CREATE TABLE IF NOT EXISTS foundry_contract(singleton INTEGER PRIMARY KEY CHECK(singleton=1), contract TEXT NOT NULL);
+            INSERT OR IGNORE INTO foundry_contract(singleton,contract) VALUES(1,'StandaloneV1');
             "#,
         )
         .map_err(|e| PortError::Permanent(format!("init ledger: {e}")))?;
@@ -75,38 +98,7 @@ impl SqliteLedger {
             if r.prev_hash != prev {
                 return Ok(false); // chain broken
             }
-            let expect = match crate::event_json::row_version(r) {
-                1 => entry_hash(
-                    r.seq,
-                    &r.order_id,
-                    &r.from_state,
-                    &r.to_state,
-                    &r.event,
-                    &r.actor,
-                    &r.intent,
-                    &r.at,
-                    &prev,
-                ),
-                _ => {
-                    // v2: v1 payload + canonical json (event_json hash-covered)
-                    let v1_payload = format!(
-                        "{}|{}|{}|{}|{}|{}|{}|{}|{}",
-                        r.seq,
-                        r.order_id,
-                        r.from_state,
-                        r.to_state,
-                        r.event,
-                        r.actor,
-                        r.intent,
-                        r.at,
-                        prev
-                    );
-                    let json = r.event_json.as_deref().unwrap_or("");
-                    let payload = crate::event_json::v2_hash_payload(&v1_payload, json);
-                    use sha2::{Digest, Sha256};
-                    hex::encode(sha2::Sha256::digest(payload.as_bytes()))
-                }
-            };
+            let expect = expected_row_hash(r, &prev);
             if expect != r.hash {
                 return Ok(false);
             }
@@ -121,18 +113,32 @@ impl SqliteLedger {
         let last = rows.last()?;
         let expect = match crate::event_json::row_version(last) {
             1 => entry_hash(
-                last.seq, &last.order_id, &last.from_state, &last.to_state,
-                &last.event, &last.actor, &last.intent, &last.at, &last.prev_hash,
+                last.seq,
+                &last.order_id,
+                &last.from_state,
+                &last.to_state,
+                &last.event,
+                &last.actor,
+                &last.intent,
+                &last.at,
+                &last.prev_hash,
             ),
             _ => {
                 let v1_payload = format!(
                     "{}|{}|{}|{}|{}|{}|{}|{}|{}",
-                    last.seq, last.order_id, last.from_state, last.to_state,
-                    last.event, last.actor, last.intent, last.at, last.prev_hash
+                    last.seq,
+                    last.order_id,
+                    last.from_state,
+                    last.to_state,
+                    last.event,
+                    last.actor,
+                    last.intent,
+                    last.at,
+                    last.prev_hash
                 );
                 let json = last.event_json.as_deref().unwrap_or("");
                 let payload = crate::event_json::v2_hash_payload(&v1_payload, json);
-                use sha2::{Digest, Sha256};
+                use sha2::Digest;
                 hex::encode(sha2::Sha256::digest(payload.as_bytes()))
             }
         };
@@ -147,37 +153,7 @@ impl SqliteLedger {
             if r.prev_hash != prev {
                 return false;
             }
-            let expect = match crate::event_json::row_version(r) {
-                1 => entry_hash(
-                    r.seq,
-                    &r.order_id,
-                    &r.from_state,
-                    &r.to_state,
-                    &r.event,
-                    &r.actor,
-                    &r.intent,
-                    &r.at,
-                    &prev,
-                ),
-                _ => {
-                    let v1_payload = format!(
-                        "{}|{}|{}|{}|{}|{}|{}|{}|{}",
-                        r.seq,
-                        r.order_id,
-                        r.from_state,
-                        r.to_state,
-                        r.event,
-                        r.actor,
-                        r.intent,
-                        r.at,
-                        prev
-                    );
-                    let json = r.event_json.as_deref().unwrap_or("");
-                    let payload = crate::event_json::v2_hash_payload(&v1_payload, json);
-                    use sha2::{Digest, Sha256};
-                    hex::encode(sha2::Sha256::digest(payload.as_bytes()))
-                }
-            };
+            let expect = expected_row_hash(r, &prev);
             if expect != r.hash {
                 return false;
             }
@@ -216,6 +192,73 @@ impl SqliteLedger {
             .collect::<Result<_, _>>()
             .map_err(port_err)?;
         Ok(rows)
+    }
+}
+
+/// Incremental equivalent of the chain-hash portion of `verify_rows` for a
+/// seq-ordered SQLite cursor. Sequence continuity is checked here as replay
+/// would check it for a materialized slice. This verifier retains only the
+/// prior hash and sequence, never prior ledger rows.
+pub(crate) struct ChainVerifier {
+    previous_hash: String,
+    previous_seq: Option<i64>,
+}
+
+impl ChainVerifier {
+    pub(crate) fn new() -> Self {
+        Self {
+            previous_hash: "GENESIS".to_owned(),
+            previous_seq: None,
+        }
+    }
+
+    pub(crate) fn push(&mut self, row: &LedgerRow) -> bool {
+        if self
+            .previous_seq
+            .is_some_and(|seq| seq.checked_add(1) != Some(row.seq))
+            || row.prev_hash != self.previous_hash
+            || expected_row_hash(row, &self.previous_hash) != row.hash
+        {
+            return false;
+        }
+        self.previous_seq = Some(row.seq);
+        self.previous_hash.clone_from(&row.hash);
+        true
+    }
+}
+
+pub(crate) fn expected_row_hash(row: &LedgerRow, previous_hash: &str) -> String {
+    match crate::event_json::row_version(row) {
+        1 => entry_hash(
+            row.seq,
+            &row.order_id,
+            &row.from_state,
+            &row.to_state,
+            &row.event,
+            &row.actor,
+            &row.intent,
+            &row.at,
+            previous_hash,
+        ),
+        _ => {
+            // v2: v1 payload + canonical json (event_json hash-covered)
+            let v1_payload = format!(
+                "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                row.seq,
+                row.order_id,
+                row.from_state,
+                row.to_state,
+                row.event,
+                row.actor,
+                row.intent,
+                row.at,
+                previous_hash
+            );
+            let json = row.event_json.as_deref().unwrap_or("");
+            let payload = crate::event_json::v2_hash_payload(&v1_payload, json);
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(payload.as_bytes()))
+        }
     }
 }
 
@@ -325,13 +368,15 @@ impl SqliteLedger {
         // BEGIN IMMEDIATE: 쓰기 잠금을 트랜잭션 시작 시점에 획득해
         // head-읽기와 INSERT 사이에 다른 쓰기가 끼어들 여지를 제거.
         let _tx_guard = TxGuard::begin_immediate(&conn)?;
-        let prev_hash: String = conn
+        let prev_hash: Option<String> = conn
             .query_row(
                 "SELECT hash FROM ledger ORDER BY seq DESC LIMIT 1",
                 [],
                 |r| r.get(0),
             )
-            .unwrap_or_else(|_| "GENESIS".into());
+            .optional()
+            .map_err(port_err)?;
+        let prev_hash = prev_hash.unwrap_or_else(|| "GENESIS".into());
         let seq: i64 = conn
             .query_row("SELECT COALESCE(MAX(seq),0)+1 FROM ledger", [], |r| {
                 r.get(0)
@@ -396,9 +441,8 @@ impl SqliteLedger {
     }
 }
 
-/// (M7 G.B4) 트랜잭션 가드 — DROP 시 COMMIT (정상 경로) / 패닉이면
-/// 커넥션 저수준 상태를 ROLLBACK 로 복구. 러스트 예외 경로에서 열린
-/// 트랜잭션이 다음 쿼리를 오염시키지 않게 한다.
+/// Append transaction guard. Only an explicit successful `commit` persists;
+/// every other exit rolls back so an error path cannot accidentally commit.
 struct TxGuard<'c> {
     conn: &'c rusqlite::Connection,
     active: bool,
@@ -410,21 +454,153 @@ impl<'c> TxGuard<'c> {
         Ok(Self { conn, active: true })
     }
 
-    /// 트랜잭션 확정 — 성공 시 active 해제(Drop 중복 방지).
+    /// Commit explicitly. Keep the guard active until SQLite reports success;
+    /// on error, attempt rollback before returning the original commit error.
     fn commit(mut self) -> PortResult<()> {
-        self.active = false;
-        self.conn.execute_batch("COMMIT").map_err(port_err)
+        match self.conn.execute_batch("COMMIT") {
+            Ok(()) => {
+                self.active = false;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                self.active = false;
+                Err(port_err(error))
+            }
+        }
     }
 }
 
 impl Drop for TxGuard<'_> {
     fn drop(&mut self) {
         if self.active {
-            // COMMIT 실패 시(예: 디스크) ROLLBACK 으로라도 종결 — 오류는
-            // 전파 불가(Drop)지만 상태를 남기지 않는다.
-            if self.conn.execute_batch("COMMIT").is_err() {
-                let _ = self.conn.execute_batch("ROLLBACK");
-            }
+            let _ = self.conn.execute_batch("ROLLBACK");
         }
+    }
+}
+
+#[cfg(test)]
+mod tx_guard_tests {
+    use super::TxGuard;
+    use rusqlite::Connection;
+
+    #[test]
+    fn failed_commit_rolls_back_and_connection_remains_writable() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY);
+             CREATE TABLE child (
+                 parent_id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED
+             );",
+        )
+        .unwrap();
+
+        let tx = TxGuard::begin_immediate(&conn).unwrap();
+        conn.execute("INSERT INTO child(parent_id) VALUES (7)", [])
+            .unwrap();
+        assert!(tx.commit().is_err(), "deferred FK must fail at COMMIT");
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM child", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "failed commit must leave no row"
+        );
+
+        conn.execute("INSERT INTO parent(id) VALUES (7)", [])
+            .unwrap();
+        let tx = TxGuard::begin_immediate(&conn).unwrap();
+        conn.execute("INSERT INTO child(parent_id) VALUES (7)", [])
+            .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM child", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "connection must accept a later committed transaction"
+        );
+    }
+
+    #[test]
+    fn dropping_uncommitted_guard_rolls_back_and_keeps_connection_writable() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE values_table (value INTEGER NOT NULL);")
+            .unwrap();
+        {
+            let _tx = TxGuard::begin_immediate(&conn).unwrap();
+            conn.execute("INSERT INTO values_table VALUES (1)", [])
+                .unwrap();
+        }
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM values_table", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "drop must roll back rather than commit"
+        );
+        let tx = TxGuard::begin_immediate(&conn).unwrap();
+        conn.execute("INSERT INTO values_table VALUES (2)", [])
+            .unwrap();
+        tx.commit().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod incremental_verifier_tests {
+    use super::{ChainVerifier, LedgerRow, SqliteLedger, expected_row_hash};
+
+    fn row(seq: i64, prev_hash: &str, event_json: Option<&str>) -> LedgerRow {
+        let mut row = LedgerRow {
+            seq,
+            order_id: format!("order-{seq}"),
+            from_state: "received".into(),
+            to_state: "queued".into(),
+            event: "Queued".into(),
+            actor: "synthetic".into(),
+            intent: String::new(),
+            at: "2026-10-18T00:00:00Z".into(),
+            prev_hash: prev_hash.into(),
+            hash: String::new(),
+            event_json: event_json.map(str::to_owned),
+        };
+        row.hash = expected_row_hash(&row, prev_hash);
+        row
+    }
+
+    fn verify_incrementally(rows: &[LedgerRow]) -> bool {
+        let mut verifier = ChainVerifier::new();
+        rows.iter().all(|row| verifier.push(row))
+    }
+
+    #[test]
+    fn incremental_hashing_matches_legacy_verifier_for_v1_v2_and_tampering() {
+        let first = row(1, "GENESIS", None);
+        let second = row(2, &first.hash, Some(r#"{"type":"queued"}"#));
+        let valid = vec![first.clone(), second.clone()];
+        assert!(SqliteLedger::verify_rows(&valid));
+        assert!(verify_incrementally(&valid));
+
+        let mut v1_tampered = valid.clone();
+        v1_tampered[0].actor.push_str("-changed");
+        assert!(!SqliteLedger::verify_rows(&v1_tampered));
+        assert_eq!(
+            verify_incrementally(&v1_tampered),
+            SqliteLedger::verify_rows(&v1_tampered)
+        );
+
+        let mut v2_tampered = valid.clone();
+        v2_tampered[1].event_json = Some(r#"{"type":"changed"}"#.into());
+        assert!(!SqliteLedger::verify_rows(&v2_tampered));
+        assert_eq!(
+            verify_incrementally(&v2_tampered),
+            SqliteLedger::verify_rows(&v2_tampered)
+        );
+
+        let mut gap = valid;
+        gap[1].seq = 3;
+        assert!(
+            !verify_incrementally(&gap),
+            "stream scan enforces the replay sequence gap rule"
+        );
     }
 }

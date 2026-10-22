@@ -43,30 +43,145 @@ pub struct StateObject {
 /// touches state must reference entries here — review #3's demand.
 pub fn state_inventory() -> Vec<StateObject> {
     vec![
-        StateObject { name: "order journal rows", scope: OwnScope::Org, store: "ledger.db (sqlite)", notes: "append-only hash chain; org-scoped" },
-        StateObject { name: "casting journal rows", scope: OwnScope::Org, store: "ledger.db casting table", notes: "v2 chain; run-scoped semantics inside org" },
-        StateObject { name: "user accounts (roles, disabled)", scope: OwnScope::Org, store: "identity.db", notes: "role changes revoke sessions" },
-        StateObject { name: "sessions (opaque tokens)", scope: OwnScope::User, store: "identity.db sessions", notes: "instant revocation; role never in token" },
-        StateObject { name: "approval token consumptions", scope: OwnScope::Org, store: "identity.db token_consumptions", notes: "single-use PK" },
-        StateObject { name: "order scope assignments", scope: OwnScope::Org, store: "scope.db order_scope", notes: "single-org contract" },
-        StateObject { name: "intake source bindings", scope: OwnScope::Org, store: "scope.db OrgConfig", notes: "admission control" },
-        StateObject { name: "jira webhook seen-ids (dedup/echo)", scope: OwnScope::Org, store: "jira_seen.txt + in-mem version floor", notes: "durable; per-connector namespacing" },
-        StateObject { name: "github intake in-process seen set", scope: OwnScope::Org, store: "process memory (watch)", notes: "M0 at-least-once; ledger dedup is the durable layer" },
-        StateObject { name: "candidate profiles (casting)", scope: OwnScope::CastingRun, store: "casting dir profile files", notes: "content-hashed; T46 freezes into bundles" },
-        StateObject { name: "candidate profile extensions (T35)", scope: OwnScope::CastingRun, store: "casting dir", notes: "repro_class/cost; separate hash" },
-        StateObject { name: "casting run workdirs (sandboxes)", scope: OwnScope::CastingRun, store: "tmp sandbox dirs", notes: "env-whitelisted; deleted after run" },
-        StateObject { name: "casting circuit breaker state", scope: OwnScope::CastingRun, store: "process memory (watch)", notes: "(blueprint, run_id) key — never global" },
-        StateObject { name: "corpus manifests (frozen)", scope: OwnScope::SharedImmutable, store: "~/.foundry/corpus", notes: "content-addressed by manifest hash" },
-        StateObject { name: "baseline metrics snapshots", scope: OwnScope::SharedImmutable, store: "~/.foundry/corpus/baseline-m2.json", notes: "frozen reference" },
-        StateObject { name: "order worktrees / patches", scope: OwnScope::Order, store: "~/.foundry-work", notes: "per-order; cleaned on terminal states" },
-        StateObject { name: "audit report envelopes (generated)", scope: OwnScope::SharedImmutable, store: "caller-owned output", notes: "verifiable; prefix-pinned" },
-        StateObject { name: "export artifacts (pseudonymized)", scope: OwnScope::Org, store: "caller-owned output", notes: "approver+ gated" },
-        StateObject { name: "logs (serve/watch/cast stdout)", scope: OwnScope::Org, store: "journald", notes: "privacy screening applies to payloads" },
-        StateObject { name: "credential files (gh_token, die.env, notifier.env)", scope: OwnScope::Org, store: "~/.foundry (600)", notes: "NEVER in cast boundary; T44 containerizes" },
-        StateObject { name: "deploy boundary table (T34)", scope: OwnScope::SharedImmutable, store: "binary + ~/.foundry/deploy", notes: "input to T44 compose generation" },
+        StateObject {
+            name: "order journal rows",
+            scope: OwnScope::Org,
+            store: "ledger.db (sqlite)",
+            notes: "append-only hash chain; org-scoped",
+        },
+        StateObject {
+            name: "casting journal rows",
+            scope: OwnScope::Org,
+            store: "ledger.db casting table",
+            notes: "v2 chain; run-scoped semantics inside org",
+        },
+        StateObject {
+            name: "user accounts (roles, disabled)",
+            scope: OwnScope::Org,
+            store: "identity.db",
+            notes: "role changes revoke sessions",
+        },
+        StateObject {
+            name: "sessions (opaque tokens)",
+            scope: OwnScope::User,
+            store: "identity.db sessions",
+            notes: "instant revocation; role never in token",
+        },
+        StateObject {
+            name: "approval token consumptions",
+            scope: OwnScope::Org,
+            store: "identity.db token_consumptions",
+            notes: "single-use PK",
+        },
+        StateObject {
+            name: "order scope assignments",
+            scope: OwnScope::Org,
+            store: "scope.db order_scope",
+            notes: "single-org contract",
+        },
+        StateObject {
+            name: "intake source bindings",
+            scope: OwnScope::Org,
+            store: "scope.db OrgConfig",
+            notes: "admission control",
+        },
+        StateObject {
+            name: "jira webhook seen-ids (dedup/echo)",
+            scope: OwnScope::Org,
+            store: "jira_seen.txt + in-mem version floor",
+            notes: "durable; per-connector namespacing",
+        },
+        StateObject {
+            name: "github intake in-process seen set",
+            scope: OwnScope::Org,
+            store: "process memory (watch)",
+            notes: "M0 at-least-once; ledger dedup is the durable layer",
+        },
+        StateObject {
+            name: "candidate profiles (casting)",
+            scope: OwnScope::CastingRun,
+            store: "casting dir profile files",
+            notes: "content-hashed; T46 freezes into bundles",
+        },
+        StateObject {
+            name: "candidate profile extensions (T35)",
+            scope: OwnScope::CastingRun,
+            store: "casting dir",
+            notes: "repro_class/cost; separate hash",
+        },
+        StateObject {
+            name: "casting run workdirs (sandboxes)",
+            scope: OwnScope::CastingRun,
+            store: "tmp sandbox dirs",
+            notes: "env-whitelisted; deleted after run",
+        },
+        StateObject {
+            name: "casting circuit breaker state",
+            scope: OwnScope::CastingRun,
+            store: "process memory (watch)",
+            notes: "(blueprint, run_id) key — never global",
+        },
+        StateObject {
+            name: "corpus manifests (frozen)",
+            scope: OwnScope::SharedImmutable,
+            store: "~/.foundry/corpus",
+            notes: "content-addressed by manifest hash",
+        },
+        StateObject {
+            name: "baseline metrics snapshots",
+            scope: OwnScope::SharedImmutable,
+            store: "~/.foundry/corpus/baseline-m2.json",
+            notes: "frozen reference",
+        },
+        StateObject {
+            name: "order worktrees / patches",
+            scope: OwnScope::Order,
+            store: "~/.foundry-work",
+            notes: "per-order; cleaned on terminal states",
+        },
+        StateObject {
+            name: "audit report envelopes (generated)",
+            scope: OwnScope::SharedImmutable,
+            store: "caller-owned output",
+            notes: "verifiable; prefix-pinned",
+        },
+        StateObject {
+            name: "export artifacts (pseudonymized)",
+            scope: OwnScope::Org,
+            store: "caller-owned output",
+            notes: "approver+ gated",
+        },
+        StateObject {
+            name: "logs (serve/watch/cast stdout)",
+            scope: OwnScope::Org,
+            store: "journald",
+            notes: "privacy screening applies to payloads",
+        },
+        StateObject {
+            name: "credential files (gh_token, die.env, notifier.env)",
+            scope: OwnScope::Org,
+            store: "~/.foundry (600)",
+            notes: "NEVER in cast boundary; T44 containerizes",
+        },
+        StateObject {
+            name: "deploy boundary table (T34)",
+            scope: OwnScope::SharedImmutable,
+            store: "binary + ~/.foundry/deploy",
+            notes: "input to T44 compose generation",
+        },
         // T45+ additions (forward-declared so gates can index them):
-        StateObject { name: "review lessons (T45)", scope: OwnScope::Org, store: "lesson corpus (new)", notes: "provenance-sealed; adversarial-input class" },
-        StateObject { name: "candidate bundles (T46)", scope: OwnScope::SharedImmutable, store: "content-addressed store (new)", notes: "immutable by construction" },
+        StateObject {
+            name: "review lessons (T45)",
+            scope: OwnScope::Org,
+            store: "lesson corpus (new)",
+            notes: "provenance-sealed; adversarial-input class",
+        },
+        StateObject {
+            name: "candidate bundles (T46)",
+            scope: OwnScope::SharedImmutable,
+            store: "content-addressed store (new)",
+            notes: "immutable by construction",
+        },
     ]
 }
 
@@ -92,22 +207,86 @@ pub enum Surface {
 
 pub fn entry_points() -> Vec<EntryPoint> {
     vec![
-        EntryPoint { name: "GET /api/orders", surface: Surface::Http, authority_check: "session + ReadBoard (T30 guard)" },
-        EntryPoint { name: "GET /api/orders/{id}", surface: Surface::Http, authority_check: "session + ReadBoard + scope (T30)" },
-        EntryPoint { name: "GET /api/audit/verify", surface: Surface::Http, authority_check: "session + ReadBoard" },
-        EntryPoint { name: "GET /api/status", surface: Surface::Http, authority_check: "intentionally unauthenticated (health, secret-free)" },
-        EntryPoint { name: "POST /api/orders/{id}/approve", surface: Surface::Http, authority_check: "session + Approve + single-token consume (T29)" },
-        EntryPoint { name: "foundry approve", surface: Surface::Cli, authority_check: "local operator context (documented); T44 containerizes CLI away" },
-        EntryPoint { name: "foundry casting --promote", surface: Surface::Cli, authority_check: "ApprovalToken required (T26 4-path block)" },
-        EntryPoint { name: "foundry casting --run-profile", surface: Surface::Casting, authority_check: "owner-only capability (C1 matrix); non-promoting observation" },
-        EntryPoint { name: "github intake poll", surface: Surface::BackgroundJob, authority_check: "source binding admission (scope.db)" },
-        EntryPoint { name: "jira webhook deliver", surface: Surface::Webhook, authority_check: "HMAC first + dedup + echo + version floor (T32)" },
-        EntryPoint { name: "audit report generate/verify", surface: Surface::Export, authority_check: "ReadBoard for view; approver+ for export (T31)" },
-        EntryPoint { name: "pseudonymized export", surface: Surface::Export, authority_check: "approver+ (T31 guard_export)" },
-        EntryPoint { name: "identity bootstrap", surface: Surface::Recovery, authority_check: "local CLI only, once, no defaults (T29 C2)" },
-        EntryPoint { name: "serve approve rehydrate path", surface: Surface::Recovery, authority_check: "order-in-ledger check + same approval gate (defect #7)" },
-        EntryPoint { name: "watch auto-cycle (Die->inspect->hold)", surface: Surface::BackgroundJob, authority_check: "gate+policy; human hold at FurnaceHold" },
-        EntryPoint { name: "gc (tmp cleanup)", surface: Surface::BackgroundJob, authority_check: "path-confined to workdir; no authority" },
+        EntryPoint {
+            name: "GET /api/orders",
+            surface: Surface::Http,
+            authority_check: "session + ReadBoard (T30 guard)",
+        },
+        EntryPoint {
+            name: "GET /api/orders/{id}",
+            surface: Surface::Http,
+            authority_check: "session + ReadBoard + scope (T30)",
+        },
+        EntryPoint {
+            name: "GET /api/audit/verify",
+            surface: Surface::Http,
+            authority_check: "session + ReadBoard",
+        },
+        EntryPoint {
+            name: "GET /api/status",
+            surface: Surface::Http,
+            authority_check: "intentionally unauthenticated (health, secret-free)",
+        },
+        EntryPoint {
+            name: "POST /api/orders/{id}/approve",
+            surface: Surface::Http,
+            authority_check: "session + Approve + single-token consume (T29)",
+        },
+        EntryPoint {
+            name: "foundry approve",
+            surface: Surface::Cli,
+            authority_check: "local operator context (documented); T44 containerizes CLI away",
+        },
+        EntryPoint {
+            name: "foundry casting --promote",
+            surface: Surface::Cli,
+            authority_check: "ApprovalToken required (T26 4-path block)",
+        },
+        EntryPoint {
+            name: "foundry casting --run-profile",
+            surface: Surface::Casting,
+            authority_check: "owner-only capability (C1 matrix); non-promoting observation",
+        },
+        EntryPoint {
+            name: "github intake poll",
+            surface: Surface::BackgroundJob,
+            authority_check: "source binding admission (scope.db)",
+        },
+        EntryPoint {
+            name: "jira webhook deliver",
+            surface: Surface::Webhook,
+            authority_check: "HMAC first + dedup + echo + version floor (T32)",
+        },
+        EntryPoint {
+            name: "audit report generate/verify",
+            surface: Surface::Export,
+            authority_check: "ReadBoard for view; approver+ for export (T31)",
+        },
+        EntryPoint {
+            name: "pseudonymized export",
+            surface: Surface::Export,
+            authority_check: "approver+ (T31 guard_export)",
+        },
+        EntryPoint {
+            name: "identity bootstrap",
+            surface: Surface::Recovery,
+            authority_check: "local CLI only, once, no defaults (T29 C2)",
+        },
+        EntryPoint {
+            name: "serve approve rehydrate path",
+            surface: Surface::Recovery,
+            authority_check: "order-in-ledger check + same approval gate (defect #7)",
+        },
+        EntryPoint {
+            name: "watch auto-cycle (Die->inspect->hold)",
+            surface: Surface::BackgroundJob,
+            authority_check: "gate+policy; human hold at FurnaceHold",
+        },
+        EntryPoint {
+            name: "gc (tmp cleanup)",
+            surface: Surface::BackgroundJob,
+            authority_check: "path-confined to workdir; no authority",
+        },
     ]
 }
 
@@ -152,7 +331,10 @@ mod tests {
             "credential files (gh_token, die.env, notifier.env)",
             "logs (serve/watch/cast stdout)",
         ] {
-            assert!(names.contains(&required), "missing review-#3 gap: {required}");
+            assert!(
+                names.contains(&required),
+                "missing review-#3 gap: {required}"
+            );
         }
     }
 
@@ -178,14 +360,24 @@ mod tests {
     #[test]
     fn breaker_is_never_global() {
         let inv = state_inventory();
-        let b = inv.iter().find(|s| s.name.contains("circuit breaker")).unwrap();
-        assert_eq!(b.scope, OwnScope::CastingRun, "breaker must stay run-scoped (review #3)");
+        let b = inv
+            .iter()
+            .find(|s| s.name.contains("circuit breaker"))
+            .unwrap();
+        assert_eq!(
+            b.scope,
+            OwnScope::CastingRun,
+            "breaker must stay run-scoped (review #3)"
+        );
     }
 
     #[test]
     fn credentials_never_cast_scoped() {
         let inv = state_inventory();
-        let c = inv.iter().find(|s| s.name.contains("credential files")).unwrap();
+        let c = inv
+            .iter()
+            .find(|s| s.name.contains("credential files"))
+            .unwrap();
         assert_ne!(c.scope, OwnScope::CastingRun);
     }
 

@@ -53,9 +53,13 @@ pub enum ProfileSource {
 
 pub fn classify_profile_arg(arg: &str) -> ProfileSource {
     if arg.starts_with(BUNDLE_DIGEST_PREFIX) {
-        ProfileSource::Bundle { digest: arg.to_string() }
+        ProfileSource::Bundle {
+            digest: arg.to_string(),
+        }
     } else {
-        ProfileSource::Legacy { raw: arg.to_string() }
+        ProfileSource::Legacy {
+            raw: arg.to_string(),
+        }
     }
 }
 
@@ -82,17 +86,15 @@ pub fn profile_from_bundle(
 ) -> Result<(crate::dry_die::CandidateProfile, WiredRunRecord), WiringError> {
     let bundle = store
         .get_verified(digest)
-        .map_err(|e| WiringError::BundleUnavailable { digest: digest.into(), detail: format!("{e:?}") })?;
+        .map_err(|e| WiringError::BundleUnavailable {
+            digest: digest.into(),
+            detail: format!("{e:?}"),
+        })?;
     let profile = crate::dry_die::CandidateProfile {
         id: bundle.candidate_id.clone(),
         model_id: bundle.profile.model.clone(),
         prompt_template: bundle.prompt_template.clone(),
-        tool_allowlist: bundle
-            .pins
-            .tool_digests
-            .keys()
-            .cloned()
-            .collect(),
+        tool_allowlist: bundle.pins.tool_digests.keys().cloned().collect(),
         env_allowlist: vec![],
         seed: bundle.profile.seed.unwrap_or(0),
     };
@@ -108,7 +110,11 @@ pub fn profile_from_bundle(
 
 /// Legacy string route: journals the route choice explicitly. The
 /// record marks it non-promotable via the bundle path.
-pub fn legacy_profile(raw: &str, run_id: &str, seed: u64) -> (crate::dry_die::CandidateProfile, WiredRunRecord) {
+pub fn legacy_profile(
+    raw: &str,
+    run_id: &str,
+    seed: u64,
+) -> (crate::dry_die::CandidateProfile, WiredRunRecord) {
     let profile = crate::dry_die::CandidateProfile {
         id: raw.to_string(),
         model_id: "mock/deterministic".into(),
@@ -150,7 +156,10 @@ pub fn issue_bundle_token_for_domain(
     }
     store
         .issue_token(digest, store_token)
-        .map_err(|e| WiringError::BundleUnavailable { digest: digest.into(), detail: format!("{e:?}") })?;
+        .map_err(|e| WiringError::BundleUnavailable {
+            digest: digest.into(),
+            detail: format!("{e:?}"),
+        })?;
     // the bridge itself is a governance event: CandidateActivate
     // intent+effect, payload = the digest + token id
     coordinator_events.push(GovernanceEvent {
@@ -194,10 +203,16 @@ pub fn promote_with_store_token(
     store_token: &str,
 ) -> Result<(), WiringError> {
     match (&record.route, &record.bundle_digest) {
-        (route, Some(d)) if route == "bundle" => store
-            .consume_token(store_token, d)
-            .map_err(|e| WiringError::DomainRefusal { detail: format!("{e:?}") }),
-        _ => Err(WiringError::LegacyNotPromotable { run_id: record.run_id.clone() }),
+        (route, Some(d)) if route == "bundle" => {
+            store
+                .consume_token(store_token, d)
+                .map_err(|e| WiringError::DomainRefusal {
+                    detail: format!("{e:?}"),
+                })
+        }
+        _ => Err(WiringError::LegacyNotPromotable {
+            run_id: record.run_id.clone(),
+        }),
     }
 }
 
@@ -210,18 +225,29 @@ mod tests {
         let mut st = BundleStore::default();
         let b = CandidateBundle::build(
             "cand-w1",
-            BundleProfile { model: "deepseek-v4".into(), temperature: Some(0.0), seed: Some(7), max_output_tokens: 4096 },
+            BundleProfile {
+                model: "deepseek-v4".into(),
+                temperature: Some(0.0),
+                seed: Some(7),
+                max_output_tokens: 4096,
+            },
             "solve {{task}} carefully",
-            vec![LessonSnapshot { lesson_id: "L1".into(), content_hash: {
-                let mut h = sha2::Sha256::new();
-                use sha2::Digest as _;
-                h.update(&(16u64).to_be_bytes());
-                h.update(b"prefer map_err..");
-                format!("{:x}", h.finalize())
-            }, content: "prefer map_err..".into() }],
+            vec![LessonSnapshot {
+                lesson_id: "L1".into(),
+                content_hash: {
+                    let mut h = sha2::Sha256::new();
+                    use sha2::Digest as _;
+                    h.update(&(16u64).to_be_bytes());
+                    h.update(b"prefer map_err..");
+                    format!("{:x}", h.finalize())
+                },
+                content: "prefer map_err..".into(),
+            }],
             DependencyPins {
                 image_digest: "sha256:aa".into(),
-                tool_digests: [("cargo".to_string(), "sha256:bb".into())].into_iter().collect(),
+                tool_digests: [("cargo".to_string(), "sha256:bb".into())]
+                    .into_iter()
+                    .collect(),
                 model_revision: Some("rev-9".into()),
             },
         )
@@ -237,7 +263,11 @@ mod tests {
     impl DomainTokenGate for HumanGate {
         fn consume_for(&self, _digest: &str) -> Result<bool, String> {
             // single-use: the first consume succeeds, the second sees false
-            if self.valid && !self.consumed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            if self.valid
+                && !self
+                    .consumed
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
                 Ok(true)
             } else if self.valid {
                 Ok(false) // token already consumed (T29 C4 semantics)
@@ -271,7 +301,10 @@ mod tests {
         let (st, d) = bundle_store();
         let (p1, _) = profile_from_bundle(&st, &d, "a").unwrap();
         let (p2, _) = profile_from_bundle(&st, &d, "b").unwrap();
-        assert_eq!(p1, p2, "same bundle -> same profile, no free-floating state");
+        assert_eq!(
+            p1, p2,
+            "same bundle -> same profile, no free-floating state"
+        );
         assert_eq!(p1.hash(), p2.hash());
         // tool allowlist derives from the pinned tools
         assert!(p1.tool_allowlist.contains(&"cargo".to_string()));
@@ -296,22 +329,31 @@ mod tests {
         let (mut st, d) = bundle_store();
         let mut events = Vec::new();
         // NO valid domain token: issuance refused
-        let no_gate = HumanGate { valid: false, consumed: Default::default() };
+        let no_gate = HumanGate {
+            valid: false,
+            consumed: Default::default(),
+        };
         assert!(matches!(
             issue_bundle_token_for_domain(&mut st, &mut events, &no_gate, &d, "tok-1"),
             Err(WiringError::TokenWithoutDomain)
         ));
         assert!(st.tokens_len() == 0);
         // valid domain token: issuance succeeds + governance pair
-        let gate = HumanGate { valid: true, consumed: Default::default() };
+        let gate = HumanGate {
+            valid: true,
+            consumed: Default::default(),
+        };
         issue_bundle_token_for_domain(&mut st, &mut events, &gate, &d, "tok-1").unwrap();
         assert_eq!(st.tokens_len(), 1);
         assert_eq!(events.len(), 2, "Pending + Committed bridge events");
         // DOUBLE ISSUANCE with the same (now consumed) domain token: refused
-        assert!(matches!(
-            issue_bundle_token_for_domain(&mut st, &mut events, &gate, &d, "tok-2"),
-            Err(WiringError::TokenWithoutDomain)
-        ), "domain token single-use semantics flow through the bridge");
+        assert!(
+            matches!(
+                issue_bundle_token_for_domain(&mut st, &mut events, &gate, &d, "tok-2"),
+                Err(WiringError::TokenWithoutDomain)
+            ),
+            "domain token single-use semantics flow through the bridge"
+        );
         // and the issued token promotes the bundle run
         let (_, record) = profile_from_bundle(&st, &d, "run-9").unwrap();
         promote_with_store_token(&mut st, &record, "tok-1").unwrap();
@@ -319,7 +361,13 @@ mod tests {
 
     #[test]
     fn run_profile_arg_classification() {
-        assert!(matches!(classify_profile_arg("bundle-abc123"), ProfileSource::Bundle { .. }));
-        assert!(matches!(classify_profile_arg("dep-bump-v1"), ProfileSource::Legacy { .. }));
+        assert!(matches!(
+            classify_profile_arg("bundle-abc123"),
+            ProfileSource::Bundle { .. }
+        ));
+        assert!(matches!(
+            classify_profile_arg("dep-bump-v1"),
+            ProfileSource::Legacy { .. }
+        ));
     }
 }

@@ -33,13 +33,19 @@ use crate::retro::InsightPipeline;
 pub fn field_class(field: &str) -> Option<PolicyClass> {
     Some(match field {
         // operational knobs
-        "poll_interval_secs" | "max_retries" | "queue_depth" | "tmp_retention_days" => PolicyClass::Operational,
+        "poll_interval_secs" | "max_retries" | "queue_depth" | "tmp_retention_days" => {
+            PolicyClass::Operational
+        }
         // candidate-affecting (worker behavior)
-        "model_id" | "prompt_template" | "tool_allowlist" | "env_allowlist"
-        | "seed" | "temperature" | "route" | "lesson_selection" => PolicyClass::CandidateAffecting,
+        "model_id" | "prompt_template" | "tool_allowlist" | "env_allowlist" | "seed"
+        | "temperature" | "route" | "lesson_selection" => PolicyClass::CandidateAffecting,
         // protected governance
-        "judging_policy" | "metric_definition" | "cohort_definition"
-        | "weight_rule" | "evaluator_partition" | "source_history" => PolicyClass::ProtectedGovernance,
+        "judging_policy"
+        | "metric_definition"
+        | "cohort_definition"
+        | "weight_rule"
+        | "evaluator_partition"
+        | "source_history" => PolicyClass::ProtectedGovernance,
         _ => return None, // unclassified -> fail closed
     })
 }
@@ -120,18 +126,28 @@ pub struct HardenedApply;
 #[derive(Debug, Clone, PartialEq)]
 pub enum HardenedError {
     /// astra's substitution test: command content != filed content
-    ContentMismatch { detail: String },
+    ContentMismatch {
+        detail: String,
+    },
     /// unclassified field — fail closed
-    UnclassifiedField { field: String },
+    UnclassifiedField {
+        field: String,
+    },
     /// a CandidateAffecting FIELD routes the whole proposal to M3
-    FieldNeedsM3 { field: String },
+    FieldNeedsM3 {
+        field: String,
+    },
     Delegate(ApplyError),
 }
 
 impl HardenedApply {
     /// Compute the digest the owner's command MUST carry, from the
     /// filed proposal — complete content, not insight+evidence only.
-    pub fn command_digest_for(pipeline: &InsightPipeline, insight_id: &str, base_policy_version: u32) -> Option<String> {
+    pub fn command_digest_for(
+        pipeline: &InsightPipeline,
+        insight_id: &str,
+        base_policy_version: u32,
+    ) -> Option<String> {
         let rec = pipeline
             .proposals()
             .into_iter()
@@ -215,7 +231,9 @@ impl HardenedApply {
                 }
                 Some(PolicyClass::ProtectedGovernance) => {
                     return Err(HardenedError::ContentMismatch {
-                        detail: format!("protected field {f} in a filed proposal — ingestion should have refused"),
+                        detail: format!(
+                            "protected field {f} in a filed proposal — ingestion should have refused"
+                        ),
                     });
                 }
                 Some(PolicyClass::Operational) | Some(PolicyClass::Unclassified) => {}
@@ -255,7 +273,10 @@ mod tests {
             insight_id: "I1".into(),
             claim: "c".into(),
             evidence: e,
-            proposal: Some(PolicyDiff { target: target.into(), changes }),
+            proposal: Some(PolicyDiff {
+                target: target.into(),
+                changes,
+            }),
             prediction: Some(Prediction {
                 metric: "retry_rate_by_task_class".into(),
                 direction: "down".into(),
@@ -287,7 +308,9 @@ mod tests {
     }
 
     fn ok_changes() -> BTreeMap<String, String> {
-        [("max_retries".to_string(), "2".to_string())].into_iter().collect()
+        [("max_retries".to_string(), "2".to_string())]
+            .into_iter()
+            .collect()
     }
 
     #[test]
@@ -347,7 +370,10 @@ mod tests {
         let mut cmd = cmd_for(&p, d);
         cmd.prediction.threshold = "<0.99".into(); // relaxed after review
         let err = HardenedApply::verify_binding(&p, &cmd, 0).unwrap_err();
-        assert!(matches!(err, HardenedError::ContentMismatch { .. }), "the prediction is bound");
+        assert!(
+            matches!(err, HardenedError::ContentMismatch { .. }),
+            "the prediction is bound"
+        );
     }
 
     #[test]
@@ -355,7 +381,10 @@ mod tests {
         let p = pipeline(ok_changes(), "poll_interval");
         let d0 = HardenedApply::command_digest_for(&p, "I1", 0).unwrap();
         let d1 = HardenedApply::command_digest_for(&p, "I1", 1).unwrap();
-        assert_ne!(d0, d1, "commands reviewed against different versions are different authorizations");
+        assert_ne!(
+            d0, d1,
+            "commands reviewed against different versions are different authorizations"
+        );
         // correct digest but stale version
         assert!(matches!(
             HardenedApply::verify_binding(&p, &cmd_for(&p, d0), 1),
@@ -385,18 +414,26 @@ mod tests {
         let p = pipeline(changes, "poll_interval");
         let d = HardenedApply::command_digest_for(&p, "I1", 0).unwrap();
         let err = HardenedApply::verify_binding(&p, &cmd_for(&p, d), 0).unwrap_err();
-        assert!(matches!(err, HardenedError::ContentMismatch { detail } if detail.contains("protected field weight_rule")));
+        assert!(
+            matches!(err, HardenedError::ContentMismatch { detail } if detail.contains("protected field weight_rule"))
+        );
     }
 
     #[test]
     fn classify_diff_takes_strongest() {
-        let mut c: BTreeMap<String, String> = [("max_retries".to_string(), "2".to_string())].into_iter().collect();
+        let mut c: BTreeMap<String, String> = [("max_retries".to_string(), "2".to_string())]
+            .into_iter()
+            .collect();
         assert_eq!(classify_diff(&c), Some(PolicyClass::Operational));
         c.insert("model_id".to_string(), "m".to_string());
         assert_eq!(classify_diff(&c), Some(PolicyClass::CandidateAffecting));
         c.insert("judging_policy".to_string(), "x".to_string());
         assert_eq!(classify_diff(&c), Some(PolicyClass::ProtectedGovernance));
         c.insert("mystery".to_string(), "x".to_string());
-        assert_eq!(classify_diff(&c), None, "unclassified poisons the whole diff");
+        assert_eq!(
+            classify_diff(&c),
+            None,
+            "unclassified poisons the whole diff"
+        );
     }
 }

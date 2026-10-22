@@ -61,7 +61,12 @@ pub enum JiraError {
     Malformed,
 }
 
-pub fn verify_signature(secret: &[u8], body: &[u8], timestamp: u64, received: &str) -> Result<(), JiraError> {
+pub fn verify_signature(
+    secret: &[u8],
+    body: &[u8],
+    timestamp: u64,
+    received: &str,
+) -> Result<(), JiraError> {
     let mut mac = Sha256::new();
     mac.update(timestamp.to_be_bytes());
     mac.update(b".");
@@ -82,7 +87,10 @@ pub fn verify_signature(secret: &[u8], body: &[u8], timestamp: u64, received: &s
     }
     // timestamp window: replay bound (a captured request older than
     // MAX_SKEW is refused even with a valid signature)
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     if now.abs_diff(timestamp) > MAX_SKEW_SECS {
         return Err(JiraError::Stale);
     }
@@ -113,15 +121,25 @@ pub fn parse_event(body: &str) -> Result<JiraEvent, JiraError> {
         _ => JiraEventKind::Ignored,
     };
     let issue = obj.get("issue").ok_or(JiraError::Malformed)?;
-    let instance = obj.get("instance").and_then(|x| x.as_str()).unwrap_or("default");
-    let key = issue.get("key").and_then(|x| x.as_str()).ok_or(JiraError::Malformed)?;
+    let instance = obj
+        .get("instance")
+        .and_then(|x| x.as_str())
+        .unwrap_or("default");
+    let key = issue
+        .get("key")
+        .and_then(|x| x.as_str())
+        .ok_or(JiraError::Malformed)?;
     let reporter_id = issue
         .get("reporter_account_id")
         .and_then(|x| x.as_str())
         .or_else(|| obj.get("actor_account_id").and_then(|x| x.as_str()))
         .unwrap_or("anonymous")
         .to_string();
-    let title = issue.get("title").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let title = issue
+        .get("title")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
     let body_text = obj
         .get("comment")
         .and_then(|c| c.get("body"))
@@ -176,7 +194,11 @@ impl JiraIntake {
         let mut out: String = String::new();
         let items: Vec<&String> = self.seen.iter().collect();
         // keep the newest 10k entries
-        let keep = if items.len() > 10_000 { &items[items.len() - 10_000..] } else { &items[..] };
+        let keep = if items.len() > 10_000 {
+            &items[items.len() - 10_000..]
+        } else {
+            &items[..]
+        };
         for id in keep {
             out.push_str(id);
             out.push('\n');
@@ -187,13 +209,22 @@ impl JiraIntake {
     /// The admission pipeline for one webhook delivery. Returns the
     /// drafts to create. All rejections are silent-200 style (the
     /// sender is a webhook; we never leak internal reasoning).
-    pub fn deliver(&mut self, body: &str, timestamp: u64, signature: &str) -> PortResult<Vec<OrderDraft>> {
+    pub fn deliver(
+        &mut self,
+        body: &str,
+        timestamp: u64,
+        signature: &str,
+    ) -> PortResult<Vec<OrderDraft>> {
         // 1. transport authenticity BEFORE parsing (#9)
         if let Err(e) = verify_signature(&self.secret, body.as_bytes(), timestamp, signature) {
-            return Err(PortError::Permanent(format!("jira webhook rejected: {e:?}")));
+            return Err(PortError::Permanent(format!(
+                "jira webhook rejected: {e:?}"
+            )));
         }
         if body.len() > MAX_BODY {
-            return Err(PortError::Permanent("jira webhook rejected: TooLarge".into()));
+            return Err(PortError::Permanent(
+                "jira webhook rejected: TooLarge".into(),
+            ));
         }
         let ev = match parse_event(body) {
             Ok(e) => e,
@@ -220,7 +251,8 @@ impl JiraIntake {
             }
         }
         self.seen.insert(ev.event_id.clone());
-        self.version_floor.insert(ev.issue_key.clone(), ev.issue_version);
+        self.version_floor
+            .insert(ev.issue_key.clone(), ev.issue_version);
         self.persist();
 
         // 5. 2-event contract: only creations produce orders; comments
@@ -275,7 +307,10 @@ mod tests {
     }
 
     fn now() -> u64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
     }
 
     fn tmpdir() -> std::path::PathBuf {
@@ -314,7 +349,14 @@ mod tests {
         // no signature
         assert!(j.deliver(&body, ts, "").is_err());
         // wrong signature
-        assert!(j.deliver(&body, ts, &sign(&body, ts).chars().rev().collect::<String>()).is_err());
+        assert!(
+            j.deliver(
+                &body,
+                ts,
+                &sign(&body, ts).chars().rev().collect::<String>()
+            )
+            .is_err()
+        );
         // wrong secret
         let other = {
             let mut mac = Sha256::new();
@@ -362,7 +404,11 @@ mod tests {
         }
         // restart: fresh instance, same durable state dir
         let mut j2 = JiraIntake::new(SECRET.to_vec(), &dir, "bot").unwrap();
-        assert_eq!(j2.deliver(&body, ts, &sign(&body, ts)).unwrap().len(), 0, "no redelivery after restart");
+        assert_eq!(
+            j2.deliver(&body, ts, &sign(&body, ts)).unwrap().len(),
+            0,
+            "no redelivery after restart"
+        );
     }
 
     #[test]
@@ -402,13 +448,17 @@ mod tests {
         let c = comment_body("e9", "PROJ-7", "human-2", 1);
         assert_eq!(j.deliver(&c, ts, &sign(&c, ts)).unwrap().len(), 0);
         // other event types: ignored, no error
-        let upd = r#"{"event_id":"e10","type":"issue_updated","issue":{"key":"PROJ-7","version":2}}"#;
+        let upd =
+            r#"{"event_id":"e10","type":"issue_updated","issue":{"key":"PROJ-7","version":2}}"#;
         assert_eq!(j.deliver(upd, ts, &sign(upd, ts)).unwrap().len(), 0);
         // creation: order
         let cr = created_body("e11", "PROJ-7", "human-2", 2);
         let drafts = j.deliver(&cr, ts, &sign(&cr, ts)).unwrap();
         assert_eq!(drafts.len(), 1);
-        assert!(matches!(drafts[0].external.source, foundry_domain::Source::Jira));
+        assert!(matches!(
+            drafts[0].external.source,
+            foundry_domain::Source::Jira
+        ));
         assert_eq!(drafts[0].external.external_id, "jira:acme/PROJ-7");
     }
 

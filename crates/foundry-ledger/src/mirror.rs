@@ -111,7 +111,6 @@ impl Mirror {
 
     /// Durable append (write + flush + fsync) — journal-commit path.
     pub fn append_durable(&self, row: &LedgerRow) -> std::io::Result<()> {
-        use std::os::unix::fs::FileExt;
         let line = serde_json::to_string(&MirrorLine::from(row))
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         let mut f = std::fs::OpenOptions::new()

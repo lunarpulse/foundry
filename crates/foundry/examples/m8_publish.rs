@@ -19,8 +19,8 @@ use std::path::{Path, PathBuf};
 use foundry_domain::order::{ExternalRef, Order, Source};
 use foundry_domain::workdir::workdir_path;
 use foundry_domain::{OrderState, PublishOutcome};
-use foundry_orch::stream::{Stream, StreamRuntime};
 use foundry_orch::OrchestrationLog;
+use foundry_orch::stream::{Stream, StreamRuntime};
 
 // ─── run.json — ExternalRef 영속화 (v1.6 r3-MAJOR-2) ─────────────
 
@@ -42,7 +42,12 @@ impl RunMeta {
         let run_suffix = format!("r{seq}");
         let order_id = format!("o-{issue}-{run_suffix}");
         let run_dir = scratch_dir().join(format!("m8pub-{issue}-{run_suffix}"));
-        Self { run_dir, issue, order_id, run_suffix }
+        Self {
+            run_dir,
+            issue,
+            order_id,
+            run_suffix,
+        }
     }
 
     fn save(&self) {
@@ -78,7 +83,10 @@ impl RunMeta {
         ExternalRef {
             source: Source::Intake,
             external_id: format!("lunarpulse/foundary-demo#{}", self.issue),
-            dedup_key: format!("lunarpulse/foundary-demo#{}:{}", self.issue, self.run_suffix),
+            dedup_key: format!(
+                "lunarpulse/foundary-demo#{}:{}",
+                self.issue, self.run_suffix
+            ),
         }
     }
 }
@@ -122,12 +130,19 @@ fn main() {
             })
         }
         _ => {
-            eprintln!("사용법: --issue <n> | --resume <run-dir> [--notify-mode console|discord|all]");
+            eprintln!(
+                "사용법: --issue <n> | --resume <run-dir> [--notify-mode console|discord|all]"
+            );
             std::process::exit(64);
         }
     };
 
-    println!("order={} run={} dir={}", meta.order_id, meta.run_suffix, meta.run_dir.display());
+    println!(
+        "order={} run={} dir={}",
+        meta.order_id,
+        meta.run_suffix,
+        meta.run_dir.display()
+    );
     let ap_db = meta.run_dir.join("ap.db");
     let orch_db = meta.run_dir.join("orch.db");
     let wd = workdir_path(&meta.order_id, 1); // 공식 빌더 경로 (D1)
@@ -142,19 +157,30 @@ fn main() {
         vec![(meta.order_id.clone(), "s-live".into())],
     )
     .unwrap();
-    rt.add_stream(Stream::new_with_root("s-live", &meta.run_dir, "bmad-quickloop").unwrap()).unwrap();
-    rt.bind_approval_ledger(foundry_approval::ApprovalLedger::open(&ap_db).unwrap()).unwrap();
+    rt.add_stream(Stream::new_with_root("s-live", &meta.run_dir, "bmad-quickloop").unwrap())
+        .unwrap();
+    rt.bind_approval_ledger(foundry_approval::ApprovalLedger::open(&ap_db).unwrap())
+        .unwrap();
 
     // ── 주문 입장 (새 런만 — 재개는 건너뜀) ──────────────────────
     let fresh = issue.is_some();
     if fresh {
-        let mut o = Order::new(meta.order_id.clone(), meta.external_ref(), chrono::Utc::now());
+        let mut o = Order::new(
+            meta.order_id.clone(),
+            meta.external_ref(),
+            chrono::Utc::now(),
+        );
         o.force_state_for_test(OrderState::Received, 1);
         rt.dispatch(&meta.order_id, o).unwrap();
-        println!("[1/8] 주문 입장 (Intake, dedup #{}:{})", meta.issue, meta.run_suffix);
+        println!(
+            "[1/8] 주문 입장 (Intake, dedup #{}:{})",
+            meta.issue, meta.run_suffix
+        );
 
         // ── 실 Die 세그먼트 ─────────────────────────────────────
-        let st = rt.start_die_segment("s-live", &meta.order_id, "m8pub").unwrap();
+        let st = rt
+            .start_die_segment("s-live", &meta.order_id, "m8pub")
+            .unwrap();
         println!("[2/8] Die 세그먼트 시작: {st:?}");
         std::fs::create_dir_all(&wd).unwrap();
         let harness = foundry_harness_cli::CliHarness::new(
@@ -162,7 +188,11 @@ fn main() {
             "coding",
             900,
         );
-        let order = rt.stream("s-live").unwrap().order_snapshot(&meta.order_id).unwrap();
+        let order = rt
+            .stream("s-live")
+            .unwrap()
+            .order_snapshot(&meta.order_id)
+            .unwrap();
         let die = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -173,12 +203,20 @@ fn main() {
             });
         match die {
             Ok(out) if out.exit_code == 0 => {
-                println!("       Die 완료: {}", &out.result_commit[..12.min(out.result_commit.len())]);
-                let st = rt.finish_die_segment("s-live", &meta.order_id, "m8pub", &out).unwrap();
+                println!(
+                    "       Die 완료: {}",
+                    &out.result_commit[..12.min(out.result_commit.len())]
+                );
+                let st = rt
+                    .finish_die_segment("s-live", &meta.order_id, "m8pub", &out)
+                    .unwrap();
                 println!("[3/8] 세그먼트 종결: {st:?}");
             }
             Ok(out) => {
-                eprintln!("[3/8] Die 거부: exit={} — 헤드룸 없음 또는 태스크 파싱 실패", out.exit_code);
+                eprintln!(
+                    "[3/8] Die 거부: exit={} — 헤드룸 없음 또는 태스크 파싱 실패",
+                    out.exit_code
+                );
                 std::process::exit(3);
             }
             Err(e) => {
@@ -196,17 +234,28 @@ fn main() {
             .artifact_digest
             .unwrap_or_default();
         let grant = format!("ship-{}", meta.order_id);
-        rt.approve_at_gate("s-live", &meta.order_id, "m8pub", &grant, "ship", &digest).unwrap();
-        println!("[4/8] 그랜트 {grant} CONSUMED — digest={}", &digest[..12.min(digest.len())]);
+        rt.approve_at_gate("s-live", &meta.order_id, "m8pub", &grant, "ship", &digest)
+            .unwrap();
+        println!(
+            "[4/8] 그랜트 {grant} CONSUMED — digest={}",
+            &digest[..12.min(digest.len())]
+        );
     }
 
     // ── 발행 (publish_precheck → publisher → confirm_published) ─
     let material = rt.publish_precheck("s-live", &meta.order_id).unwrap();
-    println!("[5/8] 발행 precheck 통과: op_id={} attempt={}", material.op_id, material.attempt);
+    println!(
+        "[5/8] 발행 precheck 통과: op_id={} attempt={}",
+        material.op_id, material.attempt
+    );
 
     // 주문 스냅샷 — ExternalRef는 run.json에서 복원(r3-MAJOR-2:
     // replay 미복원으로 Closes #N 누락 방지).
-    let mut order = rt.stream("s-live").unwrap().order_snapshot(&meta.order_id).unwrap();
+    let mut order = rt
+        .stream("s-live")
+        .unwrap()
+        .order_snapshot(&meta.order_id)
+        .unwrap();
     order.external = meta.external_ref();
 
     let publisher = foundry_watch::github_publisher::GithubPublisher {
@@ -220,7 +269,11 @@ fn main() {
         .enable_all()
         .build()
         .unwrap()
-        .block_on(async { publisher.publish(&order, &material.op_id, &material.digest).await });
+        .block_on(async {
+            publisher
+                .publish(&order, &material.op_id, &material.digest)
+                .await
+        });
     let pr_url = match outcome {
         Ok(PublishOutcome::Confirmed { pr_url }) if pr_url.starts_with("https://") => pr_url,
         Ok(PublishOutcome::Confirmed { pr_url }) => {
@@ -229,18 +282,26 @@ fn main() {
             std::process::exit(4);
         }
         Ok(other) => {
-            eprintln!("[5/8] 발행 결과 불확실({other:?}) — 보존: --resume {}", meta.run_dir.display());
+            eprintln!(
+                "[5/8] 발행 결과 불확실({other:?}) — 보존: --resume {}",
+                meta.run_dir.display()
+            );
             std::process::exit(4);
         }
         Err(e) => {
-            eprintln!("[5/8] 발행 실패({e:?}) — 보존: --resume {}", meta.run_dir.display());
+            eprintln!(
+                "[5/8] 발행 실패({e:?}) — 보존: --resume {}",
+                meta.run_dir.display()
+            );
             std::process::exit(4);
         }
     };
     println!("       PR 생성: {pr_url}");
 
     // ── Shipped 확정 ───────────────────────────────────────────
-    let st = rt.confirm_published("s-live", &meta.order_id, "m8pub", &pr_url).unwrap();
+    let st = rt
+        .confirm_published("s-live", &meta.order_id, "m8pub", &pr_url)
+        .unwrap();
     println!("[6/8] Shipped 확정: {st:?}");
 
     // ── 알림 (관측 플레인 — 실패해도 진행) ──────────────────────
@@ -268,15 +329,27 @@ fn main() {
         .iter()
         .find(|r| {
             r.order_id == meta.order_id
-                && r.event_json.as_deref().and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-                    .is_some_and(|v| v.get("type").and_then(|t| t.as_str()) == Some("publish_confirmed"))
+                && r.event_json
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                    .is_some_and(|v| {
+                        v.get("type").and_then(|t| t.as_str()) == Some("publish_confirmed")
+                    })
         })
-        .or_else(|| rows.iter().find(|r| r.order_id == meta.order_id && r.to_state == "Shipped"))
+        .or_else(|| {
+            rows.iter()
+                .find(|r| r.order_id == meta.order_id && r.to_state == "Shipped")
+        })
         .expect("Shipped journal row");
-    println!("[8/8] 증거: 저널 {}행, Shipped 행 seq={} pr_url 포함={}",
+    println!(
+        "[8/8] 증거: 저널 {}행, Shipped 행 seq={} pr_url 포함={}",
         rows.len(),
         shipped_row.seq,
-        shipped_row.event_json.as_deref().unwrap_or("").contains(&pr_url),
+        shipped_row
+            .event_json
+            .as_deref()
+            .unwrap_or("")
+            .contains(&pr_url),
     );
     println!("run-dir(보존): {}", meta.run_dir.display());
     println!("머지는 인간 리뷰 소유 — PR에서 확인하세요.");

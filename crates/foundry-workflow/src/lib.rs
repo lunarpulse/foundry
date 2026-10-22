@@ -24,37 +24,69 @@
 //! 동일한 승인·동일한 거부를 산출하고, 관측 벡터는 결정적이다 —
 //! 같은 이벤트 스트림 → 같은 관측 바이트열.
 
-
 /// **T56**: 승인 원장의 프로덕션 어댑터 — ApprovalLedgerHook 구현.
 /// (게이트·서비스가 사용하는 정상 경로; 단위 테스트용 로컬 정의는 유지.)
 pub struct ApprovalLedgerAdapter(pub foundry_approval::ApprovalLedger);
 
 impl ApprovalLedgerHook for ApprovalLedgerAdapter {
-    fn reserve(&mut self, grant_id: String, scope: serde_json::Value, exec_id: String, dispatch_seq: u64) -> Result<u64, String> {
-        self.0.reserve_grant(&grant_id, &scope, &exec_id, dispatch_seq).map(|r| r.fence_token).map_err(|e| format!("{e:?}"))
+    fn reserve(
+        &mut self,
+        grant_id: String,
+        scope: serde_json::Value,
+        exec_id: String,
+        dispatch_seq: u64,
+    ) -> Result<u64, String> {
+        self.0
+            .reserve_grant(&grant_id, &scope, &exec_id, dispatch_seq)
+            .map(|r| r.fence_token)
+            .map_err(|e| format!("{e:?}"))
     }
-    fn begin_apply(&mut self, grant_id: String, exec_id: String, dispatch_seq: u64, fence: u64) -> Result<(), String> {
-        self.0.begin_apply(&grant_id, &exec_id, dispatch_seq, fence).map_err(|e| format!("{e:?}"))
+    fn begin_apply(
+        &mut self,
+        grant_id: String,
+        exec_id: String,
+        dispatch_seq: u64,
+        fence: u64,
+    ) -> Result<(), String> {
+        self.0
+            .begin_apply(&grant_id, &exec_id, dispatch_seq, fence)
+            .map_err(|e| format!("{e:?}"))
     }
-    fn release(&mut self, grant_id: String, exec_id: String, dispatch_seq: u64, expect_fence: u64) -> Result<(), String> {
-        self.0.release_reservation_fenced(&grant_id, &exec_id, dispatch_seq, expect_fence).map_err(|e| format!("{e:?}"))
+    fn release(
+        &mut self,
+        grant_id: String,
+        exec_id: String,
+        dispatch_seq: u64,
+        expect_fence: u64,
+    ) -> Result<(), String> {
+        self.0
+            .release_reservation_fenced(&grant_id, &exec_id, dispatch_seq, expect_fence)
+            .map_err(|e| format!("{e:?}"))
     }
-    fn finalize(&mut self, grant_id: String, exec_id: String, dispatch_seq: u64, fence: u64) -> Result<(), String> {
-        self.0.finalize_grant(&grant_id, &exec_id, dispatch_seq, fence).map_err(|e| format!("{e:?}"))
+    fn finalize(
+        &mut self,
+        grant_id: String,
+        exec_id: String,
+        dispatch_seq: u64,
+        fence: u64,
+    ) -> Result<(), String> {
+        self.0
+            .finalize_grant(&grant_id, &exec_id, dispatch_seq, fence)
+            .map_err(|e| format!("{e:?}"))
     }
 }
 
 pub mod dsl;
+pub mod executor_failures;
+pub mod recovery;
+pub mod replay;
+pub mod router;
 pub mod skill;
 pub mod validator;
-pub mod router;
-pub mod executor_failures;
-pub mod replay;
-pub mod recovery;
 
 use foundry_domain::order::{Order, OrderEvent, OrderState};
 use foundry_domain::ports::{DieOutput, Ledger};
-use foundry_domain::workflow_encoding::{edge_event_of, EdgeTarget, EmbeddedWorkflow};
+use foundry_domain::workflow_encoding::{EdgeTarget, EmbeddedWorkflow, edge_event_of};
 use std::collections::HashMap;
 
 /// 실행 식별자 (op_id 관례 승계).
@@ -70,14 +102,26 @@ pub enum EngineError {
     /// 도메인이 수용했는데 엣지가 없거나 그 반대 — E1/E2 파괴. 치명.
     EncodingDrift { detail: String },
     /// B2: 예산 소진 — 정지 + 정의된 상태(발명 없음).
-    BudgetExhausted { exec_id: ExecId, steps: u32, cap: u32 },
+    BudgetExhausted {
+        exec_id: ExecId,
+        steps: u32,
+        cap: u32,
+    },
     /// 도메인 가드 거부 (stale attempt 등) — 상태 불변.
     DomainRefusal { detail: String },
     /// T53a (v6): 라이브 승인 디스패치의 인가 실패 — 도메인 전이 미발생,
     /// 주문 저널 미기록, 실행 래치. 인가는 승인 원장이 소유한다.
-    AuthorizationRefused { exec_id: ExecId, grant_id: Option<String>, reason: String },
+    AuthorizationRefused {
+        exec_id: ExecId,
+        grant_id: Option<String>,
+        reason: String,
+    },
     /// T55a (v6 B5): 매핑 불능 실행기 실패 — 주문 상태 불변, 실행 래치.
-    UnmappableFailure { exec_id: ExecId, node: String, error: String },
+    UnmappableFailure {
+        exec_id: ExecId,
+        node: String,
+        error: String,
+    },
     /// T56 P0: 저널 append 실패 — 전이 롤백됨, 관측 미발행, 실행 래치.
     Infrastructure { detail: String },
 }
@@ -92,12 +136,36 @@ pub struct GrantRef {
 /// 구현체(foundry-approval)가 소유: 예약·해제·확정의 실제 원자성은
 /// 원장 트랜잭션이 보장한다. Err(String)은 인가 거부 사유.
 pub trait ApprovalLedgerHook {
-    fn reserve(&mut self, grant_id: String, scope: serde_json::Value, exec_id: String, dispatch_seq: u64) -> Result<u64, String>;
+    fn reserve(
+        &mut self,
+        grant_id: String,
+        scope: serde_json::Value,
+        exec_id: String,
+        dispatch_seq: u64,
+    ) -> Result<u64, String>;
     /// apply 직전 **원자적 적용 시작** (T53a-r2 BLOCKER) — 즉시 쓰기
     /// 트랜잭션에서 소유권 검증 후 state=Applying 전환·커밋.
-    fn begin_apply(&mut self, grant_id: String, exec_id: String, dispatch_seq: u64, fence: u64) -> Result<(), String>;
-    fn release(&mut self, grant_id: String, exec_id: String, dispatch_seq: u64, expect_fence: u64) -> Result<(), String>;
-    fn finalize(&mut self, grant_id: String, exec_id: String, dispatch_seq: u64, fence: u64) -> Result<(), String>;
+    fn begin_apply(
+        &mut self,
+        grant_id: String,
+        exec_id: String,
+        dispatch_seq: u64,
+        fence: u64,
+    ) -> Result<(), String>;
+    fn release(
+        &mut self,
+        grant_id: String,
+        exec_id: String,
+        dispatch_seq: u64,
+        expect_fence: u64,
+    ) -> Result<(), String>;
+    fn finalize(
+        &mut self,
+        grant_id: String,
+        exec_id: String,
+        dispatch_seq: u64,
+        fence: u64,
+    ) -> Result<(), String>;
 }
 
 /// B2 실행 예산.
@@ -174,16 +242,29 @@ pub struct WorkflowEngine {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum HaltCause {
-    BudgetExhausted { steps: u32, cap: u32 },
-    EncodingDrift { detail: String },
+    BudgetExhausted {
+        steps: u32,
+        cap: u32,
+    },
+    EncodingDrift {
+        detail: String,
+    },
     /// T53a (v6 E): 승인 계열 이벤트의 라이브 디스패치가 유효 grant
     /// 예약에 실패 — 실행 래치. detail은 바이트 동일 재생.
-    AuthorizationRefused { grant_id: Option<String>, reason: String },
+    AuthorizationRefused {
+        grant_id: Option<String>,
+        reason: String,
+    },
     /// T55a (v6 B5/G14): 매핑 불능 실행기 오류 — 합법적 실패 엣지가 없는
     /// 상태. 엔진 래치, 주문 상태 불변 (새 상태 발명 금지).
-    UnmappableFailure { node: String, error: String },
+    UnmappableFailure {
+        node: String,
+        error: String,
+    },
     /// T56 P0: 저널 append 실패 — 인프라 계열 정지 (실행기·원장 아님).
-    Infrastructure { detail: String },
+    Infrastructure {
+        detail: String,
+    },
 }
 
 impl WorkflowEngine {
@@ -215,12 +296,18 @@ impl WorkflowEngine {
     /// (wf.lock_acquired — astra: "acquisition/release produce neither
     /// observations nor journal records").
     pub fn acquire(&mut self, order_id: &str, exec_id: &str) -> Result<(), EngineError> {
-        let l = self.locks.entry(order_id.to_string()).or_insert(OrderLock { held_by: None });
+        let l = self
+            .locks
+            .entry(order_id.to_string())
+            .or_insert(OrderLock { held_by: None });
         if let Some(by) = &l.held_by {
             if by == exec_id {
                 return Ok(());
             }
-            return Err(EngineError::LockHeld { order_id: order_id.into(), by: by.clone() });
+            return Err(EngineError::LockHeld {
+                order_id: order_id.into(),
+                by: by.clone(),
+            });
         }
         l.held_by = Some(exec_id.to_string());
         self.ops += 1;
@@ -319,7 +406,10 @@ impl WorkflowEngine {
             return Err(self.halted_error(exec_id));
         }
         // 승인 계열 이벤트 판별 — 인가가 필요한 전이만.
-        let needs_authority = matches!(event, OrderEvent::Approved { .. } | OrderEvent::Rejected { .. });
+        let needs_authority = matches!(
+            event,
+            OrderEvent::Approved { .. } | OrderEvent::Rejected { .. }
+        );
         if needs_authority {
             // 연산 정체성 — seq는 이 디스패치 내내 불변 (관측 수와 무관하게
             // 진입 시 1회 계산. astra T53-r1 MAJOR: release가 N-1을 쓰는
@@ -327,8 +417,12 @@ impl WorkflowEngine {
             let seq = self.next_dispatch_seq(exec_id);
             let scope_json = self.scope_for(order_id, event);
             let reservation = match grant {
-                None => Err("no grant presented (live approval dispatch requires a GrantRef)".to_string()),
-                Some(g) => approval.reserve(g.grant_id.clone(), scope_json, exec_id.to_string(), seq),
+                None => Err(
+                    "no grant presented (live approval dispatch requires a GrantRef)".to_string(),
+                ),
+                Some(g) => {
+                    approval.reserve(g.grant_id.clone(), scope_json, exec_id.to_string(), seq)
+                }
             };
             match reservation {
                 Ok(fence) => {
@@ -347,9 +441,13 @@ impl WorkflowEngine {
                         // 예산 — 잔여 스텝. dispatch_inner와 **동일 필터**
                         // (wf.lock_* 관측 제외 — astra r5 BLOCKER: 카운트
                         // 불일치가 precheck 오판을 냈다).
-                        let steps = self.observations.iter().filter(|o| {
-                            o.exec_id == exec_id && !o.event_family.starts_with("wf.lock_")
-                        }).count() as u32;
+                        let steps = self
+                            .observations
+                            .iter()
+                            .filter(|o| {
+                                o.exec_id == exec_id && !o.event_family.starts_with("wf.lock_")
+                            })
+                            .count() as u32;
                         if steps >= self.budget.max_steps {
                             return false;
                         }
@@ -366,18 +464,32 @@ impl WorkflowEngine {
                             }
                         }
                         // 엣지 — 부호화에 (패밀리, from) 존재.
-                        let from_state = self.orders.get(order_id).map(|o| o.state()).unwrap_or(OrderState::Received);
+                        let from_state = self
+                            .orders
+                            .get(order_id)
+                            .map(|o| o.state())
+                            .unwrap_or(OrderState::Received);
                         let fam = foundry_domain::workflow_encoding::edge_event_of(event);
-                        if !self.wf.edges.iter().any(|e| e.event == fam && e.from == from_state) {
+                        if !self
+                            .wf
+                            .edges
+                            .iter()
+                            .any(|e| e.event == fam && e.from == from_state)
+                        {
                             return false;
                         }
                         // 가드 — 현재 시도값에서 만족 가능.
-                        let cur_attempt = self.orders.get(order_id).map(|o| o.attempt()).unwrap_or(1);
-                        self.wf
-                            .edges
-                            .iter()
-                            .any(|e| e.event == fam && e.from == from_state
-                                && foundry_domain::workflow_encoding::guard_satisfied(&e.guard, event, cur_attempt))
+                        let cur_attempt =
+                            self.orders.get(order_id).map(|o| o.attempt()).unwrap_or(1);
+                        self.wf.edges.iter().any(|e| {
+                            e.event == fam
+                                && e.from == from_state
+                                && foundry_domain::workflow_encoding::guard_satisfied(
+                                    &e.guard,
+                                    event,
+                                    cur_attempt,
+                                )
+                        })
                     })();
                     if !can_apply {
                         // 전이가 나지 못한다 — begin_apply 없이 진행·거부.
@@ -389,7 +501,12 @@ impl WorkflowEngine {
                             // 적용은 절대 승인하지 않는다).
                             let detail = "precheck judged dispatch inapplicable but dispatch_inner APPLIED — engine invariant broken (precheck/inner logic divergence)".to_string();
                             if !self.halted.contains_key(exec_id) {
-                                self.halted.insert(exec_id.into(), HaltCause::EncodingDrift { detail: detail.clone() });
+                                self.halted.insert(
+                                    exec_id.into(),
+                                    HaltCause::EncodingDrift {
+                                        detail: detail.clone(),
+                                    },
+                                );
                             }
                             return Err(EngineError::EncodingDrift { detail });
                         }
@@ -397,13 +514,23 @@ impl WorkflowEngine {
                         if !matches!(&out, Ok(Outcome::Applied)) {
                             if let Some(g) = grant {
                                 // 해제 실패도 무시하지 않는다: 래치+전파.
-                                if let Err(cleanup) = approval.release(g.grant_id.clone(), exec_id.to_string(), seq, fence) {
+                                if let Err(cleanup) = approval.release(
+                                    g.grant_id.clone(),
+                                    exec_id.to_string(),
+                                    seq,
+                                    fence,
+                                ) {
                                     let detail = format!(
                                         "grant {} release FAILED after refusal: {cleanup} — recovery_scan will reconcile; exec halted",
                                         g.grant_id
                                     );
                                     if !self.halted.contains_key(exec_id) {
-                                        self.halted.insert(exec_id.into(), HaltCause::EncodingDrift { detail: detail.clone() });
+                                        self.halted.insert(
+                                            exec_id.into(),
+                                            HaltCause::EncodingDrift {
+                                                detail: detail.clone(),
+                                            },
+                                        );
                                     }
                                     return Err(EngineError::EncodingDrift { detail });
                                 }
@@ -416,16 +543,37 @@ impl WorkflowEngine {
                     // 즉시 쓰기 트랜잭션에서 소유권 검증+Applying 전환이
                     // 함께 커밋 — 검증↔전이 사이 회복 끼임 불가.
                     if let Some(g) = grant {
-                        if let Err(reason) = approval.begin_apply(g.grant_id.clone(), exec_id.to_string(), seq, fence) {
+                        if let Err(reason) = approval.begin_apply(
+                            g.grant_id.clone(),
+                            exec_id.to_string(),
+                            seq,
+                            fence,
+                        ) {
                             let grant_id = grant.map(|g| g.grant_id.clone());
                             if !self.halted.contains_key(exec_id) {
                                 self.halted.insert(
                                     exec_id.into(),
-                                    HaltCause::AuthorizationRefused { grant_id: grant_id.clone(), reason: reason.clone() },
+                                    HaltCause::AuthorizationRefused {
+                                        grant_id: grant_id.clone(),
+                                        reason: reason.clone(),
+                                    },
                                 );
-                                let _ = self.observe(exec_id, event, from_placeholder(), None, "-", Outcome::Refused { detail: "authorization refused (apply-intent lost)".into() });
+                                let _ = self.observe(
+                                    exec_id,
+                                    event,
+                                    from_placeholder(),
+                                    None,
+                                    "-",
+                                    Outcome::Refused {
+                                        detail: "authorization refused (apply-intent lost)".into(),
+                                    },
+                                );
                             }
-                            return Err(EngineError::AuthorizationRefused { exec_id: exec_id.into(), grant_id, reason });
+                            return Err(EngineError::AuthorizationRefused {
+                                exec_id: exec_id.into(),
+                                grant_id,
+                                reason,
+                            });
                         }
                     }
                     let out = self.dispatch_inner(order_id, exec_id, event, event_attempt);
@@ -434,7 +582,12 @@ impl WorkflowEngine {
                         // 거부/NoEdge/에러 전부 — 예약은 소비되지 않는다.
                         // (astra MAJOR: NoEdge가 grant를 소비하던 결함 폐쇄.)
                         if let Some(g) = grant {
-                            if let Err(cleanup) = approval.release(g.grant_id.clone(), exec_id.to_string(), seq, fence) {
+                            if let Err(cleanup) = approval.release(
+                                g.grant_id.clone(),
+                                exec_id.to_string(),
+                                seq,
+                                fence,
+                            ) {
                                 // astra r3/r4 MAJOR: 클린업 실패도 래치 —
                                 // 방치 예약은 회복이 정리하되 실행 정지.
                                 let detail = format!(
@@ -442,7 +595,12 @@ impl WorkflowEngine {
                                     g.grant_id
                                 );
                                 if !self.halted.contains_key(exec_id) {
-                                    self.halted.insert(exec_id.into(), HaltCause::EncodingDrift { detail: detail.clone() });
+                                    self.halted.insert(
+                                        exec_id.into(),
+                                        HaltCause::EncodingDrift {
+                                            detail: detail.clone(),
+                                        },
+                                    );
                                 }
                                 return Err(EngineError::EncodingDrift { detail });
                             }
@@ -451,14 +609,22 @@ impl WorkflowEngine {
                         // 전이 적용 성공 직후 — 확정. 확정 실패는 삼키지 않는다
                         // (astra BLOCKER): 그 상태로 Applied를 반환하면
                         // grant가 재사용 가능한 채 남는다. 치명 에러로 전파.
-                        if let Err(reason) = approval.finalize(g.grant_id.clone(), exec_id.to_string(), seq, fence) {
+                        if let Err(reason) =
+                            approval.finalize(g.grant_id.clone(), exec_id.to_string(), seq, fence)
+                        {
                             // astra r2 MAJOR: "halting exec" 주장을 실제로 —
                             // 래치. Applying이므로 회복은 CONSUMED로 완결한다.
                             let detail = format!(
-                                "grant {} finalized FAILED after transition: {reason} — recovery_scan will complete CONSUMED; exec halted", g.grant_id
+                                "grant {} finalized FAILED after transition: {reason} — recovery_scan will complete CONSUMED; exec halted",
+                                g.grant_id
                             );
                             if !self.halted.contains_key(exec_id) {
-                                self.halted.insert(exec_id.into(), HaltCause::EncodingDrift { detail: detail.clone() });
+                                self.halted.insert(
+                                    exec_id.into(),
+                                    HaltCause::EncodingDrift {
+                                        detail: detail.clone(),
+                                    },
+                                );
                             }
                             return Err(EngineError::EncodingDrift { detail });
                         }
@@ -473,11 +639,27 @@ impl WorkflowEngine {
                     if !self.halted.contains_key(exec_id) {
                         self.halted.insert(
                             exec_id.into(),
-                            HaltCause::AuthorizationRefused { grant_id: grant_id.clone(), reason: reason.clone() },
+                            HaltCause::AuthorizationRefused {
+                                grant_id: grant_id.clone(),
+                                reason: reason.clone(),
+                            },
                         );
-                        let _ = self.observe(exec_id, event, from_placeholder(), None, "-", Outcome::Refused { detail: "authorization refused (exec latched)".into() });
+                        let _ = self.observe(
+                            exec_id,
+                            event,
+                            from_placeholder(),
+                            None,
+                            "-",
+                            Outcome::Refused {
+                                detail: "authorization refused (exec latched)".into(),
+                            },
+                        );
                     }
-                    return Err(EngineError::AuthorizationRefused { exec_id: exec_id.into(), grant_id, reason });
+                    return Err(EngineError::AuthorizationRefused {
+                        exec_id: exec_id.into(),
+                        grant_id,
+                        reason,
+                    });
                 }
             }
         } else {
@@ -502,13 +684,19 @@ impl WorkflowEngine {
                 steps: *steps,
                 cap: *cap,
             },
-            HaltCause::EncodingDrift { detail } => EngineError::EncodingDrift { detail: detail.clone() },
-            HaltCause::AuthorizationRefused { grant_id, reason } => EngineError::AuthorizationRefused {
-                exec_id: exec_id.into(),
-                grant_id: grant_id.clone(),
-                reason: reason.clone(),
+            HaltCause::EncodingDrift { detail } => EngineError::EncodingDrift {
+                detail: detail.clone(),
             },
-            HaltCause::Infrastructure { detail } => EngineError::Infrastructure { detail: detail.clone() },
+            HaltCause::AuthorizationRefused { grant_id, reason } => {
+                EngineError::AuthorizationRefused {
+                    exec_id: exec_id.into(),
+                    grant_id: grant_id.clone(),
+                    reason: reason.clone(),
+                }
+            }
+            HaltCause::Infrastructure { detail } => EngineError::Infrastructure {
+                detail: detail.clone(),
+            },
             HaltCause::UnmappableFailure { node, error } => EngineError::UnmappableFailure {
                 exec_id: exec_id.into(),
                 node: node.clone(),
@@ -523,12 +711,23 @@ impl WorkflowEngine {
             return; // astra r2 MAJOR: 최초 사유 보존 — 덮지 않는다.
         }
         self.halted.insert(exec_id.into(), cause);
-        let _ = self.observe(exec_id, &foundry_domain::OrderEvent::Queued, from_placeholder(), None, "-", Outcome::Refused { detail });
+        let _ = self.observe(
+            exec_id,
+            &foundry_domain::OrderEvent::Queued,
+            from_placeholder(),
+            None,
+            "-",
+            Outcome::Refused { detail },
+        );
     }
 
     /// 이 실행의 다음 디스패치 일련번호 (연산 정체성 — 예약 키).
     fn next_dispatch_seq(&self, exec_id: &str) -> u64 {
-        self.observations.iter().filter(|o| o.exec_id == exec_id).count() as u64 + 1
+        self.observations
+            .iter()
+            .filter(|o| o.exec_id == exec_id)
+            .count() as u64
+            + 1
     }
 
     /// 승인 이벤트의 grant 스코프 — 주문 상태 + 활성 root에서 유도.
@@ -538,7 +737,10 @@ impl WorkflowEngine {
     fn scope_for(&self, order_id: &str, event: &OrderEvent) -> serde_json::Value {
         let root_scope = self.active_root.clone().unwrap_or_default();
         match event {
-            OrderEvent::Approved { intent, artifact_digest } => serde_json::json!({
+            OrderEvent::Approved {
+                intent,
+                artifact_digest,
+            } => serde_json::json!({
                 "order_id": order_id, "intent": intent, "artifact_digest": artifact_digest,
                 "root_scope": root_scope,
             }),
@@ -587,7 +789,7 @@ impl WorkflowEngine {
                 return Err(EngineError::LockHeld {
                     order_id: order_id.into(),
                     by: "<unheld>".into(),
-                })
+                });
             }
         }
         // G5: 결속된 실행은 자기 시점의 digest로 완결 — 스킬/정책
@@ -608,9 +810,16 @@ impl WorkflowEngine {
         if let Some(bound) = self.exec_bindings.get(exec_id).cloned() {
             if let Some(active) = &active_root_now {
                 if &bound != active {
-                    let _ = self.observe(exec_id, event, from_placeholder(), None, "-", Outcome::Refused {
-                        detail: "doc root changed mid-flight (G5: no mixing)".into(),
-                    });
+                    let _ = self.observe(
+                        exec_id,
+                        event,
+                        from_placeholder(),
+                        None,
+                        "-",
+                        Outcome::Refused {
+                            detail: "doc root changed mid-flight (G5: no mixing)".into(),
+                        },
+                    );
                     return Err(EngineError::EncodingDrift {
                         detail: format!(
                             "exec {exec_id} bound to {bound} but active root is {active} — refuse to mix"
@@ -634,7 +843,9 @@ impl WorkflowEngine {
         // code double-counted prior BudgetStopped rows as steps and
         // appended a new stop record each time).
         if let Some(HaltCause::EncodingDrift { detail }) = self.halted.get(exec_id) {
-            return Err(EngineError::EncodingDrift { detail: detail.clone() });
+            return Err(EngineError::EncodingDrift {
+                detail: detail.clone(),
+            });
         }
         if let Some(HaltCause::BudgetExhausted { steps, cap }) = self.halted.get(exec_id) {
             return Err(EngineError::BudgetExhausted {
@@ -643,7 +854,8 @@ impl WorkflowEngine {
                 cap: *cap,
             });
         }
-        if let Some(HaltCause::AuthorizationRefused { grant_id, reason }) = self.halted.get(exec_id) {
+        if let Some(HaltCause::AuthorizationRefused { grant_id, reason }) = self.halted.get(exec_id)
+        {
             return Err(EngineError::AuthorizationRefused {
                 exec_id: exec_id.into(),
                 grant_id: grant_id.clone(),
@@ -657,11 +869,19 @@ impl WorkflowEngine {
                 error: error.clone(),
             });
         }
-        let steps = self.observations.iter().filter(|o| {
-            &o.exec_id == exec_id && !o.event_family.starts_with("wf.lock_")
-        }).count() as u32;
+        let steps = self
+            .observations
+            .iter()
+            .filter(|o| &o.exec_id == exec_id && !o.event_family.starts_with("wf.lock_"))
+            .count() as u32;
         if steps >= self.budget.max_steps {
-            self.halted.insert(exec_id.into(), HaltCause::BudgetExhausted { steps, cap: self.budget.max_steps });
+            self.halted.insert(
+                exec_id.into(),
+                HaltCause::BudgetExhausted {
+                    steps,
+                    cap: self.budget.max_steps,
+                },
+            );
             let _ = self.observe(exec_id, event, from, None, "-", Outcome::BudgetStopped);
             return Err(EngineError::BudgetExhausted {
                 exec_id: exec_id.into(),
@@ -681,9 +901,13 @@ impl WorkflowEngine {
             .iter()
             .filter(|e| e.event == fam && e.from == from)
             .collect();
-        let edge = candidates
-            .iter()
-            .find(|e| foundry_domain::workflow_encoding::guard_satisfied(&e.guard, event, current_attempt_of(self.orders.get(order_id).unwrap())));
+        let edge = candidates.iter().find(|e| {
+            foundry_domain::workflow_encoding::guard_satisfied(
+                &e.guard,
+                event,
+                current_attempt_of(self.orders.get(order_id).unwrap()),
+            )
+        });
         let edge = match edge {
             Some(e) => (*e).clone(),
             None if candidates.is_empty() => {
@@ -699,8 +923,22 @@ impl WorkflowEngine {
                         let detail = format!(
                             "domain ACCEPTS {fam:?} from {from:?} but encoding has no edge (E1 broken)"
                         );
-                        self.halted.insert(exec_id.into(), HaltCause::EncodingDrift { detail: detail.clone() });
-                        let _ = self.observe(exec_id, event, from, None, "-", Outcome::Refused { detail: "encoding drift: no edge (exec latched)".into() });
+                        self.halted.insert(
+                            exec_id.into(),
+                            HaltCause::EncodingDrift {
+                                detail: detail.clone(),
+                            },
+                        );
+                        let _ = self.observe(
+                            exec_id,
+                            event,
+                            from,
+                            None,
+                            "-",
+                            Outcome::Refused {
+                                detail: "encoding drift: no edge (exec latched)".into(),
+                            },
+                        );
                         return Err(EngineError::EncodingDrift { detail });
                     }
                 }
@@ -711,15 +949,40 @@ impl WorkflowEngine {
                 let mut probe = self.orders.get(order_id).unwrap().clone();
                 match probe.transition(event.clone(), event_attempt) {
                     Err(_) => {
-                        let _ = self.observe(exec_id, event, from, None, "-", Outcome::Refused { detail: "no guard satisfied".into() });
-                        return Ok(Outcome::Refused { detail: "no guard satisfied (E7-consistent)".into() });
+                        let _ = self.observe(
+                            exec_id,
+                            event,
+                            from,
+                            None,
+                            "-",
+                            Outcome::Refused {
+                                detail: "no guard satisfied".into(),
+                            },
+                        );
+                        return Ok(Outcome::Refused {
+                            detail: "no guard satisfied (E7-consistent)".into(),
+                        });
                     }
                     Ok(_) => {
                         let detail = format!(
                             "domain ACCEPTS {fam:?} from {from:?} but NO matching edge's guard is satisfied (E7 broken)"
                         );
-                        self.halted.insert(exec_id.into(), HaltCause::EncodingDrift { detail: detail.clone() });
-                        let _ = self.observe(exec_id, event, from, None, "-", Outcome::Refused { detail: "encoding drift: no guard satisfied (exec latched)".into() });
+                        self.halted.insert(
+                            exec_id.into(),
+                            HaltCause::EncodingDrift {
+                                detail: detail.clone(),
+                            },
+                        );
+                        let _ = self.observe(
+                            exec_id,
+                            event,
+                            from,
+                            None,
+                            "-",
+                            Outcome::Refused {
+                                detail: "encoding drift: no guard satisfied (exec latched)".into(),
+                            },
+                        );
                         return Err(EngineError::EncodingDrift { detail });
                     }
                 }
@@ -743,7 +1006,8 @@ impl WorkflowEngine {
                     EdgeTarget::State(t) => {
                         *t == to
                             && (order.attempt() == before
-                                || (edge.event == foundry_domain::workflow_encoding::EdgeEvent::DieStarted
+                                || (edge.event
+                                    == foundry_domain::workflow_encoding::EdgeEvent::DieStarted
                                     && order.attempt() == before.max(1)))
                     }
                     EdgeTarget::BackEdge { to: t, .. } => *t == to && order.attempt() == before + 1,
@@ -759,8 +1023,22 @@ impl WorkflowEngine {
                     let detail = format!(
                         "destination mismatch: edge says {edge_repr} (domain reached {to:?}, attempt {before}->{after}) — E1/E2 violated; order ROLLED BACK, exec latched"
                     );
-                    self.halted.insert(exec_id.into(), HaltCause::EncodingDrift { detail: detail.clone() });
-                    let _ = self.observe(exec_id, event, from, None, guard_name(&edge.guard).as_str(), Outcome::Refused { detail: "encoding drift: destination mismatch (exec latched)".into() });
+                    self.halted.insert(
+                        exec_id.into(),
+                        HaltCause::EncodingDrift {
+                            detail: detail.clone(),
+                        },
+                    );
+                    let _ = self.observe(
+                        exec_id,
+                        event,
+                        from,
+                        None,
+                        guard_name(&edge.guard).as_str(),
+                        Outcome::Refused {
+                            detail: "encoding drift: destination mismatch (exec latched)".into(),
+                        },
+                    );
                     return Err(EngineError::EncodingDrift { detail });
                 }
                 // P0 (T56): 저널 배선 — append 성공 후에만 상태 공개·관측.
@@ -782,7 +1060,12 @@ impl WorkflowEngine {
                                 "journal append FAILED after transition: {e} — transition ROLLED BACK, no observation, exec latched (infrastructure)"
                             );
                             if !self.halted.contains_key(exec_id) {
-                                self.halted.insert(exec_id.into(), HaltCause::Infrastructure { detail: detail.clone() });
+                                self.halted.insert(
+                                    exec_id.into(),
+                                    HaltCause::Infrastructure {
+                                        detail: detail.clone(),
+                                    },
+                                );
                             }
                             // astra T56 MAJOR: append 실패는 관측도 내지 않는다
                             // — "no observation" 계약의 문자 그대로 이행.
@@ -791,14 +1074,32 @@ impl WorkflowEngine {
                     }
                 }
                 drop(order);
-                let _ = self.observe(exec_id, event, from, Some(to), guard_name(&edge.guard).as_str(), Outcome::Applied);
+                let _ = self.observe(
+                    exec_id,
+                    event,
+                    from,
+                    Some(to),
+                    guard_name(&edge.guard).as_str(),
+                    Outcome::Applied,
+                );
                 Ok(Outcome::Applied)
             }
             Err(e) => {
                 // 도메인 거부는 정상 경로 (가드) — EncodingDrift 아님:
                 // 엣지는 존재하지만 가드 조건 미충족일 뿐.
-                let _ = self.observe(exec_id, event, from, None, guard_name(&edge.guard).as_str(), Outcome::Refused { detail: e.to_string() });
-                Ok(Outcome::Refused { detail: e.to_string() })
+                let _ = self.observe(
+                    exec_id,
+                    event,
+                    from,
+                    None,
+                    guard_name(&edge.guard).as_str(),
+                    Outcome::Refused {
+                        detail: e.to_string(),
+                    },
+                );
+                Ok(Outcome::Refused {
+                    detail: e.to_string(),
+                })
             }
         }
     }
@@ -808,7 +1109,12 @@ impl WorkflowEngine {
         self.observations
             .iter()
             .filter(|o| &o.exec_id == exec_id && o.outcome == Outcome::BudgetStopped)
-            .map(|o| format!("wf.budget_exhausted exec={} step_cap={}", o.exec_id, self.budget.max_steps))
+            .map(|o| {
+                format!(
+                    "wf.budget_exhausted exec={} step_cap={}",
+                    o.exec_id, self.budget.max_steps
+                )
+            })
             .collect()
     }
 
@@ -897,7 +1203,9 @@ mod tests {
         // 역순으로도: b가 잡으면 a는 거부 (순서 무관성)
         assert!(e.release("o1", "exec-a"));
         assert!(e.acquire("o1", "exec-b").is_ok());
-        assert!(matches!(e.acquire("o1", "exec-a"), Err(EngineError::LockHeld { by, .. }) if by == "exec-b"));
+        assert!(
+            matches!(e.acquire("o1", "exec-a"), Err(EngineError::LockHeld { by, .. }) if by == "exec-b")
+        );
         // 해제는 보유자만
         assert!(!e.release("o1", "exec-a"));
         assert!(e.release("o1", "exec-b"));
@@ -910,14 +1218,28 @@ mod tests {
         e.enroll(order("o1"));
         e.acquire("o1", "ex").unwrap();
         // 합법 2스텝
-        assert_eq!(e.dispatch_inner("o1", "ex", &OrderEvent::Queued, 1).unwrap(), Outcome::Applied);
         assert_eq!(
-            e.dispatch_inner("o1", "ex", &OrderEvent::DieStarted, 1).unwrap(),
+            e.dispatch_inner("o1", "ex", &OrderEvent::Queued, 1)
+                .unwrap(),
+            Outcome::Applied
+        );
+        assert_eq!(
+            e.dispatch_inner("o1", "ex", &OrderEvent::DieStarted, 1)
+                .unwrap(),
             Outcome::Applied
         );
         // 3스텝째: 예산 초과 — 상태는 Working에 머문다 (새 상태 없음)
-        let err = e.dispatch_inner("o1", "ex", &OrderEvent::DieSucceeded { attempt: 1 }, 1).unwrap_err();
-        assert!(matches!(err, EngineError::BudgetExhausted { steps: 2, cap: 2, .. }));
+        let err = e
+            .dispatch_inner("o1", "ex", &OrderEvent::DieSucceeded { attempt: 1 }, 1)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::BudgetExhausted {
+                steps: 2,
+                cap: 2,
+                ..
+            }
+        ));
         assert_eq!(e.order("o1").unwrap().state(), OrderState::Working);
         // 저널 심기 재료가 산출된다
         assert!(!e.budget_stop_journal_events("ex").is_empty());
@@ -930,10 +1252,14 @@ mod tests {
         let mut e = WorkflowEngine::embedded_default();
         e.enroll(order("o1"));
         e.acquire("o1", "ex").unwrap();
-        e.dispatch_inner("o1", "ex", &OrderEvent::Queued, 1).unwrap();
-        e.dispatch_inner("o1", "ex", &OrderEvent::DieStarted, 1).unwrap();
+        e.dispatch_inner("o1", "ex", &OrderEvent::Queued, 1)
+            .unwrap();
+        e.dispatch_inner("o1", "ex", &OrderEvent::DieStarted, 1)
+            .unwrap();
         // stale: 현재 attempt 1에 attempt 0 주장
-        let r = e.dispatch_inner("o1", "ex", &OrderEvent::DieSucceeded { attempt: 0 }, 1).unwrap();
+        let r = e
+            .dispatch_inner("o1", "ex", &OrderEvent::DieSucceeded { attempt: 0 }, 1)
+            .unwrap();
         assert!(matches!(r, Outcome::Refused { .. }));
         assert_eq!(e.order("o1").unwrap().state(), OrderState::Working);
     }
@@ -945,10 +1271,14 @@ mod tests {
         let mut e = WorkflowEngine::embedded_default();
         e.enroll(order("o1"));
         e.acquire("o1", "ex").unwrap();
-        e.dispatch_inner("o1", "ex", &OrderEvent::Queued, 1).unwrap();
+        e.dispatch_inner("o1", "ex", &OrderEvent::Queued, 1)
+            .unwrap();
         // Working에서 Queued 이벤트는 부호화·도메인 모두에 없음
-        e.dispatch_inner("o1", "ex", &OrderEvent::DieStarted, 1).unwrap();
-        let r = e.dispatch_inner("o1", "ex", &OrderEvent::Queued, 1).unwrap();
+        e.dispatch_inner("o1", "ex", &OrderEvent::DieStarted, 1)
+            .unwrap();
+        let r = e
+            .dispatch_inner("o1", "ex", &OrderEvent::Queued, 1)
+            .unwrap();
         assert_eq!(r, Outcome::NoEdge);
     }
 
@@ -978,7 +1308,8 @@ mod tests {
         let mut e = WorkflowEngine::embedded_default();
         e.enroll(order("o1"));
         e.acquire("o1", "ex").unwrap();
-        e.dispatch_inner("o1", "ex", &OrderEvent::Queued, 1).unwrap();
+        e.dispatch_inner("o1", "ex", &OrderEvent::Queued, 1)
+            .unwrap();
         let all = e.observations();
         // B1 생명주기 관측(lock_acquired) + 노드 관측 1
         assert_eq!(all.len(), 2);
@@ -1002,9 +1333,16 @@ mod tests {
         e.bind_root("ex", &root1).unwrap();
         e.set_active_root(&root1);
         // 결속 일치 — 정상 진행
-        assert_eq!(e.dispatch_inner("o1", "ex", &OrderEvent::Queued, 1).unwrap(), Outcome::Applied);
+        assert_eq!(
+            e.dispatch_inner("o1", "ex", &OrderEvent::Queued, 1)
+                .unwrap(),
+            Outcome::Applied
+        );
         // 스킬 교체 등으로 문서가 바뀌어 새 root가 로드됨 — 결속 재시도는 거부
-        assert!(e.bind_root("ex", "wf-root-changed").is_err(), "rebinding must be refused");
+        assert!(
+            e.bind_root("ex", "wf-root-changed").is_err(),
+            "rebinding must be refused"
+        );
         e.set_active_root("wf-root-changed");
         let r = e.dispatch_inner("o1", "ex", &OrderEvent::DieStarted, 1);
         let detail = match &r {
@@ -1016,9 +1354,17 @@ mod tests {
         let _ = e.acquire("o1", "ex2").is_err();
         assert!(e.release("o1", "ex"));
         e.acquire("o1", "ex2").unwrap();
-        assert!(e.dispatch_inner("o1", "ex2", &OrderEvent::DieStarted, 1).is_err(), "unbound dispatch must be refused");
+        assert!(
+            e.dispatch_inner("o1", "ex2", &OrderEvent::DieStarted, 1)
+                .is_err(),
+            "unbound dispatch must be refused"
+        );
         e.bind_root("ex2", "wf-root-changed").unwrap();
-        assert_eq!(e.dispatch_inner("o1", "ex2", &OrderEvent::DieStarted, 1).unwrap(), Outcome::Applied);
+        assert_eq!(
+            e.dispatch_inner("o1", "ex2", &OrderEvent::DieStarted, 1)
+                .unwrap(),
+            Outcome::Applied
+        );
     }
 
     /// r3 MINOR 회귀: 변조 목적지 → 원자적 롤백 + 래치 + 사유 보존.
@@ -1030,7 +1376,8 @@ mod tests {
         let mut e = WorkflowEngine::embedded_default();
         e.enroll(order("o1"));
         e.acquire("o1", "ex").unwrap();
-        e.dispatch_inner("o1", "ex", &OrderEvent::Queued, 1).unwrap();
+        e.dispatch_inner("o1", "ex", &OrderEvent::Queued, 1)
+            .unwrap();
         // 부호화 변조: Queued/Received 엣지의 목적지를 Failed로 찢는다
         e.wf.edges[0].to = EdgeTarget::State(OrderState::Failed);
         // 미결속 엔진(active_root 없음)에서도 목적지 드리프트는 치명 —
@@ -1063,14 +1410,22 @@ mod tests {
         let mut e = WorkflowEngine::embedded_default();
         e.enroll(order("o1"));
         e.acquire("o1", "ex").unwrap();
-        e.dispatch_inner("o1", "ex", &OrderEvent::Queued, 1).unwrap();
+        e.dispatch_inner("o1", "ex", &OrderEvent::Queued, 1)
+            .unwrap();
         // 부호화 변조: DieStarted 엣지 제거 (도메인엔 있음 — E1 위반)
-        e.wf.edges.retain(|edge| edge.event != foundry_domain::workflow_encoding::EdgeEvent::DieStarted);
+        e.wf.edges
+            .retain(|edge| edge.event != foundry_domain::workflow_encoding::EdgeEvent::DieStarted);
         let r = e.dispatch_inner("o1", "ex", &OrderEvent::DieStarted, 1);
-        assert!(matches!(&r, Err(EngineError::EncodingDrift { detail }) if detail.contains("no edge")), "{r:?}");
+        assert!(
+            matches!(&r, Err(EngineError::EncodingDrift { detail }) if detail.contains("no edge")),
+            "{r:?}"
+        );
         // 래치 확인: 다른 합법 이벤트조차 같은 드리프트로 거부
         let r2 = e.dispatch_inner("o1", "ex", &OrderEvent::Canceled { reason: "r".into() }, 1);
-        assert_eq!(r2, r, "latched exec refuses even otherwise-legal events with the same cause");
+        assert_eq!(
+            r2, r,
+            "latched exec refuses even otherwise-legal events with the same cause"
+        );
     }
 
     /// r4 MINOR 회귀: 가드 미충족 드리프트 — 엣지는 있으나 어느 가드도
@@ -1080,7 +1435,8 @@ mod tests {
         let mut e = WorkflowEngine::embedded_default();
         e.enroll(order("o1"));
         e.acquire("o1", "ex").unwrap();
-        e.dispatch_inner("o1", "ex", &OrderEvent::Queued, 1).unwrap();
+        e.dispatch_inner("o1", "ex", &OrderEvent::Queued, 1)
+            .unwrap();
         // 부호화 변조: DieStarted 엣지의 가드를 절대 만족 불가로 교체
         // (가드 평가기는 거짓, 도메인은 수용 — 가드/도메인 불일치 = E7 위반)
         for edge in e.wf.edges.iter_mut() {
@@ -1092,7 +1448,10 @@ mod tests {
             }
         }
         let r = e.dispatch_inner("o1", "ex", &OrderEvent::DieStarted, 1);
-        assert!(matches!(&r, Err(EngineError::EncodingDrift { detail }) if detail.contains("NO matching edge's guard")), "{r:?}");
+        assert!(
+            matches!(&r, Err(EngineError::EncodingDrift { detail }) if detail.contains("NO matching edge's guard")),
+            "{r:?}"
+        );
         let r2 = e.dispatch_inner("o1", "ex", &OrderEvent::DieStarted, 1);
         assert_eq!(r2, r, "redispatch replays the identical cause");
     }
@@ -1104,9 +1463,16 @@ mod tests {
         let mut e = WorkflowEngine::new(EmbeddedWorkflow::frozen_v1(), Budget { max_steps: 1 });
         e.enroll(order("o1"));
         e.acquire("o1", "ex").unwrap();
-        assert_eq!(e.dispatch_inner("o1", "ex", &OrderEvent::Queued, 1).unwrap(), Outcome::Applied);
-        let stops_before = e.observations().iter()
-            .filter(|o| &o.exec_id == "ex" && o.outcome == Outcome::BudgetStopped).count();
+        assert_eq!(
+            e.dispatch_inner("o1", "ex", &OrderEvent::Queued, 1)
+                .unwrap(),
+            Outcome::Applied
+        );
+        let stops_before = e
+            .observations()
+            .iter()
+            .filter(|o| &o.exec_id == "ex" && o.outcome == Outcome::BudgetStopped)
+            .count();
         assert_eq!(stops_before, 0);
         // 초과 디스패치 3회 — 모두 같은 에러
         for _ in 0..3 {
@@ -1116,8 +1482,11 @@ mod tests {
             ));
         }
         // stop 관측은 정확히 1개 (반복 없음)
-        let stops_after = e.observations().iter()
-            .filter(|o| &o.exec_id == "ex" && o.outcome == Outcome::BudgetStopped).count();
+        let stops_after = e
+            .observations()
+            .iter()
+            .filter(|o| &o.exec_id == "ex" && o.outcome == Outcome::BudgetStopped)
+            .count();
         assert_eq!(stops_after, 1, "exactly one durable stop record");
     }
 
@@ -1130,17 +1499,50 @@ mod tests {
     struct LedgerHook(foundry_approval::ApprovalLedger);
 
     impl ApprovalLedgerHook for LedgerHook {
-        fn reserve(&mut self, grant_id: String, scope: serde_json::Value, exec_id: String, dispatch_seq: u64) -> Result<u64, String> {
-            self.0.reserve_grant(&grant_id, &scope, &exec_id, dispatch_seq).map(|r| r.fence_token).map_err(|e| e.to_string())
+        fn reserve(
+            &mut self,
+            grant_id: String,
+            scope: serde_json::Value,
+            exec_id: String,
+            dispatch_seq: u64,
+        ) -> Result<u64, String> {
+            self.0
+                .reserve_grant(&grant_id, &scope, &exec_id, dispatch_seq)
+                .map(|r| r.fence_token)
+                .map_err(|e| e.to_string())
         }
-        fn begin_apply(&mut self, grant_id: String, exec_id: String, dispatch_seq: u64, fence: u64) -> Result<(), String> {
-            self.0.begin_apply(&grant_id, &exec_id, dispatch_seq, fence).map_err(|e| e.to_string())
+        fn begin_apply(
+            &mut self,
+            grant_id: String,
+            exec_id: String,
+            dispatch_seq: u64,
+            fence: u64,
+        ) -> Result<(), String> {
+            self.0
+                .begin_apply(&grant_id, &exec_id, dispatch_seq, fence)
+                .map_err(|e| e.to_string())
         }
-        fn release(&mut self, grant_id: String, exec_id: String, dispatch_seq: u64, expect_fence: u64) -> Result<(), String> {
-            self.0.release_reservation_fenced(&grant_id, &exec_id, dispatch_seq, expect_fence).map_err(|e| e.to_string())
+        fn release(
+            &mut self,
+            grant_id: String,
+            exec_id: String,
+            dispatch_seq: u64,
+            expect_fence: u64,
+        ) -> Result<(), String> {
+            self.0
+                .release_reservation_fenced(&grant_id, &exec_id, dispatch_seq, expect_fence)
+                .map_err(|e| e.to_string())
         }
-        fn finalize(&mut self, grant_id: String, exec_id: String, dispatch_seq: u64, fence: u64) -> Result<(), String> {
-            self.0.finalize_grant(&grant_id, &exec_id, dispatch_seq, fence).map_err(|e| e.to_string())
+        fn finalize(
+            &mut self,
+            grant_id: String,
+            exec_id: String,
+            dispatch_seq: u64,
+            fence: u64,
+        ) -> Result<(), String> {
+            self.0
+                .finalize_grant(&grant_id, &exec_id, dispatch_seq, fence)
+                .map_err(|e| e.to_string())
         }
     }
 
@@ -1154,7 +1556,10 @@ mod tests {
     }
 
     fn g3_approval_event() -> OrderEvent {
-        OrderEvent::Approved { intent: "ship".into(), artifact_digest: "dig-1".into() }
+        OrderEvent::Approved {
+            intent: "ship".into(),
+            artifact_digest: "dig-1".into(),
+        }
     }
 
     /// ② 무grant → AuthorizationRefused: 상태 불변·래치·재디스패치 동일 사유.
@@ -1165,7 +1570,9 @@ mod tests {
         let mut hook = LedgerHook(foundry_approval::ApprovalLedger::open_in_memory().unwrap());
         let r = e.dispatch_live("g3-o", "ex", &g3_approval_event(), 1, None, &mut hook);
         let (gid, reason) = match &r {
-            Err(EngineError::AuthorizationRefused { grant_id, reason, .. }) => (grant_id.clone(), reason.clone()),
+            Err(EngineError::AuthorizationRefused {
+                grant_id, reason, ..
+            }) => (grant_id.clone(), reason.clone()),
             other => panic!("expected AuthorizationRefused, got {other:?}"),
         };
         assert_eq!(gid, None);
@@ -1174,7 +1581,10 @@ mod tests {
         assert_eq!(e.order("g3-o").unwrap().state(), OrderState::FurnaceHold);
         // 래치 — 재디스패치는 동일 사유 (다른 합법 이벤트도).
         let r2 = e.dispatch_live("g3-o", "ex", &g3_approval_event(), 1, None, &mut hook);
-        assert_eq!(r, r2, "redispatch replays the identical authorization failure");
+        assert_eq!(
+            r, r2,
+            "redispatch replays the identical authorization failure"
+        );
     }
 
     /// ③ 유효하지만 다른 스코프의 grant → 거부 (전 스코프 매칭).
@@ -1187,15 +1597,30 @@ mod tests {
         let wrong_scope = serde_json::json!({
             "order_id": "g3-o", "intent": "ship", "artifact_digest": "dig-OTHER", "root_scope": "",
         });
-        ledger.issue_grant("g-wrong", "tok-1", &wrong_scope).unwrap();
+        ledger
+            .issue_grant("g-wrong", "tok-1", &wrong_scope)
+            .unwrap();
         let mut hook = LedgerHook(ledger);
-        let grant = GrantRef { grant_id: "g-wrong".into() };
-        let r = e.dispatch_live("g3-o", "ex", &g3_approval_event(), 1, Some(&grant), &mut hook);
+        let grant = GrantRef {
+            grant_id: "g-wrong".into(),
+        };
+        let r = e.dispatch_live(
+            "g3-o",
+            "ex",
+            &g3_approval_event(),
+            1,
+            Some(&grant),
+            &mut hook,
+        );
         assert!(
             matches!(&r, Err(EngineError::AuthorizationRefused { grant_id: Some(g), reason, .. }) if g == "g-wrong" && reason.contains("scope")),
             "{r:?}"
         );
-        assert_eq!(e.order("g3-o").unwrap().state(), OrderState::FurnaceHold, "state unchanged");
+        assert_eq!(
+            e.order("g3-o").unwrap().state(),
+            OrderState::FurnaceHold,
+            "state unchanged"
+        );
     }
 
     /// ④ 유효 인간 승인 대조군 — grant 소비로 전이 성공.
@@ -1210,12 +1635,24 @@ mod tests {
         });
         ledger.issue_grant("g-right", "tok-9", &right).unwrap();
         let mut hook = LedgerHook(ledger);
-        let grant = GrantRef { grant_id: "g-right".into() };
-        let out = e.dispatch_live("g3-o", "ex", &g3_approval_event(), 1, Some(&grant), &mut hook);
+        let grant = GrantRef {
+            grant_id: "g-right".into(),
+        };
+        let out = e.dispatch_live(
+            "g3-o",
+            "ex",
+            &g3_approval_event(),
+            1,
+            Some(&grant),
+            &mut hook,
+        );
         assert_eq!(out.unwrap(), Outcome::Applied);
         assert_eq!(e.order("g3-o").unwrap().state(), OrderState::Publishing);
         // grant는 CONSUMED — 재사용 불가 (래치된 게 아니라 소비됨).
-        assert_eq!(hook.0.get_grant("g-right").unwrap().state, foundry_approval::GrantState::Consumed);
+        assert_eq!(
+            hook.0.get_grant("g-right").unwrap().state,
+            foundry_approval::GrantState::Consumed
+        );
     }
 
     /// 재생 경로는 grant 불요 — G1 하위호환 (승인 이벤트도 커서 없는
@@ -1227,7 +1664,11 @@ mod tests {
         let mut hook = LedgerHook(foundry_approval::ApprovalLedger::open_in_memory().unwrap());
         let _ = &mut hook;
         let out = e.dispatch_inner("g3-o", "ex", &g3_approval_event(), 1);
-        assert_eq!(out.unwrap(), Outcome::Applied, "replay of a journaled approval needs no grant (envelope owns integrity)");
+        assert_eq!(
+            out.unwrap(),
+            Outcome::Applied,
+            "replay of a journaled approval needs no grant (envelope owns integrity)"
+        );
     }
 
     /// (astra T53-r1 MAJOR 4) 래치 사유 보존 — 첫 인가 실패 사유가 이후
@@ -1237,12 +1678,31 @@ mod tests {
         let mut e = g3_engine();
         e.acquire("g3-o", "ex").unwrap();
         let mut hook = LedgerHook(foundry_approval::ApprovalLedger::open_in_memory().unwrap());
-        let r1 = e.dispatch_live("g3-o", "ex", &g3_approval_event(), 1, None, &mut hook).unwrap_err();
-        assert!(matches!(&r1, EngineError::AuthorizationRefused { grant_id: None, .. }));
+        let r1 = e
+            .dispatch_live("g3-o", "ex", &g3_approval_event(), 1, None, &mut hook)
+            .unwrap_err();
+        assert!(matches!(
+            &r1,
+            EngineError::AuthorizationRefused { grant_id: None, .. }
+        ));
         // 다른 grant로 재시도 — 여전히 최초 사유 (None) 재생.
-        let grant = GrantRef { grant_id: "g-other".into() };
-        let r2 = e.dispatch_live("g3-o", "ex", &g3_approval_event(), 1, Some(&grant), &mut hook).unwrap_err();
-        assert_eq!(r1, r2, "latched cause must NOT be overwritten by later failures");
+        let grant = GrantRef {
+            grant_id: "g-other".into(),
+        };
+        let r2 = e
+            .dispatch_live(
+                "g3-o",
+                "ex",
+                &g3_approval_event(),
+                1,
+                Some(&grant),
+                &mut hook,
+            )
+            .unwrap_err();
+        assert_eq!(
+            r1, r2,
+            "latched cause must NOT be overwritten by later failures"
+        );
     }
 
     /// (astra T53-r1 MAJOR 3) NoEdge는 grant를 소비하지 않는다 —
@@ -1259,12 +1719,27 @@ mod tests {
         });
         ledger.issue_grant("g-n", "tok-n", &sc).unwrap();
         let mut hook = LedgerHook(ledger);
-        let grant = GrantRef { grant_id: "g-n".into() };
+        let grant = GrantRef {
+            grant_id: "g-n".into(),
+        };
         // Received에서 Approved — 부호화에 엣지 없음 = NoEdge.
-        let out = e.dispatch_live("g3-n2", "ex", &g3_approval_event(), 1, Some(&grant), &mut hook).unwrap();
+        let out = e
+            .dispatch_live(
+                "g3-n2",
+                "ex",
+                &g3_approval_event(),
+                1,
+                Some(&grant),
+                &mut hook,
+            )
+            .unwrap();
         assert_eq!(out, Outcome::NoEdge);
         // grant는 소비되지 않았다 — Issued.
-        assert_eq!(hook.0.get_grant("g-n").unwrap().state, foundry_approval::GrantState::Issued, "NoEdge must NOT consume the grant");
+        assert_eq!(
+            hook.0.get_grant("g-n").unwrap().state,
+            foundry_approval::GrantState::Issued,
+            "NoEdge must NOT consume the grant"
+        );
     }
 
     /// (astra T53-r1 MAJOR 5) root-결속 라이브 승인 — active_root 엔진의
@@ -1282,9 +1757,21 @@ mod tests {
         });
         ledger.issue_grant("g-w", "tok-w", &wrong_root).unwrap();
         let mut hook = LedgerHook(ledger);
-        let grant = GrantRef { grant_id: "g-w".into() };
-        let r = e.dispatch_live("g3-o", "ex", &g3_approval_event(), 1, Some(&grant), &mut hook);
-        assert!(matches!(r, Err(EngineError::AuthorizationRefused { .. })), "{r:?}");
+        let grant = GrantRef {
+            grant_id: "g-w".into(),
+        };
+        let r = e.dispatch_live(
+            "g3-o",
+            "ex",
+            &g3_approval_event(),
+            1,
+            Some(&grant),
+            &mut hook,
+        );
+        assert!(
+            matches!(r, Err(EngineError::AuthorizationRefused { .. })),
+            "{r:?}"
+        );
         assert_eq!(e.order("g3-o").unwrap().state(), OrderState::FurnaceHold);
     }
 
@@ -1303,11 +1790,27 @@ mod tests {
         });
         ledger.issue_grant("g-r5", "tok-r5", &sc).unwrap();
         let mut hook = LedgerHook(ledger);
-        let grant = GrantRef { grant_id: "g-r5".into() };
-        let out = e.dispatch_live("r5-o", "ex", &g3_approval_event(), 1, Some(&grant), &mut hook);
+        let grant = GrantRef {
+            grant_id: "g-r5".into(),
+        };
+        let out = e.dispatch_live(
+            "r5-o",
+            "ex",
+            &g3_approval_event(),
+            1,
+            Some(&grant),
+            &mut hook,
+        );
         // 예산 0 → BudgetExhausted (Applied 아님), grant는 미소비.
-        assert!(matches!(out, Err(EngineError::BudgetExhausted { .. })), "{out:?}");
-        assert_eq!(hook.0.get_grant("g-r5").unwrap().state, foundry_approval::GrantState::Issued, "precheck-ineligible dispatch must NOT consume");
+        assert!(
+            matches!(out, Err(EngineError::BudgetExhausted { .. })),
+            "{out:?}"
+        );
+        assert_eq!(
+            hook.0.get_grant("g-r5").unwrap().state,
+            foundry_approval::GrantState::Issued,
+            "precheck-ineligible dispatch must NOT consume"
+        );
         assert_eq!(e.order("r5-o").unwrap().state(), OrderState::FurnaceHold);
     }
 
@@ -1328,10 +1831,23 @@ mod tests {
         });
         ledger.issue_grant("g-u", "tok-u", &sc).unwrap();
         let mut hook = LedgerHook(ledger);
-        let grant = GrantRef { grant_id: "g-u".into() };
-        let r = e.dispatch_live("r5-u", "ex", &g3_approval_event(), 1, Some(&grant), &mut hook);
+        let grant = GrantRef {
+            grant_id: "g-u".into(),
+        };
+        let r = e.dispatch_live(
+            "r5-u",
+            "ex",
+            &g3_approval_event(),
+            1,
+            Some(&grant),
+            &mut hook,
+        );
         assert!(matches!(r, Err(EngineError::EncodingDrift { .. })), "{r:?}");
-        assert_eq!(hook.0.get_grant("g-u").unwrap().state, foundry_approval::GrantState::Issued, "root refusal must not strand Applying");
+        assert_eq!(
+            hook.0.get_grant("g-u").unwrap().state,
+            foundry_approval::GrantState::Issued,
+            "root refusal must not strand Applying"
+        );
         assert_eq!(e.order("r5-u").unwrap().state(), OrderState::FurnaceHold);
     }
 
@@ -1352,10 +1868,23 @@ mod tests {
         });
         ledger.issue_grant("g-r6", "tok-r6", &sc).unwrap();
         let mut hook = LedgerHook(ledger);
-        let grant = GrantRef { grant_id: "g-r6".into() };
-        let r = e.dispatch_live("r6-o", "ex", &g3_approval_event(), 1, Some(&grant), &mut hook);
+        let grant = GrantRef {
+            grant_id: "g-r6".into(),
+        };
+        let r = e.dispatch_live(
+            "r6-o",
+            "ex",
+            &g3_approval_event(),
+            1,
+            Some(&grant),
+            &mut hook,
+        );
         assert!(matches!(r, Err(EngineError::EncodingDrift { .. })), "{r:?}");
-        assert_eq!(hook.0.get_grant("g-r6").unwrap().state, foundry_approval::GrantState::Issued, "stale-binding refusal must not consume");
+        assert_eq!(
+            hook.0.get_grant("g-r6").unwrap().state,
+            foundry_approval::GrantState::Issued,
+            "stale-binding refusal must not consume"
+        );
         assert_eq!(e.order("r6-o").unwrap().state(), OrderState::FurnaceHold);
     }
 

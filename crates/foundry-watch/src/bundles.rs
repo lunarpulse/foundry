@@ -65,12 +65,24 @@ pub enum BundleError {
     /// references are the exact hole review #15 closed
     MutableLessonReference { lesson_id: String },
     /// snapshot content does not hash to its declared hash
-    SnapshotCorrupt { lesson_id: String, declared: String, computed: String },
+    SnapshotCorrupt {
+        lesson_id: String,
+        declared: String,
+        computed: String,
+    },
     /// digest drift at consumption time — the stored artifact is not
     /// what was reviewed
-    DigestDrift { bundle_id: String, stored: String, recomputed: String },
+    DigestDrift {
+        bundle_id: String,
+        stored: String,
+        recomputed: String,
+    },
     /// token was issued for a different digest
-    TokenDigestMismatch { token: String, bound: String, presented: String },
+    TokenDigestMismatch {
+        token: String,
+        bound: String,
+        presented: String,
+    },
     /// unpinned provider on a Deterministic claim — the declaration
     /// must be honest (astra #11: declare limits, don't paper over)
     UnpinnedButDeterministic { model: String },
@@ -142,7 +154,9 @@ impl CandidateBundle {
         // the builder to either pin the provider or drop the seed
         // (declare Undecodable). Unenforceable claims never ship.
         if profile.seed.is_some() && pins.model_revision.is_none() {
-            return Err(BundleError::UnpinnedButDeterministic { model: profile.model.clone() });
+            return Err(BundleError::UnpinnedButDeterministic {
+                model: profile.model.clone(),
+            });
         }
         Ok(CandidateBundle {
             candidate_id: candidate_id.to_string(),
@@ -187,7 +201,10 @@ impl BundleStore {
     pub fn open(path: &std::path::Path) -> BundleStore {
         match std::fs::read(path) {
             Ok(bytes) => match serde_json::from_slice::<BundleStoreSnapshot>(&bytes) {
-                Ok(snap) => BundleStore { by_digest: snap.by_digest, tokens: snap.tokens },
+                Ok(snap) => BundleStore {
+                    by_digest: snap.by_digest,
+                    tokens: snap.tokens,
+                },
                 Err(_) => BundleStore::default(),
             },
             Err(_) => BundleStore::default(),
@@ -234,7 +251,10 @@ impl BundleStore {
 
     /// Clone for scenario forks (gate/eval tooling).
     pub fn clone_for_test(&self) -> Self {
-        BundleStore { by_digest: self.by_digest.clone(), tokens: self.tokens.clone() }
+        BundleStore {
+            by_digest: self.by_digest.clone(),
+            tokens: self.tokens.clone(),
+        }
     }
 
     /// Consumption-time re-verification (astra #11): recompute from
@@ -274,7 +294,11 @@ impl BundleStore {
 
     /// Consume a token against a presented digest: the token only
     /// ever promotes exactly what it was issued for.
-    pub fn consume_token(&mut self, token: &str, presented_digest: &str) -> Result<(), BundleError> {
+    pub fn consume_token(
+        &mut self,
+        token: &str,
+        presented_digest: &str,
+    ) -> Result<(), BundleError> {
         match self.tokens.get(token) {
             None => Err(BundleError::TokenDigestMismatch {
                 token: token.into(),
@@ -303,7 +327,9 @@ impl BundleStore {
         let b = self.get_verified(digest)?;
         for l in &b.lessons {
             if !lesson_active(&l.lesson_id) {
-                return Err(BundleError::LessonRevoked { lesson_id: l.lesson_id.clone() });
+                return Err(BundleError::LessonRevoked {
+                    lesson_id: l.lesson_id.clone(),
+                });
             }
         }
         Ok(())
@@ -323,21 +349,42 @@ mod tests {
     }
 
     fn profile() -> BundleProfile {
-        BundleProfile { model: "deepseek-v4".into(), temperature: Some(0.0), seed: Some(7), max_output_tokens: 4096 }
+        BundleProfile {
+            model: "deepseek-v4".into(),
+            temperature: Some(0.0),
+            seed: Some(7),
+            max_output_tokens: 4096,
+        }
     }
 
     fn pins(revision: Option<&str>) -> DependencyPins {
         DependencyPins {
             image_digest: "sha256:aa".into(),
-            tool_digests: [("cargo".to_string(), "sha256:bb".into())].into_iter().collect(),
+            tool_digests: [("cargo".to_string(), "sha256:bb".into())]
+                .into_iter()
+                .collect(),
             model_revision: revision.map(|s| s.into()),
         }
     }
 
     #[test]
     fn digest_covers_every_behavior_shaping_byte() {
-        let a = CandidateBundle::build("cand-1", profile(), "solve {{task}}", vec![snap("L1", "prefer map_err")], pins(Some("rev-9"))).unwrap();
-        let a2 = CandidateBundle::build("cand-1", profile(), "solve {{task}}", vec![snap("L1", "prefer map_err")], pins(Some("rev-9"))).unwrap();
+        let a = CandidateBundle::build(
+            "cand-1",
+            profile(),
+            "solve {{task}}",
+            vec![snap("L1", "prefer map_err")],
+            pins(Some("rev-9")),
+        )
+        .unwrap();
+        let a2 = CandidateBundle::build(
+            "cand-1",
+            profile(),
+            "solve {{task}}",
+            vec![snap("L1", "prefer map_err")],
+            pins(Some("rev-9")),
+        )
+        .unwrap();
         assert_eq!(a.digest(), a2.digest(), "deterministic");
 
         let mut b = a2.clone();
@@ -346,7 +393,10 @@ mod tests {
 
         let c = CandidateBundle::build(
             "cand-1",
-            BundleProfile { temperature: Some(0.1), ..profile() },
+            BundleProfile {
+                temperature: Some(0.1),
+                ..profile()
+            },
             "solve {{task}}",
             vec![snap("L1", "prefer map_err")],
             pins(Some("rev-9")),
@@ -354,10 +404,24 @@ mod tests {
         .unwrap();
         assert_ne!(a.digest(), c.digest(), "parameter edit");
 
-        let d = CandidateBundle::build("cand-1", profile(), "solve {{task}}", vec![snap("L1", "prefer unwrap")], pins(Some("rev-9"))).unwrap();
+        let d = CandidateBundle::build(
+            "cand-1",
+            profile(),
+            "solve {{task}}",
+            vec![snap("L1", "prefer unwrap")],
+            pins(Some("rev-9")),
+        )
+        .unwrap();
         assert_ne!(a.digest(), d.digest(), "lesson content edit");
 
-        let e = CandidateBundle::build("cand-1", profile(), "solve {{task}}", vec![snap("L1", "prefer map_err")], pins(Some("rev-10"))).unwrap();
+        let e = CandidateBundle::build(
+            "cand-1",
+            profile(),
+            "solve {{task}}",
+            vec![snap("L1", "prefer map_err")],
+            pins(Some("rev-10")),
+        )
+        .unwrap();
         assert_ne!(a.digest(), e.digest(), "dependency pin edit");
     }
 
@@ -376,10 +440,17 @@ mod tests {
         // the compile-time form: CandidateBundle.lessons is
         // Vec<LessonSnapshot> — there is no "reference" field to set.
         // Serializing proves no bare lesson-id list leaks in:
-        let b = CandidateBundle::build("c", profile(), "p", vec![snap("L1", "x")], pins(Some("r"))).unwrap();
+        let b = CandidateBundle::build("c", profile(), "p", vec![snap("L1", "x")], pins(Some("r")))
+            .unwrap();
         let j = serde_json::to_string(&b).unwrap();
-        assert!(j.contains("content_hash"), "snapshots carry content, not references");
-        assert!(serde_json::from_str::<serde_json::Value>(&j).unwrap()["lessons"][0]["content"].is_string());
+        assert!(
+            j.contains("content_hash"),
+            "snapshots carry content, not references"
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&j).unwrap()["lessons"][0]["content"]
+                .is_string()
+        );
     }
 
     #[test]
@@ -409,12 +480,13 @@ mod tests {
         let d = store.put(b);
         assert!(store.get_verified(&d).is_ok());
         // tamper: swap contents under the same digest key
-        let tampered = CandidateBundle::build("c", profile(), "p tampered", vec![], pins(Some("r"))).unwrap();
+        let tampered =
+            CandidateBundle::build("c", profile(), "p tampered", vec![], pins(Some("r"))).unwrap();
         store.by_digest.insert(d.clone(), tampered);
-        assert!(matches!(
-            store.get_verified(&d),
-            Err(BundleError::DigestDrift { .. })
-        ), "byte drift must be caught at load time");
+        assert!(
+            matches!(store.get_verified(&d), Err(BundleError::DigestDrift { .. })),
+            "byte drift must be caught at load time"
+        );
     }
 
     #[test]
@@ -423,7 +495,8 @@ mod tests {
         let b = CandidateBundle::build("cand-A", profile(), "p", vec![], pins(Some("r"))).unwrap();
         let d1 = store.put(b);
         // same candidate_id, DIFFERENT contents -> different digest
-        let b2 = CandidateBundle::build("cand-A", profile(), "p evolved", vec![], pins(Some("r"))).unwrap();
+        let b2 = CandidateBundle::build("cand-A", profile(), "p evolved", vec![], pins(Some("r")))
+            .unwrap();
         let d2 = store.put(b2);
         assert_ne!(d1, d2, "identity is content, not name");
 
@@ -459,6 +532,9 @@ mod tests {
         // revoked: blocked — but the bundle bytes are unchanged
         let err = store.promotion_check(&d, |l| l != "L9").unwrap_err();
         assert!(matches!(err, BundleError::LessonRevoked { lesson_id } if lesson_id == "L9"));
-        assert!(store.get_verified(&d).is_ok(), "bytes immutable, eligibility changed (C-V1)");
+        assert!(
+            store.get_verified(&d).is_ok(),
+            "bytes immutable, eligibility changed (C-V1)"
+        );
     }
 }

@@ -25,9 +25,11 @@
 //! 전부 거부 (G13 4케이스).
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+
+pub mod product;
 
 /// 정규 JSON — 키 정렬·결정적 직렬화 (scope_json 동결용).
 pub fn canonical_scope_json(v: &serde_json::Value) -> String {
@@ -44,9 +46,16 @@ pub enum LedgerError {
     /// grant 없음 / 매칭 실패 (스코프 전체 비교).
     GrantNotFound { grant_id: String },
     /// 예약 충돌 — 그 grant는 다른 (exec, seq)에 예약됨.
-    ReservationConflict { grant_id: String, held_by: (String, u64) },
+    ReservationConflict {
+        grant_id: String,
+        held_by: (String, u64),
+    },
     /// fence 불일치 — 릴리즈된(회복된) 예약의 옛 소유자 확정 시도.
-    FenceStale { grant_id: String, your_fence: u64, current_fence: u64 },
+    FenceStale {
+        grant_id: String,
+        your_fence: u64,
+        current_fence: u64,
+    },
     /// grant가 소비됨 (PENDING 아님).
     AlreadyConsumed { grant_id: String },
     /// 활성화 토큰 거부 (B4 4케이스).
@@ -58,11 +67,29 @@ pub enum LedgerError {
 impl std::fmt::Display for LedgerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LedgerError::TokenAlreadyIssued { token_id } => write!(f, "token {token_id} already has a grant (1 token = 1 grant)"),
-            LedgerError::GrantNotFound { grant_id } => write!(f, "no grant {grant_id} matching the full scope"),
-            LedgerError::ReservationConflict { grant_id, held_by } => write!(f, "grant {grant_id} reserved by ({}, {})", held_by.0, held_by.1),
-            LedgerError::FenceStale { grant_id, your_fence, current_fence } => write!(f, "grant {grant_id}: your fence {your_fence} is stale (current {current_fence}) — reservation was recovered"),
-            LedgerError::AlreadyConsumed { grant_id } => write!(f, "grant {grant_id} already consumed"),
+            LedgerError::TokenAlreadyIssued { token_id } => write!(
+                f,
+                "token {token_id} already has a grant (1 token = 1 grant)"
+            ),
+            LedgerError::GrantNotFound { grant_id } => {
+                write!(f, "no grant {grant_id} matching the full scope")
+            }
+            LedgerError::ReservationConflict { grant_id, held_by } => write!(
+                f,
+                "grant {grant_id} reserved by ({}, {})",
+                held_by.0, held_by.1
+            ),
+            LedgerError::FenceStale {
+                grant_id,
+                your_fence,
+                current_fence,
+            } => write!(
+                f,
+                "grant {grant_id}: your fence {your_fence} is stale (current {current_fence}) — reservation was recovered"
+            ),
+            LedgerError::AlreadyConsumed { grant_id } => {
+                write!(f, "grant {grant_id} already consumed")
+            }
             LedgerError::ActivationRefused { reason } => write!(f, "activation refused: {reason}"),
             LedgerError::Db(e) => write!(f, "db: {e}"),
         }
@@ -117,24 +144,12 @@ pub struct ApprovalLedger {
 }
 
 impl ApprovalLedger {
-    /// activations 재구축 마이그레이션 — token_id UNIQUE 적용 (멱등).
+    /// Add token uniqueness without rebuilding or deleting historical rows.
+    /// Existing duplicate evidence is preserved and reported as an error.
     fn migrate_activations_unique(conn: &Connection) -> Result<(), LedgerError> {
         conn.execute_batch(
-            "BEGIN;
-             CREATE TABLE IF NOT EXISTS activations_migrate (
-                 root TEXT NOT NULL,
-                 intent TEXT NOT NULL,
-                 token_id TEXT NOT NULL UNIQUE,
-                 activated_at TEXT NOT NULL,
-                 PRIMARY KEY (root, intent)
-             );
-             DELETE FROM activations_migrate;
-             INSERT INTO activations_migrate SELECT root, intent, token_id, activated_at FROM activations;
-             DROP TABLE IF EXISTS activations;
-             ALTER TABLE activations_migrate RENAME TO activations;
-             COMMIT;",
-        )
-        .map_err(|e| LedgerError::Db(e.to_string()))?;
+            "CREATE UNIQUE INDEX IF NOT EXISTS activations_token_id_unique ON activations(token_id);",
+        ).map_err(|e| LedgerError::Db(format!("activations contain duplicate token ids; rows preserved: {e}")))?;
         Ok(())
     }
 
@@ -142,9 +157,7 @@ impl ApprovalLedger {
     /// 교차 검증용(예약은 소비/해제 시 삭제). (r2 MAJOR-2) 읽기 실패는
     /// fail-closed: 빈 벡터가 아니라 Err — 호출자가 drain됐다고
     /// 오판하지 못하게.
-    pub fn pending_reservations(
-        &self,
-    ) -> Result<Vec<(String, String, i64)>, String> {
+    pub fn pending_reservations(&self) -> Result<Vec<(String, String, i64)>, String> {
         let mut stmt = self
             .conn
             .prepare("SELECT grant_id, exec_id, dispatch_seq FROM reservations")
@@ -172,6 +185,7 @@ impl ApprovalLedger {
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LedgerError> {
         let conn = Connection::open(&path).map_err(|e| LedgerError::Db(e.to_string()))?;
+        Self::check_standalone_contract(&conn)?;
         let mut s = Self::init(conn)?;
         s.path = Some(path.as_ref().to_path_buf());
         Ok(s)
@@ -180,7 +194,33 @@ impl ApprovalLedger {
     /// 인메모리 원장 — 테스트·임베디드 진단용 (프로덕션은 open).
     pub fn open_in_memory() -> Result<Self, LedgerError> {
         let conn = Connection::open_in_memory().map_err(|e| LedgerError::Db(e.to_string()))?;
+        Self::check_standalone_contract(&conn)?;
         Self::init(conn)
+    }
+
+    fn check_standalone_contract(conn: &Connection) -> Result<(), LedgerError> {
+        let has_contract: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='foundry_contract')",
+            [], |r| r.get(0),
+        ).map_err(|e| LedgerError::Db(e.to_string()))?;
+        if has_contract {
+            let contract: String = conn
+                .query_row(
+                    "SELECT contract FROM foundry_contract WHERE singleton=1",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(|e| LedgerError::Db(e.to_string()))?;
+            if contract != "StandaloneV1" {
+                return Err(LedgerError::Db("ledger contract mismatch".into()));
+            }
+        } else {
+            let product_db: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='product_meta_v1')", [], |r| r.get(0)).map_err(|e| LedgerError::Db(e.to_string()))?;
+            if product_db {
+                return Err(LedgerError::Db("ledger contract mismatch".into()));
+            }
+        }
+        Ok(())
     }
 
     fn init(conn: Connection) -> Result<Self, LedgerError> {
@@ -230,11 +270,12 @@ impl ApprovalLedger {
                  next INTEGER NOT NULL
              );
              INSERT OR IGNORE INTO fence_counter (id, next) VALUES (1, 1);
+             CREATE TABLE IF NOT EXISTS foundry_contract(singleton INTEGER PRIMARY KEY CHECK(singleton=1), contract TEXT NOT NULL);
+             INSERT OR IGNORE INTO foundry_contract(singleton,contract) VALUES(1,'StandaloneV1');
              COMMIT;",
         )
         .map_err(|e| LedgerError::Db(e.to_string()))?;
-        // 마이그레이션(astra r2 MAJOR): 기존 activations에 token_id UNIQUE가
-        // 없으면 CREATE IF NOT EXISTS로는 못 붙인다 — 재구축(멱등).
+        // Additive uniqueness migration; never copy/drop historical rows.
         Self::migrate_activations_unique(&conn)?;
         Ok(Self { conn, path: None })
     }
@@ -264,7 +305,9 @@ impl ApprovalLedger {
                 rusqlite::Error::SqliteFailure(f, _)
                     if f.code == rusqlite::ErrorCode::ConstraintViolation =>
                 {
-                    LedgerError::TokenAlreadyIssued { token_id: token_id.clone() }
+                    LedgerError::TokenAlreadyIssued {
+                        token_id: token_id.clone(),
+                    }
                 }
                 other => LedgerError::Db(other.to_string()),
             })?;
@@ -304,7 +347,9 @@ impl ApprovalLedger {
             )
             .optional()
             .map_err(|e| LedgerError::Db(e.to_string()))?;
-        row.ok_or_else(|| LedgerError::GrantNotFound { grant_id: grant_id.into() })
+        row.ok_or_else(|| LedgerError::GrantNotFound {
+            grant_id: grant_id.into(),
+        })
     }
 
     // ------------------------------------------------------------------
@@ -324,7 +369,10 @@ impl ApprovalLedger {
         dispatch_seq: u64,
     ) -> Result<Reservation, LedgerError> {
         let scope_json = canonical_scope_json(scope);
-        let tx = self.conn.transaction().map_err(|e| LedgerError::Db(e.to_string()))?;
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| LedgerError::Db(e.to_string()))?;
 
         // fence 검사와 상태 변이가 같은 트랜잭션 — 검사가 먼저.
         let g: (String, String, String) = tx
@@ -335,10 +383,14 @@ impl ApprovalLedger {
             )
             .optional()
             .map_err(|e| LedgerError::Db(e.to_string()))?
-            .ok_or_else(|| LedgerError::GrantNotFound { grant_id: grant_id.into() })?;
+            .ok_or_else(|| LedgerError::GrantNotFound {
+                grant_id: grant_id.into(),
+            })?;
 
         if g.1 != scope_json {
-            return Err(LedgerError::GrantNotFound { grant_id: grant_id.into() });
+            return Err(LedgerError::GrantNotFound {
+                grant_id: grant_id.into(),
+            });
         }
 
         // 기존 예약 조회를 상태 가드보다 먼저 — 같은 키의 멱등 재시도는
@@ -357,7 +409,9 @@ impl ApprovalLedger {
                 // 멱등 재호출 — 같은 fence. 단 Applying은 제외: 적용이
                 // 이미 확정됐으므로 새 진입은 거부 (astra r3).
                 if g.2 == "applying" {
-                    return Err(LedgerError::AlreadyConsumed { grant_id: grant_id.into() });
+                    return Err(LedgerError::AlreadyConsumed {
+                        grant_id: grant_id.into(),
+                    });
                 }
                 fence as u64
             }
@@ -371,11 +425,17 @@ impl ApprovalLedger {
                 // 신규 예약 — issued 상태만.
                 if g.2 != "issued" {
                     // pending(진행 중)/applying(전이 확정 중)/consumed 전부 — 재예약 거부.
-                    return Err(LedgerError::AlreadyConsumed { grant_id: grant_id.into() });
+                    return Err(LedgerError::AlreadyConsumed {
+                        grant_id: grant_id.into(),
+                    });
                 }
                 // 신규 예약 — fence 발급.
-                let fence: u64 = tx
-                    .query_row("UPDATE fence_counter SET next = next + 1 WHERE id = 1 RETURNING next", [], |r| r.get::<_, i64>(0))
+                let fence: u64 =
+                    tx.query_row(
+                        "UPDATE fence_counter SET next = next + 1 WHERE id = 1 RETURNING next",
+                        [],
+                        |r| r.get::<_, i64>(0),
+                    )
                     .map_err(|e| LedgerError::Db(e.to_string()))? as u64;
                 let now = Utc::now().to_rfc3339();
                 tx.execute(
@@ -393,7 +453,12 @@ impl ApprovalLedger {
         };
 
         tx.commit().map_err(|e| LedgerError::Db(e.to_string()))?;
-        Ok(Reservation { grant_id: grant_id.into(), exec_id: exec_id.into(), dispatch_seq, fence_token: fence })
+        Ok(Reservation {
+            grant_id: grant_id.into(),
+            exec_id: exec_id.into(),
+            dispatch_seq,
+            fence_token: fence,
+        })
     }
 
     /// **begin_apply (astra r2 BLOCKER 폐쇄)** — 도메인 전이 직전 호출.
@@ -447,7 +512,9 @@ impl ApprovalLedger {
             )
             .map_err(|e| LedgerError::Db(e.to_string()))?;
         if n != 1 {
-            return Err(LedgerError::AlreadyConsumed { grant_id: grant_id.into() });
+            return Err(LedgerError::AlreadyConsumed {
+                grant_id: grant_id.into(),
+            });
         }
         // 내구 적용 의도 (astra r4 MAJOR): begin_apply 커밋 = "전이가 날
         // 것"의 증거. 크래시 후 감사·회복이 이 테이블로 의도를 재구성한다.
@@ -462,7 +529,12 @@ impl ApprovalLedger {
 
     /// 적용 의도 조회 (astra r4) — 크래시 조사·감사용: 그 (grant, exec,
     /// seq)가 begin_apply를 통과했는가.
-    pub fn apply_intent(&self, grant_id: &str, exec_id: &str, dispatch_seq: u64) -> Result<bool, LedgerError> {
+    pub fn apply_intent(
+        &self,
+        grant_id: &str,
+        exec_id: &str,
+        dispatch_seq: u64,
+    ) -> Result<bool, LedgerError> {
         let row: Option<i64> = self
             .conn
             .query_row(
@@ -543,14 +615,27 @@ impl ApprovalLedger {
     }
 
     /// 하위 호환 해제 (fence 무지) — 진단용. 프로덕션 경로는 _fenced.
-    pub fn release_reservation(&mut self, grant_id: &str, exec_id: &str, dispatch_seq: u64) -> Result<(), LedgerError> {
-        let tx = self.conn.transaction().map_err(|e| LedgerError::Db(e.to_string()))?;
+    pub fn release_reservation(
+        &mut self,
+        grant_id: &str,
+        exec_id: &str,
+        dispatch_seq: u64,
+    ) -> Result<(), LedgerError> {
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| LedgerError::Db(e.to_string()))?;
         Self::release_inner(&tx, grant_id, exec_id, dispatch_seq)?;
         tx.commit().map_err(|e| LedgerError::Db(e.to_string()))?;
         Ok(())
     }
 
-    fn release_inner(tx: &rusqlite::Transaction, grant_id: &str, exec_id: &str, dispatch_seq: u64) -> Result<(), LedgerError> {
+    fn release_inner(
+        tx: &rusqlite::Transaction,
+        grant_id: &str,
+        exec_id: &str,
+        dispatch_seq: u64,
+    ) -> Result<(), LedgerError> {
         // (grant, exec, seq)와 그 시점의 state를 함께 조회 — astra r3
         // BLOCKER: Applying은 절대 해제 불가(전이가 났거나 곧 난다).
         let owned: Option<(i64, String)> = tx
@@ -566,22 +651,24 @@ impl ApprovalLedger {
             None => Ok(()), // 멱등 — 이미 없음.
             Some((_, st)) if st == "applying" => {
                 // 적용 시작 후에는 어떤 경로도 Issued로 되돌리지 않는다.
-                Err(LedgerError::AlreadyConsumed { grant_id: grant_id.into() })
+                Err(LedgerError::AlreadyConsumed {
+                    grant_id: grant_id.into(),
+                })
             }
             Some(_) => {
                 // fence 무효화 (옛 소유자의 확정 시도 영구 거부) + 상태 복귀.
-                tx.execute(
-                    "UPDATE fence_counter SET next = next + 1 WHERE id = 1",
-                    [],
-                )
-                .map_err(|e| LedgerError::Db(e.to_string()))?;
+                tx.execute("UPDATE fence_counter SET next = next + 1 WHERE id = 1", [])
+                    .map_err(|e| LedgerError::Db(e.to_string()))?;
                 tx.execute(
                     "UPDATE grants SET fence_token = (SELECT next FROM fence_counter WHERE id = 1), state = 'issued', reserved_exec = NULL, reserved_seq = NULL WHERE grant_id = ?1",
                     params![grant_id],
                 )
                 .map_err(|e| LedgerError::Db(e.to_string()))?;
-                tx.execute("DELETE FROM reservations WHERE grant_id = ?1", params![grant_id])
-                    .map_err(|e| LedgerError::Db(e.to_string()))?;
+                tx.execute(
+                    "DELETE FROM reservations WHERE grant_id = ?1",
+                    params![grant_id],
+                )
+                .map_err(|e| LedgerError::Db(e.to_string()))?;
                 Ok(())
             }
         }
@@ -597,7 +684,10 @@ impl ApprovalLedger {
         dispatch_seq: u64,
         fence_token: u64,
     ) -> Result<(), LedgerError> {
-        let tx = self.conn.transaction().map_err(|e| LedgerError::Db(e.to_string()))?;
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| LedgerError::Db(e.to_string()))?;
 
         // 멱등: 이미 확정 기록 있으면 성공.
         let done: Option<i64> = tx
@@ -624,10 +714,16 @@ impl ApprovalLedger {
             .optional()
             .map_err(|e| LedgerError::Db(e.to_string()))?;
         let current_fence: i64 = tx
-            .query_row("SELECT fence_token FROM grants WHERE grant_id = ?1", params![grant_id], |r| r.get(0))
+            .query_row(
+                "SELECT fence_token FROM grants WHERE grant_id = ?1",
+                params![grant_id],
+                |r| r.get(0),
+            )
             .optional()
             .map_err(|e| LedgerError::Db(e.to_string()))?
-            .ok_or_else(|| LedgerError::GrantNotFound { grant_id: grant_id.into() })?;
+            .ok_or_else(|| LedgerError::GrantNotFound {
+                grant_id: grant_id.into(),
+            })?;
         match reserved_fence {
             // 예약 없이 fence 0을 제시하는 우회 — 명시적 거부.
             None if fence_token == 0 => {
@@ -670,8 +766,11 @@ impl ApprovalLedger {
             params![grant_id],
         )
         .map_err(|e| LedgerError::Db(e.to_string()))?;
-        tx.execute("DELETE FROM reservations WHERE grant_id = ?1", params![grant_id])
-            .map_err(|e| LedgerError::Db(e.to_string()))?;
+        tx.execute(
+            "DELETE FROM reservations WHERE grant_id = ?1",
+            params![grant_id],
+        )
+        .map_err(|e| LedgerError::Db(e.to_string()))?;
 
         tx.commit().map_err(|e| LedgerError::Db(e.to_string()))?;
         Ok(())
@@ -747,8 +846,11 @@ impl ApprovalLedger {
                     params![grant_id],
                 )
                 .map_err(|e| LedgerError::Db(e.to_string()))?;
-                tx.execute("DELETE FROM reservations WHERE grant_id = ?1", params![grant_id])
-                    .map_err(|e| LedgerError::Db(e.to_string()))?;
+                tx.execute(
+                    "DELETE FROM reservations WHERE grant_id = ?1",
+                    params![grant_id],
+                )
+                .map_err(|e| LedgerError::Db(e.to_string()))?;
                 finalized.push(grant_id);
             } else {
                 // 증거 없음 — 릴리즈 (fence 무효화 포함).
@@ -776,18 +878,27 @@ impl ApprovalLedger {
     ) -> Result<(), LedgerError> {
         let token_id = Self::normalize_token_id(token_id);
         if token_id.is_empty() {
-            return Err(LedgerError::ActivationRefused { reason: "no activation token (B4: activation requires a human ApprovalToken)".into() });
+            return Err(LedgerError::ActivationRefused {
+                reason: "no activation token (B4: activation requires a human ApprovalToken)"
+                    .into(),
+            });
         }
         // 주문 스토브 토큰 재사용 차단: 그 token_id가 이미 grant로 쓰였으면
         // 활성화 결속으로 재사용 불가 (결속 스코프가 다르다).
         let used_as_grant: Option<i64> = self
             .conn
-            .query_row("SELECT 1 FROM grants WHERE token_id = ?1", params![token_id], |r| r.get(0))
+            .query_row(
+                "SELECT 1 FROM grants WHERE token_id = ?1",
+                params![token_id],
+                |r| r.get(0),
+            )
             .optional()
             .map_err(|e| LedgerError::Db(e.to_string()))?;
         if used_as_grant.is_some() {
             return Err(LedgerError::ActivationRefused {
-                reason: format!("token {token_id} is order-scoped (used as a grant) — activation requires a root+intent-bound token"),
+                reason: format!(
+                    "token {token_id} is order-scoped (used as a grant) — activation requires a root+intent-bound token"
+                ),
             });
         }
         let now = Utc::now().to_rfc3339();
@@ -836,7 +947,12 @@ impl ApprovalLedger {
 
     /// 활성화 검증 — 호출자가 주장하는 (root, intent, token)이 원장 기록과
     /// 정확히 일치하는가 (다른 root·다른 의도 = 거부).
-    pub fn verify_activation(&self, root: &str, intent: &str, token_id: &str) -> Result<(), LedgerError> {
+    pub fn verify_activation(
+        &self,
+        root: &str,
+        intent: &str,
+        token_id: &str,
+    ) -> Result<(), LedgerError> {
         let token_id = Self::normalize_token_id(token_id);
         let recorded: Option<String> = self
             .conn
@@ -860,7 +976,12 @@ impl ApprovalLedger {
 }
 
 /// grant 스코프 값 편의 생성자 (정규 JSON — 전 스코프 비교).
-pub fn grant_scope(order_id: &str, intent: &str, artifact_digest: &str, root_scope: &str) -> serde_json::Value {
+pub fn grant_scope(
+    order_id: &str,
+    intent: &str,
+    artifact_digest: &str,
+    root_scope: &str,
+) -> serde_json::Value {
     serde_json::json!({
         "order_id": order_id,
         "intent": intent,
@@ -889,7 +1010,9 @@ mod tests {
     #[test]
     fn g3_case2_no_grant_matching_fails() {
         let mut l = ledger();
-        let err = l.reserve_grant("g-ghost", &scope_a(), "ex-1", 1).unwrap_err();
+        let err = l
+            .reserve_grant("g-ghost", &scope_a(), "ex-1", 1)
+            .unwrap_err();
         assert!(matches!(err, LedgerError::GrantNotFound { .. }));
     }
 
@@ -903,7 +1026,10 @@ mod tests {
         assert!(matches!(err, LedgerError::GrantNotFound { .. }), "{err:?}");
         // 다른 order도 거부.
         let wrong2 = grant_scope("o-OTHER", "ship", "dig-abc", "wf-root-1");
-        assert!(matches!(l.reserve_grant("g-1", &wrong2, "ex-1", 1), Err(LedgerError::GrantNotFound { .. })));
+        assert!(matches!(
+            l.reserve_grant("g-1", &wrong2, "ex-1", 1),
+            Err(LedgerError::GrantNotFound { .. })
+        ));
     }
 
     // 1토큰 1grant — 스키마 강제 (D′).
@@ -912,10 +1038,14 @@ mod tests {
         let mut l = ledger();
         l.issue_grant("g-1", "tok-1", &scope_a()).unwrap();
         // 같은 토큰으로 다른 grant 발급 — UNIQUE 위반.
-        let err = l.issue_grant("g-2", "tok-1", &grant_scope("o-2", "ship", "d", "r")).unwrap_err();
+        let err = l
+            .issue_grant("g-2", "tok-1", &grant_scope("o-2", "ship", "d", "r"))
+            .unwrap_err();
         assert!(matches!(err, LedgerError::TokenAlreadyIssued { .. }));
         // token_id 정규화: " tok-1 "도 동일 토큰으로 인식 (이중 등록 차단).
-        let err = l.issue_grant("g-3", "  tok-1  ", &grant_scope("o-3", "s", "d", "r")).unwrap_err();
+        let err = l
+            .issue_grant("g-3", "  tok-1  ", &grant_scope("o-3", "s", "d", "r"))
+            .unwrap_err();
         assert!(matches!(err, LedgerError::TokenAlreadyIssued { .. }));
     }
 
@@ -926,7 +1056,10 @@ mod tests {
         l.issue_grant("g-1", "tok-1", &scope_a()).unwrap();
         let r1 = l.reserve_grant("g-1", &scope_a(), "ex-1", 7).unwrap();
         let r2 = l.reserve_grant("g-1", &scope_a(), "ex-1", 7).unwrap();
-        assert_eq!(r1, r2, "same-key reservation retry must return the SAME fence");
+        assert_eq!(
+            r1, r2,
+            "same-key reservation retry must return the SAME fence"
+        );
         // 다른 키 충돌.
         assert!(matches!(
             l.reserve_grant("g-1", &scope_a(), "ex-OTHER", 7),
@@ -938,7 +1071,10 @@ mod tests {
         // 소비 후 재예약 거부 — finalize가 예약 행을 지우므로 이미
         // CONSUMED 상태 = AlreadyConsumed (state != issued).
         let err = l.reserve_grant("g-1", &scope_a(), "ex-2", 1).unwrap_err();
-        assert!(matches!(err, LedgerError::AlreadyConsumed { .. }), "{err:?}");
+        assert!(
+            matches!(err, LedgerError::AlreadyConsumed { .. }),
+            "{err:?}"
+        );
     }
 
     // 회복-디스패처 경쟁 — fence가 옛 소유자를 차단 (A′ BLOCKER 폐쇄).
@@ -950,8 +1086,13 @@ mod tests {
         let x = l.reserve_grant("g-1", &scope_a(), "ex-X", 1).unwrap();
         l.release_reservation("g-1", "ex-X", 1).unwrap();
         let y = l.reserve_grant("g-1", &scope_a(), "ex-Y", 1).unwrap();
-        assert_ne!(x.fence_token, y.fence_token, "new reservation must get a NEW fence");
-        let err = l.finalize_grant("g-1", "ex-X", 1, x.fence_token).unwrap_err();
+        assert_ne!(
+            x.fence_token, y.fence_token,
+            "new reservation must get a NEW fence"
+        );
+        let err = l
+            .finalize_grant("g-1", "ex-X", 1, x.fence_token)
+            .unwrap_err();
         assert!(
             matches!(&err, LedgerError::FenceStale { your_fence, current_fence, .. }
                 if *your_fence == x.fence_token && *current_fence != x.fence_token),
@@ -962,7 +1103,10 @@ mod tests {
         // X는 Y의 진행 중 예약을 뺏을 수 없다.)
         let err = l.reserve_grant("g-1", &scope_a(), "ex-X", 2).unwrap_err();
         assert!(
-            matches!(err, LedgerError::ReservationConflict { .. } | LedgerError::AlreadyConsumed { .. }),
+            matches!(
+                err,
+                LedgerError::ReservationConflict { .. } | LedgerError::AlreadyConsumed { .. }
+            ),
             "{err:?}"
         );
     }
@@ -972,17 +1116,30 @@ mod tests {
     fn recovery_scan_evidence_semantics() {
         let mut l = ledger();
         l.issue_grant("g-1", "tok-1", &scope_a()).unwrap();
-        l.issue_grant("g-2", "tok-2", &grant_scope("o-2", "ship", "d2", "r2")).unwrap();
+        l.issue_grant("g-2", "tok-2", &grant_scope("o-2", "ship", "d2", "r2"))
+            .unwrap();
         // g-1: 예약+확정 (전이 완료). g-2: 예약만 (크래시 — 증거 없음).
         let r1 = l.reserve_grant("g-1", &scope_a(), "ex-1", 1).unwrap();
         l.finalize_grant("g-1", "ex-1", 1, r1.fence_token).unwrap();
-        l.reserve_grant("g-2", &grant_scope("o-2", "ship", "d2", "r2"), "ex-1", 1).unwrap();
+        l.reserve_grant("g-2", &grant_scope("o-2", "ship", "d2", "r2"), "ex-1", 1)
+            .unwrap();
         let released = l.recovery_scan().unwrap();
-        assert_eq!(released, vec!["g-2".to_string()], "only the evidence-less reservation is released");
+        assert_eq!(
+            released,
+            vec!["g-2".to_string()],
+            "only the evidence-less reservation is released"
+        );
         assert_eq!(l.get_grant("g-1").unwrap().state, GrantState::Consumed);
-        assert_eq!(l.get_grant("g-2").unwrap().state, GrantState::Issued, "released grant returns to Issued (re-reservable)");
+        assert_eq!(
+            l.get_grant("g-2").unwrap().state,
+            GrantState::Issued,
+            "released grant returns to Issued (re-reservable)"
+        );
         // 재예약 가능.
-        assert!(l.reserve_grant("g-2", &grant_scope("o-2", "ship", "d2", "r2"), "ex-9", 1).is_ok());
+        assert!(
+            l.reserve_grant("g-2", &grant_scope("o-2", "ship", "d2", "r2"), "ex-9", 1)
+                .is_ok()
+        );
     }
 
     // release 멱등성 — 이중 해제 무해.
@@ -1001,14 +1158,19 @@ mod tests {
     fn g13_activation_four_cases() {
         let mut l = ledger();
         // ① 무토큰 거부.
-        assert!(matches!(l.activate_workflow("root-1", "activate", ""), Err(LedgerError::ActivationRefused { .. })));
+        assert!(matches!(
+            l.activate_workflow("root-1", "activate", ""),
+            Err(LedgerError::ActivationRefused { .. })
+        ));
         // ② 정상 — root+intent 결속 토큰.
-        l.activate_workflow("root-1", "activate", "tok-act-1").unwrap();
+        l.activate_workflow("root-1", "activate", "tok-act-1")
+            .unwrap();
         // ③ 다른 root / 다른 의도 — 미활성화.
         assert!(!l.is_activated("root-OTHER", "activate").unwrap());
         assert!(!l.is_activated("root-1", "other-intent").unwrap());
         // 검증: 정확 토큰만 통과.
-        l.verify_activation("root-1", "activate", "tok-act-1").unwrap();
+        l.verify_activation("root-1", "activate", "tok-act-1")
+            .unwrap();
         assert!(matches!(
             l.verify_activation("root-1", "activate", "tok-act-2"),
             Err(LedgerError::ActivationRefused { .. })
@@ -1027,8 +1189,13 @@ mod tests {
         let mut l = ledger();
         l.issue_grant("g-1", "tok-A", &scope_a()).unwrap();
         // 전각 Ａ (U+FF21) — NFKC 후 'A'와 동일 → 이중 등록 거부.
-        let err = l.issue_grant("g-2", "tok-Ａ", &grant_scope("o-2", "s", "d", "r")).unwrap_err();
-        assert!(matches!(err, LedgerError::TokenAlreadyIssued { .. }), "{err:?}");
+        let err = l
+            .issue_grant("g-2", "tok-Ａ", &grant_scope("o-2", "s", "d", "r"))
+            .unwrap_err();
+        assert!(
+            matches!(err, LedgerError::TokenAlreadyIssued { .. }),
+            "{err:?}"
+        );
     }
 
     // (astra T53-r1 MAJOR 6) 1토큰 1활성화 결속 — 같은 토큰이 다른
@@ -1036,12 +1203,19 @@ mod tests {
     #[test]
     fn t53r1_activation_token_unique_binding() {
         let mut l = ledger();
-        l.activate_workflow("root-1", "intent-1", "tok-act").unwrap();
+        l.activate_workflow("root-1", "intent-1", "tok-act")
+            .unwrap();
         // 같은 결속 재실행 — 멱드 성공.
-        l.activate_workflow("root-1", "intent-1", "tok-act").unwrap();
+        l.activate_workflow("root-1", "intent-1", "tok-act")
+            .unwrap();
         // 같은 토큰, 다른 결속 — 거부.
-        let err = l.activate_workflow("root-2", "intent-2", "tok-act").unwrap_err();
-        assert!(matches!(err, LedgerError::ActivationRefused { .. }), "{err:?}");
+        let err = l
+            .activate_workflow("root-2", "intent-2", "tok-act")
+            .unwrap_err();
+        assert!(
+            matches!(err, LedgerError::ActivationRefused { .. }),
+            "{err:?}"
+        );
         // 다른 (root,intent)는 미활성화.
         assert!(!l.is_activated("root-2", "intent-2").unwrap());
     }
@@ -1055,10 +1229,17 @@ mod tests {
         // 예약 없이 즉시 finalize — 거부.
         let err = l.finalize_grant("g-1", "arbitrary-exec", 1, 0).unwrap_err();
         assert!(
-            matches!(err, LedgerError::ReservationConflict { .. } | LedgerError::FenceStale { .. }),
+            matches!(
+                err,
+                LedgerError::ReservationConflict { .. } | LedgerError::FenceStale { .. }
+            ),
             "{err:?}"
         );
-        assert_eq!(l.get_grant("g-1").unwrap().state, GrantState::Issued, "bypass attempt must NOT consume");
+        assert_eq!(
+            l.get_grant("g-1").unwrap().state,
+            GrantState::Issued,
+            "bypass attempt must NOT consume"
+        );
     }
 
     // (T53a-r1 BLOCKER 보조) verify_reservation — 해제된 예약은 apply 직전 검증 실패.
@@ -1068,10 +1249,14 @@ mod tests {
         l.issue_grant("g-1", "tok-1", &scope_a()).unwrap();
         let r = l.reserve_grant("g-1", &scope_a(), "ex-1", 5).unwrap();
         // 아직 유효.
-        l.verify_reservation("g-1", "ex-1", 5, r.fence_token).unwrap();
+        l.verify_reservation("g-1", "ex-1", 5, r.fence_token)
+            .unwrap();
         // 해제 후 — 실패.
         l.release_reservation("g-1", "ex-1", 5).unwrap();
-        assert!(l.verify_reservation("g-1", "ex-1", 5, r.fence_token).is_err());
+        assert!(
+            l.verify_reservation("g-1", "ex-1", 5, r.fence_token)
+                .is_err()
+        );
     }
 
     // (astra r2 BLOCKER) begin_apply 커밋 후에는 회복조차 릴리즈 불가 —
@@ -1086,8 +1271,15 @@ mod tests {
         assert_eq!(l.get_grant("g-1").unwrap().state, GrantState::Applying);
         // 크래시 시뮬레이션: finalize 없이 회복 스캔.
         let released = l.recovery_scan().unwrap();
-        assert!(released.is_empty(), "APPLYING must NEVER be released: {released:?}");
-        assert_eq!(l.get_grant("g-1").unwrap().state, GrantState::Consumed, "recovery completes APPLYING to CONSUMED — no reissue");
+        assert!(
+            released.is_empty(),
+            "APPLYING must NEVER be released: {released:?}"
+        );
+        assert_eq!(
+            l.get_grant("g-1").unwrap().state,
+            GrantState::Consumed,
+            "recovery completes APPLYING to CONSUMED — no reissue"
+        );
         // 재발급 시도도 불가.
         assert!(matches!(
             l.reserve_grant("g-1", &scope_a(), "ex-2", 1),
@@ -1122,8 +1314,15 @@ mod tests {
         l.begin_apply("g-1", "ex-1", 3, r.fence_token).unwrap();
         // 동일 키 release — 거부 (Applying은 소비 확정).
         let err = l.release_reservation("g-1", "ex-1", 3).unwrap_err();
-        assert!(matches!(err, LedgerError::AlreadyConsumed { .. }), "{err:?}");
-        assert_eq!(l.get_grant("g-1").unwrap().state, GrantState::Applying, "still APPLYING");
+        assert!(
+            matches!(err, LedgerError::AlreadyConsumed { .. }),
+            "{err:?}"
+        );
+        assert_eq!(
+            l.get_grant("g-1").unwrap().state,
+            GrantState::Applying,
+            "still APPLYING"
+        );
         // 재예약도 불가.
         assert!(matches!(
             l.reserve_grant("g-1", &scope_a(), "ex-1", 3),
@@ -1136,15 +1335,27 @@ mod tests {
     fn t53r4_stale_fence_cannot_release_newer_reservation() {
         let mut l = ledger();
         l.issue_grant("g-1", "tok-1", &scope_a()).unwrap();
-        let f1 = l.reserve_grant("g-1", &scope_a(), "ex-1", 7).unwrap().fence_token;
+        let f1 = l
+            .reserve_grant("g-1", &scope_a(), "ex-1", 7)
+            .unwrap()
+            .fence_token;
         // 회복이 릴리즈 → 같은 키로 재예약 (새 fence).
         l.release_reservation_fenced("g-1", "ex-1", 7, f1).unwrap();
-        let f2 = l.reserve_grant("g-1", &scope_a(), "ex-1", 7).unwrap().fence_token;
+        let f2 = l
+            .reserve_grant("g-1", &scope_a(), "ex-1", 7)
+            .unwrap()
+            .fence_token;
         assert_ne!(f1, f2);
         // 옛 fence f1으로의 지연 해제 — 거부, 새 예약 보존.
-        let err = l.release_reservation_fenced("g-1", "ex-1", 7, f1).unwrap_err();
+        let err = l
+            .release_reservation_fenced("g-1", "ex-1", 7, f1)
+            .unwrap_err();
         assert!(matches!(err, LedgerError::FenceStale { .. }), "{err:?}");
-        assert_eq!(l.get_grant("g-1").unwrap().state, GrantState::Pending, "newer reservation survives");
+        assert_eq!(
+            l.get_grant("g-1").unwrap().state,
+            GrantState::Pending,
+            "newer reservation survives"
+        );
         // 올바른 fence f2는 해제 가능.
         l.release_reservation_fenced("g-1", "ex-1", 7, f2).unwrap();
         assert_eq!(l.get_grant("g-1").unwrap().state, GrantState::Issued);
@@ -1157,20 +1368,32 @@ mod tests {
         let mut l = ledger();
         l.issue_grant("g-1", "tok-1", &scope_a()).unwrap();
         let r = l.reserve_grant("g-1", &scope_a(), "ex-1", 5).unwrap();
-        assert!(!l.apply_intent("g-1", "ex-1", 5).unwrap(), "no intent before begin_apply");
+        assert!(
+            !l.apply_intent("g-1", "ex-1", 5).unwrap(),
+            "no intent before begin_apply"
+        );
         l.begin_apply("g-1", "ex-1", 5, r.fence_token).unwrap();
         // "크래시" — 확정 없이 조사.
-        assert!(l.apply_intent("g-1", "ex-1", 5).unwrap(), "intent survives the crash window");
+        assert!(
+            l.apply_intent("g-1", "ex-1", 5).unwrap(),
+            "intent survives the crash window"
+        );
         // 회복은 CONSUMED로 완결.
         l.recovery_scan().unwrap();
         assert_eq!(l.get_grant("g-1").unwrap().state, GrantState::Consumed);
         // 정상 경로: 의도 → 확정 → 정리.
-        l.issue_grant("g-2", "tok-2", &grant_scope("o-2", "s", "d", "r")).unwrap();
-        let r2 = l.reserve_grant("g-2", &grant_scope("o-2", "s", "d", "r"), "ex-2", 1).unwrap();
+        l.issue_grant("g-2", "tok-2", &grant_scope("o-2", "s", "d", "r"))
+            .unwrap();
+        let r2 = l
+            .reserve_grant("g-2", &grant_scope("o-2", "s", "d", "r"), "ex-2", 1)
+            .unwrap();
         l.begin_apply("g-2", "ex-2", 1, r2.fence_token).unwrap();
         assert!(l.apply_intent("g-2", "ex-2", 1).unwrap());
         l.finalize_grant("g-2", "ex-2", 1, r2.fence_token).unwrap();
-        assert!(!l.apply_intent("g-2", "ex-2", 1).unwrap(), "intent cleaned after finalize");
+        assert!(
+            !l.apply_intent("g-2", "ex-2", 1).unwrap(),
+            "intent cleaned after finalize"
+        );
     }
 
     // 정규 스코프 — 키 순서 무관 동결 비교.

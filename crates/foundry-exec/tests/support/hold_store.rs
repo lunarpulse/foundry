@@ -1,8 +1,14 @@
-use std::{collections::BTreeMap, fs::{self, File}, path::PathBuf, sync::Mutex};
+use std::{
+    collections::BTreeMap,
+    fs::{self, File},
+    path::PathBuf,
+    sync::Mutex,
+};
 
 use foundry_exec::{
-    HoldApplied, HoldCasOutcome, HoldCommand, HoldInstanceId, HoldState, HoldStatus,
-    apply_hold, cas_hold, ports::{HoldStore, PortError},
+    HoldApplied, HoldCasOutcome, HoldCommand, HoldInstanceId, HoldState, HoldStatus, apply_hold,
+    cas_hold,
+    ports::{HoldStore, PortError},
 };
 use serde::{Deserialize, Serialize};
 
@@ -17,11 +23,15 @@ pub struct HoldDb {
 
 pub struct DiskHolds(PathBuf);
 impl DiskHolds {
-    pub fn new(path: PathBuf) -> Self { Self(path) }
+    pub fn new(path: PathBuf) -> Self {
+        Self(path)
+    }
 
     pub fn read(&self) -> Result<HoldDb, PortError> {
         match fs::read(&self.0) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| PortError::Store(error.to_string())),
+            Ok(bytes) => {
+                serde_json::from_slice(&bytes).map_err(|error| PortError::Store(error.to_string()))
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(HoldDb::default()),
             Err(error) => Err(PortError::Store(error.to_string())),
         }
@@ -31,7 +41,9 @@ impl DiskHolds {
         use std::io::Write;
         let pending = self.0.with_extension("pending");
         let persist = || -> Result<(), Box<dyn std::error::Error>> {
-            let mut inventory = fs::OpenOptions::new().create(true).append(true)
+            let mut inventory = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
                 .open(std::env::temp_dir().join("runtime-temporaries.txt"))?;
             writeln!(inventory, "{} (hold state)", self.0.display())?;
             writeln!(inventory, "{} (rename temporary)", pending.display())?;
@@ -55,21 +67,37 @@ impl HoldStore for DiskHolds {
         let _writer = WRITER.lock().unwrap();
         let mut db = self.read()?;
         let key = key(instance);
-        if db.states.contains_key(&key) { return Ok(false); }
-        db.states.insert(key, HoldState { instance: instance.clone(), resume_to: resume_to.into(),
-            status: HoldStatus::Waiting, resolution: None });
+        if db.states.contains_key(&key) {
+            return Ok(false);
+        }
+        db.states.insert(
+            key,
+            HoldState {
+                instance: instance.clone(),
+                resume_to: resume_to.into(),
+                status: HoldStatus::Waiting,
+                resolution: None,
+            },
+        );
         self.write(&db)?;
         Ok(true)
     }
 
-    fn apply(&self, cmd: &HoldCommand, expected: &HoldInstanceId) -> Result<HoldApplied, PortError> {
+    fn apply(
+        &self,
+        cmd: &HoldCommand,
+        expected: &HoldInstanceId,
+    ) -> Result<HoldApplied, PortError> {
         // CAS mismatch takes precedence over lookup and all operation validation.
         if let conflict @ HoldCasOutcome::Conflict { .. } = cas_hold(expected, cmd) {
             return Err(PortError::HoldConflict(conflict));
         }
         let _writer = WRITER.lock().unwrap();
         let mut db = self.read()?;
-        let state = db.states.get_mut(&key(expected)).ok_or(PortError::MissingHold)?;
+        let state = db
+            .states
+            .get_mut(&key(expected))
+            .ok_or(PortError::MissingHold)?;
         let applied = apply_hold(state, cmd, expected)?;
         if matches!(applied, HoldApplied::Info) || matches!(state.status, HoldStatus::Resolved(_)) {
             return Ok(applied);

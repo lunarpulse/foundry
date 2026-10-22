@@ -102,7 +102,8 @@ impl Harness for CliHarness {
             let origin_base = match &protocol.base {
                 BaseSelection::Latest => None,
                 BaseSelection::Origin => Some(git_repo_commit(
-                    &workdir.join("repo"), "refs/remotes/origin/main^{commit}",
+                    &workdir.join("repo"),
+                    "refs/remotes/origin/main^{commit}",
                 )?),
                 BaseSelection::Commit(commit) => Some(commit.clone()),
             };
@@ -277,7 +278,6 @@ fn git_ref(dir: &Path, reference: &str) -> String {
         .unwrap_or_default()
 }
 
-
 /// Unlike the legacy workdir lookup, Origin is bound to this exact clone.
 /// Do not inherit GIT_DIR/GIT_WORK_TREE (or Git config env) from the host.
 fn git_repo_commit(repo: &Path, reference: &str) -> PortResult<String> {
@@ -286,12 +286,18 @@ fn git_repo_commit(repo: &Path, reference: &str) -> PortResult<String> {
             .args(args)
             .current_dir(repo)
             .env_clear()
-            .env("PATH", std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()))
+            .env(
+                "PATH",
+                std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()),
+            )
             .output()
-            .map_err(|e| PortError::Permanent(format!("git {reference} in {}: {e}", repo.display())))?;
+            .map_err(|e| {
+                PortError::Permanent(format!("git {reference} in {}: {e}", repo.display()))
+            })?;
         if !output.status.success() {
             return Err(PortError::Permanent(format!(
-                "git {reference} failed in {}", repo.display()
+                "git {reference} failed in {}",
+                repo.display()
             )));
         }
         Ok(output.stdout)
@@ -301,7 +307,8 @@ fn git_repo_commit(repo: &Path, reference: &str) -> PortResult<String> {
     let prefix = run(&["rev-parse", "--show-prefix"])?;
     if prefix != b"\n" && !prefix.is_empty() {
         return Err(PortError::Permanent(format!(
-            "die repository is not rooted at {}", repo.display()
+            "die repository is not rooted at {}",
+            repo.display()
         )));
     }
     let bytes = run(&["rev-parse", "--verify", reference])?;
@@ -310,7 +317,8 @@ fn git_repo_commit(repo: &Path, reference: &str) -> PortResult<String> {
     // non-object response. Git supports both SHA-1 and SHA-256 repositories.
     if !matches!(commit.len(), 40 | 64) || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(PortError::Permanent(format!(
-            "invalid git {reference} output in {}", repo.display()
+            "invalid git {reference} output in {}",
+            repo.display()
         )));
     }
     Ok(commit.to_string())

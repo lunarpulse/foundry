@@ -39,15 +39,37 @@ pub struct ApprovalRef {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SealError {
-    BotAuthor { comment_id: u64 },
-    EditedComment { comment_id: u64, revisions: u32 },
-    WithdrawnComment { comment_id: u64 },
-    UnboundApproval { comment_id: u64 },
-    HeadShaDrift { comment_id: u64, sealed: String, current: String },
-    HoldoutReference { comment_id: u64, digest: String },
-    PrivacyLeak { comment_id: u64 },
-    AlreadySealed { lesson_id: String },
-    UnknownApproval { order_id: String },
+    BotAuthor {
+        comment_id: u64,
+    },
+    EditedComment {
+        comment_id: u64,
+        revisions: u32,
+    },
+    WithdrawnComment {
+        comment_id: u64,
+    },
+    UnboundApproval {
+        comment_id: u64,
+    },
+    HeadShaDrift {
+        comment_id: u64,
+        sealed: String,
+        current: String,
+    },
+    HoldoutReference {
+        comment_id: u64,
+        digest: String,
+    },
+    PrivacyLeak {
+        comment_id: u64,
+    },
+    AlreadySealed {
+        lesson_id: String,
+    },
+    UnknownApproval {
+        order_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -129,24 +151,35 @@ impl LessonStore {
     /// moment); it must equal the approval transition's head.
     pub fn seal(&mut self, input: LessonSealInput, current_head: &str) -> Result<(), SealError> {
         if self.lessons.contains_key(&input.lesson_id) {
-            return Err(SealError::AlreadySealed { lesson_id: input.lesson_id });
+            return Err(SealError::AlreadySealed {
+                lesson_id: input.lesson_id,
+            });
         }
         // (a) human authorship — bot output is machine output, not
         // human feedback; a bot spoofing a human account is exactly
         // why the flag is trusted only from the connector layer
         if input.author_is_bot {
-            return Err(SealError::BotAuthor { comment_id: input.comment_id });
+            return Err(SealError::BotAuthor {
+                comment_id: input.comment_id,
+            });
         }
         // (b) unedited
         if input.comment_revisions != 1 {
-            return Err(SealError::EditedComment { comment_id: input.comment_id, revisions: input.comment_revisions });
+            return Err(SealError::EditedComment {
+                comment_id: input.comment_id,
+                revisions: input.comment_revisions,
+            });
         }
         // (c) unwithdrawn
         if input.withdrawn {
-            return Err(SealError::WithdrawnComment { comment_id: input.comment_id });
+            return Err(SealError::WithdrawnComment {
+                comment_id: input.comment_id,
+            });
         }
         // (d) approval-transition binding: head drift voids the seal
-        if input.pr_head_sha != input.approval.approved_head_sha || input.pr_head_sha != current_head {
+        if input.pr_head_sha != input.approval.approved_head_sha
+            || input.pr_head_sha != current_head
+        {
             return Err(SealError::HeadShaDrift {
                 comment_id: input.comment_id,
                 sealed: input.approval.approved_head_sha.clone(),
@@ -156,12 +189,17 @@ impl LessonStore {
         // (e) holdout contamination is adversarial input
         for d in &input.holdout_digests {
             if input.content.contains(d.as_str()) {
-                return Err(SealError::HoldoutReference { comment_id: input.comment_id, digest: d.clone() });
+                return Err(SealError::HoldoutReference {
+                    comment_id: input.comment_id,
+                    digest: d.clone(),
+                });
             }
         }
         // (f) privacy screen
         if CREDENTIAL_SHAPES.iter().any(|p| input.content.contains(p)) {
-            return Err(SealError::PrivacyLeak { comment_id: input.comment_id });
+            return Err(SealError::PrivacyLeak {
+                comment_id: input.comment_id,
+            });
         }
 
         // governance ride-along: intent + effect with the SAME digest.
@@ -169,14 +207,27 @@ impl LessonStore {
         // revoking the same lesson are two distinct op instances
         // (T49a: one op_id = one intent/effect pair).
         let seal_op = format!("seal:{}", input.lesson_id);
-        let e1 = self.gov(OpKind::LessonSeal, Phase::Pending, &seal_op, &input.content_hash);
-        let e2 = self.gov(OpKind::LessonSeal, Phase::Committed, &seal_op, &input.content_hash);
+        let e1 = self.gov(
+            OpKind::LessonSeal,
+            Phase::Pending,
+            &seal_op,
+            &input.content_hash,
+        );
+        let e2 = self.gov(
+            OpKind::LessonSeal,
+            Phase::Committed,
+            &seal_op,
+            &input.content_hash,
+        );
         self.governance_journal.push(e1);
         self.governance_journal.push(e2);
 
         self.lessons.insert(
             input.lesson_id.clone(),
-            LessonRecord { input, state: LessonState::Active },
+            LessonRecord {
+                input,
+                state: LessonState::Active,
+            },
         );
         Ok(())
     }
@@ -216,19 +267,39 @@ impl LessonStore {
             rec.input.content_hash.clone()
         };
         let revoke_op = format!("revoke:{lesson_id}");
-        let e1 = self.gov(OpKind::LessonRevoke, Phase::Pending, &revoke_op, &content_hash);
-        let e2 = self.gov(OpKind::LessonRevoke, Phase::Committed, &revoke_op, &content_hash);
+        let e1 = self.gov(
+            OpKind::LessonRevoke,
+            Phase::Pending,
+            &revoke_op,
+            &content_hash,
+        );
+        let e2 = self.gov(
+            OpKind::LessonRevoke,
+            Phase::Committed,
+            &revoke_op,
+            &content_hash,
+        );
         self.governance_journal.push(e1);
         self.governance_journal.push(e2);
         // state flip AFTER the governance pair (intent precedes effect)
         let rec = self.lessons.get_mut(lesson_id).unwrap();
-        rec.state = LessonState::Revoked { reason: reason.into(), at: "2026-10-08T00:00:00Z".into() };
+        rec.state = LessonState::Revoked {
+            reason: reason.into(),
+            at: "2026-10-08T00:00:00Z".into(),
+        };
 
         // effect matrix over the bundle index
-        let mut fx = RevocationEffects { excluded_from_selection: vec![lesson_id.to_string()], ..Default::default() };
+        let mut fx = RevocationEffects {
+            excluded_from_selection: vec![lesson_id.to_string()],
+            ..Default::default()
+        };
         let active = bundles.active_candidates();
         for cand in known_candidates {
-            if bundles.lessons_of_candidate(cand).iter().any(|l| l == lesson_id) {
+            if bundles
+                .lessons_of_candidate(cand)
+                .iter()
+                .any(|l| l == lesson_id)
+            {
                 if active.contains(cand) {
                     // already live: flag for human re-evaluation, never auto-rollback
                     fx.active_deployments_flagged.push(cand.clone());
@@ -239,7 +310,11 @@ impl LessonStore {
         }
         for t in known_tokens {
             if let Some(binding) = bundles.token_binding(t) {
-                if bundles.lessons_of_candidate(&binding).iter().any(|l| l == lesson_id) {
+                if bundles
+                    .lessons_of_candidate(&binding)
+                    .iter()
+                    .any(|l| l == lesson_id)
+                {
                     fx.promotion_tokens_invalidated.push(t.clone());
                 }
             }
@@ -252,9 +327,18 @@ impl LessonStore {
     pub fn promotion_eligible(&self, lessons_referenced: &[String]) -> Result<(), String> {
         for l in lessons_referenced {
             match self.lessons.get(l) {
-                None => return Err(format!("candidate references unknown lesson {l} — mutable lesson references are not interpretable in production (M5 #15)")),
+                None => {
+                    return Err(format!(
+                        "candidate references unknown lesson {l} — mutable lesson references are not interpretable in production (M5 #15)"
+                    ));
+                }
                 Some(r) if r.state == LessonState::Active => {}
-                Some(r) => return Err(format!("candidate references revoked lesson {l}: {:?}", r.state)),
+                Some(r) => {
+                    return Err(format!(
+                        "candidate references revoked lesson {l}: {:?}",
+                        r.state
+                    ));
+                }
             }
         }
         Ok(())
@@ -316,7 +400,10 @@ mod tests {
         let mut s = LessonStore::new();
         let mut i = input("L2");
         i.author_is_bot = true;
-        assert!(matches!(s.seal(i, "sha-1"), Err(SealError::BotAuthor { .. })));
+        assert!(matches!(
+            s.seal(i, "sha-1"),
+            Err(SealError::BotAuthor { .. })
+        ));
     }
 
     #[test]
@@ -324,7 +411,10 @@ mod tests {
         let mut s = LessonStore::new();
         let mut i = input("L3");
         i.comment_revisions = 2; // the comment was edited after the fact
-        assert!(matches!(s.seal(i, "sha-1"), Err(SealError::EditedComment { revisions: 2, .. })));
+        assert!(matches!(
+            s.seal(i, "sha-1"),
+            Err(SealError::EditedComment { revisions: 2, .. })
+        ));
     }
 
     #[test]
@@ -332,19 +422,28 @@ mod tests {
         let mut s = LessonStore::new();
         let mut i = input("L4");
         i.withdrawn = true;
-        assert!(matches!(s.seal(i, "sha-1"), Err(SealError::WithdrawnComment { .. })));
+        assert!(matches!(
+            s.seal(i, "sha-1"),
+            Err(SealError::WithdrawnComment { .. })
+        ));
     }
 
     #[test]
     fn post_approval_push_voids_binding() {
         let mut s = LessonStore::new();
         // force-push after approval: current head drifted
-        assert!(matches!(s.seal(input("L5"), "sha-2"), Err(SealError::HeadShaDrift { .. })));
+        assert!(matches!(
+            s.seal(input("L5"), "sha-2"),
+            Err(SealError::HeadShaDrift { .. })
+        ));
         // and a seal claiming a different head than the approval is
         // refused even if the CURRENT head matches the claim
         let mut i = input("L5b");
         i.pr_head_sha = "sha-2".into();
-        assert!(matches!(s.seal(i, "sha-2"), Err(SealError::HeadShaDrift { .. })));
+        assert!(matches!(
+            s.seal(i, "sha-2"),
+            Err(SealError::HeadShaDrift { .. })
+        ));
     }
 
     #[test]
@@ -353,7 +452,9 @@ mod tests {
         let mut i = input("L6");
         i.holdout_digests.insert("m-hold-9".into());
         i.content = "remember the fix pattern from m-hold-9".into();
-        assert!(matches!(s.seal(i, "sha-1"), Err(SealError::HoldoutReference { digest, .. }) if digest == "m-hold-9"));
+        assert!(
+            matches!(s.seal(i, "sha-1"), Err(SealError::HoldoutReference { digest, .. }) if digest == "m-hold-9")
+        );
     }
 
     #[test]
@@ -361,7 +462,10 @@ mod tests {
         let mut s = LessonStore::new();
         let mut i = input("L7");
         i.content = "use this key instead: sk-CANARY-1234".into();
-        assert!(matches!(s.seal(i, "sha-1"), Err(SealError::PrivacyLeak { .. })));
+        assert!(matches!(
+            s.seal(i, "sha-1"),
+            Err(SealError::PrivacyLeak { .. })
+        ));
     }
 
     #[test]
@@ -371,13 +475,18 @@ mod tests {
         s.seal(input("L11"), "sha-1").unwrap();
         let idx = FlatIndex {
             bundles: [
-                ("cand-pending".to_string(), vec!["L10".to_string(), "L11".to_string()]),
+                (
+                    "cand-pending".to_string(),
+                    vec!["L10".to_string(), "L11".to_string()],
+                ),
                 ("cand-clean".to_string(), vec!["L11".to_string()]),
                 ("cand-live".to_string(), vec!["L10".to_string()]),
             ]
             .into_iter()
             .collect(),
-            tokens: [("tok-1".to_string(), "cand-pending".to_string())].into_iter().collect(),
+            tokens: [("tok-1".to_string(), "cand-pending".to_string())]
+                .into_iter()
+                .collect(),
             active: vec!["cand-live".to_string()],
         };
         let fx = s
@@ -385,19 +494,36 @@ mod tests {
                 "L10",
                 "author requested deletion",
                 &idx,
-                &["cand-pending".into(), "cand-clean".into(), "cand-live".into()],
+                &[
+                    "cand-pending".into(),
+                    "cand-clean".into(),
+                    "cand-live".into(),
+                ],
                 &["tok-1".into()],
             )
             .unwrap();
         assert_eq!(fx.excluded_from_selection, vec!["L10"]);
         assert_eq!(fx.candidates_made_ineligible, vec!["cand-pending"]);
         assert_eq!(fx.promotion_tokens_invalidated, vec!["tok-1"]);
-        assert_eq!(fx.active_deployments_flagged, vec!["cand-live"], "live: flagged for human re-eval, NOT auto-rollback");
+        assert_eq!(
+            fx.active_deployments_flagged,
+            vec!["cand-live"],
+            "live: flagged for human re-eval, NOT auto-rollback"
+        );
         // clean candidate untouched
-        assert!(!fx.candidates_made_ineligible.contains(&"cand-clean".to_string()));
+        assert!(
+            !fx.candidates_made_ineligible
+                .contains(&"cand-clean".to_string())
+        );
 
         // eligibility follows immediately
-        assert_eq!(s.eligible().iter().map(|l| l.input.lesson_id.clone()).collect::<Vec<_>>(), vec!["L11"]);
+        assert_eq!(
+            s.eligible()
+                .iter()
+                .map(|l| l.input.lesson_id.clone())
+                .collect::<Vec<_>>(),
+            vec!["L11"]
+        );
         // promotion gate: pending candidate is now blocked
         assert!(s.promotion_eligible(&["L10".into(), "L11".into()]).is_err());
         assert!(s.promotion_eligible(&["L11".into()]).is_ok());
@@ -411,11 +537,18 @@ mod tests {
     fn lesson_lifecycle_rides_the_governance_protocol() {
         let mut s = LessonStore::new();
         s.seal(input("L20"), "sha-1").unwrap();
-        let idx = FlatIndex { bundles: BTreeMap::new(), tokens: BTreeMap::new(), active: vec![] };
+        let idx = FlatIndex {
+            bundles: BTreeMap::new(),
+            tokens: BTreeMap::new(),
+            active: vec![],
+        };
         s.revoke("L20", "test", &idx, &[], &[]).unwrap();
         // the journal is a valid intent/effect stream (T49a verifier)
         let ok = crate::governance_events::verify_stream(&s.governance_journal);
-        assert!(ok.is_ok(), "seal+revoke must verify as paired governance events");
+        assert!(
+            ok.is_ok(),
+            "seal+revoke must verify as paired governance events"
+        );
         // and the record itself was never rewritten: state flipped only
         let r = s.lessons.get("L20").unwrap();
         assert_eq!(r.input.content_hash, "h-abc");

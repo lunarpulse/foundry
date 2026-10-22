@@ -13,9 +13,12 @@
 //!      and observe the same durability contract as T58w: the file
 //!      opens, the stream is valid, committed facts survive, the
 //!      journal continues at the right seq.
-use foundry_watch::bundles::{BundleProfile, BundleStore, CandidateBundle, DependencyPins, LessonSnapshot};
+use foundry_watch::bundles::{
+    BundleProfile, BundleStore, CandidateBundle, DependencyPins, LessonSnapshot,
+};
 use foundry_watch::casting_wiring::{
-    issue_bundle_token_for_domain, profile_from_bundle, promote_with_store_token, DomainTokenGate, WiringError,
+    DomainTokenGate, WiringError, issue_bundle_token_for_domain, profile_from_bundle,
+    promote_with_store_token,
 };
 use foundry_watch::governance_events::GovernanceEvent;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,12 +36,23 @@ fn store_with_bundle() -> (BundleStore, String) {
     let mut st = BundleStore::default();
     let b = CandidateBundle::build(
         "cand-lin",
-        BundleProfile { model: "deepseek-v4".into(), temperature: Some(0.0), seed: Some(7), max_output_tokens: 512 },
+        BundleProfile {
+            model: "deepseek-v4".into(),
+            temperature: Some(0.0),
+            seed: Some(7),
+            max_output_tokens: 512,
+        },
         "solve {{task}}",
-        vec![LessonSnapshot { lesson_id: "L1".into(), content_hash: lesson_hash("prefer map_err"), content: "prefer map_err".into() }],
+        vec![LessonSnapshot {
+            lesson_id: "L1".into(),
+            content_hash: lesson_hash("prefer map_err"),
+            content: "prefer map_err".into(),
+        }],
         DependencyPins {
             image_digest: "sha256:aa".into(),
-            tool_digests: [("cargo".to_string(), "sha256:bb".into())].into_iter().collect(),
+            tool_digests: [("cargo".to_string(), "sha256:bb".into())]
+                .into_iter()
+                .collect(),
             model_revision: Some("rev-9".into()),
         },
     )
@@ -117,7 +131,10 @@ fn l1_concurrent_token_issuance_linearizes_to_exactly_one() {
             Err(e) => panic!("unexpected: {e:?}"),
         }
     }
-    assert_eq!(issued, 1, "the single-use domain token authorizes exactly ONE issuance");
+    assert_eq!(
+        issued, 1,
+        "the single-use domain token authorizes exactly ONE issuance"
+    );
     assert_eq!(denied, N as i64 - 1);
     let st = shared.lock().unwrap();
     assert_eq!(st.tokens_len(), 1);
@@ -139,7 +156,8 @@ fn l2_process_group_cancellation_durability() {
     let db = dir.join("gov.db");
     let ready = dir.join("ready");
 
-    let mut child = std::process::Command::new("setsid").arg("-w")
+    let mut child = std::process::Command::new("setsid")
+        .arg("-w")
         .arg(BIN)
         .arg(&db)
         .arg(&ready)
@@ -174,7 +192,10 @@ fn l2_process_group_cancellation_durability() {
     // the kill must have landed BEFORE completion: the done marker
     // (written after the final committed pair) must be absent —
     // otherwise this run proved nothing about cancellation (astra 3rd).
-    assert!(!dir.join("done").exists(), "child completed before the kill — run proved nothing");
+    assert!(
+        !dir.join("done").exists(),
+        "child completed before the kill — run proved nothing"
+    );
 
     // durability contract holds after group cancellation
     let mut coord = foundry_watch::coordinator::GovernanceCoordinator::open(&db)
@@ -188,7 +209,10 @@ fn l2_process_group_cancellation_durability() {
         .iter()
         .filter(|e| matches!(e.phase, foundry_watch::governance_events::Phase::Committed))
         .count();
-    assert!(committed >= 3, "committed facts survive group cancellation: {committed}");
+    assert!(
+        committed >= 3,
+        "committed facts survive group cancellation: {committed}"
+    );
     let next = coord
         .append(foundry_watch::governance_events::GovernanceEvent {
             schema_version: 1,
@@ -201,6 +225,10 @@ fn l2_process_group_cancellation_durability() {
             at: "t".into(),
         })
         .unwrap();
-    assert_eq!(next, stream.last().unwrap().seq + 1, "journal continues at the right seq");
+    assert_eq!(
+        next,
+        stream.last().unwrap().seq + 1,
+        "journal continues at the right seq"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

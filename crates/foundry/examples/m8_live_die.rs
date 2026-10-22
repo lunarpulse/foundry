@@ -14,10 +14,10 @@ use std::path::PathBuf;
 
 use foundry_domain::order::{ExternalRef, Order};
 use foundry_domain::{OrderEvent, OrderState};
-use foundry_orch::chainer::Chainer;
-use foundry_orch::stream::{Stream, StreamRuntime};
 use foundry_orch::OrchestrationKind;
 use foundry_orch::OrchestrationLog;
+use foundry_orch::chainer::Chainer;
+use foundry_orch::stream::{Stream, StreamRuntime};
 
 fn main() {
     let mut issue = String::from("139");
@@ -59,8 +59,10 @@ fn main() {
 
     let rt = StreamRuntime::new(OrchestrationLog::open(&orch_db).unwrap());
     let orch = rt.orch.clone();
-    rt.add_stream(Stream::new_with_root("s-live", &d, "bmad-quickloop").unwrap()).unwrap();
-    rt.bind_approval_ledger(foundry_approval::ApprovalLedger::open(&ap_db).unwrap()).unwrap();
+    rt.add_stream(Stream::new_with_root("s-live", &d, "bmad-quickloop").unwrap())
+        .unwrap();
+    rt.bind_approval_ledger(foundry_approval::ApprovalLedger::open(&ap_db).unwrap())
+        .unwrap();
     println!("플랜 선언 + 스트림 s-live(quickloop) + 승인 원장 바인딩");
 
     // ── 입장: Jira/Intake 대신 이슈 참조 직접 구성 ─────────────
@@ -76,7 +78,9 @@ fn main() {
 
     // ── 실 Die 세그먼트 ────────────────────────────────────────
     println!("\n── 실 Die 세그먼트 ──");
-    let st = rt.start_die_segment("s-live", &order_id, "m8-live").unwrap();
+    let st = rt
+        .start_die_segment("s-live", &order_id, "m8-live")
+        .unwrap();
     println!("세그먼트 시작: {st:?} — foundry-die(클론→rustain→범프→커밋) 실행…");
     println!("   (cargo check 포함, 수 분 소요 가능 — 로그는 workdir 참조)\n");
 
@@ -85,7 +89,11 @@ fn main() {
         "coding",
         900, // 15분 — rustain 에이전트 런타임 여유
     );
-    let order = rt.stream("s-live").unwrap().order_snapshot(&order_id).unwrap();
+    let order = rt
+        .stream("s-live")
+        .unwrap()
+        .order_snapshot(&order_id)
+        .unwrap();
     let workdir = d.join("die");
     std::fs::create_dir_all(&workdir).unwrap();
 
@@ -100,8 +108,14 @@ fn main() {
 
     match die {
         Ok(out) if out.exit_code == 0 => {
-            println!("   Die 성공: exit={} result_commit={}", out.exit_code, &out.result_commit[..12.min(out.result_commit.len())]);
-            let st = rt.finish_die_segment("s-live", &order_id, "m8-live", &out).unwrap();
+            println!(
+                "   Die 성공: exit={} result_commit={}",
+                out.exit_code,
+                &out.result_commit[..12.min(out.result_commit.len())]
+            );
+            let st = rt
+                .finish_die_segment("s-live", &order_id, "m8-live", &out)
+                .unwrap();
             println!("   세그먼트 종결: {st:?} — 실 커밋이 artifact_digest로 결속됨");
         }
         Ok(out) => {

@@ -11,8 +11,8 @@
 //!   crash → PublishUnknown → reconcile (#2).
 //! - **Approval ≠ published**: separate FurnaceHold → Publishing → Shipped
 //!   states; PR creation is fallible and re-verifies the digest (#1, §11).
-use crate::error::LineError;
 use crate::PublishReceipt;
+use crate::error::LineError;
 use foundry_domain::ports::{Gate, Harness, Ledger, Policy, PortError, PublishOutcome, Publisher};
 use foundry_domain::{ActorId, ActorKind, Order, OrderEvent, OrderState, workdir_path};
 use foundry_exec::{Attempt, Epoch, OrderId, ReviewRunPort, ReviewRunRequest, RunId, TupleStore};
@@ -112,12 +112,22 @@ where
 
     fn has_review_tuple(&self, order: &Order) -> Result<bool, LineError> {
         let store_guard = self.tuple_store.lock().unwrap();
-        let Some(store) = store_guard.as_ref() else { return Ok(false); };
+        let Some(store) = store_guard.as_ref() else {
+            return Ok(false);
+        };
         let digest = order.artifact_digest.as_deref().unwrap_or_default();
-        if digest.is_empty() { return Ok(false); }
-        store.latest_promoted(&OrderId(order.id.clone()), Attempt(order.attempt() as u64))
+        if digest.is_empty() {
+            return Ok(false);
+        }
+        store
+            .latest_promoted(&OrderId(order.id.clone()), Attempt(order.attempt() as u64))
             .map(|tuple| tuple.is_some_and(|tuple| tuple.immutable_commit.0 == digest))
-            .map_err(|e| LineError::Port(order.id.clone(), foundry_domain::ports::PortError::Permanent(format!("tuple store: {e:?}"))))
+            .map_err(|e| {
+                LineError::Port(
+                    order.id.clone(),
+                    foundry_domain::ports::PortError::Permanent(format!("tuple store: {e:?}")),
+                )
+            })
     }
 
     /// Test/integration helper: commit a specific event WITHOUT running
@@ -259,7 +269,9 @@ where
                                     o.artifact_digest = Some(die_out.result_commit.clone());
                                 }
                             }
-                            let current = self.get(order_id).await
+                            let current = self
+                                .get(order_id)
+                                .await
                                 .ok_or_else(|| LineError::UnknownOrder(order_id.to_string()))?;
                             // Preserve the no-op taxonomy, but require durable
                             // review evidence before the passing transition.
@@ -267,10 +279,19 @@ where
                                 || die_out.result_commit == die_out.base_commit;
                             if noop {
                                 let verdict = foundry_domain::inspector::inspect(
-                                    &foundry_domain::inspector::DiffStats { files_changed: 0, lines_changed: 0 },
+                                    &foundry_domain::inspector::DiffStats {
+                                        files_changed: 0,
+                                        lines_changed: 0,
+                                    },
                                     foundry_domain::inspector::change_required(&order),
                                 );
-                                self.commit(order_id, foundry_domain::inspector::event_for(&verdict), attempt, &actor).await?;
+                                self.commit(
+                                    order_id,
+                                    foundry_domain::inspector::event_for(&verdict),
+                                    attempt,
+                                    &actor,
+                                )
+                                .await?;
                                 match verdict {
                                     foundry_domain::inspector::Verdict::PreflightNoWork { .. }
                                     | foundry_domain::inspector::Verdict::ExpectedChangeButEmptyDiff => {
@@ -289,47 +310,120 @@ where
                                 }
                             } else if self.has_review_tuple(&current)? {
                                 // Reuse durable evidence before invoking the review host.
-                                self.commit(order_id, OrderEvent::InspectionPassed, attempt, &actor).await?;
+                                self.commit(
+                                    order_id,
+                                    OrderEvent::InspectionPassed,
+                                    attempt,
+                                    &actor,
+                                )
+                                .await?;
                             } else {
                                 let request = ReviewRunRequest {
-                                    order: OrderId(order_id.to_string()), attempt: Attempt(attempt as u64),
-                                    run: RunId(attempt as u64), base_commit: die_out.base_commit,
-                                    result_commit: die_out.result_commit.clone(), artifact_digest: die_out.result_commit,
-                                    epoch: Epoch(0), activation: order.version,
+                                    order: OrderId(order_id.to_string()),
+                                    attempt: Attempt(attempt as u64),
+                                    run: RunId(attempt as u64),
+                                    base_commit: die_out.base_commit,
+                                    result_commit: die_out.result_commit.clone(),
+                                    artifact_digest: die_out.result_commit,
+                                    epoch: Epoch(0),
+                                    activation: order.version,
                                 };
                                 let review = match self.review_run.lock().unwrap().as_mut() {
                                     Some(runner) => runner.run(request),
                                     None => Err(foundry_exec::ReviewRunError::MissingRunner),
                                 };
                                 match review {
-                                    Ok(foundry_exec::ReviewRunOutcome::Completed(evidence)) if evidence.verdict == foundry_exec::ReviewVerdict::Passed => {
-                                        let tuple={
-                                            let store=self.tuple_store.lock().unwrap();
-                                            store.as_ref().map(|s|s.latest_promoted(&OrderId(order_id.to_owned()),Attempt(attempt as u64)))
-                                                .transpose().map_err(|e|LineError::Port(order_id.to_owned(),foundry_domain::ports::PortError::Permanent(format!("tuple store: {e:?}"))))?.flatten()
+                                    Ok(foundry_exec::ReviewRunOutcome::Completed(evidence))
+                                        if evidence.verdict
+                                            == foundry_exec::ReviewVerdict::Passed =>
+                                    {
+                                        let tuple = {
+                                            let store = self.tuple_store.lock().unwrap();
+                                            store
+                                                .as_ref()
+                                                .map(|s| {
+                                                    s.latest_promoted(
+                                                        &OrderId(order_id.to_owned()),
+                                                        Attempt(attempt as u64),
+                                                    )
+                                                })
+                                                .transpose()
+                                                .map_err(|e| {
+                                                    LineError::Port(
+                                                        order_id.to_owned(),
+                                                        foundry_domain::ports::PortError::Permanent(
+                                                            format!("tuple store: {e:?}"),
+                                                        ),
+                                                    )
+                                                })?
+                                                .flatten()
                                         };
                                         let bound = evidence.tuple_key.order.0 == order_id
                                             && evidence.tuple_key.attempt.0 == attempt as u64
                                             && evidence.tuple_key.run.0 == attempt as u64
                                             && evidence.emit_receipt.key == evidence.tuple_key
-                                            && tuple.as_ref().is_some_and(|t|t.key()==evidence.tuple_key);
+                                            && tuple
+                                                .as_ref()
+                                                .is_some_and(|t| t.key() == evidence.tuple_key);
                                         if bound {
-                                            if let Some(tuple)=tuple && let Some(order)=self.orders.lock().await.get_mut(order_id) {
-                                                order.artifact_digest=Some(tuple.immutable_commit.0);
+                                            if let Some(tuple) = tuple
+                                                && let Some(order) =
+                                                    self.orders.lock().await.get_mut(order_id)
+                                            {
+                                                order.artifact_digest =
+                                                    Some(tuple.immutable_commit.0);
                                             }
-                                            self.commit(order_id, OrderEvent::InspectionPassed, attempt, &actor).await?;
+                                            self.commit(
+                                                order_id,
+                                                OrderEvent::InspectionPassed,
+                                                attempt,
+                                                &actor,
+                                            )
+                                            .await?;
                                         } else {
-                                            self.commit(order_id, OrderEvent::InspectionFailed { reason: "review evidence tuple mismatch".into() }, attempt, &actor).await?;
+                                            self.commit(
+                                                order_id,
+                                                OrderEvent::InspectionFailed {
+                                                    reason: "review evidence tuple mismatch".into(),
+                                                },
+                                                attempt,
+                                                &actor,
+                                            )
+                                            .await?;
                                         }
                                     }
                                     Ok(foundry_exec::ReviewRunOutcome::Held(held)) => {
-                                        self.commit(order_id, OrderEvent::ReviewHeld { reason: held.hold.reason }, attempt, &actor).await?;
+                                        self.commit(
+                                            order_id,
+                                            OrderEvent::ReviewHeld {
+                                                reason: held.hold.reason,
+                                            },
+                                            attempt,
+                                            &actor,
+                                        )
+                                        .await?;
                                     }
                                     Ok(foundry_exec::ReviewRunOutcome::Completed(_)) => {
-                                        self.commit(order_id, OrderEvent::InspectionFailed { reason: "review returned no passing verdict".into() }, attempt, &actor).await?;
+                                        self.commit(
+                                            order_id,
+                                            OrderEvent::InspectionFailed {
+                                                reason: "review returned no passing verdict".into(),
+                                            },
+                                            attempt,
+                                            &actor,
+                                        )
+                                        .await?;
                                     }
                                     Err(error) => {
-                                        self.commit(order_id, OrderEvent::InspectionFailed { reason: format!("review failed: {error:?}") }, attempt, &actor).await?;
+                                        self.commit(
+                                            order_id,
+                                            OrderEvent::InspectionFailed {
+                                                reason: format!("review failed: {error:?}"),
+                                            },
+                                            attempt,
+                                            &actor,
+                                        )
+                                        .await?;
                                     }
                                 }
                             }
@@ -376,7 +470,13 @@ where
                 }
                 OrderState::Inspecting => {
                     if self.has_review_tuple(&order)? {
-                        self.commit(order_id, OrderEvent::InspectionPassed, order.attempt(), &actor).await?;
+                        self.commit(
+                            order_id,
+                            OrderEvent::InspectionPassed,
+                            order.attempt(),
+                            &actor,
+                        )
+                        .await?;
                     } else {
                         return Ok(OrderState::Inspecting);
                     }
@@ -394,63 +494,234 @@ where
 
     /// Restores a verified ledger order using the durable review run as its artifact source.
     /// Review holds have no promoted tuple until human resolution completes.
-    pub async fn restore_review_hold(&self, mut order:Order)->Result<(),LineError> {
-        let invalid=|message:&str|LineError::Port(order.id.clone(),foundry_domain::ports::PortError::Permanent(message.into()));
-        if order.state()!=OrderState::FurnaceHold {return Err(invalid("order is not waiting on review"));}
-        let latest={let port=self.review_run.lock().unwrap();
-            port.as_ref().ok_or_else(||invalid("review runner unavailable"))?.latest_run(&order.id,order.attempt() as u64)
-                .map_err(|e|invalid(&format!("latest review run: {e:?}")))?
-        }.ok_or_else(||invalid("review run not found"))?;
-        if !matches!(latest.status.as_str(),"held"|"resolved"|"review_aborted") || latest.result_commit.is_empty() {return Err(invalid("review hold is not recoverable"));}
-        order.artifact_digest=Some(latest.result_commit);
-        self.orders.lock().await.entry(order.id.clone()).or_insert(order);
+    pub async fn restore_review_hold(&self, mut order: Order) -> Result<(), LineError> {
+        let invalid = |message: &str| {
+            LineError::Port(
+                order.id.clone(),
+                foundry_domain::ports::PortError::Permanent(message.into()),
+            )
+        };
+        if order.state() != OrderState::FurnaceHold {
+            return Err(invalid("order is not waiting on review"));
+        }
+        let latest = {
+            let port = self.review_run.lock().unwrap();
+            port.as_ref()
+                .ok_or_else(|| invalid("review runner unavailable"))?
+                .latest_run(&order.id, order.attempt() as u64)
+                .map_err(|e| invalid(&format!("latest review run: {e:?}")))?
+        }
+        .ok_or_else(|| invalid("review run not found"))?;
+        if !matches!(
+            latest.status.as_str(),
+            "held" | "resolved" | "review_aborted"
+        ) || latest.result_commit.is_empty()
+        {
+            return Err(invalid("review hold is not recoverable"));
+        }
+        order.artifact_digest = Some(latest.result_commit);
+        self.orders
+            .lock()
+            .await
+            .entry(order.id.clone())
+            .or_insert(order);
         Ok(())
     }
 
     /// Re-enters a resolved review hold through a new durable host run.
     pub async fn resume_review(&self, order_id: &str) -> Result<OrderState, LineError> {
-        let order=self.get(order_id).await.ok_or_else(||LineError::UnknownOrder(order_id.to_owned()))?;
-        if order.state()!=OrderState::FurnaceHold { return Err(LineError::IllegalTransition(order_id.to_owned(),foundry_domain::order::TransitionError("review resume requires FurnaceHold".into()))); }
-        let attempt=order.attempt() as u64;
-        let latest={
-            let port=self.review_run.lock().unwrap();
-            port.as_ref().ok_or_else(||LineError::Port(order_id.to_owned(),foundry_domain::ports::PortError::Permanent("review runner unavailable".into())))?
-                .latest_run(order_id,attempt).map_err(|e|LineError::Port(order_id.to_owned(),foundry_domain::ports::PortError::Permanent(format!("latest review run: {e:?}"))))?
-        }.ok_or_else(||LineError::Port(order_id.to_owned(),foundry_domain::ports::PortError::Permanent("review run not found".into())))?;
-        if latest.status=="held" { return Ok(OrderState::FurnaceHold); }
-        if latest.status!="resolved" && latest.status!="review_aborted" {
-            return Err(LineError::Port(order_id.to_owned(),foundry_domain::ports::PortError::Permanent("review hold is not resolved".into())));
+        let order = self
+            .get(order_id)
+            .await
+            .ok_or_else(|| LineError::UnknownOrder(order_id.to_owned()))?;
+        if order.state() != OrderState::FurnaceHold {
+            return Err(LineError::IllegalTransition(
+                order_id.to_owned(),
+                foundry_domain::order::TransitionError("review resume requires FurnaceHold".into()),
+            ));
         }
-        let request=ReviewRunRequest{order:OrderId(order_id.to_owned()),attempt:Attempt(attempt),run:RunId(latest.run+1),base_commit:latest.base_commit,result_commit:latest.result_commit,artifact_digest:order.artifact_digest.clone().unwrap_or_default(),epoch:Epoch(order.version),activation:order.version};
-        let result={
-            let mut port=self.review_run.lock().unwrap();
-            port.as_mut().ok_or_else(||LineError::Port(order_id.to_owned(),foundry_domain::ports::PortError::Permanent("review runner unavailable".into())))?
+        let attempt = order.attempt() as u64;
+        let latest = {
+            let port = self.review_run.lock().unwrap();
+            port.as_ref()
+                .ok_or_else(|| {
+                    LineError::Port(
+                        order_id.to_owned(),
+                        foundry_domain::ports::PortError::Permanent(
+                            "review runner unavailable".into(),
+                        ),
+                    )
+                })?
+                .latest_run(order_id, attempt)
+                .map_err(|e| {
+                    LineError::Port(
+                        order_id.to_owned(),
+                        foundry_domain::ports::PortError::Permanent(format!(
+                            "latest review run: {e:?}"
+                        )),
+                    )
+                })?
+        }
+        .ok_or_else(|| {
+            LineError::Port(
+                order_id.to_owned(),
+                foundry_domain::ports::PortError::Permanent("review run not found".into()),
+            )
+        })?;
+        if latest.status == "held" {
+            return Ok(OrderState::FurnaceHold);
+        }
+        if latest.status != "resolved" && latest.status != "review_aborted" {
+            return Err(LineError::Port(
+                order_id.to_owned(),
+                foundry_domain::ports::PortError::Permanent("review hold is not resolved".into()),
+            ));
+        }
+        let request = ReviewRunRequest {
+            order: OrderId(order_id.to_owned()),
+            attempt: Attempt(attempt),
+            run: RunId(latest.run + 1),
+            base_commit: latest.base_commit,
+            result_commit: latest.result_commit,
+            artifact_digest: order.artifact_digest.clone().unwrap_or_default(),
+            epoch: Epoch(order.version),
+            activation: order.version,
+        };
+        let result = {
+            let mut port = self.review_run.lock().unwrap();
+            port.as_mut()
+                .ok_or_else(|| {
+                    LineError::Port(
+                        order_id.to_owned(),
+                        foundry_domain::ports::PortError::Permanent(
+                            "review runner unavailable".into(),
+                        ),
+                    )
+                })?
                 .run(request)
         };
-        let actor=ActorId{kind:ActorKind::Agent,source:"line".into(),id:"review-resume".into()};
+        let actor = ActorId {
+            kind: ActorKind::Agent,
+            source: "line".into(),
+            id: "review-resume".into(),
+        };
         match result {
             Ok(foundry_exec::ReviewRunOutcome::Held(_)) => Ok(OrderState::FurnaceHold),
-            Ok(foundry_exec::ReviewRunOutcome::Completed(evidence)) if evidence.verdict==foundry_exec::ReviewVerdict::Passed => {
-                let tuple=self.tuple_store.lock().unwrap().as_ref().ok_or_else(||LineError::Port(order_id.to_owned(),foundry_domain::ports::PortError::Permanent("tuple store unavailable".into())))?
-                    .latest_promoted(&OrderId(order_id.to_owned()),Attempt(attempt)).map_err(|e|LineError::Port(order_id.to_owned(),foundry_domain::ports::PortError::Permanent(format!("tuple store: {e:?}"))))?
-                    .ok_or_else(||LineError::Port(order_id.to_owned(),foundry_domain::ports::PortError::Permanent("promoted review tuple missing".into())))?;
-                if evidence.tuple_key!=tuple.key() || evidence.emit_receipt.key!=tuple.key() || tuple.run.0!=latest.run+1 {
-                    return Err(LineError::Port(order_id.to_owned(),foundry_domain::ports::PortError::Permanent("review evidence tuple mismatch".into())));
+            Ok(foundry_exec::ReviewRunOutcome::Completed(evidence))
+                if evidence.verdict == foundry_exec::ReviewVerdict::Passed =>
+            {
+                let tuple = self
+                    .tuple_store
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .ok_or_else(|| {
+                        LineError::Port(
+                            order_id.to_owned(),
+                            foundry_domain::ports::PortError::Permanent(
+                                "tuple store unavailable".into(),
+                            ),
+                        )
+                    })?
+                    .latest_promoted(&OrderId(order_id.to_owned()), Attempt(attempt))
+                    .map_err(|e| {
+                        LineError::Port(
+                            order_id.to_owned(),
+                            foundry_domain::ports::PortError::Permanent(format!(
+                                "tuple store: {e:?}"
+                            )),
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        LineError::Port(
+                            order_id.to_owned(),
+                            foundry_domain::ports::PortError::Permanent(
+                                "promoted review tuple missing".into(),
+                            ),
+                        )
+                    })?;
+                if evidence.tuple_key != tuple.key()
+                    || evidence.emit_receipt.key != tuple.key()
+                    || tuple.run.0 != latest.run + 1
+                {
+                    return Err(LineError::Port(
+                        order_id.to_owned(),
+                        foundry_domain::ports::PortError::Permanent(
+                            "review evidence tuple mismatch".into(),
+                        ),
+                    ));
                 }
-                if let Some(current)=self.orders.lock().await.get_mut(order_id) { current.artifact_digest=Some(tuple.immutable_commit.0); }
-                self.commit(order_id,OrderEvent::InspectionPassed,attempt as u32,&actor).await.map(|o|o.state())
+                if let Some(current) = self.orders.lock().await.get_mut(order_id) {
+                    current.artifact_digest = Some(tuple.immutable_commit.0);
+                }
+                self.commit(
+                    order_id,
+                    OrderEvent::InspectionPassed,
+                    attempt as u32,
+                    &actor,
+                )
+                .await
+                .map(|o| o.state())
             }
-            Ok(foundry_exec::ReviewRunOutcome::Completed(_)) => Err(LineError::Port(order_id.to_owned(),foundry_domain::ports::PortError::Permanent("review returned no passing verdict".into()))),
-            Err(error) => self.commit(order_id,OrderEvent::InspectionFailed{reason:format!("review failed: {error:?}")},attempt as u32,&actor).await.map(|o|o.state()),
+            Ok(foundry_exec::ReviewRunOutcome::Completed(_)) => Err(LineError::Port(
+                order_id.to_owned(),
+                foundry_domain::ports::PortError::Permanent(
+                    "review returned no passing verdict".into(),
+                ),
+            )),
+            Err(error) => self
+                .commit(
+                    order_id,
+                    OrderEvent::InspectionFailed {
+                        reason: format!("review failed: {error:?}"),
+                    },
+                    attempt as u32,
+                    &actor,
+                )
+                .await
+                .map(|o| o.state()),
         }
     }
 
-    pub async fn resolve_review_hold(&self,order_id:&str,hold_id:&str,action:foundry_exec::ReviewHoldAction,actor:&str)->Result<OrderState,LineError>{
-        if self.get(order_id).await.is_none_or(|o|o.state()!=OrderState::FurnaceHold){return Err(LineError::Port(order_id.to_owned(),foundry_domain::ports::PortError::Permanent("order is not waiting on review".into())));}
+    pub async fn resolve_review_hold(
+        &self,
+        order_id: &str,
+        hold_id: &str,
+        action: foundry_exec::ReviewHoldAction,
+        actor: &str,
+    ) -> Result<OrderState, LineError> {
+        if self
+            .get(order_id)
+            .await
+            .is_none_or(|o| o.state() != OrderState::FurnaceHold)
         {
-            let mut port=self.review_run.lock().unwrap();
-            port.as_mut().ok_or_else(||LineError::Port(order_id.to_owned(),foundry_domain::ports::PortError::Permanent("review runner unavailable".into())))?
-                .resolve_hold(order_id,hold_id,action,actor).map_err(|e|LineError::Port(order_id.to_owned(),foundry_domain::ports::PortError::Permanent(format!("review hold resolution: {e:?}"))))?;
+            return Err(LineError::Port(
+                order_id.to_owned(),
+                foundry_domain::ports::PortError::Permanent(
+                    "order is not waiting on review".into(),
+                ),
+            ));
+        }
+        {
+            let mut port = self.review_run.lock().unwrap();
+            port.as_mut()
+                .ok_or_else(|| {
+                    LineError::Port(
+                        order_id.to_owned(),
+                        foundry_domain::ports::PortError::Permanent(
+                            "review runner unavailable".into(),
+                        ),
+                    )
+                })?
+                .resolve_hold(order_id, hold_id, action, actor)
+                .map_err(|e| {
+                    LineError::Port(
+                        order_id.to_owned(),
+                        foundry_domain::ports::PortError::Permanent(format!(
+                            "review hold resolution: {e:?}"
+                        )),
+                    )
+                })?;
         }
         self.resume_review(order_id).await
     }
@@ -476,7 +747,10 @@ where
 
         let digest = order.artifact_digest.clone().unwrap_or_default();
         if !self.has_review_tuple(&order)? {
-            return Err(LineError::Port(order_id.to_string(), foundry_domain::ports::PortError::Permanent("review evidence required".into())));
+            return Err(LineError::Port(
+                order_id.to_string(),
+                foundry_domain::ports::PortError::Permanent("review evidence required".into()),
+            ));
         }
         self.gate
             .verify(&order, token, &digest)
@@ -496,7 +770,11 @@ where
     }
 
     /// Create the PR — idempotent via operation_id (critique #2).
-    pub async fn publish(&self, order_id: &str, actor: &ActorId) -> Result<PublishReceipt, LineError> {
+    pub async fn publish(
+        &self,
+        order_id: &str,
+        actor: &ActorId,
+    ) -> Result<PublishReceipt, LineError> {
         let order = self
             .get(order_id)
             .await
@@ -505,7 +783,10 @@ where
         let operation_id = format!("{order_id}:{attempt}");
         let digest = order.artifact_digest.clone().unwrap_or_default();
         if !self.has_review_tuple(&order)? {
-            return Err(LineError::Port(order_id.to_string(), foundry_domain::ports::PortError::Permanent("review evidence required".into())));
+            return Err(LineError::Port(
+                order_id.to_string(),
+                foundry_domain::ports::PortError::Permanent("review evidence required".into()),
+            ));
         }
 
         let mut last_pr_url: Option<String> = None;

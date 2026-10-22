@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+p2-test-support = ["foundry-ledger/p2-test-support"]
+
 [dependencies]
 foundry-domain = { path = "../foundry-domain" }
 foundry-ledger = { path = "../foundry-ledger" }
@@ -23,3 +27,13 @@ chrono.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
+
+[[test]]
+name = "b1_product_results"
+path = "tests/b1_product_results.rs"
+required-features = ["p2-test-support"]
+
+[[test]]
+name = "b1_product_result_processes"
+path = "tests/b1_product_result_processes.rs"
+required-features = ["p2-test-support"]

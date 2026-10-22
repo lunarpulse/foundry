@@ -3,26 +3,30 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::routing::Router;
+use foundry_serve::ServeState;
 use foundry_serve::identity::{Identity, PasswordHasher, Role};
 use foundry_serve::scope::{OrgConfig, ScopeStore};
-use foundry_serve::ServeState;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tower::ServiceExt;
 
 struct FastHasher;
 impl PasswordHasher for FastHasher {
-    fn hash(&self, p: &str) -> String {
-        format!("fast${p}")
+    fn hash(&self, p: &str) -> Result<String, String> {
+        Ok(format!("fast${p}"))
     }
-    fn verify(&self, p: &str, hash: &str) -> bool {
-        self.hash(p) == hash
+    fn verify(&self, p: &str, hash: &str) -> Result<bool, String> {
+        Ok(self.hash(p)? == hash)
     }
 }
 
 fn db(tag: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!("t30-{}-{}.db", tag, std::process::id()));
-    for path in [p.clone(), p.with_extension("identity.db"), p.with_extension("scope.db")] {
+    for path in [
+        p.clone(),
+        p.with_extension("identity.db"),
+        p.with_extension("scope.db"),
+    ] {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
@@ -58,13 +62,32 @@ async fn board_requires_authentication() {
     let st = setup("board").await;
     let tok = login(&st).await;
     // no token -> 401
-    let code = get(Router::new().merge(foundry_serve::http::router(st.clone())), "/api/orders", None).await;
-    assert_eq!(code, StatusCode::UNAUTHORIZED, "reads must be authenticated");
+    let code = get(
+        Router::new().merge(foundry_serve::http::router(st.clone())),
+        "/api/orders",
+        None,
+    )
+    .await;
+    assert_eq!(
+        code,
+        StatusCode::UNAUTHORIZED,
+        "reads must be authenticated"
+    );
     // with token -> 200
-    let code = get(Router::new().merge(foundry_serve::http::router(st.clone())), "/api/orders", Some(&tok)).await;
+    let code = get(
+        Router::new().merge(foundry_serve::http::router(st.clone())),
+        "/api/orders",
+        Some(&tok),
+    )
+    .await;
     assert_eq!(code, StatusCode::OK);
     // verify endpoint too
-    let code = get(Router::new().merge(foundry_serve::http::router(st)), "/api/audit/verify", None).await;
+    let code = get(
+        Router::new().merge(foundry_serve::http::router(st)),
+        "/api/audit/verify",
+        None,
+    )
+    .await;
     assert_eq!(code, StatusCode::UNAUTHORIZED);
 }
 
@@ -84,7 +107,11 @@ async fn foreign_order_invisible_even_to_owner() {
         Some(&tok),
     )
     .await;
-    assert_eq!(code, StatusCode::FORBIDDEN, "foreign org order must not be readable");
+    assert_eq!(
+        code,
+        StatusCode::FORBIDDEN,
+        "foreign org order must not be readable"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -92,18 +119,29 @@ async fn intake_admission_single_org() {
     // the scope store bound to ServeState admits only the demo repo
     let st = setup("intake").await;
     let scope = st.scope.lock().await;
-    assert!(scope.admit_intake("github:lunarpulse/foundary-demo").is_ok());
+    assert!(
+        scope
+            .admit_intake("github:lunarpulse/foundary-demo")
+            .is_ok()
+    );
     let err = scope.admit_intake("github:evil/repo").unwrap_err();
     assert!(err.to_string().contains("foreign organization"));
     // registration of a foreign-sourced order fails outright
-    assert!(scope.register_order("o-x", Some("github:evil/repo")).is_err());
+    assert!(
+        scope
+            .register_order("o-x", Some("github:evil/repo"))
+            .is_err()
+    );
 }
 
 #[test]
 fn scope_store_single_org_contract() {
     let s = ScopeStore::open(
         std::path::Path::new(""),
-        OrgConfig { org_id: "acme".into(), bound_sources: vec!["github:acme/w".into()] },
+        OrgConfig {
+            org_id: "acme".into(),
+            bound_sources: vec!["github:acme/w".into()],
+        },
     )
     .unwrap();
     // an org can only ever be ONE: bound_sources all map to org_id
@@ -113,6 +151,9 @@ fn scope_store_single_org_contract() {
     // single-org invariant is structural: register_order only ever
     // writes the configured org (verified by reading back through the
     // guard — foreign test row invisible, own row readable)
-    let owner = foundry_serve::identity::AuthenticatedUser { username: "r".into(), role: Role::Owner };
+    let owner = foundry_serve::identity::AuthenticatedUser {
+        username: "r".into(),
+        role: Role::Owner,
+    };
     assert!(s.guard_read(Some(&owner), Some("o-1")).is_ok());
 }

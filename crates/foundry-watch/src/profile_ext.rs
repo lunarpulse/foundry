@@ -77,27 +77,48 @@ impl ProfileExtensions {
 
     pub fn deepseek_v4() -> Self {
         Self {
-            decoding: DecodingSupport { temperature: true, seed: false, max_completion_tokens: false },
+            decoding: DecodingSupport {
+                temperature: true,
+                seed: false,
+                max_completion_tokens: false,
+            },
             repro_class: ReproClass::Deterministic,
-            cost: CostShape { reasoning_budget: None, reasoning_billed_as_output: false },
+            cost: CostShape {
+                reasoning_budget: None,
+                reasoning_billed_as_output: false,
+            },
         }
     }
 
     pub fn glm_5_3() -> Self {
         Self {
-            decoding: DecodingSupport { temperature: true, seed: false, max_completion_tokens: false },
+            decoding: DecodingSupport {
+                temperature: true,
+                seed: false,
+                max_completion_tokens: false,
+            },
             // measured M3-prep: temp=0 declared but phrasing still
             // varied 8/8 — honest class, not the optimistic one
             repro_class: ReproClass::NondeterministicContract,
-            cost: CostShape { reasoning_budget: None, reasoning_billed_as_output: true },
+            cost: CostShape {
+                reasoning_budget: None,
+                reasoning_billed_as_output: true,
+            },
         }
     }
 
     pub fn gpt_6_luna() -> Self {
         Self {
-            decoding: DecodingSupport { temperature: false, seed: false, max_completion_tokens: true },
+            decoding: DecodingSupport {
+                temperature: false,
+                seed: false,
+                max_completion_tokens: true,
+            },
             repro_class: ReproClass::NondeterministicContract,
-            cost: CostShape { reasoning_budget: Some(1024), reasoning_billed_as_output: true },
+            cost: CostShape {
+                reasoning_budget: Some(1024),
+                reasoning_billed_as_output: true,
+            },
         }
     }
 
@@ -109,7 +130,11 @@ impl ProfileExtensions {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
         h.update(b"t35-ext-v1");
-        h.update([self.decoding.temperature as u8, self.decoding.seed as u8, self.decoding.max_completion_tokens as u8]);
+        h.update([
+            self.decoding.temperature as u8,
+            self.decoding.seed as u8,
+            self.decoding.max_completion_tokens as u8,
+        ]);
         let rc = match self.repro_class {
             ReproClass::Deterministic => 1u8,
             ReproClass::RequiresSnapshot => 2,
@@ -117,7 +142,12 @@ impl ProfileExtensions {
             ReproClass::NondeterministicContract => 4,
         };
         h.update([rc]);
-        h.update(self.cost.reasoning_budget.map(|x| x.to_le_bytes()).unwrap_or([0; 4]));
+        h.update(
+            self.cost
+                .reasoning_budget
+                .map(|x| x.to_le_bytes())
+                .unwrap_or([0; 4]),
+        );
         h.update([self.cost.reasoning_billed_as_output as u8]);
         hex(h.finalize().as_slice())
     }

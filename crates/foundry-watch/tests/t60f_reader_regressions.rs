@@ -47,8 +47,13 @@ fn nonzero_retry_rate_over_the_event_column() {
         ],
     );
     let r = LedgerEvidenceReader::new(db);
-    let out = r.run_query("retry_rate_by_task_class", &params(), 100).unwrap();
-    assert!(out.contains("0.3333"), "1/3 retry rate over real rows: {out}");
+    let out = r
+        .run_query("retry_rate_by_task_class", &params(), 100)
+        .unwrap();
+    assert!(
+        out.contains("0.3333"),
+        "1/3 retry rate over real rows: {out}"
+    );
 }
 
 #[test]
@@ -68,8 +73,13 @@ fn canonical_json_fallback_snake_case() {
         ],
     );
     let r = LedgerEvidenceReader::new(db);
-    let out = r.run_query("retry_rate_by_task_class", &params(), 100).unwrap();
-    assert!(out.contains("0.5000"), "snake_case canonical JSON decoded: {out}");
+    let out = r
+        .run_query("retry_rate_by_task_class", &params(), 100)
+        .unwrap();
+    assert!(
+        out.contains("0.5000"),
+        "snake_case canonical JSON decoded: {out}"
+    );
 }
 
 #[test]
@@ -77,7 +87,9 @@ fn empty_prefix_is_refused_not_zero() {
     let db = tmp_db("empty");
     seed(&db, &[("Queued", None)]); // table exists, but prefix 0 rows
     let r = LedgerEvidenceReader::new(db);
-    let err = r.run_query("retry_rate_by_task_class", &params(), 0).unwrap_err();
+    let err = r
+        .run_query("retry_rate_by_task_class", &params(), 0)
+        .unwrap_err();
     assert!(err.contains("cannot certify"), "no rows -> Err: {err}");
 }
 
@@ -85,12 +97,19 @@ fn empty_prefix_is_refused_not_zero() {
 fn genuine_zero_completions_is_real_zero() {
     let db = tmp_db("zero");
     // rows exist, none are completions -> 0.0 is the TRUE answer
-    seed(&db, &[("Queued", None), ("DieStarted", None), ("Queued", None)]);
+    seed(
+        &db,
+        &[("Queued", None), ("DieStarted", None), ("Queued", None)],
+    );
     let r = LedgerEvidenceReader::new(db);
-    let out = r.run_query("retry_rate_by_task_class", &params(), 100).unwrap();
-    assert!(out.contains("0.0000"), "rows without completions -> real 0.0: {out}");
+    let out = r
+        .run_query("retry_rate_by_task_class", &params(), 100)
+        .unwrap();
+    assert!(
+        out.contains("0.0000"),
+        "rows without completions -> real 0.0: {out}"
+    );
 }
-
 
 #[tokio::test]
 async fn astra6_verified_profile_with_bundle_seed_executes_as_bundle_seed() {
@@ -103,7 +122,9 @@ async fn astra6_verified_profile_with_bundle_seed_executes_as_bundle_seed() {
     //   DryDie (as run_casting now receives the executed_profile) ->
     //   artifact must match a seed-7 execution and DIFFER from seed 0.
     use foundry_domain::ports::Harness as _;
-    use foundry_watch::bundles::{BundleProfile, BundleStore, CandidateBundle, DependencyPins, LessonSnapshot};
+    use foundry_watch::bundles::{
+        BundleProfile, BundleStore, CandidateBundle, DependencyPins, LessonSnapshot,
+    };
     use foundry_watch::casting_wiring::profile_from_bundle;
 
     fn lesson_hash(content: &str) -> String {
@@ -117,12 +138,23 @@ async fn astra6_verified_profile_with_bundle_seed_executes_as_bundle_seed() {
     let mut store = BundleStore::default();
     let bundle = CandidateBundle::build(
         "cand-b1",
-        BundleProfile { model: "deepseek-v4".into(), temperature: Some(0.0), seed: Some(7), max_output_tokens: 512 },
+        BundleProfile {
+            model: "deepseek-v4".into(),
+            temperature: Some(0.0),
+            seed: Some(7),
+            max_output_tokens: 512,
+        },
         "solve {{task}}",
-        vec![LessonSnapshot { lesson_id: "L1".into(), content_hash: lesson_hash("prefer map_err"), content: "prefer map_err".into() }],
+        vec![LessonSnapshot {
+            lesson_id: "L1".into(),
+            content_hash: lesson_hash("prefer map_err"),
+            content: "prefer map_err".into(),
+        }],
         DependencyPins {
             image_digest: "sha256:aa".into(),
-            tool_digests: [("cargo".to_string(), "sha256:bb".into())].into_iter().collect(),
+            tool_digests: [("cargo".to_string(), "sha256:bb".into())]
+                .into_iter()
+                .collect(),
             model_revision: Some("rev-9".into()),
         },
     )
@@ -131,10 +163,17 @@ async fn astra6_verified_profile_with_bundle_seed_executes_as_bundle_seed() {
 
     // the VERIFIED load — this is the wiring entry casting main uses
     let (verified, record) = profile_from_bundle(&store, &digest, "run-b1").unwrap();
-    assert_eq!(verified.seed, 7, "the bundle's seed is the verified profile's seed");
+    assert_eq!(
+        verified.seed, 7,
+        "the bundle's seed is the verified profile's seed"
+    );
     assert!(record.consumption_verified);
     // the recorded hash IS the hash of the profile we will execute
-    assert_eq!(record.profile_hash, verified.hash(), "recorded hash describes the EXECUTED profile");
+    assert_eq!(
+        record.profile_hash,
+        verified.hash(),
+        "recorded hash describes the EXECUTED profile"
+    );
 
     // execute THROUGH the verified profile (run_casting's contract)
     let dir = std::env::temp_dir().join(format!("t60f-exec-{}", std::process::id()));
@@ -147,14 +186,23 @@ async fn astra6_verified_profile_with_bundle_seed_executes_as_bundle_seed() {
         chrono::Utc::now(),
     );
     let die = foundry_watch::dry_die::DryDie::new(verified.clone(), &sandbox.root);
-    let out = die.run(&order, 1, std::path::Path::new("wd")).await.unwrap();
+    let out = die
+        .run(&order, 1, std::path::Path::new("wd"))
+        .await
+        .unwrap();
 
     // the executed artifact is a function of seed 7: a seed-0 profile
     // (what the OLD hardcoded reconstruction produced from CLI seed 0)
     // yields a DIFFERENT artifact
-    let seed0 = foundry_watch::dry_die::CandidateProfile { seed: 0, ..verified.clone() };
+    let seed0 = foundry_watch::dry_die::CandidateProfile {
+        seed: 0,
+        ..verified.clone()
+    };
     let die0 = foundry_watch::dry_die::DryDie::new(seed0, &sandbox.root);
-    let out0 = die0.run(&order, 1, std::path::Path::new("wd")).await.unwrap();
+    let out0 = die0
+        .run(&order, 1, std::path::Path::new("wd"))
+        .await
+        .unwrap();
     assert_ne!(
         out.result_commit, out0.result_commit,
         "executed artifact follows the VERIFIED seed (7), not a CLI seed (0)"

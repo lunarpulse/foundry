@@ -3,7 +3,6 @@
 //!   1. reconcile Unknown publishes (critique #2)
 //!   2. Intake.poll → dedup → submit → drive (to FurnaceHold)
 //!   3. notify FurnaceHold orders (M0: stdout; M1: Discord Notifier)
-use crate::intake::GithubLabelIntake;
 use foundry_domain::ports::Intake;
 use foundry_domain::{ActorId, ActorKind, Order};
 use foundry_line::Line;
@@ -34,9 +33,9 @@ impl Default for WatchConfig {
 
 /// Run one poll→drive cycle. Returns how many orders were processed.
 /// Public so tests / `foundry run --once` can drive a single tick.
-pub async fn tick<G, P, L, PUB>(
+pub async fn tick<G, P, L, PUB, I>(
     line: &Line<G, P, L, PUB>,
-    intake: Arc<Mutex<GithubLabelIntake>>,
+    intake: Arc<Mutex<I>>,
     actor: &ActorId,
 ) -> Result<usize, String>
 where
@@ -44,6 +43,7 @@ where
     P: foundry_domain::ports::Harness + Send + Sync,
     L: foundry_domain::ports::Ledger + Send + Sync,
     PUB: foundry_domain::ports::Publisher + Send + Sync,
+    I: Intake + Send + 'static,
 {
     // poll() blocks (reqwest::blocking) — run off the async runtime so the
     // client's internal pool never drops inside tokio (T9 실측 버그 #3).
@@ -97,9 +97,9 @@ where
 }
 
 /// Long-running loop. Holds the lease; exits if someone else holds it.
-pub async fn run<G, P, L, PUB>(
+pub async fn run<G, P, L, PUB, I>(
     line: &Line<G, P, L, PUB>,
-    intake: GithubLabelIntake,
+    intake: I,
     cfg: WatchConfig,
 ) -> Result<(), String>
 where
@@ -107,6 +107,7 @@ where
     P: foundry_domain::ports::Harness + Send + Sync + 'static,
     L: foundry_domain::ports::Ledger + Send + Sync + 'static,
     PUB: foundry_domain::ports::Publisher + Send + Sync + 'static,
+    I: Intake + Send + 'static,
 {
     let actor = ActorId {
         kind: ActorKind::Agent,

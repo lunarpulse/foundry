@@ -11,13 +11,16 @@
 //! - 스트림 활성화는 런타임 수명과 1:1 — leaked 저널 핸들은 활성 스트림
 //!   수만큼 유한(같은 root 재활성화는 새 런타임).
 
-use crate::refusal::{record_refusal, RefusalCode};
+use crate::refusal::{RefusalCode, record_refusal};
 use crate::{OrchestrationKind, OrchestrationLog};
 use foundry_domain::order::Order;
 use foundry_domain::{OrderEvent, OrderState};
+use foundry_exec::{
+    Attempt as ExecAttempt, Epoch, OrderId as ExecOrderId, ReviewRunPort, ReviewRunRequest, RunId,
+    TupleStore,
+};
 use foundry_workflow::recovery::RecoveryRunner;
 use foundry_workflow::{Outcome, WorkflowEngine};
-use foundry_exec::{Attempt as ExecAttempt, Epoch, OrderId as ExecOrderId, ReviewRunPort, ReviewRunRequest, RunId, TupleStore};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -46,7 +49,11 @@ pub struct Stream {
 impl Stream {
     /// 신규 스트림 — journal_dir/{stream_id}.db 소유.
     /// (M7.1 리뷰 B2) 루트 결속 생성자 — 이 스트림의 프리셋 루트를 고정.
-    pub fn new_with_root(stream_id: &str, journal_dir: &Path, preset_root: &str) -> Result<Self, String> {
+    pub fn new_with_root(
+        stream_id: &str,
+        journal_dir: &Path,
+        preset_root: &str,
+    ) -> Result<Self, String> {
         let mut s = Self::new(stream_id, journal_dir)?;
         s.preset_root = preset_root.to_string();
         Ok(s)
@@ -72,11 +79,14 @@ impl Stream {
             foundry_ledger::SqliteLedger::open(&journal_path).map_err(|e| format!("{e:?}"))?,
         ));
         let mut engine = WorkflowEngine::embedded_default();
-        engine.set_ledger(ledger, foundry_domain::ActorId {
-            kind: foundry_domain::ActorKind::Agent,
-            source: "stream".into(),
-            id: stream_id.into(),
-        });
+        engine.set_ledger(
+            ledger,
+            foundry_domain::ActorId {
+                kind: foundry_domain::ActorKind::Agent,
+                source: "stream".into(),
+                id: stream_id.into(),
+            },
+        );
         engine.set_clock(chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap());
         Ok(Self {
             stream_id: stream_id.into(),
@@ -84,7 +94,7 @@ impl Stream {
             engine: Mutex::new(engine),
             dispatched: Mutex::new(BTreeSet::new()),
             fenced: std::sync::atomic::AtomicBool::new(false),
-        
+
             preset_root: String::new(),
             orch: Mutex::new(None),
         })
@@ -109,7 +119,8 @@ impl Stream {
     /// (astra r6) 해제는 **회복 코디네이터 전용** — pub(crate). 외부가
     /// 펜스를 임의 해제해 구 엔진을 되살리는 우회를 차단.
     pub(crate) fn unfence(&self) {
-        self.fenced.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.fenced
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn is_fenced(&self) -> bool {
@@ -138,7 +149,10 @@ impl Stream {
         let mut disp = self.dispatched.lock().unwrap();
         if disp.contains(&oid) {
             record(RefusalCode::DuplicateDispatch, &oid);
-            return Err(format!("order '{oid}' already dispatched on stream {}", self.stream_id));
+            return Err(format!(
+                "order '{oid}' already dispatched on stream {}",
+                self.stream_id
+            ));
         }
         // (M7.1 리뷰 MAJOR-1) **내구 이중 디스패치 방지** — dispatched 는
         // 인메모리(크래시 후 소실)이므로 저널 증거로 보강: 이 주문의
@@ -192,15 +206,17 @@ impl Stream {
     /// engine_if_unfenced 가드로 스왑 설치하는 경로를 차단.
     pub(crate) fn rebuilt_engine(&self) -> Result<WorkflowEngine, String> {
         let ledger: &'static mut foundry_ledger::SqliteLedger = Box::leak(Box::new(
-            foundry_ledger::SqliteLedger::open(&self.journal_path)
-                .map_err(|e| format!("{e:?}"))?,
+            foundry_ledger::SqliteLedger::open(&self.journal_path).map_err(|e| format!("{e:?}"))?,
         ));
         let mut engine = WorkflowEngine::embedded_default();
-        engine.set_ledger(ledger, foundry_domain::ActorId {
-            kind: foundry_domain::ActorKind::Agent,
-            source: "stream".into(),
-            id: self.stream_id.clone(),
-        });
+        engine.set_ledger(
+            ledger,
+            foundry_domain::ActorId {
+                kind: foundry_domain::ActorKind::Agent,
+                source: "stream".into(),
+                id: self.stream_id.clone(),
+            },
+        );
         engine.set_clock(chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap());
         Ok(engine)
     }
@@ -268,14 +284,27 @@ impl StreamRuntime {
         *self.review_run.lock().unwrap() = Some(Box::new(runner));
     }
 
-    fn require_review_tuple(&self, order_id: &str, attempt: u32, digest: &str) -> Result<(), String> {
-        if digest.is_empty() { return Err("review evidence unavailable: empty artifact digest".into()); }
+    fn require_review_tuple(
+        &self,
+        order_id: &str,
+        attempt: u32,
+        digest: &str,
+    ) -> Result<(), String> {
+        if digest.is_empty() {
+            return Err("review evidence unavailable: empty artifact digest".into());
+        }
         let guard = self.tuple_store.lock().unwrap();
-        let store = guard.as_ref().ok_or("review evidence unavailable: tuple reader not configured")?;
-        let tuple = store.latest_promoted(&ExecOrderId(order_id.into()), ExecAttempt(attempt as u64))
+        let store = guard
+            .as_ref()
+            .ok_or("review evidence unavailable: tuple reader not configured")?;
+        let tuple = store
+            .latest_promoted(&ExecOrderId(order_id.into()), ExecAttempt(attempt as u64))
             .map_err(|e| format!("review tuple read failed: {e:?}"))?;
-        if tuple.is_some_and(|tuple| tuple.immutable_commit.0 == digest) { Ok(()) }
-        else { Err("review evidence unavailable: matching tuple missing".into()) }
+        if tuple.is_some_and(|tuple| tuple.immutable_commit.0 == digest) {
+            Ok(())
+        } else {
+            Err("review evidence unavailable: matching tuple missing".into())
+        }
     }
 
     /// 발행 전 주문 상태와 발행 재료를 확인한다. 엔진 가드는 반환 전에 해제한다.
@@ -284,12 +313,19 @@ impl StreamRuntime {
         stream_id: &str,
         order_id: &str,
     ) -> Result<PublishMaterial, String> {
-        let stream = self.stream(stream_id).ok_or(format!("stream {stream_id} not registered"))?;
+        let stream = self
+            .stream(stream_id)
+            .ok_or(format!("stream {stream_id} not registered"))?;
         let material = {
             let engine = stream.engine_if_unfenced()?;
-            let order = engine.order(order_id).ok_or(format!("order {order_id} not enrolled"))?;
+            let order = engine
+                .order(order_id)
+                .ok_or(format!("order {order_id} not enrolled"))?;
             if order.state() != OrderState::Publishing {
-                return Err(format!("order {order_id} must be Publishing, was {}", order.state()));
+                return Err(format!(
+                    "order {order_id} must be Publishing, was {}",
+                    order.state()
+                ));
             }
             let digest = order.artifact_digest.clone().unwrap_or_default();
             if digest.is_empty() {
@@ -297,7 +333,11 @@ impl StreamRuntime {
             }
             let attempt = order.attempt().max(1);
             self.require_review_tuple(order_id, attempt, &digest)?;
-            PublishMaterial { digest, attempt, op_id: format!("{order_id}:{attempt}") }
+            PublishMaterial {
+                digest,
+                attempt,
+                op_id: format!("{order_id}:{attempt}"),
+            }
         };
         Ok(material)
     }
@@ -313,39 +353,76 @@ impl StreamRuntime {
         if pr_url.is_empty() || !pr_url.starts_with("https://") {
             return Err("invalid pr_url".into());
         }
-        let stream = self.stream(stream_id).ok_or(format!("stream {stream_id} not registered"))?;
+        let stream = self
+            .stream(stream_id)
+            .ok_or(format!("stream {stream_id} not registered"))?;
         let mut engine = stream.engine_if_unfenced()?;
-        let state = engine.order(order_id).ok_or(format!("order {order_id} not enrolled"))?.state();
+        let state = engine
+            .order(order_id)
+            .ok_or(format!("order {order_id} not enrolled"))?
+            .state();
         let rows = stream.journal_rows()?;
-        let has_url = |rows: &[foundry_ledger::LedgerRow]| rows.iter().any(|row| {
-            if row.order_id != order_id || row.to_state != OrderState::Shipped.to_string() {
-                return false;
-            }
-            row.event_json.as_deref().and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-                .is_some_and(|v| v.get("type").and_then(|t| t.as_str()) == Some("publish_confirmed")
-                    && v.get("pr_url").and_then(|u| u.as_str()) == Some(pr_url))
-        });
+        let has_url = |rows: &[foundry_ledger::LedgerRow]| {
+            rows.iter().any(|row| {
+                if row.order_id != order_id || row.to_state != OrderState::Shipped.to_string() {
+                    return false;
+                }
+                row.event_json
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                    .is_some_and(|v| {
+                        v.get("type").and_then(|t| t.as_str()) == Some("publish_confirmed")
+                            && v.get("pr_url").and_then(|u| u.as_str()) == Some(pr_url)
+                    })
+            })
+        };
         if state == OrderState::Shipped {
-            return if has_url(&rows) { Ok(OrderState::Shipped) }
-                else { Err("pr_url mismatch on shipped order".into()) };
+            return if has_url(&rows) {
+                Ok(OrderState::Shipped)
+            } else {
+                Err("pr_url mismatch on shipped order".into())
+            };
         }
         if state != OrderState::Publishing {
-            return Err(format!("order {order_id} must be Publishing or Shipped, was {state}"));
+            return Err(format!(
+                "order {order_id} must be Publishing or Shipped, was {state}"
+            ));
         }
-        let order = engine.order(order_id).ok_or(format!("order {order_id} not enrolled"))?;
-        self.require_review_tuple(order_id, order.attempt().max(1), order.artifact_digest.as_deref().unwrap_or(""))?;
-        engine.acquire(order_id, exec).map_err(|e| format!("publish lock: {e:?}"))?;
+        let order = engine
+            .order(order_id)
+            .ok_or(format!("order {order_id} not enrolled"))?;
+        self.require_review_tuple(
+            order_id,
+            order.attempt().max(1),
+            order.artifact_digest.as_deref().unwrap_or(""),
+        )?;
+        engine
+            .acquire(order_id, exec)
+            .map_err(|e| format!("publish lock: {e:?}"))?;
         let ctx = crate::test_support::replay_ctx(order_id, &rows);
         let ledger: &'static mut foundry_ledger::SqliteLedger = Box::leak(Box::new(
-            foundry_ledger::SqliteLedger::open(stream.journal()).map_err(|e| format!("journal: {e:?}"))?,
+            foundry_ledger::SqliteLedger::open(stream.journal())
+                .map_err(|e| format!("journal: {e:?}"))?,
         ));
-        let outcome = engine.dispatch_replay_ctx(
-            order_id, exec, &OrderEvent::PublishConfirmed { pr_url: pr_url.into() }, 1, &ctx, ledger,
-        ).map_err(|e| format!("publish: {e:?}"))?;
+        let outcome = engine
+            .dispatch_replay_ctx(
+                order_id,
+                exec,
+                &OrderEvent::PublishConfirmed {
+                    pr_url: pr_url.into(),
+                },
+                1,
+                &ctx,
+                ledger,
+            )
+            .map_err(|e| format!("publish: {e:?}"))?;
         if outcome != Outcome::Applied {
             return Err(format!("{outcome:?}"));
         }
-        let state = engine.order(order_id).ok_or(format!("order {order_id} not enrolled"))?.state();
+        let state = engine
+            .order(order_id)
+            .ok_or(format!("order {order_id} not enrolled"))?
+            .state();
         if state != OrderState::Shipped {
             return Err(format!("order {order_id} confirmation left state {state}"));
         }
@@ -409,7 +486,9 @@ impl StreamRuntime {
         intent: &str,
         artifact_digest: &str,
     ) -> Result<foundry_workflow::Outcome, String> {
-        let e = self.stream(stream_id).ok_or(format!("stream {stream_id} not registered"))?;
+        let e = self
+            .stream(stream_id)
+            .ok_or(format!("stream {stream_id} not registered"))?;
         let mut eng = e.engine_if_unfenced()?;
         let ap_path = self
             .approval_path
@@ -429,7 +508,9 @@ impl StreamRuntime {
         )
         .map_err(|er| format!("issue grant: {er:?}"))?;
         let mut hook = foundry_workflow::ApprovalLedgerAdapter(ap);
-        let grant = foundry_workflow::GrantRef { grant_id: grant_id.into() };
+        let grant = foundry_workflow::GrantRef {
+            grant_id: grant_id.into(),
+        };
         eng.dispatch_live(
             order_id,
             exec,
@@ -452,10 +533,18 @@ impl StreamRuntime {
         exec: &str,
         pr_url: &str,
     ) -> Result<(), String> {
-        let e = self.stream(stream_id).ok_or(format!("stream {stream_id} not registered"))?;
+        let e = self
+            .stream(stream_id)
+            .ok_or(format!("stream {stream_id} not registered"))?;
         let mut eng = e.engine_if_unfenced()?;
-        let order = eng.order(order_id).ok_or(format!("order {order_id} not enrolled"))?;
-        self.require_review_tuple(order_id, order.attempt().max(1), order.artifact_digest.as_deref().unwrap_or(""))?;
+        let order = eng
+            .order(order_id)
+            .ok_or(format!("order {order_id} not enrolled"))?;
+        self.require_review_tuple(
+            order_id,
+            order.attempt().max(1),
+            order.artifact_digest.as_deref().unwrap_or(""),
+        )?;
         let rows = foundry_ledger::SqliteLedger::open(e.journal())
             .map_err(|er| format!("journal: {er:?}"))?
             .read_all()
@@ -468,7 +557,9 @@ impl StreamRuntime {
         eng.dispatch_replay_ctx(
             order_id,
             exec,
-            &foundry_domain::OrderEvent::PublishConfirmed { pr_url: pr_url.into() },
+            &foundry_domain::OrderEvent::PublishConfirmed {
+                pr_url: pr_url.into(),
+            },
             1,
             &ctx,
             ro,
@@ -508,7 +599,13 @@ impl StreamRuntime {
         let ch = crate::chainer::Chainer::new(&self.orch, &ap);
         let proposal_id = format!("ho-{source_order}-{dest_order}-{artifact_digest}");
         let view = ch
-            .propose_handoff(&proposal_id, source_order, dest_order, artifact_digest, "intake")
+            .propose_handoff(
+                &proposal_id,
+                source_order,
+                dest_order,
+                artifact_digest,
+                "intake",
+            )
             .map_err(|e| format!("propose: {e:?}"))?;
         // 반환: 매니페스트 + 그랜트 스코프 발급용 6필드 재료.
         // artifact_digest 는 제안 인코딩(fp1) 문자열 — confirm 결속 기준.
@@ -556,8 +653,14 @@ impl StreamRuntime {
         // 소비 전 거부(그랜트 상태 무관 게이트).
         {
             let ch = crate::chainer::Chainer::new(&self.orch, &ap);
-            ch.propose_handoff(&proposal_id, source_order, dest_order, artifact_digest, "intake")
-                .map_err(|e| format!("propose: {e:?}"))?;
+            ch.propose_handoff(
+                &proposal_id,
+                source_order,
+                dest_order,
+                artifact_digest,
+                "intake",
+            )
+            .map_err(|e| format!("propose: {e:?}"))?;
             ch.verify_handoff(&proposal_id, grant_id)
                 .map_err(|e| format!("verify: {e:?}"))?;
         }
@@ -599,51 +702,61 @@ impl StreamRuntime {
     ) -> Result<foundry_domain::OrderState, String> {
         // (r2 MAJOR-1) 회복 정지 중 입장 차단 — dispatch 와 동일 게이트.
         if self.is_admission_blocked() {
-            let _ = record_refusal(
-                &self.orch,
-                RefusalCode::QuiescenceBlocked,
-                order_id,
-                None,
-            );
+            let _ = record_refusal(&self.orch, RefusalCode::QuiescenceBlocked, order_id, None);
             return Err(format!(
                 "admission blocked — advance for '{order_id}' refused during recovery quiescence"
             ));
         }
-        let e = self.stream(stream_id).ok_or(format!("stream {stream_id} not registered"))?;
+        let e = self
+            .stream(stream_id)
+            .ok_or(format!("stream {stream_id} not registered"))?;
         let mut eng = e.engine_if_unfenced()?;
-        eng.acquire(order_id, exec).map_err(|er| format!("acquire: {er:?}"))?;
+        eng.acquire(order_id, exec)
+            .map_err(|er| format!("acquire: {er:?}"))?;
         for ev in [
             foundry_domain::OrderEvent::Queued,
             foundry_domain::OrderEvent::DieStarted,
             foundry_domain::OrderEvent::DieSucceeded { attempt: 1 },
             foundry_domain::OrderEvent::InspectionPassed,
         ] {
-            let att = eng.order(order_id)
+            let att = eng
+                .order(order_id)
                 .ok_or(format!("order {order_id} unknown"))?
-                .attempt().max(1);
+                .attempt()
+                .max(1);
             let rows = foundry_ledger::SqliteLedger::open(e.journal())
                 .map_err(|er| format!("journal: {er:?}"))?
-                .read_all().map_err(|er| format!("journal read: {er:?}"))?;
+                .read_all()
+                .map_err(|er| format!("journal read: {er:?}"))?;
             let ctx = crate::test_support::replay_ctx(order_id, &rows);
             let ro: &'static mut foundry_ledger::SqliteLedger = Box::leak(Box::new(
                 foundry_ledger::SqliteLedger::open(e.journal())
                     .map_err(|er| format!("journal: {er:?}"))?,
             ));
             if ev == foundry_domain::OrderEvent::InspectionPassed {
-                let digest = eng.order(order_id).and_then(|o| o.artifact_digest.as_deref()).unwrap_or("");
+                let digest = eng
+                    .order(order_id)
+                    .and_then(|o| o.artifact_digest.as_deref())
+                    .unwrap_or("");
                 self.require_review_tuple(order_id, att, digest)?;
             }
             eng.dispatch_replay_ctx(order_id, exec, &ev, att, &ctx, ro)
                 .map_err(|er| format!("advance event: {er:?}"))?;
         }
-        let st = eng.order(order_id)
+        let st = eng
+            .order(order_id)
             .ok_or(format!("order {order_id} unknown"))?
             .state();
         Ok(st)
     }
 
     pub fn stream(&self, id: &str) -> Option<Arc<Stream>> {
-        self.streams.lock().unwrap().iter().find(|s| s.stream_id == id).cloned()
+        self.streams
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|s| s.stream_id == id)
+            .cloned()
     }
 
     /// (M8 데모 어댑터) 실 Die 세그먼트 시작 — Queued→DieStarted까지만
@@ -658,19 +771,17 @@ impl StreamRuntime {
         exec: &str,
     ) -> Result<foundry_domain::OrderState, String> {
         if self.is_admission_blocked() {
-            let _ = record_refusal(
-                &self.orch,
-                RefusalCode::QuiescenceBlocked,
-                order_id,
-                None,
-            );
+            let _ = record_refusal(&self.orch, RefusalCode::QuiescenceBlocked, order_id, None);
             return Err(format!(
                 "admission blocked — die segment for '{order_id}' refused during recovery quiescence"
             ));
         }
-        let e = self.stream(stream_id).ok_or(format!("stream {stream_id} not registered"))?;
+        let e = self
+            .stream(stream_id)
+            .ok_or(format!("stream {stream_id} not registered"))?;
         let mut eng = e.engine_if_unfenced()?;
-        eng.acquire(order_id, exec).map_err(|er| format!("acquire: {er:?}"))?;
+        eng.acquire(order_id, exec)
+            .map_err(|er| format!("acquire: {er:?}"))?;
         for ev in [
             foundry_domain::OrderEvent::Queued,
             foundry_domain::OrderEvent::DieStarted,
@@ -711,7 +822,9 @@ impl StreamRuntime {
         exec: &str,
         die: &foundry_domain::ports::DieOutput,
     ) -> Result<foundry_domain::OrderState, String> {
-        let e = self.stream(stream_id).ok_or(format!("stream {stream_id} not registered"))?;
+        let e = self
+            .stream(stream_id)
+            .ok_or(format!("stream {stream_id} not registered"))?;
         let mut eng = e.engine_if_unfenced()?;
         let att = eng
             .order(order_id)
@@ -723,38 +836,55 @@ impl StreamRuntime {
         if die.result_commit.is_empty() || die.result_commit == die.base_commit {
             return Err(format!(
                 "die produced no change (result {:?} == base {:?}) — no-op taxonomy refuses",
-                die.result_commit,
-                die.base_commit
+                die.result_commit, die.base_commit
             ));
         }
         let has_tuple = {
             let guard = self.tuple_store.lock().unwrap();
-            let store = guard.as_ref().ok_or("review evidence unavailable: tuple reader not configured")?;
-            store.latest_promoted(&ExecOrderId(order_id.into()), ExecAttempt(att as u64))
+            let store = guard
+                .as_ref()
+                .ok_or("review evidence unavailable: tuple reader not configured")?;
+            store
+                .latest_promoted(&ExecOrderId(order_id.into()), ExecAttempt(att as u64))
                 .map_err(|er| format!("review tuple read failed: {er:?}"))?
                 .is_some_and(|tuple| tuple.immutable_commit.0 == die.result_commit)
         };
         if !has_tuple {
-            let order = eng.order(order_id).ok_or(format!("order {order_id} unknown"))?;
+            let order = eng
+                .order(order_id)
+                .ok_or(format!("order {order_id} unknown"))?;
             let request = ReviewRunRequest {
-                order: ExecOrderId(order_id.into()), attempt: ExecAttempt(att as u64),
-                run: RunId(att as u64), base_commit: die.base_commit.clone(),
-                result_commit: die.result_commit.clone(), artifact_digest: die.result_commit.clone(),
-                epoch: Epoch(0), activation: order.version,
+                order: ExecOrderId(order_id.into()),
+                attempt: ExecAttempt(att as u64),
+                run: RunId(att as u64),
+                base_commit: die.base_commit.clone(),
+                result_commit: die.result_commit.clone(),
+                artifact_digest: die.result_commit.clone(),
+                epoch: Epoch(0),
+                activation: order.version,
             };
-            let result = self.review_run.lock().unwrap().as_mut()
+            let result = self
+                .review_run
+                .lock()
+                .unwrap()
+                .as_mut()
                 .ok_or("review evidence unavailable: review runner not configured")?
-                .run(request).map_err(|er| format!("review run failed: {er:?}"))?;
+                .run(request)
+                .map_err(|er| format!("review run failed: {er:?}"))?;
             let result = match result {
                 foundry_exec::ReviewRunOutcome::Completed(result) => result,
-                foundry_exec::ReviewRunOutcome::Held(_) => return Err("review held for human resolution".into()),
+                foundry_exec::ReviewRunOutcome::Held(_) => {
+                    return Err("review held for human resolution".into());
+                }
             };
             if result.verdict != foundry_exec::ReviewVerdict::Passed
                 || result.tuple_key.order.0 != order_id
                 || result.tuple_key.attempt.0 != att as u64
                 || result.tuple_key.run.0 != att as u64
                 || result.emit_receipt.key != result.tuple_key
-            { return Err("review evidence binding mismatch".into()); }
+            {
+                return Err("review evidence binding mismatch".into());
+            }
         }
         self.require_review_tuple(order_id, att, &die.result_commit)?;
         let rows = foundry_ledger::SqliteLedger::open(e.journal())
@@ -785,17 +915,20 @@ impl StreamRuntime {
     /// 입장 차단 (코디네이터 전용). (T61 astra r2) 오케스트레이션 정지
     /// 래치와 **결합** — 회복 경계에서 preset append 도 함께 멈춘다.
     pub(crate) fn block_admission(&self) {
-        self.admission_blocked.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.admission_blocked
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self.orch.set_quiescent(true);
     }
 
     pub(crate) fn resume_admission(&self) {
-        self.admission_blocked.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.admission_blocked
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         self.orch.set_quiescent(false);
     }
 
     pub fn is_admission_blocked(&self) -> bool {
-        self.admission_blocked.load(std::sync::atomic::Ordering::SeqCst)
+        self.admission_blocked
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// (astra r9) plan 의 preset_bound 역산 — spawn_plan 이 이 plan 인
@@ -803,11 +936,11 @@ impl StreamRuntime {
     fn sizing_of_plan(&self, plan: &str) -> Option<String> {
         let rows = self.orch.read_all().ok()?;
         rows.iter().find_map(|r| match &r.kind {
-            OrchestrationKind::PresetBound { sizing_order, spawn_plan, .. }
-                if spawn_plan == plan =>
-            {
-                Some(sizing_order.clone())
-            }
+            OrchestrationKind::PresetBound {
+                sizing_order,
+                spawn_plan,
+                ..
+            } if spawn_plan == plan => Some(sizing_order.clone()),
             _ => None,
         })
     }
@@ -815,11 +948,11 @@ impl StreamRuntime {
     fn digest_of_sizing(&self, sizing: &str) -> Option<String> {
         let rows = self.orch.read_all().ok()?;
         rows.iter().find_map(|r| match &r.kind {
-            OrchestrationKind::PresetBound { sizing_order, approved_digest, .. }
-                if sizing_order == sizing =>
-            {
-                Some(approved_digest.clone())
-            }
+            OrchestrationKind::PresetBound {
+                sizing_order,
+                approved_digest,
+                ..
+            } if sizing_order == sizing => Some(approved_digest.clone()),
             _ => None,
         })
     }
@@ -827,11 +960,11 @@ impl StreamRuntime {
     fn root_of_sizing(&self, sizing: &str) -> Option<String> {
         let rows = self.orch.read_all().ok()?;
         rows.iter().find_map(|r| match &r.kind {
-            OrchestrationKind::PresetBound { sizing_order, selected_root, .. }
-                if sizing_order == sizing =>
-            {
-                Some(selected_root.clone())
-            }
+            OrchestrationKind::PresetBound {
+                sizing_order,
+                selected_root,
+                ..
+            } if sizing_order == sizing => Some(selected_root.clone()),
             _ => None,
         })
     }
@@ -853,7 +986,11 @@ impl StreamRuntime {
     fn assignment_of(&self, order_id: &str) -> Result<Option<(String, String)>, String> {
         let rows = self.orch.read_all().map_err(|e| e.to_string())?;
         for r in rows {
-            if let OrchestrationKind::PlanDeclared { plan_id, edges, streams } = &r.kind
+            if let OrchestrationKind::PlanDeclared {
+                plan_id,
+                edges,
+                streams,
+            } = &r.kind
                 && edges.iter().any(|(o, _)| o == order_id)
                 && let Some((_, s)) = streams.iter().find(|(o, _)| o == order_id)
             {
@@ -870,7 +1007,9 @@ impl StreamRuntime {
             let Some((_, s)) = self.assignment_of(p)? else {
                 return Err(format!("pred {p} has no stream"));
             };
-            let stream = self.stream(&s).ok_or(format!("stream {s} not registered"))?;
+            let stream = self
+                .stream(&s)
+                .ok_or(format!("stream {s} not registered"))?;
             match stream.order_shipped(p) {
                 Ok(true) => {}
                 Ok(false) => return Ok(false),
@@ -913,7 +1052,9 @@ impl StreamRuntime {
                 ));
             }
             Some(ap) => {
-                let stream = self.stream(&s).ok_or(format!("stream {s} not registered"))?;
+                let stream = self
+                    .stream(&s)
+                    .ok_or(format!("stream {s} not registered"))?;
                 let ch = crate::chainer::Chainer::new(&self.orch, ap);
                 // 주문 소스 — 인테이크 부트스트랩 판별. 소스가 없으면
                 // 비부트스트랩(보수).
@@ -926,12 +1067,9 @@ impl StreamRuntime {
                     _ => format!("ext:{}", order.external.external_id),
                 };
                 let r = ch.check_spawn_binding(
-                    order_id,
-                    &source,
+                    order_id, &source,
                     None, // sizing_order 후보: 로그 preset_bound 에서 역산
-                    None,
-                    &plan,
-                    "preset",
+                    None, &plan, "preset",
                 );
                 // sizing_order 역산 — 이 plan 의 preset_bound 찾기.
                 let sizing = self.sizing_of_plan(&plan);
@@ -939,23 +1077,15 @@ impl StreamRuntime {
                 // (Source::Intake) 주문은 이 스트림의 preset_root 와
                 // preset_bound selected_root 가 일치해야 한다. 임의
                 // 스트림에서의 부트스트랩 차단(자기비교 폐지).
-                let is_bootstrap = matches!(
-                    order.external.source,
-                    foundry_domain::order::Source::Intake
-                );
+                let is_bootstrap =
+                    matches!(order.external.source, foundry_domain::order::Source::Intake);
                 if is_bootstrap {
-                    let bound_root = sizing
-                        .as_deref()
-                        .and_then(|so| self.root_of_sizing(so));
+                    let bound_root = sizing.as_deref().and_then(|so| self.root_of_sizing(so));
                     // (r2 B2) 빈 preset_root 스트림은 부트스트랩 거부 —
                     // 자기비교 폴백 폐지(fail-closed).
                     if stream.preset_root.is_empty() {
-                        let _ = record_refusal(
-                            &self.orch,
-                            RefusalCode::UnsizedSpawn,
-                            order_id,
-                            None,
-                        );
+                        let _ =
+                            record_refusal(&self.orch, RefusalCode::UnsizedSpawn, order_id, None);
                         return Err(format!(
                             "order '{order_id}' bootstrap refused — stream '{}' has no bound preset root (use new_with_root)",
                             stream.id()
@@ -966,12 +1096,8 @@ impl StreamRuntime {
                     // 스트림이면 허용 — 사이징 이전 입장(결속 생성 전).
                     // 결속이 존재하면 일치해야 한다.
                     if bound_root.is_some() && bound_root != expected {
-                        let _ = record_refusal(
-                            &self.orch,
-                            RefusalCode::UnsizedSpawn,
-                            order_id,
-                            None,
-                        );
+                        let _ =
+                            record_refusal(&self.orch, RefusalCode::UnsizedSpawn, order_id, None);
                         return Err(format!(
                             "order '{order_id}' bootstrap root mismatch — stream expects {:?}, bound {:?}",
                             expected, bound_root
@@ -1008,11 +1134,17 @@ impl StreamRuntime {
         drop(ap_guard);
         if !self.ready_to_start(order_id)? {
             let _ = record_refusal(&self.orch, RefusalCode::NotReady, order_id, None);
-            return Err(format!("order '{order_id}' not ready — predecessors unshipped"));
+            return Err(format!(
+                "order '{order_id}' not ready — predecessors unshipped"
+            ));
         }
-        let stream = self.stream(&s).ok_or(format!("stream {s} not registered"))?;
+        let stream = self
+            .stream(&s)
+            .ok_or(format!("stream {s} not registered"))?;
         stream.enroll(order)?;
-        self.orch.spawn_order(order_id, &plan, &s).map_err(|e| e.to_string())?;
+        self.orch
+            .spawn_order(order_id, &plan, &s)
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 }
@@ -1034,17 +1166,27 @@ pub struct RecoveryCoordinator<'r> {
 #[derive(Debug, PartialEq)]
 pub enum RecoveryOutcome {
     /// 회복 완료 — 재구축 엔진 설치됨·무효화된 예약 수.
-    Completed { streams_rebuilt: usize, invalidated_reservations: usize },
+    Completed {
+        streams_rebuilt: usize,
+        invalidated_reservations: usize,
+    },
     /// 타임아웃 — **스캔 없이** 중단 (부분 정지 스캔 경로 제거).
     AbortedWithoutScan { missing_acks: Vec<String> },
     /// (astra r2) 스캔/rebuild 실패 — 부분 결과 동반(성공 스트림은
     /// 이미 교체됨). 입장은 재개됐다.
-    Failed { stage: String, streams_rebuilt: usize, invalidated_reservations: usize },
+    Failed {
+        stage: String,
+        streams_rebuilt: usize,
+        invalidated_reservations: usize,
+    },
 }
 
 impl<'r> RecoveryCoordinator<'r> {
     pub fn new(runtime: &'r StreamRuntime, timeout_secs: u64) -> Self {
-        Self { runtime, timeout_secs }
+        Self {
+            runtime,
+            timeout_secs,
+        }
     }
 
     /// 회복 — ack 폴링은 호출자(in-flight 소유자)가 제공.
@@ -1081,10 +1223,15 @@ impl<'r> RecoveryCoordinator<'r> {
                 // (타임아웃이 안전 중단 담당).
             }
             if std::time::Instant::now() >= deadline {
-                let missing: Vec<String> =
-                    want.iter().filter(|k| !done.contains(*k)).cloned().collect();
+                let missing: Vec<String> = want
+                    .iter()
+                    .filter(|k| !done.contains(*k))
+                    .cloned()
+                    .collect();
                 self.runtime.resume_admission();
-                return RecoveryOutcome::AbortedWithoutScan { missing_acks: missing };
+                return RecoveryOutcome::AbortedWithoutScan {
+                    missing_acks: missing,
+                };
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
@@ -1145,8 +1292,7 @@ impl<'r> RecoveryCoordinator<'r> {
             };
             // 재배선 엔진 (BLOCKER: 저널 결속 회복 후 rebuild).
             let Ok(mut fresh) = s.rebuilt_engine() else {
-                first_failure =
-                    Some(format!("journal rewire: {}", s.journal_path.display()));
+                first_failure = Some(format!("journal rewire: {}", s.journal_path.display()));
                 s.fence();
                 continue;
             };
@@ -1159,8 +1305,10 @@ impl<'r> RecoveryCoordinator<'r> {
                     rebuilt += 1;
                 }
                 Ok(_) => {
-                    first_failure =
-                        Some(format!("journal verify failed: {}", s.journal_path.display()));
+                    first_failure = Some(format!(
+                        "journal verify failed: {}",
+                        s.journal_path.display()
+                    ));
                     s.fence();
                 }
                 Err(e) => {
@@ -1177,7 +1325,10 @@ impl<'r> RecoveryCoordinator<'r> {
                 invalidated_reservations: invalidated,
             };
         }
-        RecoveryOutcome::Completed { streams_rebuilt: rebuilt, invalidated_reservations: invalidated }
+        RecoveryOutcome::Completed {
+            streams_rebuilt: rebuilt,
+            invalidated_reservations: invalidated,
+        }
     }
 }
 
@@ -1195,7 +1346,11 @@ mod tests {
 
     fn mkorder(id: &str) -> Order {
         // (T61) 인테이크 부트스트랩 — 타입화된 Source::Intake.
-        let mut o = Order::new(id.into(), ExternalRef::intake(id, &format!("dedup:{id}")), chrono::Utc::now());
+        let mut o = Order::new(
+            id.into(),
+            ExternalRef::intake(id, &format!("dedup:{id}")),
+            chrono::Utc::now(),
+        );
         o.force_state_for_test(OrderState::Received, 1);
         o
     }
@@ -1204,125 +1359,240 @@ mod tests {
     fn finish_die_segment_requires_latest_bound_evidence() {
         struct NoReview;
         impl ReviewRunPort for NoReview {
-            fn run(&mut self, _: ReviewRunRequest) -> Result<foundry_exec::ReviewRunOutcome, foundry_exec::ReviewRunError> {
+            fn run(
+                &mut self,
+                _: ReviewRunRequest,
+            ) -> Result<foundry_exec::ReviewRunOutcome, foundry_exec::ReviewRunError> {
                 panic!("matching tuple must bypass review dispatch");
             }
         }
-        for mode in ["unconfigured", "empty", "mismatch", "wrong-attempt", "existing"] {
+        for mode in [
+            "unconfigured",
+            "empty",
+            "mismatch",
+            "wrong-attempt",
+            "existing",
+        ] {
             let d = tmpdir(&format!("review-finish-{mode}"));
             let orch = OrchestrationLog::open(&d.join("orch.db")).unwrap();
-            orch.declare_plan("review-plan", vec![("review-order".into(), vec![])], vec![("review-order".into(), "review-stream".into())]).unwrap();
+            orch.declare_plan(
+                "review-plan",
+                vec![("review-order".into(), vec![])],
+                vec![("review-order".into(), "review-stream".into())],
+            )
+            .unwrap();
             let rt = StreamRuntime::new(orch);
-            rt.add_stream(Stream::new_with_root("review-stream", &d, "bmad-quickloop").unwrap()).unwrap();
-            rt.bind_approval_ledger(foundry_approval::ApprovalLedger::open(&d.join("approval.db")).unwrap()).unwrap();
-            rt.dispatch("review-order", mkorder("review-order")).unwrap();
-            assert_eq!(rt.start_die_segment("review-stream", "review-order", "review-exec").unwrap(), OrderState::Working);
+            rt.add_stream(Stream::new_with_root("review-stream", &d, "bmad-quickloop").unwrap())
+                .unwrap();
+            rt.bind_approval_ledger(
+                foundry_approval::ApprovalLedger::open(&d.join("approval.db")).unwrap(),
+            )
+            .unwrap();
+            rt.dispatch("review-order", mkorder("review-order"))
+                .unwrap();
+            assert_eq!(
+                rt.start_die_segment("review-stream", "review-order", "review-exec")
+                    .unwrap(),
+                OrderState::Working
+            );
             if mode != "unconfigured" {
                 let tuples = foundry_exec::SqliteTupleStore::open(d.join("tuples.db")).unwrap();
                 if mode != "empty" {
                     let tuple = foundry_exec::ArtifactTuple {
                         order: ExecOrderId("review-order".into()),
                         attempt: ExecAttempt(if mode == "wrong-attempt" { 2 } else { 1 }),
-                        run: RunId(7), generation: foundry_exec::Generation(0),
-                        immutable_commit: foundry_exec::ImmutableCommit(if mode == "mismatch" { "other" } else { "result" }.into()),
-                        artifact_location: foundry_exec::ArtifactLocation("review.log".into()), generations: Vec::new(),
+                        run: RunId(7),
+                        generation: foundry_exec::Generation(0),
+                        immutable_commit: foundry_exec::ImmutableCommit(
+                            if mode == "mismatch" {
+                                "other"
+                            } else {
+                                "result"
+                            }
+                            .into(),
+                        ),
+                        artifact_location: foundry_exec::ArtifactLocation("review.log".into()),
+                        generations: Vec::new(),
                     };
                     tuples.record(&tuple).unwrap();
                     if mode == "existing" {
-                        tuples.promote(&tuple.key(), &foundry_exec::EmitReceipt { key: tuple.key(), event: "publish".into(), at: chrono::Utc::now() }).unwrap();
+                        tuples
+                            .promote(
+                                &tuple.key(),
+                                &foundry_exec::EmitReceipt {
+                                    key: tuple.key(),
+                                    event: "publish".into(),
+                                    at: chrono::Utc::now(),
+                                },
+                            )
+                            .unwrap();
                     }
                 }
                 rt.set_tuple_store(Arc::new(tuples));
             }
-            if mode == "existing" { rt.set_review_run(NoReview); }
+            if mode == "existing" {
+                rt.set_review_run(NoReview);
+            }
             let output = foundry_domain::ports::DieOutput {
-                attempt: 1, base_commit: "base".into(), result_commit: "result".into(), log_path: "die.log".into(), exit_code: 0,
+                attempt: 1,
+                base_commit: "base".into(),
+                result_commit: "result".into(),
+                log_path: "die.log".into(),
+                exit_code: 0,
             };
-            let result = rt.finish_die_segment("review-stream", "review-order", "review-exec", &output);
+            let result =
+                rt.finish_die_segment("review-stream", "review-order", "review-exec", &output);
             let rows = rt.stream("review-stream").unwrap().journal_rows().unwrap();
-            let passes = rows.iter().filter(|r| r.event == "InspectionPassed").count();
+            let passes = rows
+                .iter()
+                .filter(|r| r.event == "InspectionPassed")
+                .count();
             if mode == "existing" {
                 assert_eq!(result.unwrap(), OrderState::FurnaceHold);
                 assert_eq!(passes, 1);
             } else {
                 assert!(result.is_err(), "{mode}");
                 assert_eq!(passes, 0, "{mode}");
-                assert_eq!(rt.stream("review-stream").unwrap().engine_if_unfenced().unwrap().order("review-order").unwrap().state(), OrderState::Working);
+                assert_eq!(
+                    rt.stream("review-stream")
+                        .unwrap()
+                        .engine_if_unfenced()
+                        .unwrap()
+                        .order("review-order")
+                        .unwrap()
+                        .state(),
+                    OrderState::Working
+                );
             }
         }
     }
 
     mod publish {
-    use super::*;
+        use super::*;
 
-    fn tuples(path: &Path, order: &str, digest: &str) -> Arc<foundry_exec::SqliteTupleStore> {
-        use foundry_exec::TupleStore as _;
-        let store = Arc::new(foundry_exec::SqliteTupleStore::open(path).unwrap());
-        let tuple = foundry_exec::ArtifactTuple {
-            order: ExecOrderId(order.into()), attempt: ExecAttempt(2), run: RunId(1),
-            generation: foundry_exec::Generation(0),
-            immutable_commit: foundry_exec::ImmutableCommit(digest.into()),
-            artifact_location: foundry_exec::ArtifactLocation("review.log".into()), generations: Vec::new(),
-        };
-        store.record(&tuple).unwrap();
-        store.promote(&tuple.key(), &foundry_exec::EmitReceipt { key: tuple.key(), event: "publish".into(), at: chrono::Utc::now() }).unwrap();
-        store
-    }
-
-    fn publish_fixture(name: &str, state: OrderState) -> (PathBuf, StreamRuntime) {
-        let d = tmpdir(name);
-        let orch = OrchestrationLog::open(&d.join("orch.db")).unwrap();
-        let rt = StreamRuntime::new(orch);
-        let tuple_store = tuples(&d.join("tuples.db"), "pub-order", "digest-1");
-        rt.set_tuple_store(tuple_store);
-        rt.add_stream(Stream::new("publish", &d).unwrap()).unwrap();
-        let mut order = mkorder("pub-order");
-        order.force_state_for_test(state, 2);
-        if state == OrderState::Publishing { order.artifact_digest = Some("digest-1".into()); }
-        rt.stream("publish").unwrap().enroll(order).unwrap();
-        (d, rt)
-    }
-
-    #[test]
-    fn precheck_refuses_non_publishing() {
-        let (_d, rt) = publish_fixture("precheck-state", OrderState::FurnaceHold);
-        assert!(rt.publish_precheck("publish", "pub-order").unwrap_err().contains("Publishing"));
-    }
-
-    #[test]
-    fn confirm_first_transition_ships() {
-        let (_d, rt) = publish_fixture("confirm-first", OrderState::Publishing);
-        let url = "https://github.com/x/pr/1";
-        assert_eq!(rt.confirm_published("publish", "pub-order", "exec-a", url).unwrap(), OrderState::Shipped);
-        assert!(rt.stream("publish").unwrap().journal_rows().unwrap().iter().any(|r|
-            r.order_id == "pub-order" && r.to_state == "shipped" &&
-            r.event_json.as_deref().is_some_and(|j| j.contains(url))));
-    }
-
-    #[test]
-    fn confirm_idempotent_on_shipped_matching_url() {
-        let (_d, rt) = publish_fixture("confirm-idempotent", OrderState::Publishing);
-        let url = "https://github.com/x/pr/1";
-        rt.confirm_published("publish", "pub-order", "exec-a", url).unwrap();
-        let before = rt.stream("publish").unwrap().journal_rows().unwrap().len();
-        assert_eq!(rt.confirm_published("publish", "pub-order", "exec-b", url).unwrap(), OrderState::Shipped);
-        assert_eq!(rt.stream("publish").unwrap().journal_rows().unwrap().len(), before);
-    }
-
-    #[test]
-    fn confirm_rejects_url_mismatch_on_shipped() {
-        let (_d, rt) = publish_fixture("confirm-mismatch", OrderState::Publishing);
-        rt.confirm_published("publish", "pub-order", "exec-a", "https://github.com/x/pr/1").unwrap();
-        assert!(rt.confirm_published("publish", "pub-order", "exec-b", "https://github.com/x/pr/2").is_err());
-    }
-
-    #[test]
-    fn confirm_rejects_empty_or_invalid_url() {
-        let (_d, rt) = publish_fixture("confirm-invalid-url", OrderState::Publishing);
-        for url in ["", "github.com/x"] {
-            assert_eq!(rt.confirm_published("publish", "pub-order", "exec-a", url).unwrap_err(), "invalid pr_url");
+        fn tuples(path: &Path, order: &str, digest: &str) -> Arc<foundry_exec::SqliteTupleStore> {
+            use foundry_exec::TupleStore as _;
+            let store = Arc::new(foundry_exec::SqliteTupleStore::open(path).unwrap());
+            let tuple = foundry_exec::ArtifactTuple {
+                order: ExecOrderId(order.into()),
+                attempt: ExecAttempt(2),
+                run: RunId(1),
+                generation: foundry_exec::Generation(0),
+                immutable_commit: foundry_exec::ImmutableCommit(digest.into()),
+                artifact_location: foundry_exec::ArtifactLocation("review.log".into()),
+                generations: Vec::new(),
+            };
+            store.record(&tuple).unwrap();
+            store
+                .promote(
+                    &tuple.key(),
+                    &foundry_exec::EmitReceipt {
+                        key: tuple.key(),
+                        event: "publish".into(),
+                        at: chrono::Utc::now(),
+                    },
+                )
+                .unwrap();
+            store
         }
-    }
+
+        fn publish_fixture(name: &str, state: OrderState) -> (PathBuf, StreamRuntime) {
+            let d = tmpdir(name);
+            let orch = OrchestrationLog::open(&d.join("orch.db")).unwrap();
+            let rt = StreamRuntime::new(orch);
+            let tuple_store = tuples(&d.join("tuples.db"), "pub-order", "digest-1");
+            rt.set_tuple_store(tuple_store);
+            rt.add_stream(Stream::new("publish", &d).unwrap()).unwrap();
+            let mut order = mkorder("pub-order");
+            order.force_state_for_test(state, 2);
+            if state == OrderState::Publishing {
+                order.artifact_digest = Some("digest-1".into());
+            }
+            rt.stream("publish").unwrap().enroll(order).unwrap();
+            (d, rt)
+        }
+
+        #[test]
+        fn precheck_refuses_non_publishing() {
+            let (_d, rt) = publish_fixture("precheck-state", OrderState::FurnaceHold);
+            assert!(
+                rt.publish_precheck("publish", "pub-order")
+                    .unwrap_err()
+                    .contains("Publishing")
+            );
+        }
+
+        #[test]
+        fn confirm_first_transition_ships() {
+            let (_d, rt) = publish_fixture("confirm-first", OrderState::Publishing);
+            let url = "https://github.com/x/pr/1";
+            assert_eq!(
+                rt.confirm_published("publish", "pub-order", "exec-a", url)
+                    .unwrap(),
+                OrderState::Shipped
+            );
+            assert!(
+                rt.stream("publish")
+                    .unwrap()
+                    .journal_rows()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r.order_id == "pub-order"
+                        && r.to_state == "shipped"
+                        && r.event_json.as_deref().is_some_and(|j| j.contains(url)))
+            );
+        }
+
+        #[test]
+        fn confirm_idempotent_on_shipped_matching_url() {
+            let (_d, rt) = publish_fixture("confirm-idempotent", OrderState::Publishing);
+            let url = "https://github.com/x/pr/1";
+            rt.confirm_published("publish", "pub-order", "exec-a", url)
+                .unwrap();
+            let before = rt.stream("publish").unwrap().journal_rows().unwrap().len();
+            assert_eq!(
+                rt.confirm_published("publish", "pub-order", "exec-b", url)
+                    .unwrap(),
+                OrderState::Shipped
+            );
+            assert_eq!(
+                rt.stream("publish").unwrap().journal_rows().unwrap().len(),
+                before
+            );
+        }
+
+        #[test]
+        fn confirm_rejects_url_mismatch_on_shipped() {
+            let (_d, rt) = publish_fixture("confirm-mismatch", OrderState::Publishing);
+            rt.confirm_published(
+                "publish",
+                "pub-order",
+                "exec-a",
+                "https://github.com/x/pr/1",
+            )
+            .unwrap();
+            assert!(
+                rt.confirm_published(
+                    "publish",
+                    "pub-order",
+                    "exec-b",
+                    "https://github.com/x/pr/2"
+                )
+                .is_err()
+            );
+        }
+
+        #[test]
+        fn confirm_rejects_empty_or_invalid_url() {
+            let (_d, rt) = publish_fixture("confirm-invalid-url", OrderState::Publishing);
+            for url in ["", "github.com/x"] {
+                assert_eq!(
+                    rt.confirm_published("publish", "pub-order", "exec-a", url)
+                        .unwrap_err(),
+                    "invalid pr_url"
+                );
+            }
+        }
     }
 
     /// 주문을 자율 구간+직접 승인으로 Shipped 까지.
@@ -1336,15 +1606,25 @@ mod tests {
         let tuple_path = ap_db.with_file_name(format!("{oid}-tuples.db"));
         let tuple_store = foundry_exec::SqliteTupleStore::open(&tuple_path).unwrap();
         let tuple = foundry_exec::ArtifactTuple {
-            order: ExecOrderId(oid.into()), attempt: ExecAttempt(1), run: RunId(1),
+            order: ExecOrderId(oid.into()),
+            attempt: ExecAttempt(1),
+            run: RunId(1),
             generation: foundry_exec::Generation(0),
             immutable_commit: foundry_exec::ImmutableCommit(format!("dig-{oid}")),
-            artifact_location: foundry_exec::ArtifactLocation("review.log".into()), generations: Vec::new(),
+            artifact_location: foundry_exec::ArtifactLocation("review.log".into()),
+            generations: Vec::new(),
         };
         foundry_exec::TupleStore::record(&tuple_store, &tuple).unwrap();
-        foundry_exec::TupleStore::promote(&tuple_store, &tuple.key(), &foundry_exec::EmitReceipt {
-            key: tuple.key(), event: "publish".into(), at: chrono::Utc::now(),
-        }).unwrap();
+        foundry_exec::TupleStore::promote(
+            &tuple_store,
+            &tuple.key(),
+            &foundry_exec::EmitReceipt {
+                key: tuple.key(),
+                event: "publish".into(),
+                at: chrono::Utc::now(),
+            },
+        )
+        .unwrap();
         rt.set_tuple_store(Arc::new(tuple_store));
         let mut ap = foundry_approval::ApprovalLedger::open(ap_db).unwrap();
         let e = rt.stream(stream_id).unwrap();
@@ -1366,7 +1646,8 @@ mod tests {
                 let ro: &'static mut foundry_ledger::SqliteLedger = Box::leak(Box::new(
                     foundry_ledger::SqliteLedger::open(&e.journal_path).unwrap(),
                 ));
-                eng.dispatch_replay_ctx(oid, "ex", &ev, att, &ctx, ro).unwrap();
+                eng.dispatch_replay_ctx(oid, "ex", &ev, att, &ctx, ro)
+                    .unwrap();
             }
         }
         ap.issue_grant(grant_id, &format!("tok-{grant_id}"), &serde_json::json!({
@@ -1377,7 +1658,9 @@ mod tests {
         {
             let e2 = rt.stream(stream_id).unwrap();
             let mut eng = e2.engine_if_unfenced().unwrap();
-            let grant = foundry_workflow::GrantRef { grant_id: grant_id.into() };
+            let grant = foundry_workflow::GrantRef {
+                grant_id: grant_id.into(),
+            };
             let out = eng
                 .dispatch_live(
                     oid,
@@ -1403,7 +1686,9 @@ mod tests {
             eng.dispatch_replay_ctx(
                 oid,
                 "ex",
-                &OrderEvent::PublishConfirmed { pr_url: "https://pr/1".into() },
+                &OrderEvent::PublishConfirmed {
+                    pr_url: "https://pr/1".into(),
+                },
                 1,
                 &ctx,
                 ro,
@@ -1425,11 +1710,10 @@ mod tests {
         )
         .unwrap();
         let rt = StreamRuntime::new(orch);
-        rt.add_stream(Stream::new_with_root("s-1", &d, "bmad-quickloop").unwrap()).unwrap();
-        rt.bind_approval_ledger(
-            foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
-        )
-        .unwrap();
+        rt.add_stream(Stream::new_with_root("s-1", &d, "bmad-quickloop").unwrap())
+            .unwrap();
+        rt.bind_approval_ledger(foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap())
+            .unwrap();
         assert!(rt.ready_to_start("o-a").unwrap());
         assert!(!rt.ready_to_start("o-b").unwrap());
         rt.dispatch("o-a", mkorder("o-a")).unwrap();
@@ -1448,8 +1732,14 @@ mod tests {
         assert!(rt.stream("s-1").unwrap().order_shipped("o-b").unwrap());
 
         let rows = rt.stream("s-1").unwrap().journal_rows().unwrap();
-        assert!(rows.iter().any(|r| r.order_id == "o-a" && r.to_state == "shipped"));
-        assert!(rows.iter().any(|r| r.order_id == "o-b" && r.to_state == "shipped"));
+        assert!(
+            rows.iter()
+                .any(|r| r.order_id == "o-a" && r.to_state == "shipped")
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.order_id == "o-b" && r.to_state == "shipped")
+        );
         // 발행 기록 2건.
         let prows = rt.orch.read_all().unwrap();
         let spawned: Vec<_> = prows
@@ -1475,11 +1765,10 @@ mod tests {
         )
         .unwrap();
         let rt = StreamRuntime::new(orch);
-        rt.add_stream(Stream::new_with_root("s-c", &d, "bmad-quickloop").unwrap()).unwrap();
-        rt.bind_approval_ledger(
-            foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
-        )
-        .unwrap();
+        rt.add_stream(Stream::new_with_root("s-c", &d, "bmad-quickloop").unwrap())
+            .unwrap();
+        rt.bind_approval_ledger(foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap())
+            .unwrap();
 
         // o-a Shipped 까지 — 저널에 rebuild 증거 심기.
         rt.dispatch("o-a", mkorder("o-a")).unwrap();
@@ -1494,21 +1783,26 @@ mod tests {
         );
         assert_eq!(
             out,
-            RecoveryOutcome::Completed { streams_rebuilt: 1, invalidated_reservations: 0 }
+            RecoveryOutcome::Completed {
+                streams_rebuilt: 1,
+                invalidated_reservations: 0
+            }
         );
         assert!(!rt.is_admission_blocked(), "admission resumed");
 
         // 타임아웃+차단 중 dispatch 거부 — 별도 런타임 (엔진이 non-Send
         // 라 단일 스레드 시뮬레이션: 짧은 타임아웃 + 즉시 폴링).
         let orch2 = OrchestrationLog::open(&d.join("orch2.db")).unwrap();
-        orch2.declare_plan(
-            "q1",
-            vec![("o-z".into(), vec![])],
-            vec![("o-z".into(), "s-t".into())],
-        )
-        .unwrap();
+        orch2
+            .declare_plan(
+                "q1",
+                vec![("o-z".into(), vec![])],
+                vec![("o-z".into(), "s-t".into())],
+            )
+            .unwrap();
         let rt2 = StreamRuntime::new(orch2);
-        rt2.add_stream(Stream::new_with_root("s-t", &d, "bmad-quickloop").unwrap()).unwrap();
+        rt2.add_stream(Stream::new_with_root("s-t", &d, "bmad-quickloop").unwrap())
+            .unwrap();
 
         let c2 = RecoveryCoordinator::new(&rt2, 0); // 즉시 타임아웃
         // (2) 차단 시작을 관측한 뒤 dispatch 시도 — recover 는 폴링 사이
@@ -1531,7 +1825,9 @@ mod tests {
         );
         assert_eq!(
             out2,
-            RecoveryOutcome::AbortedWithoutScan { missing_acks: vec!["never".into()] }
+            RecoveryOutcome::AbortedWithoutScan {
+                missing_acks: vec!["never".into()]
+            }
         );
         assert!(!rt2.is_admission_blocked());
         // 거부 레코드 3요소로 남음.
@@ -1555,23 +1851,32 @@ mod tests {
         )
         .unwrap();
         let rt = StreamRuntime::new(orch);
-        rt.add_stream(Stream::new_with_root("sx", &d, "bmad-quickloop").unwrap()).unwrap();
-        rt.add_stream(Stream::new_with_root("sy", &d, "bmad-quickloop").unwrap()).unwrap();
-        rt.bind_approval_ledger(
-            foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
-        )
-        .unwrap();
+        rt.add_stream(Stream::new_with_root("sx", &d, "bmad-quickloop").unwrap())
+            .unwrap();
+        rt.add_stream(Stream::new_with_root("sy", &d, "bmad-quickloop").unwrap())
+            .unwrap();
+        rt.bind_approval_ledger(foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap())
+            .unwrap();
         rt.dispatch("o-x", mkorder("o-x")).unwrap();
         rt.dispatch("o-y", mkorder("o-y")).unwrap();
         run_to_shipped(&rt, "sx", "o-x", "g-x", &d.join("ap.db"));
         run_to_shipped(&rt, "sy", "o-y", "g-y", &d.join("ap.db"));
         let sx = rt.stream("sx").unwrap().journal_rows().unwrap();
         let sy = rt.stream("sy").unwrap().journal_rows().unwrap();
-        assert!(sx.iter().all(|r| r.order_id == "o-x"), "sx owns only o-x rows");
-        assert!(sy.iter().all(|r| r.order_id == "o-y"), "sy owns only o-y rows");
+        assert!(
+            sx.iter().all(|r| r.order_id == "o-x"),
+            "sx owns only o-x rows"
+        );
+        assert!(
+            sy.iter().all(|r| r.order_id == "o-y"),
+            "sy owns only o-y rows"
+        );
         assert!(sx.iter().any(|r| r.to_state == "shipped"));
         assert!(sy.iter().any(|r| r.to_state == "shipped"));
-        assert_ne!(rt.stream("sx").unwrap().journal(), rt.stream("sy").unwrap().journal());
+        assert_ne!(
+            rt.stream("sx").unwrap().journal(),
+            rt.stream("sy").unwrap().journal()
+        );
     }
 
     /// (astra r4) 펜스 — 실패 스트림의 실행 경로 차단·해제.
@@ -1591,7 +1896,10 @@ mod tests {
         let s = rt.stream("s-f").unwrap();
         assert!(s.engine_if_unfenced().is_ok());
         s.fence();
-        assert!(s.engine_if_unfenced().is_err(), "fenced stream refuses execution");
+        assert!(
+            s.engine_if_unfenced().is_err(),
+            "fenced stream refuses execution"
+        );
         match s.engine_if_unfenced() {
             Err(msg) => assert!(msg.contains("fenced")),
             Ok(_) => panic!("must be fenced"),

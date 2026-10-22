@@ -9,8 +9,8 @@
 //! keyed hash of actor ids, ALL identifying fields scrubbed, separate
 //! access capability.
 use crate::identity::{AuthenticatedUser, Capability};
+use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::sync::OnceLock;
 
 /// Canary values injected by tests/ops. If ANY of these appear in any
@@ -34,7 +34,9 @@ pub fn scan_for_leaks(text: &str) -> Vec<String> {
     // canary values
     for c in canaries() {
         if !c.is_empty() && text.contains(&c) {
-            found.push(format!("canary:{}", &c[..c.len().min(8)]));
+            // Diagnostics must never repeat even a short prefix of the
+            // configured canary; a fixed category is enough for telemetry.
+            found.push("canary".to_string());
         }
     }
     // common credential shapes
@@ -56,21 +58,33 @@ pub fn scan_for_leaks(text: &str) -> Vec<String> {
 
 /// Tiny regex shim: we only need literal alternations of simple char
 /// classes; avoid a regex dependency by hand-matching the small set.
-struct LiteRe { pat: String }
+struct LiteRe {
+    pat: String,
+}
 fn regex_lite(pat: &str) -> LiteRe {
-    LiteRe { pat: pat.to_string() }
+    LiteRe {
+        pat: pat.to_string(),
+    }
 }
 impl LiteRe {
     fn is_match(&self, text: &str) -> bool {
         // hand-rolled matchers for the exact patterns above
         match self.pat.as_str() {
-            "sk-[A-Za-z0-9_-]{16,}" => find_run(text, "sk-", 16, &|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
-            "gh[pousr]_[A-Za-z0-9]{20,}" => {
-                ["ghp_", "gho_", "ghu_", "ghs_", "ghr_"].iter().any(|p| find_run(text, p, 20, &|c| c.is_ascii_alphanumeric()))
+            "sk-[A-Za-z0-9_-]{16,}" => find_run(text, "sk-", 16, &|c| {
+                c.is_ascii_alphanumeric() || c == '_' || c == '-'
+            }),
+            "gh[pousr]_[A-Za-z0-9]{20,}" => ["ghp_", "gho_", "ghu_", "ghs_", "ghr_"]
+                .iter()
+                .any(|p| find_run(text, p, 20, &|c| c.is_ascii_alphanumeric())),
+            "Bearer\\s+[A-Za-z0-9._-]{24,}" => find_run_ws(text, "Bearer", 24, &|c| {
+                c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-'
+            }),
+            "-----BEGIN [A-Z ]*PRIVATE KEY-----" => {
+                text.contains("-----BEGIN") && text.contains("PRIVATE KEY-----")
             }
-            "Bearer\\s+[A-Za-z0-9._-]{24,}" => find_run_ws(text, "Bearer", 24, &|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-'),
-            "-----BEGIN [A-Z ]*PRIVATE KEY-----" => text.contains("-----BEGIN") && text.contains("PRIVATE KEY-----"),
-            "xoxb-[A-Za-z0-9-]{10,}" => find_run(text, "xoxb-", 10, &|c| c.is_ascii_alphanumeric() || c == '-'),
+            "xoxb-[A-Za-z0-9-]{10,}" => find_run(text, "xoxb-", 10, &|c| {
+                c.is_ascii_alphanumeric() || c == '-'
+            }),
             _ => false,
         }
     }
@@ -153,8 +167,8 @@ pub fn sanitize_error(e: &str) -> String {
     out = cleaned;
     // k=v env assignments
     if out.contains('=') && out.len() > 200 {
-        out.truncate(200);
-        out.push_str("…");
+        out = out.chars().take(200).collect();
+        out.push('…');
     }
     if !scan_for_leaks(&out).is_empty() {
         return "internal error (details redacted)".into();
@@ -178,7 +192,9 @@ pub fn scrub_event_json(event_json: &str) -> String {
                     serde_json::Value::Number(n) => {
                         m.insert(k, n.into());
                     }
-                    serde_json::Value::String(s) if s.len() <= 64 && scan_for_leaks(&s).is_empty() => {
+                    serde_json::Value::String(s)
+                        if s.len() <= 64 && scan_for_leaks(&s).is_empty() =>
+                    {
                         m.insert(k, s.into());
                     }
                     _ => {} // drop long strings, arrays, objects
@@ -222,7 +238,7 @@ impl PublicLedgerRow {
     }
 
     #[allow(dead_code)]
-    fn from_row(r: &foundry_ledger::LedgerRow, scrub_json: bool) -> Self {
+    fn from_row(r: &foundry_ledger::LedgerRow, _scrub_json: bool) -> Self {
         Self {
             seq: r.seq,
             order_id: r.order_id.clone(),
@@ -232,19 +248,13 @@ impl PublicLedgerRow {
             at: r.at.clone(),
             prev_hash: r.prev_hash.clone(),
             hash: r.hash.clone(),
-            event_json: r.event_json.as_deref().map(scrub_event_json).or_else(|| {
-                if scrub_json {
-                    None
-                } else {
-                    None
-                }
-            }),
+            event_json: r.event_json.as_deref().map(scrub_event_json),
         }
     }
     /// Export view: pseudonymized actor (review #15) — keyed hash,
     /// stable within one export key, useless outside.
-    pub fn export_row(r: &foundry_ledger::LedgerRow, export_key: &str) -> Self {
-        let mut out = Self::from_row(r, true);
+    pub fn export_row(r: &foundry_ledger::LedgerRow, _export_key: &str) -> Self {
+        let out = Self::from_row(r, true);
         // the row itself doesn't carry actor in the public DTO; the
         // detail view assembles actor lines separately — hashed there.
         out
@@ -268,12 +278,228 @@ fn sanitize_event_repr(e: &str) -> String {
 /// key and reveal nothing without the mapping table (kept separately,
 /// access-gated).
 pub fn pseudonymize(export_key: &str, actor_id: &str) -> String {
-    let mut h = Sha256::new();
-    h.update(b"foundry-pseudonym-v1");
-    h.update(export_key.as_bytes());
-    h.update(actor_id.as_bytes());
-    let d = h.finalize();
-    format!("anon-{}", &crate::identity_hex(&d[..8]))
+    let mut key = [0_u8; 32];
+    let source = export_key.as_bytes();
+    if source.is_empty() {
+        return "anon-invalid-key".into();
+    }
+    // Compatibility helper only. Product exports use fresh random ExportKey
+    // material and `export_alias` below.
+    key.copy_from_slice(&Sha256::digest(source));
+    let alias = export_alias(&key, "legacy-compat", "actor", actor_id);
+    key.fill(0);
+    alias
+}
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// Export-only random key. It has no Debug/serde implementation and is
+/// overwritten when its owner drops it.
+pub struct ExportKey([u8; 32]);
+
+impl ExportKey {
+    pub fn generate() -> Result<Self, String> {
+        use rand_core::RngCore as _;
+        let mut key = [0_u8; 32];
+        if rand_core::OsRng.try_fill_bytes(&mut key).is_err() {
+            key.fill(0);
+            return Err("export key generation failed".to_string());
+        }
+        Ok(Self(key))
+    }
+
+    pub fn alias(&self, context: &str, domain: &str, value: &str) -> String {
+        export_alias(&self.0, context, domain, value)
+    }
+
+    #[cfg(test)]
+    pub fn from_bytes_for_test(key: [u8; 32]) -> Self {
+        Self(key)
+    }
+}
+
+impl Drop for ExportKey {
+    fn drop(&mut self) {
+        self.0.fill(0);
+    }
+}
+
+/// Domain-separated HMAC alias with unambiguous length framing. The returned
+/// 128-bit pseudonym is stable only within the export's secret-key context.
+pub fn export_alias(key: &[u8; 32], context: &str, domain: &str, value: &str) -> String {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts a 32-byte key");
+    mac.update(b"foundry-product-export-alias-v2\0");
+    for part in [context.as_bytes(), domain.as_bytes(), value.as_bytes()] {
+        mac.update(&(part.len() as u64).to_be_bytes());
+        mac.update(part);
+    }
+    let digest = mac.finalize().into_bytes();
+    format!("anon-{}", crate::identity_hex(&digest[..16]))
+}
+
+#[derive(serde::Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ProductExportRow {
+    pub sequence: i64,
+    pub order: String,
+    pub actor: String,
+    pub from_state: String,
+    pub to_state: String,
+    pub event: String,
+    pub at: String,
+}
+
+#[derive(serde::Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ProductExportDocument {
+    pub schema: &'static str,
+    pub export_context: String,
+    pub source: String,
+    pub prefix_sequence: i64,
+    /// Commitment to the original S1 prefix. Projected rows intentionally do
+    /// not claim to verify this raw chain after identifiers are pseudonymized.
+    pub raw_prefix_head: String,
+    pub projected_digest: String,
+    pub rows: Vec<ProductExportRow>,
+}
+
+/// ProductAtomicV1 scoped projection. It intentionally has no global sequence,
+/// hash, installation identity, source identity, or hidden-row count.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ScopedProductExportRow {
+    pub ordinal: usize,
+    pub order: String,
+    pub actor: String,
+    pub from_state: String,
+    pub to_state: String,
+    pub event: String,
+    pub at: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ScopedProductExportDocument {
+    pub schema: String,
+    pub export_context: String,
+    /// `complete` means all currently authorized orders fit this response;
+    /// `page` means more authorized orders exist beyond it.
+    pub coverage: String,
+    pub has_more: bool,
+    pub source_coverage_complete: bool,
+    pub projected_digest: String,
+    pub rows: Vec<ScopedProductExportRow>,
+}
+
+#[derive(serde::Serialize)]
+struct ScopedProductExportBody<'a> {
+    schema: &'static str,
+    export_context: &'a str,
+    coverage: &'static str,
+    has_more: bool,
+    source_coverage_complete: bool,
+    rows: &'a [ScopedProductExportRow],
+}
+
+/// Create a distinct, bounded projection from already scope-selected S1 rows.
+/// Serialization errors are returned; they are never replaced with an empty
+/// byte string for digesting.
+pub fn scoped_product_export(
+    snapshot: &foundry_ledger::ScopedEvidenceSnapshot,
+    export_context: &str,
+    key: &ExportKey,
+) -> Result<ScopedProductExportDocument, String> {
+    let coverage = if snapshot.has_more {
+        "page"
+    } else {
+        "complete"
+    };
+    let rows: Vec<_> = snapshot
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| {
+            // Keep only the event variant head. Event payloads may contain short
+            // identifiers that do not trigger generic PII scanners.
+            let event = sanitize_event_repr(&row.event);
+            ScopedProductExportRow {
+                ordinal: index + 1,
+                order: key.alias(export_context, "order", &row.order_id),
+                actor: key.alias(export_context, "actor", &row.actor),
+                from_state: safe_projection_text(&row.from_state, 64),
+                to_state: safe_projection_text(&row.to_state, 64),
+                event: safe_projection_text(&event, 160),
+                at: safe_projection_text(&row.at, 64),
+            }
+        })
+        .collect();
+    let body = ScopedProductExportBody {
+        schema: "foundry-scoped-evidence-projection-v1",
+        export_context,
+        coverage,
+        has_more: snapshot.has_more,
+        source_coverage_complete: snapshot.coverage_complete,
+        rows: &rows,
+    };
+    let bytes = serde_json::to_vec(&body).map_err(|_| "scoped projection serialization failed")?;
+    let projected_digest = crate::identity_hex(&Sha256::digest(bytes));
+    Ok(ScopedProductExportDocument {
+        schema: body.schema.to_owned(),
+        export_context: export_context.to_owned(),
+        coverage: coverage.to_owned(),
+        has_more: snapshot.has_more,
+        source_coverage_complete: snapshot.coverage_complete,
+        projected_digest,
+        rows,
+    })
+}
+
+fn safe_projection_text(value: &str, max_chars: usize) -> String {
+    if value.chars().count() > max_chars || !scan_for_leaks(value).is_empty() {
+        return "[redacted]".into();
+    }
+    value.chars().collect()
+}
+
+pub fn product_export(
+    installation_id: &str,
+    rows: &[foundry_ledger::LedgerRow],
+    export_id: &str,
+    key: &ExportKey,
+) -> ProductExportDocument {
+    try_product_export(installation_id, rows, export_id, key)
+        .expect("legacy ProductExportRow values must serialize")
+}
+
+/// Fallible form for callers that need serialization errors propagated.
+pub fn try_product_export(
+    installation_id: &str,
+    rows: &[foundry_ledger::LedgerRow],
+    export_id: &str,
+    key: &ExportKey,
+) -> Result<ProductExportDocument, String> {
+    let source = export_alias(&key.0, export_id, "installation", installation_id);
+    let projected_rows: Vec<_> = rows
+        .iter()
+        .map(|row| ProductExportRow {
+            sequence: row.seq,
+            order: export_alias(&key.0, export_id, "order", &row.order_id),
+            actor: export_alias(&key.0, export_id, "actor", &row.actor),
+            from_state: row.from_state.clone(),
+            to_state: row.to_state.clone(),
+            event: sanitize_event_repr(&row.event),
+            at: row.at.clone(),
+        })
+        .collect();
+    let projected_bytes = serde_json::to_vec(&projected_rows)
+        .map_err(|_| "product export serialization failed".to_string())?;
+    let projected_digest = crate::identity_hex(&Sha256::digest(&projected_bytes));
+    let raw_prefix_head = rows.last().map(|r| r.hash.clone()).unwrap_or_default();
+    Ok(ProductExportDocument {
+        schema: "foundry-product-export-v2",
+        export_context: export_id.to_owned(),
+        source,
+        prefix_sequence: rows.last().map(|r| r.seq).unwrap_or(0),
+        raw_prefix_head,
+        projected_digest,
+        rows: projected_rows,
+    })
 }
 
 /// Export authorization: separate capability from board reads.
@@ -296,10 +522,12 @@ mod tests {
 
     #[test]
     fn scanner_catches_credential_shapes() {
-        assert!(!scan_for_leaks("normal text about Cargo.toml").is_empty() == false);
+        assert!(scan_for_leaks("normal text about Cargo.toml").is_empty());
         assert!(scan_for_leaks("here: sk-AbCdEf1234567890GhIjKl").len() == 1);
         assert!(scan_for_leaks("token ghp_0123456789abcdef0123456789abcdef0123").len() == 1);
-        assert!(scan_for_leaks("Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345").len() == 1);
+        assert!(
+            scan_for_leaks("Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345").len() == 1
+        );
         assert!(scan_for_leaks("-----BEGIN RSA PRIVATE KEY-----").len() == 1);
         assert!(scan_for_leaks("xoxb-1234567890abcdef").len() == 1);
     }
@@ -307,7 +535,9 @@ mod tests {
     #[test]
     fn scanner_catches_registered_canaries() {
         register_canaries(vec!["CANARY-faa73129de".into()]);
-        assert!(scan_for_leaks("log line with CANARY-faa73129de inside").len() == 1);
+        let diagnostic = scan_for_leaks("log line with CANARY-faa73129de inside");
+        assert_eq!(diagnostic, vec!["canary"]);
+        assert!(!diagnostic[0].contains("CANARY"));
         assert!(scan_for_leaks("no canary here").is_empty());
     }
 
@@ -345,10 +575,47 @@ mod tests {
 
     #[test]
     fn export_requires_approver_plus() {
-        let obs = AuthenticatedUser { username: "o".into(), role: Role::Observer };
-        let app = AuthenticatedUser { username: "a".into(), role: Role::Approver };
+        let obs = AuthenticatedUser {
+            username: "o".into(),
+            role: Role::Observer,
+        };
+        let app = AuthenticatedUser {
+            username: "a".into(),
+            role: Role::Approver,
+        };
         assert!(guard_export(Some(&obs)).is_err(), "observer cannot export");
         assert!(guard_export(Some(&app)).is_ok());
         assert!(guard_export(None).is_err());
+    }
+
+    #[test]
+    fn product_export_hmac_matches_independent_framed_vector() {
+        let key = [0x0b; 32];
+        assert_eq!(
+            export_alias(&key, "ctx", "actor", "value"),
+            "anon-bb3bf1bd71d0b51f9e1f57f88819e1a8"
+        );
+        assert_ne!(
+            export_alias(&[0x0c; 32], "ctx", "actor", "value"),
+            export_alias(&key, "ctx", "actor", "value")
+        );
+        assert_ne!(
+            export_alias(&key, "ctx", "actor", "ab"),
+            export_alias(&key, "ctx", "a", "b")
+        );
+        assert_ne!(
+            export_alias(&key, "ctx", "actor", "value"),
+            export_alias(&key, "other", "actor", "value")
+        );
+    }
+
+    #[test]
+    fn diagnostics_do_not_echo_canary_prefixes_and_handle_unicode_boundaries() {
+        let discovered = scan_for_leaks("ghp_0123456789abcdef0123456789abcdef0123");
+        assert_eq!(discovered, vec!["github-token"]);
+        let unicode = format!("{}=value", "界🗝".repeat(100));
+        let sanitized = sanitize_error(&unicode);
+        assert!(sanitized.is_char_boundary(sanitized.len()));
+        assert!(sanitized.chars().count() <= 301);
     }
 }

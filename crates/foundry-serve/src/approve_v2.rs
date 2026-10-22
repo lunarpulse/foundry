@@ -13,8 +13,8 @@ use axum::extract::{FromRequestParts, Path, State};
 use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
-use std::sync::Arc;
 use foundry_exec::SqliteTupleStore;
+use std::sync::Arc;
 
 #[derive(serde::Deserialize)]
 pub struct ApproveBody {
@@ -95,16 +95,29 @@ pub async fn approve(
         }
     }
 
-    let tuple_path = std::env::var("FOUNDRY_TUPLES").unwrap_or_else(|_| "~/.foundry/tuples.db".into());
+    let tuple_path =
+        std::env::var("FOUNDRY_TUPLES").unwrap_or_else(|_| "~/.foundry/tuples.db".into());
     let tuple_path = if let Some(rest) = tuple_path.strip_prefix("~/") {
         match std::env::var_os("HOME") {
             Some(home) => std::path::PathBuf::from(home).join(rest),
-            None => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"tuple store home unavailable"}))).into_response(),
+            None => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error":"tuple store home unavailable"})),
+                )
+                    .into_response();
+            }
         }
-    } else { tuple_path.into() };
+    } else {
+        tuple_path.into()
+    };
     let tuples = match SqliteTupleStore::open(&tuple_path) {
         Ok(store) => Arc::new(store),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"tuple store unavailable","detail":format!("{e:?}")}))).into_response(),
+        Err(e) => return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error":"tuple store unavailable","detail":format!("{e:?}")})),
+        )
+            .into_response(),
     };
     st.line.set_tuple_store(tuples.clone());
 
@@ -208,7 +221,11 @@ fn auth_error(e: IdentityError) -> axum::response::Response {
         IdentityError::Disabled => StatusCode::UNAUTHORIZED,
         _ => StatusCode::UNAUTHORIZED,
     };
-    (code, Json(serde_json::json!({"error": crate::privacy::sanitize_error(&e.to_string())}))).into_response()
+    (
+        code,
+        Json(serde_json::json!({"error": crate::privacy::sanitize_error(&e.to_string())})),
+    )
+        .into_response()
 }
 
 fn not_found(id: &str) -> axum::response::Response {

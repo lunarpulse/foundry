@@ -23,7 +23,7 @@
 //!   로그·원장 기준으로 전부 재검사 — A 수리가 B 를 우회하지 않는다.
 
 use crate::refusal::{RefusalCode, RemediationKind};
-use crate::{OrchestrationKind, OrchestrationLog, OrchRow};
+use crate::{OrchRow, OrchestrationKind, OrchestrationLog};
 use foundry_approval::{ApprovalLedger, GrantState};
 
 /// 체이너 오류.
@@ -32,9 +32,17 @@ pub enum ChainerError {
     /// unsized — preset_bound 없는 발행.
     Unsized { order: String },
     /// digest 불일치.
-    DigestMismatch { order: String, expected: String, got: String },
+    DigestMismatch {
+        order: String,
+        expected: String,
+        got: String,
+    },
     /// 목적지 plan/root 불일치 — preset_bound.spawn_plan/selected_root 와.
-    DestinationMismatch { order: String, expected: String, got: String },
+    DestinationMismatch {
+        order: String,
+        expected: String,
+        got: String,
+    },
     /// 사이징이 거부됨(Rejected) — 같은 사이징 주문으로 발행 불가.
     SizingRejected { order: String },
     /// (astra r3) 재입장 선언 재검사 실패 — 전용 사유(Unsized 와 구분).
@@ -110,10 +118,18 @@ const PROPOSAL_ENCODING_LABEL: &str = "fp1";
 /// 인코딩 필드 상한 — 4자리 hex len-prefix 의 표현 한계.
 const PROPOSAL_FIELD_CAP: usize = 0xFFFF;
 
-fn encode_proposal_digest(proposal_id: &str, issuer_token: &str, artifact: &str) -> Result<String, ChainerError> {
+fn encode_proposal_digest(
+    proposal_id: &str,
+    issuer_token: &str,
+    artifact: &str,
+) -> Result<String, ChainerError> {
     // (astra r3) 4자리 초과 필드는 인코딩 불가 — append 전 거부(재생에서
     // 침묵 누락되는 사고 방지).
-    for (label, part) in [("proposal_id", proposal_id), ("issuer", issuer_token), ("artifact", artifact)] {
+    for (label, part) in [
+        ("proposal_id", proposal_id),
+        ("issuer", issuer_token),
+        ("artifact", artifact),
+    ] {
         if part.len() > PROPOSAL_FIELD_CAP {
             return Err(ChainerError::Log(format!(
                 "{label} exceeds {PROPOSAL_FIELD_CAP} bytes"
@@ -129,7 +145,9 @@ fn encode_proposal_digest(proposal_id: &str, issuer_token: &str, artifact: &str)
 }
 
 fn decode_proposal_digest(encoded: &str) -> Option<(String, String, String)> {
-    let mut rest = encoded.strip_prefix(format!("{PROPOSAL_ENCODING_LABEL}:").as_str())?.as_bytes();
+    let mut rest = encoded
+        .strip_prefix(format!("{PROPOSAL_ENCODING_LABEL}:").as_str())?
+        .as_bytes();
     let mut parts = Vec::new();
     for _ in 0..3 {
         // 4 hex + ':'.
@@ -173,21 +191,23 @@ impl<'o, 'a> Chainer<'o, 'a> {
         // 재생은 seq 순 첫 행만 취급 — 멱등 유지(나중 행은 사본).
         let mut seen = std::collections::BTreeSet::new();
         let mut out = Vec::new();
-        for row in self.log.read_all().map_err(|e| ChainerError::Log(format!("{e:?}")))? {
-            if let OrchestrationKind::HandoffBound { artifact_digest, source_order: s0, dest_order: d0 } =
-                &row.kind
+        for row in self
+            .log
+            .read_all()
+            .map_err(|e| ChainerError::Log(format!("{e:?}")))?
+        {
+            if let OrchestrationKind::HandoffBound {
+                artifact_digest,
+                source_order: s0,
+                dest_order: d0,
+            } = &row.kind
             {
                 if let Some((pid, tok, dig)) = decode_proposal_digest(artifact_digest) {
                     if !seen.insert(pid.clone()) {
                         continue; // 사본 행 — 첫 행이 권위.
                     }
-                    let manifest = crate::handoff_manifest_digest(
-                        s0,
-                        d0,
-                        artifact_digest,
-                        row.seq,
-                    )
-                    .map_err(ChainerError::Log)?;
+                    let manifest = crate::handoff_manifest_digest(s0, d0, artifact_digest, row.seq)
+                        .map_err(ChainerError::Log)?;
                     out.push(ProposalView {
                         proposal_id: pid,
                         manifest,
@@ -228,9 +248,15 @@ impl<'o, 'a> Chainer<'o, 'a> {
                     .log
                     .row_at(p.log_seq)
                     .map_err(|e| ChainerError::Log(format!("{e:?}")))?;
-                let OrchestrationKind::HandoffBound { source_order, dest_order, .. } = &row.kind
+                let OrchestrationKind::HandoffBound {
+                    source_order,
+                    dest_order,
+                    ..
+                } = &row.kind
                 else {
-                    return Err(ChainerError::ThreeWayMismatch { proposal_id: proposal_id.into() });
+                    return Err(ChainerError::ThreeWayMismatch {
+                        proposal_id: proposal_id.into(),
+                    });
                 };
                 if source_order != source_order_param || dest_order != dest_order_param {
                     return Err(ChainerError::ThreeWayMismatch {
@@ -281,10 +307,10 @@ impl<'o, 'a> Chainer<'o, 'a> {
         grant_id: &str,
         pre_verify_only: bool,
     ) -> Result<ProposalView, ChainerError> {
-        let Some(p) = self
-            .reply_proposal(proposal_id)?
-        else {
-            return Err(ChainerError::NotProposed { proposal_id: proposal_id.into() });
+        let Some(p) = self.reply_proposal(proposal_id)? else {
+            return Err(ChainerError::NotProposed {
+                proposal_id: proposal_id.into(),
+            });
         };
         // (원장) 그랜트 조회 — 존재·상태·스코프.
         let grant = self
@@ -303,30 +329,30 @@ impl<'o, 'a> Chainer<'o, 'a> {
             .log
             .row_at(p.log_seq)
             .map_err(|e| ChainerError::Log(format!("{e:?}")))?;
-        let OrchestrationKind::HandoffBound { source_order, dest_order, artifact_digest: encoded } =
-            &row.kind
+        let OrchestrationKind::HandoffBound {
+            source_order,
+            dest_order,
+            artifact_digest: encoded,
+        } = &row.kind
         else {
-            return Err(ChainerError::ThreeWayMismatch { proposal_id: proposal_id.into() });
+            return Err(ChainerError::ThreeWayMismatch {
+                proposal_id: proposal_id.into(),
+            });
         };
         // (astra r4) 3자 완성 — 로그 행에서 매니페스트 **재계산** 후 그
         // 매니페스트가 그랜트 스코프에 결속돼 있는지까지 확인. 매니페스트는
         // 행 seq 를 포함하므로 제안별 유일 — 동일 스코프/발급자의 별개
         // 제안이 하나의 소비된 그랜트를 재사용할 수 없다.
-        let recomputed = crate::handoff_manifest_digest(
-            source_order,
-            dest_order,
-            encoded,
-            row.seq,
-        )
-        .map_err(ChainerError::Log)?;
+        let recomputed = crate::handoff_manifest_digest(source_order, dest_order, encoded, row.seq)
+            .map_err(ChainerError::Log)?;
         if recomputed != p.manifest {
-            return Err(ChainerError::ThreeWayMismatch { proposal_id: proposal_id.into() });
+            return Err(ChainerError::ThreeWayMismatch {
+                proposal_id: proposal_id.into(),
+            });
         }
-        let scope: serde_json::Value =
-            serde_json::from_str(&grant.scope_json).map_err(|e| ChainerError::Ledger(format!("{e:?}")))?;
-        let scope_str = |k: &str| {
-            scope.get(k).and_then(|v| v.as_str()).map(|s| s.to_string())
-        };
+        let scope: serde_json::Value = serde_json::from_str(&grant.scope_json)
+            .map_err(|e| ChainerError::Ledger(format!("{e:?}")))?;
+        let scope_str = |k: &str| scope.get(k).and_then(|v| v.as_str()).map(|s| s.to_string());
         let pairs = [
             ("order_id", source_order.clone()),
             ("dest_order_id", dest_order.clone()),
@@ -344,7 +370,7 @@ impl<'o, 'a> Chainer<'o, 'a> {
                 _ => {
                     return Err(ChainerError::ThreeWayMismatch {
                         proposal_id: proposal_id.into(),
-                    })
+                    });
                 }
             }
         }
@@ -425,7 +451,11 @@ impl<'o, 'a> Chainer<'o, 'a> {
         // 원장에서 승인 산출 — Approved 여야.
         match self.sizing_verdict_from_ledger(sizing_order)? {
             Some(SizingVerdict::Approved) => {}
-            _ => return Err(ChainerError::SizingRejected { order: sizing_order.into() }),
+            _ => {
+                return Err(ChainerError::SizingRejected {
+                    order: sizing_order.into(),
+                });
+            }
         }
         // 승인 digest — 그랜트 스코프의 artifact_digest. (T60 astra r1)
         // 목적지는 **digest 사전이미지**에 인코딩 — 라이브 소비 경로
@@ -441,10 +471,14 @@ impl<'o, 'a> Chainer<'o, 'a> {
         let digest = scope
             .get("artifact_digest")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| ChainerError::SizingRejected { order: sizing_order.into() })?
+            .ok_or_else(|| ChainerError::SizingRejected {
+                order: sizing_order.into(),
+            })?
             .to_string();
         let Some((_outcome, dig_root, dig_plan)) = parse_sizing_digest(&digest) else {
-            return Err(ChainerError::SizingRejected { order: sizing_order.into() });
+            return Err(ChainerError::SizingRejected {
+                order: sizing_order.into(),
+            });
         };
         if dig_root != selected_root {
             return Err(ChainerError::DestinationMismatch {
@@ -466,7 +500,9 @@ impl<'o, 'a> Chainer<'o, 'a> {
             .read_all()
             .map_err(|e| ChainerError::Log(format!("{e:?}")))?;
         let already = rows.iter().any(|r| match &r.kind {
-            OrchestrationKind::PresetBound { sizing_order: s0, .. } => s0 == sizing_order,
+            OrchestrationKind::PresetBound {
+                sizing_order: s0, ..
+            } => s0 == sizing_order,
             _ => false,
         });
         if !already {
@@ -493,14 +529,20 @@ impl<'o, 'a> Chainer<'o, 'a> {
                 if is_intake_bootstrap(order_source) {
                     Ok(())
                 } else {
-                    Err(ChainerError::BootstrapViolation { order: order_id.into() })
+                    Err(ChainerError::BootstrapViolation {
+                        order: order_id.into(),
+                    })
                 }
             }
             Some(s) => match self.sizing_verdict_from_ledger(s)? {
-                Some(SizingVerdict::Rejected) => Err(ChainerError::SizingRejected { order: s.into() }),
+                Some(SizingVerdict::Rejected) => {
+                    Err(ChainerError::SizingRejected { order: s.into() })
+                }
                 Some(SizingVerdict::Approved) => {
                     let Some(d) = approval_digest else {
-                        return Err(ChainerError::Unsized { order: order_id.into() });
+                        return Err(ChainerError::Unsized {
+                            order: order_id.into(),
+                        });
                     };
                     let rows = self
                         .log
@@ -512,13 +554,17 @@ impl<'o, 'a> Chainer<'o, 'a> {
                             selected_root,
                             approved_digest,
                             spawn_plan,
-                        } if sizing_order == s => {
-                            Some((approved_digest.clone(), spawn_plan.clone(), selected_root.clone()))
-                        }
+                        } if sizing_order == s => Some((
+                            approved_digest.clone(),
+                            spawn_plan.clone(),
+                            selected_root.clone(),
+                        )),
                         _ => None,
                     });
                     let Some((expected_digest, expected_plan, expected_root)) = bound else {
-                        return Err(ChainerError::Unsized { order: order_id.into() });
+                        return Err(ChainerError::Unsized {
+                            order: order_id.into(),
+                        });
                     };
                     if expected_digest != d {
                         return Err(ChainerError::DigestMismatch {
@@ -543,7 +589,9 @@ impl<'o, 'a> Chainer<'o, 'a> {
                     }
                     Ok(())
                 }
-                None => Err(ChainerError::Unsized { order: order_id.into() }),
+                None => Err(ChainerError::Unsized {
+                    order: order_id.into(),
+                }),
             },
         }
     }
@@ -554,7 +602,10 @@ impl<'o, 'a> Chainer<'o, 'a> {
     /// 체인), 제안 사실을 HandoffBound 가 아닌 **신규 거부 유사 행**이
     /// 아니라 로그 재생으로 판정한다: 제안 id "rem-{seq}" 가 이미
     /// **remediation 연결 행**(아래 append)에 존재하면 거부.
-    pub fn propose_remediation(&self, refusal_seq: i64) -> Result<(String, RemediationKind), ChainerError> {
+    pub fn propose_remediation(
+        &self,
+        refusal_seq: i64,
+    ) -> Result<(String, RemediationKind), ChainerError> {
         let rows = self
             .log
             .read_all()
@@ -563,7 +614,11 @@ impl<'o, 'a> Chainer<'o, 'a> {
             .iter()
             .find(|r| r.seq == refusal_seq)
             .ok_or(ChainerError::RemediationDepth { refusal_seq })?;
-        let OrchestrationKind::Refusal { refusal_code, remediation_proposal_id, .. } = &row.kind
+        let OrchestrationKind::Refusal {
+            refusal_code,
+            remediation_proposal_id,
+            ..
+        } = &row.kind
         else {
             return Err(ChainerError::RemediationDepth { refusal_seq });
         };
@@ -573,7 +628,11 @@ impl<'o, 'a> Chainer<'o, 'a> {
             return Err(ChainerError::RemediationAlreadyProposed { refusal_seq });
         }
         let linked = rows.iter().any(|r| match &r.kind {
-            OrchestrationKind::Refusal { refused_request, remediation_proposal_id, .. } => {
+            OrchestrationKind::Refusal {
+                refused_request,
+                remediation_proposal_id,
+                ..
+            } => {
                 // 연결 행: refused_request 가 "rem-{seq}" 를 지목.
                 refused_request == &format!("rem-link-{refusal_seq}")
                     && remediation_proposal_id.is_some()
@@ -586,7 +645,10 @@ impl<'o, 'a> Chainer<'o, 'a> {
         // 깊이 1 — 이 거부가 **재디에이션 작업 주문 자신**의 거부인지:
         // 재디에이션 작업은 "rem-" 주문이고, 그 거부의 refused_request 가
         // "rem-" 로 시작하면 깊이 초과.
-        let OrchestrationKind::Refusal { refused_request, .. } = &row.kind else {
+        let OrchestrationKind::Refusal {
+            refused_request, ..
+        } = &row.kind
+        else {
             unreachable!()
         };
         if refused_request.starts_with("rem-") {
@@ -666,7 +728,9 @@ impl<'o, 'a> Chainer<'o, 'a> {
                     order_id,
                     None,
                 );
-                return Err(ChainerError::DeclarationMissing { order: order_id.into() });
+                return Err(ChainerError::DeclarationMissing {
+                    order: order_id.into(),
+                });
             }
         }
         // 바인딩 전량 재검사 — 승인 상태는 원장에서 재산출(전량 재평가).
@@ -736,7 +800,9 @@ mod tests {
     fn propose_confirm_replay_idempotence() {
         let (_d, log, mut ledger) = setup("threeway");
         let ch = Chainer::new(&log, &ledger);
-        let p1 = ch.propose_handoff("hp-1", "o-a", "o-b", "dig-1", "tok-issuer-1").unwrap();
+        let p1 = ch
+            .propose_handoff("hp-1", "o-a", "o-b", "dig-1", "tok-issuer-1")
+            .unwrap();
         assert!(p1.manifest.starts_with("fh1:"));
 
         // 발급 그랜트 — issuer 토큰 일치·digest+**매니페스트** 결속.
@@ -747,12 +813,18 @@ mod tests {
         });
         ledger.issue_grant("g-1", "tok-issuer-1", &scope1).unwrap();
         let res = ledger.reserve_grant("g-1", &scope1, "ex-1", 1).unwrap();
-        ledger.begin_apply("g-1", "ex-1", 1, res.fence_token).unwrap();
-        ledger.finalize_grant("g-1", "ex-1", 1, res.fence_token).unwrap();
+        ledger
+            .begin_apply("g-1", "ex-1", 1, res.fence_token)
+            .unwrap();
+        ledger
+            .finalize_grant("g-1", "ex-1", 1, res.fence_token)
+            .unwrap();
 
         // 크래시 재현 — 새 Chainer(로그만)가 같은 제안을 본다.
         let ch2 = Chainer::new(&log, &ledger);
-        let p2 = ch2.propose_handoff("hp-1", "o-a", "o-b", "dig-1", "tok-issuer-1").unwrap();
+        let p2 = ch2
+            .propose_handoff("hp-1", "o-a", "o-b", "dig-1", "tok-issuer-1")
+            .unwrap();
         assert_eq!(p1, p2, "replay-based idempotence across instances");
 
         let c1 = ch2.confirm_handoff("hp-1", "g-1").unwrap();
@@ -761,7 +833,9 @@ mod tests {
         assert_eq!(ch2.confirm_handoff("hp-1", "g-1").unwrap(), c1);
 
         // 위조 발급자 — 다른 토큰의 그랜트.
-        let _ = ch2.propose_handoff("hp-2", "o-c", "o-d", "dig-2", "tok-issuer-2").unwrap();
+        let _ = ch2
+            .propose_handoff("hp-2", "o-c", "o-d", "dig-2", "tok-issuer-2")
+            .unwrap();
         drop(ch2);
         let scope2 = serde_json::json!({
             "order_id": "o-c", "intent": "handoff", "artifact_digest": "dig-2", "root_scope": "",
@@ -769,7 +843,9 @@ mod tests {
         ledger.issue_grant("g-2", "tok-FORGED", &scope2).unwrap();
         // hp-3 제안 — ch3 경유(재생 멱등이 hp-2/hp-3 도 커버).
         let ch_pre = Chainer::new(&log, &ledger);
-        let _ = ch_pre.propose_handoff("hp-3", "o-e", "o-f", "dig-3", "tok-3").unwrap();
+        let _ = ch_pre
+            .propose_handoff("hp-3", "o-e", "o-f", "dig-3", "tok-3")
+            .unwrap();
         drop(ch_pre);
         let scope3 = serde_json::json!({
             "order_id": "o-e", "intent": "handoff", "artifact_digest": "dig-WRONG", "root_scope": "",
@@ -804,24 +880,36 @@ mod tests {
             "artifact_digest": crate::chainer::sizing_digest("approved", "root-quick", "plan-1"),
             "root_scope": "intake",
         });
-        ledger.issue_grant("sizing-s-1", "tok-sizing", &sscope).unwrap();
-        let r0 = ledger.reserve_grant("sizing-s-1", &sscope, "ex-s", 1).unwrap();
-        ledger.begin_apply("sizing-s-1", "ex-s", 1, r0.fence_token).unwrap();
-        ledger.finalize_grant("sizing-s-1", "ex-s", 1, r0.fence_token).unwrap();
+        ledger
+            .issue_grant("sizing-s-1", "tok-sizing", &sscope)
+            .unwrap();
+        let r0 = ledger
+            .reserve_grant("sizing-s-1", &sscope, "ex-s", 1)
+            .unwrap();
+        ledger
+            .begin_apply("sizing-s-1", "ex-s", 1, r0.fence_token)
+            .unwrap();
+        ledger
+            .finalize_grant("sizing-s-1", "ex-s", 1, r0.fence_token)
+            .unwrap();
         // 사이징 거부 그랜트 — sizing_outcome: rejected.
         let rscope = serde_json::json!({
             "order_id": "s-rej", "intent": "sizing",
             "artifact_digest": crate::chainer::sizing_digest("rejected", "r", "p"),
             "root_scope": "intake",
         });
-        ledger.issue_grant("sizing-s-rej", "tok-r", &rscope).unwrap();
+        ledger
+            .issue_grant("sizing-s-rej", "tok-r", &rscope)
+            .unwrap();
         // (astra r7 회귀용) 미소비 그랜트 — Issued 상태로 방치.
         let iscope = serde_json::json!({
             "order_id": "s-issued", "intent": "sizing",
             "artifact_digest": crate::chainer::sizing_digest("approved", "ri", "pi"),
             "root_scope": "intake",
         });
-        ledger.issue_grant("sizing-s-issued", "tok-i", &iscope).unwrap();
+        ledger
+            .issue_grant("sizing-s-issued", "tok-i", &iscope)
+            .unwrap();
         let ch = Chainer::new(&log, &ledger);
         // unsized — 비인테이크 소스.
         assert!(matches!(
@@ -829,39 +917,73 @@ mod tests {
             Err(ChainerError::BootstrapViolation { .. })
         ));
         // 부트스트랩 — 인테이크 소스 패턴.
-        assert!(ch
-            .check_spawn_binding("o-boot", "intake:ticket-1", None, None, "p-x", "r-x")
-            .is_ok());
+        assert!(
+            ch.check_spawn_binding("o-boot", "intake:ticket-1", None, None, "p-x", "r-x")
+                .is_ok()
+        );
         // 사이징 거부 후 발행 — 원장 sizing_outcome=rejected 에서 산출.
         assert!(matches!(
             ch.check_spawn_binding("o-2", "intake:t", Some("s-rej"), Some("dig"), "p", "r"),
             Err(ChainerError::SizingRejected { .. })
         ));
         // 승인 + preset_bound 일치.
-        log.append_preset_bound("s-1", "root-quick", "dig-approv", "plan-1").unwrap();
-        assert!(ch
-            .check_spawn_binding("o-3", "ext:x", Some("s-1"), Some("dig-approv"), "plan-1", "root-quick")
-            .is_ok());
+        log.append_preset_bound("s-1", "root-quick", "dig-approv", "plan-1")
+            .unwrap();
+        assert!(
+            ch.check_spawn_binding(
+                "o-3",
+                "ext:x",
+                Some("s-1"),
+                Some("dig-approv"),
+                "plan-1",
+                "root-quick"
+            )
+            .is_ok()
+        );
         // digest 불일치.
         assert!(matches!(
-            ch.check_spawn_binding("o-4", "ext:x", Some("s-1"), Some("dig-other"), "plan-1", "root-quick"),
+            ch.check_spawn_binding(
+                "o-4",
+                "ext:x",
+                Some("s-1"),
+                Some("dig-other"),
+                "plan-1",
+                "root-quick"
+            ),
             Err(ChainerError::DigestMismatch { .. })
         ));
         // 목적지 plan 불일치.
         assert!(matches!(
-            ch.check_spawn_binding("o-5", "ext:x", Some("s-1"), Some("dig-approv"), "plan-OTHER", "root-quick"),
+            ch.check_spawn_binding(
+                "o-5",
+                "ext:x",
+                Some("s-1"),
+                Some("dig-approv"),
+                "plan-OTHER",
+                "root-quick"
+            ),
             Err(ChainerError::DestinationMismatch { .. })
         ));
         // 목적지 root 불일치.
         assert!(matches!(
-            ch.check_spawn_binding("o-6", "ext:x", Some("s-1"), Some("dig-approv"), "plan-1", "root-OTHER"),
+            ch.check_spawn_binding(
+                "o-6",
+                "ext:x",
+                Some("s-1"),
+                Some("dig-approv"),
+                "plan-1",
+                "root-OTHER"
+            ),
             Err(ChainerError::DestinationMismatch { .. })
         ));
 
-        assert!(matches!(
-            ch.check_spawn_binding("o-7", "ext:x", Some("s-issued"), Some("dig-i"), "p", "r"),
-            Err(ChainerError::Unsized { .. })
-        ), "unconsumed sizing grant is not approval evidence");
+        assert!(
+            matches!(
+                ch.check_spawn_binding("o-7", "ext:x", Some("s-issued"), Some("dig-i"), "p", "r"),
+                Err(ChainerError::Unsized { .. })
+            ),
+            "unconsumed sizing grant is not approval evidence"
+        );
     }
     /// (게이트 6) 재디에이션 — 제안 1회(로그 멱등·인스턴스 무관)·깊이 1.
     #[test]
@@ -918,13 +1040,26 @@ mod tests {
             "root_scope": "intake",
         });
         ledger.issue_grant("sizing-s-2", "tok-s2", &sscope).unwrap();
-        let r0 = ledger.reserve_grant("sizing-s-2", &sscope, "ex-s2", 1).unwrap();
-        ledger.begin_apply("sizing-s-2", "ex-s2", 1, r0.fence_token).unwrap();
-        ledger.finalize_grant("sizing-s-2", "ex-s2", 1, r0.fence_token).unwrap();
+        let r0 = ledger
+            .reserve_grant("sizing-s-2", &sscope, "ex-s2", 1)
+            .unwrap();
+        ledger
+            .begin_apply("sizing-s-2", "ex-s2", 1, r0.fence_token)
+            .unwrap();
+        ledger
+            .finalize_grant("sizing-s-2", "ex-s2", 1, r0.fence_token)
+            .unwrap();
         let ch = Chainer::new(&log, &ledger);
         // (T61) 전량 재평가 순서: ①선언 없음 → DeclarationMissing.
         assert!(matches!(
-            ch.reenter("o-bad", "ext:x", Some("s-2"), Some("dig-x"), "plan-2", "root-x"),
+            ch.reenter(
+                "o-bad",
+                "ext:x",
+                Some("s-2"),
+                Some("dig-x"),
+                "plan-2",
+                "root-x"
+            ),
             Err(ChainerError::DeclarationMissing { .. })
         ));
         log.declare_plan(
@@ -934,17 +1069,43 @@ mod tests {
         )
         .unwrap();
         // ②사이징 승인(A 수리) — 그러나 preset_bound 미등록(B) → 여전히 거부.
-        let r = ch.reenter("o-bad", "ext:x", Some("s-2"), Some("dig-x"), "plan-2", "root-x");
-        assert!(matches!(r, Err(ChainerError::Unsized { .. })), "A repaired, B refuses");
+        let r = ch.reenter(
+            "o-bad",
+            "ext:x",
+            Some("s-2"),
+            Some("dig-x"),
+            "plan-2",
+            "root-x",
+        );
+        assert!(
+            matches!(r, Err(ChainerError::Unsized { .. })),
+            "A repaired, B refuses"
+        );
         // ③preset_bound 등록 — 통과.
-        log.append_preset_bound("s-2", "root-x", "dig-x", "plan-2").unwrap();
-        assert!(ch
-            .reenter("o-bad", "ext:x", Some("s-2"), Some("dig-x"), "plan-2", "root-x")
-            .is_ok());
+        log.append_preset_bound("s-2", "root-x", "dig-x", "plan-2")
+            .unwrap();
+        assert!(
+            ch.reenter(
+                "o-bad",
+                "ext:x",
+                Some("s-2"),
+                Some("dig-x"),
+                "plan-2",
+                "root-x"
+            )
+            .is_ok()
+        );
         // 선언 재검사 — declared=true 인데 로그에 없으면 거부(새 B).
         // (T61) 미선언 주문의 재입장 — 항상 DeclarationMissing.
         assert!(matches!(
-            ch.reenter("o-undeclared", "ext:x", Some("s-2"), Some("dig-x"), "plan-2", "root-x"),
+            ch.reenter(
+                "o-undeclared",
+                "ext:x",
+                Some("s-2"),
+                Some("dig-x"),
+                "plan-2",
+                "root-x"
+            ),
             Err(ChainerError::DeclarationMissing { .. })
         ));
     }
@@ -966,21 +1127,31 @@ mod tests {
             "root_scope": "intake",
         });
         ledger.issue_grant("sizing-s-9", "tok-9", &sscope).unwrap();
-        let r0 = ledger.reserve_grant("sizing-s-9", &sscope, "ex-9", 1).unwrap();
-        ledger.begin_apply("sizing-s-9", "ex-9", 1, r0.fence_token).unwrap();
-        ledger.finalize_grant("sizing-s-9", "ex-9", 1, r0.fence_token).unwrap();
+        let r0 = ledger
+            .reserve_grant("sizing-s-9", &sscope, "ex-9", 1)
+            .unwrap();
+        ledger
+            .begin_apply("sizing-s-9", "ex-9", 1, r0.fence_token)
+            .unwrap();
+        ledger
+            .finalize_grant("sizing-s-9", "ex-9", 1, r0.fence_token)
+            .unwrap();
         // 거부된 사이징 그랜트.
         let rscope = serde_json::json!({
             "order_id": "s-rej9", "intent": "sizing",
             "artifact_digest": crate::chainer::sizing_digest("rejected", "r9", "p9"),
             "root_scope": "intake",
         });
-        ledger.issue_grant("sizing-s-rej9", "tok-r9", &rscope).unwrap();
+        ledger
+            .issue_grant("sizing-s-rej9", "tok-r9", &rscope)
+            .unwrap();
         let ch = Chainer::new(&log, &ledger);
         // 결속 성공 — digest 는 그랜트 스코프에서.
-        ch.bind_preset_from_ledger("s-9", "root-9", "plan-9").unwrap();
+        ch.bind_preset_from_ledger("s-9", "root-9", "plan-9")
+            .unwrap();
         // 멱등 — 재호출 이중 행 없음.
-        ch.bind_preset_from_ledger("s-9", "root-9", "plan-9").unwrap();
+        ch.bind_preset_from_ledger("s-9", "root-9", "plan-9")
+            .unwrap();
         let rows = log.read_all().unwrap();
         let bounds = rows
             .iter()

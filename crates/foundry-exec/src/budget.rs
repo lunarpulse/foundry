@@ -19,9 +19,11 @@ impl Budget {
     // discard funds that would have fit after settlement.
     fn available_nano(&self) -> u128 {
         if self.settled_nano <= self.reserved_nano {
-            self.carried_nano.saturating_add(self.reserved_nano - self.settled_nano)
+            self.carried_nano
+                .saturating_add(self.reserved_nano - self.settled_nano)
         } else {
-            self.carried_nano.saturating_sub(self.settled_nano - self.reserved_nano)
+            self.carried_nano
+                .saturating_sub(self.settled_nano - self.reserved_nano)
         }
     }
 

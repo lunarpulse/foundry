@@ -4,11 +4,11 @@ mod t60_scale3_epic {
     //! 크레이트 내부 테스트 — 엔진 주도권(실행 경로)이 크레이트 내부이기
     //! 때문(T58 r10 계약). 공개면은 dispatch/Chainer 만 사용해 종단을 증명.
 
-    use foundry_domain::order::{ExternalRef, Order};
-    use foundry_domain::{OrderEvent, OrderState};
     use crate::chainer::{Chainer, ChainerError};
     use crate::stream::{Stream, StreamRuntime};
     use crate::{OrchestrationKind, OrchestrationLog};
+    use foundry_domain::order::{ExternalRef, Order};
+    use foundry_domain::{OrderEvent, OrderState};
     use foundry_workflow::{Outcome, WorkflowEngine};
     use std::collections::BTreeSet;
 
@@ -39,7 +39,12 @@ mod t60_scale3_epic {
     }
 
     /// 사이징 주문 하나를 FurnaceHold(인간 게이트)까지 진행.
-    fn sizing_to_gate(e: &mut WorkflowEngine, exec: &str, oid: &str, journal_path: &std::path::Path) {
+    fn sizing_to_gate(
+        e: &mut WorkflowEngine,
+        exec: &str,
+        oid: &str,
+        journal_path: &std::path::Path,
+    ) {
         for ev in [
             OrderEvent::Queued,
             OrderEvent::DieStarted,
@@ -55,7 +60,8 @@ mod t60_scale3_epic {
             let ro: &'static mut foundry_ledger::SqliteLedger = Box::leak(Box::new(
                 foundry_ledger::SqliteLedger::open(journal_path).unwrap(),
             ));
-            e.dispatch_replay_ctx(oid, exec, &ev, att, &ctx, ro).unwrap();
+            e.dispatch_replay_ctx(oid, exec, &ev, att, &ctx, ro)
+                .unwrap();
         }
         assert_eq!(e.order(oid).unwrap().state(), OrderState::FurnaceHold);
     }
@@ -79,12 +85,16 @@ mod t60_scale3_epic {
                 OrderEvent::InspectionPassed,
             ] {
                 let att = eng.order(oid).unwrap().attempt().max(1);
-                let rows = foundry_ledger::SqliteLedger::open(&e.journal()).unwrap().read_all().unwrap();
+                let rows = foundry_ledger::SqliteLedger::open(&e.journal())
+                    .unwrap()
+                    .read_all()
+                    .unwrap();
                 let ctx = crate::test_support::replay_ctx(oid, &rows);
                 let ro: &'static mut foundry_ledger::SqliteLedger = Box::leak(Box::new(
                     foundry_ledger::SqliteLedger::open(&e.journal()).unwrap(),
                 ));
-                eng.dispatch_replay_ctx(oid, "t60", &ev, att, &ctx, ro).unwrap();
+                eng.dispatch_replay_ctx(oid, "t60", &ev, att, &ctx, ro)
+                    .unwrap();
             }
         }
         let mut ap = foundry_approval::ApprovalLedger::open(ap_db).unwrap();
@@ -96,19 +106,27 @@ mod t60_scale3_epic {
         {
             let e2 = rt.stream(stream_id).unwrap();
             let mut eng = e2.engine_if_unfenced().unwrap();
-            let grant = foundry_workflow::GrantRef { grant_id: grant_id.into() };
+            let grant = foundry_workflow::GrantRef {
+                grant_id: grant_id.into(),
+            };
             let out = eng
                 .dispatch_live(
                     oid,
                     "t60",
-                    &OrderEvent::Approved { intent: "ship".into(), artifact_digest: format!("dig-{oid}") },
+                    &OrderEvent::Approved {
+                        intent: "ship".into(),
+                        artifact_digest: format!("dig-{oid}"),
+                    },
                     1,
                     Some(&grant),
                     &mut hook,
                 )
                 .unwrap();
             assert_eq!(out, Outcome::Applied);
-            let rows = foundry_ledger::SqliteLedger::open(&e2.journal()).unwrap().read_all().unwrap();
+            let rows = foundry_ledger::SqliteLedger::open(&e2.journal())
+                .unwrap()
+                .read_all()
+                .unwrap();
             let ctx = crate::test_support::replay_ctx(oid, &rows);
             let ro: &'static mut foundry_ledger::SqliteLedger = Box::leak(Box::new(
                 foundry_ledger::SqliteLedger::open(&e2.journal()).unwrap(),
@@ -116,7 +134,9 @@ mod t60_scale3_epic {
             eng.dispatch_replay_ctx(
                 oid,
                 "t60",
-                &OrderEvent::PublishConfirmed { pr_url: "https://pr/t60".into() },
+                &OrderEvent::PublishConfirmed {
+                    pr_url: "https://pr/t60".into(),
+                },
                 1,
                 &ctx,
                 ro,
@@ -151,12 +171,12 @@ mod t60_scale3_epic {
         .unwrap();
         let rt = StreamRuntime::new(orch);
         let orch = rt.orch.clone();
-        rt.add_stream(Stream::new_with_root("s-sizing", &d, "bmad-epic-build").unwrap()).unwrap();
-        rt.add_stream(Stream::new_with_root("s-epic", &d, "bmad-epic-build").unwrap()).unwrap();
-        rt.bind_approval_ledger(
-            foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
-        )
-        .unwrap();
+        rt.add_stream(Stream::new_with_root("s-sizing", &d, "bmad-epic-build").unwrap())
+            .unwrap();
+        rt.add_stream(Stream::new_with_root("s-epic", &d, "bmad-epic-build").unwrap())
+            .unwrap();
+        rt.bind_approval_ledger(foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap())
+            .unwrap();
         rt.dispatch("sz-1", mkorder("sz-1", true)).unwrap();
 
         // (T60 astra r1 MINOR) 사이징 주문은 **런타임 소유 엔진**으로 구동 —
@@ -173,15 +193,15 @@ mod t60_scale3_epic {
         let mut ap = foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap();
         // (T60 astra r1) 목적지 인코딩 digest — 라이브 소비 스코프(4필드)와
         // 양립하는 유일한 인코딩 자리.
-        let sizing_digest = crate::chainer::sizing_digest(
-            "approved", "bmad-epic-build", "plan-epic-42",
-        );
+        let sizing_digest =
+            crate::chainer::sizing_digest("approved", "bmad-epic-build", "plan-epic-42");
         // root_scope 는 scope_for 기본("")와 일치 — 라이브 소비용.
         let sscope = serde_json::json!({
             "order_id": "sz-1", "intent": "sizing", "artifact_digest": sizing_digest,
             "root_scope": "",
         });
-        ap.issue_grant("sizing-sz-1", "tok-sizing-human", &sscope).unwrap();
+        ap.issue_grant("sizing-sz-1", "tok-sizing-human", &sscope)
+            .unwrap();
         // **라이브 인간 게이트** — 사이징 주문 FurnaceHold 에서 dispatch_live
         // 로 승인(그랜트가 정상 경로로 소비된다 — 원장 직접 조작 아님).
         {
@@ -190,7 +210,9 @@ mod t60_scale3_epic {
             let mut hook = foundry_workflow::ApprovalLedgerAdapter(
                 foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
             );
-            let grant = foundry_workflow::GrantRef { grant_id: "sizing-sz-1".into() };
+            let grant = foundry_workflow::GrantRef {
+                grant_id: "sizing-sz-1".into(),
+            };
             let out = eng
                 .dispatch_live(
                     "sz-1",
@@ -209,7 +231,8 @@ mod t60_scale3_epic {
 
         // ── (3) preset_bound — 체이너의 유일 경로(원장 검증+멱등).
         let ch = Chainer::new(&orch, &ap);
-        ch.bind_preset_from_ledger("sz-1", "bmad-epic-build", "plan-epic-42").unwrap();
+        ch.bind_preset_from_ledger("sz-1", "bmad-epic-build", "plan-epic-42")
+            .unwrap();
 
         // ── (4) 4-티켓 에픽 발행 — 의존성: t1→{t2,t3}→t4.
         orch.declare_plan(
@@ -232,7 +255,12 @@ mod t60_scale3_epic {
         // ── (5) 티켓 dispatch — 사이즈 게이트 통과(preset_bound 존재+digest 일치).
         rt.dispatch("t-1", mkorder("t-1", false)).unwrap();
         // 게이트 ①: unsized — preset_bound 없는 다른 플랜의 발행 거부.
-        orch.declare_plan("plan-rogue", vec![("bad-1".into(), vec![])], vec![("bad-1".into(), "s-epic".into())]).unwrap();
+        orch.declare_plan(
+            "plan-rogue",
+            vec![("bad-1".into(), vec![])],
+            vec![("bad-1".into(), "s-epic".into())],
+        )
+        .unwrap();
         let refused = rt.dispatch("bad-1", mkorder("bad-1", false));
         assert!(refused.is_err(), "gate1: unsized spawn refused");
         // 게이트 ②: digest 불일치 — chainer 직접 확인.
@@ -240,14 +268,18 @@ mod t60_scale3_epic {
             "t-2",
             "ext:x",
             Some("sz-1"),
-            Some(&crate::chainer::sizing_digest("approved", "bmad-epic-build", "plan-OTHER")),
+            Some(&crate::chainer::sizing_digest(
+                "approved",
+                "bmad-epic-build",
+                "plan-OTHER",
+            )),
             "plan-epic-42",
             "bmad-epic-build",
         );
         assert!(
-        matches!(r2, Err(ChainerError::DigestMismatch { .. })),
-        "gate2: digest (destination) mismatch refused"
-    );
+            matches!(r2, Err(ChainerError::DigestMismatch { .. })),
+            "gate2: digest (destination) mismatch refused"
+        );
 
         // ── (6) 티켓 완주 — t1 후 t2·t3 병렬, 전부 후 t4.
         ticket_to_shipped(&rt, "s-epic", "t-1", "g-t1", &d.join("ap.db"));
@@ -264,7 +296,10 @@ mod t60_scale3_epic {
 
         // 에픽 스트림 — 4티켓 전원 Shipped.
         for t in ["t-1", "t-2", "t-3", "t-4"] {
-            assert!(rt.stream("s-epic").unwrap().order_shipped(t).unwrap(), "{t} shipped");
+            assert!(
+                rt.stream("s-epic").unwrap().order_shipped(t).unwrap(),
+                "{t} shipped"
+            );
         }
         // 발행 기록 — 사이징+4티켓 = 5 (rogue 거부는 미발행).
         let rows = orch.read_all().unwrap();
@@ -297,13 +332,17 @@ mod t60_scale3_epic {
             )
             .unwrap();
             let rt = StreamRuntime::new(orch);
-            rt.add_stream(Stream::new_with_root(&format!("s-sel{scale}"), &d, root).unwrap()).unwrap();
+            rt.add_stream(Stream::new_with_root(&format!("s-sel{scale}"), &d, root).unwrap())
+                .unwrap();
             rt.bind_approval_ledger(
                 foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
             )
             .unwrap();
-            rt.dispatch(&format!("sz-scale{scale}"), mkorder(&format!("sz-scale{scale}"), true))
-                .unwrap_or_else(|e| panic!("scale {scale} dispatch: {e:?}"));
+            rt.dispatch(
+                &format!("sz-scale{scale}"),
+                mkorder(&format!("sz-scale{scale}"), true),
+            )
+            .unwrap_or_else(|e| panic!("scale {scale} dispatch: {e:?}"));
             let sid = format!("sz-scale{scale}");
             {
                 let e = rt.stream(&format!("s-sel{scale}")).unwrap();
@@ -317,7 +356,8 @@ mod t60_scale3_epic {
                 "order_id": sid.clone(), "intent": "sizing",
                 "artifact_digest": digest.clone(), "root_scope": "",
             });
-            ap.issue_grant(&format!("sizing-{sid}"), &format!("tok-{scale}"), &sscope).unwrap();
+            ap.issue_grant(&format!("sizing-{sid}"), &format!("tok-{scale}"), &sscope)
+                .unwrap();
             // 라이브 인간 승인 — FurnaceHold 에서 dispatch_live.
             {
                 let e2 = rt.stream(&format!("s-sel{scale}")).unwrap();
@@ -325,12 +365,17 @@ mod t60_scale3_epic {
                 let mut hook = foundry_workflow::ApprovalLedgerAdapter(
                     foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
                 );
-                let grant = foundry_workflow::GrantRef { grant_id: format!("sizing-{sid}") };
+                let grant = foundry_workflow::GrantRef {
+                    grant_id: format!("sizing-{sid}"),
+                };
                 let out = eng
                     .dispatch_live(
                         &sid,
                         "sel",
-                        &OrderEvent::Approved { intent: "sizing".into(), artifact_digest: digest.clone() },
+                        &OrderEvent::Approved {
+                            intent: "sizing".into(),
+                            artifact_digest: digest.clone(),
+                        },
                         1,
                         Some(&grant),
                         &mut hook,
@@ -390,18 +435,25 @@ mod t60_scale3_epic {
         // preset_bound 없음 → 발행도 거부(unsized).
         assert!(matches!(
             ch.check_spawn_binding(
-            "t-x",
-            "ext:x",
-            Some("sz-rej"),
-            Some(&crate::chainer::sizing_digest("rejected", "bmad-epic-build", "plan-r")),
-            "plan-r",
-            "bmad-epic-build",
-        ),
+                "t-x",
+                "ext:x",
+                Some("sz-rej"),
+                Some(&crate::chainer::sizing_digest(
+                    "rejected",
+                    "bmad-epic-build",
+                    "plan-r"
+                )),
+                "plan-r",
+                "bmad-epic-build",
+            ),
             Err(ChainerError::SizingRejected { .. })
         ));
         // 로그에 preset_bound 행 없음 단정.
         let rows = orch.read_all().unwrap();
-        assert!(rows.iter().all(|r| !matches!(&r.kind, OrchestrationKind::PresetBound { .. })));
+        assert!(
+            rows.iter()
+                .all(|r| !matches!(&r.kind, OrchestrationKind::PresetBound { .. }))
+        );
     }
 
     /// 게이트 ④(보강) — 스케일 3 티켓의 방화벽: 재생 경로 Approved 거부.
@@ -416,11 +468,10 @@ mod t60_scale3_epic {
         )
         .unwrap();
         let rt = StreamRuntime::new(orch);
-        rt.add_stream(Stream::new_with_root("s-f", &d, "bmad-epic-build").unwrap()).unwrap();
-        rt.bind_approval_ledger(
-            foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap(),
-        )
-        .unwrap();
+        rt.add_stream(Stream::new_with_root("s-f", &d, "bmad-epic-build").unwrap())
+            .unwrap();
+        rt.bind_approval_ledger(foundry_approval::ApprovalLedger::open(&d.join("ap.db")).unwrap())
+            .unwrap();
         rt.dispatch("sz-f", mkorder("sz-f", true)).unwrap();
         let e = rt.stream("s-f").unwrap();
         let mut eng = e.engine_if_unfenced().unwrap();
@@ -432,16 +483,23 @@ mod t60_scale3_epic {
             OrderEvent::InspectionPassed,
         ] {
             let att = eng.order("sz-f").unwrap().attempt().max(1);
-            let rows = foundry_ledger::SqliteLedger::open(&e.journal()).unwrap().read_all().unwrap();
+            let rows = foundry_ledger::SqliteLedger::open(&e.journal())
+                .unwrap()
+                .read_all()
+                .unwrap();
             let ctx = crate::test_support::replay_ctx("sz-f", &rows);
             let ro: &'static mut foundry_ledger::SqliteLedger = Box::leak(Box::new(
                 foundry_ledger::SqliteLedger::open(&e.journal()).unwrap(),
             ));
-            eng.dispatch_replay_ctx("sz-f", "fw", &ev, att, &ctx, ro).unwrap();
+            eng.dispatch_replay_ctx("sz-f", "fw", &ev, att, &ctx, ro)
+                .unwrap();
         }
         // 게이트 도달 — 재생 Approved 거부.
         assert_eq!(eng.order("sz-f").unwrap().state(), OrderState::FurnaceHold);
-        let rows = foundry_ledger::SqliteLedger::open(&e.journal()).unwrap().read_all().unwrap();
+        let rows = foundry_ledger::SqliteLedger::open(&e.journal())
+            .unwrap()
+            .read_all()
+            .unwrap();
         let ctx = crate::test_support::replay_ctx("sz-f", &rows);
         let ro: &'static mut foundry_ledger::SqliteLedger = Box::leak(Box::new(
             foundry_ledger::SqliteLedger::open(&e.journal()).unwrap(),
@@ -449,16 +507,21 @@ mod t60_scale3_epic {
         let fw = eng.dispatch_replay_ctx(
             "sz-f",
             "fw",
-            &OrderEvent::Approved { intent: "ship".into(), artifact_digest: "d".into() },
+            &OrderEvent::Approved {
+                intent: "ship".into(),
+                artifact_digest: "d".into(),
+            },
             1,
             &ctx,
             ro,
         );
         assert!(
-            matches!(fw, Err(foundry_workflow::EngineError::AuthorizationRefused { .. })),
+            matches!(
+                fw,
+                Err(foundry_workflow::EngineError::AuthorizationRefused { .. })
+            ),
             "firewall holds at scale 3"
         );
         let _ = BTreeSet::<String>::new();
     }
-
 }

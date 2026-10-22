@@ -24,18 +24,27 @@ fn docker(args: &[&str]) -> Result<String, String> {
     if out.status.success() {
         Ok(stdout)
     } else {
-        Err(format!("docker {} -> {}: {}", args.join(" "), out.status, stderr.trim()))
+        Err(format!(
+            "docker {} -> {}: {}",
+            args.join(" "),
+            out.status,
+            stderr.trim()
+        ))
     }
 }
 
 fn daemon_net_exists(net: &str) -> bool {
-    Command::new("docker").args(["network", "ls", "--format", "{{.Name}}"]).output()
+    Command::new("docker")
+        .args(["network", "ls", "--format", "{{.Name}}"])
+        .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).lines().any(|l| l == net))
         .unwrap_or(false)
 }
 
 fn daemon_up() -> bool {
-    Command::new("docker").args(["version", "--format", "{{.Server.Version}}"]).output()
+    Command::new("docker")
+        .args(["version", "--format", "{{.Server.Version}}"])
+        .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
@@ -54,13 +63,14 @@ fn setup() -> Result<(), String> {
     docker(&["network", "create", "--internal", NET])?;
     // internal network: no external route by docker's own enforcement
     docker(&[
-        "build", "-t", IMG, "-",
-        "-f", "-", // stdin dockerfile below via echo is awkward; use build with heredoc file
+        "build", "-t", IMG, "-", "-f",
+        "-", // stdin dockerfile below via echo is awkward; use build with heredoc file
     ])
     .map(|_| ())
     .or_else(|_| {
         // simpler: pull busybox (cached in most cases) and retag
-        docker(&["pull", "-q", "busybox:1.37"]).and_then(|_| docker(&["tag", "busybox:1.37", IMG]).map(|_| ()))
+        docker(&["pull", "-q", "busybox:1.37"])
+            .and_then(|_| docker(&["tag", "busybox:1.37", IMG]).map(|_| ()))
     })
 }
 
@@ -74,8 +84,14 @@ fn runtime_boundary_observed() {
 
     // R1: external egress refused — internal network has no gateway out
     let egress = docker(&[
-        "run", "--rm", "--network", NET, IMG,
-        "sh", "-c", "wget -q -T 3 -O /dev/null http://93.184.216.34/ 2>&1; echo rc=$?",
+        "run",
+        "--rm",
+        "--network",
+        NET,
+        IMG,
+        "sh",
+        "-c",
+        "wget -q -T 3 -O /dev/null http://93.184.216.34/ 2>&1; echo rc=$?",
     ]);
     let egress_out = egress.unwrap_or_default();
     assert!(
@@ -85,8 +101,14 @@ fn runtime_boundary_observed() {
 
     // R1b: even DNS is not an escape hatch
     let dns = docker(&[
-        "run", "--rm", "--network", NET, IMG,
-        "sh", "-c", "nslookup example.com >/dev/null 2>&1; echo rc=$?",
+        "run",
+        "--rm",
+        "--network",
+        NET,
+        IMG,
+        "sh",
+        "-c",
+        "nslookup example.com >/dev/null 2>&1; echo rc=$?",
     ]);
     let dns_out = dns.unwrap_or_default();
     // internal networks still allow docker's embedded DNS to answer NXDOMAIN
@@ -95,8 +117,14 @@ fn runtime_boundary_observed() {
 
     // R2: credential files invisible
     let creds = docker(&[
-        "run", "--rm", "--network", NET, IMG,
-        "sh", "-c", "ls /root/.foundry /home 2>&1; echo ---; find / -maxdepth 3 -name 'gh_token' -o -maxdepth 3 -name 'die.env' 2>/dev/null | head -3",
+        "run",
+        "--rm",
+        "--network",
+        NET,
+        IMG,
+        "sh",
+        "-c",
+        "ls /root/.foundry /home 2>&1; echo ---; find / -maxdepth 3 -name 'gh_token' -o -maxdepth 3 -name 'die.env' 2>/dev/null | head -3",
     ]);
     let creds_out = creds.unwrap_or_default();
     assert!(
@@ -106,29 +134,67 @@ fn runtime_boundary_observed() {
 
     // R3: read-only rootfs — write attempt must fail
     let write = docker(&[
-        "run", "--rm", "--network", NET, "--read-only", IMG,
-        "sh", "-c", "echo x > /probe 2>&1; echo rc=$?",
+        "run",
+        "--rm",
+        "--network",
+        NET,
+        "--read-only",
+        IMG,
+        "sh",
+        "-c",
+        "echo x > /probe 2>&1; echo rc=$?",
     ]);
     let write_out = write.unwrap_or_default();
-    assert!(!write_out.trim().ends_with("rc=0"), "rootfs write must fail, got: {write_out}");
+    assert!(
+        !write_out.trim().ends_with("rc=0"),
+        "rootfs write must fail, got: {write_out}"
+    );
 
     // R4: live config carries the hardening flags
     let _ = docker(&["rm", "-f", "t44b-live"]); // stale from a previous failed run
     let inspect = docker(&[
-        "run", "-d", "--name", "t44b-live", "--network", NET,
-        "--read-only", "--cap-drop=ALL", "--security-opt", "no-new-privileges", IMG, "sleep", "30",
+        "run",
+        "-d",
+        "--name",
+        "t44b-live",
+        "--network",
+        NET,
+        "--read-only",
+        "--cap-drop=ALL",
+        "--security-opt",
+        "no-new-privileges",
+        IMG,
+        "sleep",
+        "30",
     ]);
     if let Ok(_) = inspect {
         // docker inspect emits pretty-printed JSON (spaces/newlines) —
         // parse it instead of substring-matching formatting
         let cfg = docker(&["inspect", "t44b-live"]).unwrap_or_default();
-        let v: serde_json::Value = serde_json::from_str(&cfg)
-            .expect("inspect output is JSON");
+        let v: serde_json::Value = serde_json::from_str(&cfg).expect("inspect output is JSON");
         let hc = &v[0]["HostConfig"];
-        assert_eq!(hc["CapDrop"].as_array().map(|a| a.len()), Some(1), "CapDrop live");
-        assert_eq!(hc["CapDrop"][0].as_str(), Some("ALL"), "cap-drop ALL live in HostConfig");
-        assert_eq!(hc["ReadonlyRootfs"].as_bool(), Some(true), "read-only rootfs live");
-        assert!(hc["SecurityOpt"].as_array().map(|a| a.iter().any(|x| x.as_str() == Some("no-new-privileges"))).unwrap_or(false), "no-new-privileges live");
+        assert_eq!(
+            hc["CapDrop"].as_array().map(|a| a.len()),
+            Some(1),
+            "CapDrop live"
+        );
+        assert_eq!(
+            hc["CapDrop"][0].as_str(),
+            Some("ALL"),
+            "cap-drop ALL live in HostConfig"
+        );
+        assert_eq!(
+            hc["ReadonlyRootfs"].as_bool(),
+            Some(true),
+            "read-only rootfs live"
+        );
+        assert!(
+            hc["SecurityOpt"]
+                .as_array()
+                .map(|a| a.iter().any(|x| x.as_str() == Some("no-new-privileges")))
+                .unwrap_or(false),
+            "no-new-privileges live"
+        );
         let _ = docker(&["rm", "-f", "t44b-live"]);
     } else {
         panic!("failed to start hardened container: {inspect:?}");

@@ -13,7 +13,10 @@ fn v3_doc_with_waive() -> WorkflowDoc {
     // 최소 v3 문서 — Waive 를 policy 에 주입한 변형.
     let mut doc = foundry_workflow::dsl::load_preset(
         &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("presets/bmad-intake-pool.v3.json"),
     )
     .unwrap();
@@ -43,22 +46,40 @@ fn g3_case2_no_grant_refused_state_frozen_ledger_empty() {
     e.enroll(furnace_order("g3-o"));
     e.acquire("g3-o", "ex").unwrap();
     let mut hook = LedgerHook(foundry_approval::ApprovalLedger::open_in_memory().unwrap());
-    let r = e.dispatch_live("g3-o", "ex", &approval_event("ship", "dig-1"), 1, None, &mut hook);
+    let r = e.dispatch_live(
+        "g3-o",
+        "ex",
+        &approval_event("ship", "dig-1"),
+        1,
+        None,
+        &mut hook,
+    );
     match &r {
         Err(EngineError::AuthorizationRefused { grant_id: None, .. }) => {}
         other => panic!("expected AuthorizationRefused(None): {other:?}"),
     }
-    assert_eq!(e.order("g3-o").unwrap().state(), OrderState::FurnaceHold, "state frozen");
+    assert_eq!(
+        e.order("g3-o").unwrap().state(),
+        OrderState::FurnaceHold,
+        "state frozen"
+    );
     // acquire 관측(wf.lock_*)은 남지만 승인 Applied 는 0이어야 한다 —
     // 이벤트 패밀리로 필터.
     let applied = e
         .observations()
         .iter()
-        .filter(|o| o.exec_id == "ex" && matches!(o.outcome, Outcome::Applied) && o.event_family == "Approved")
+        .filter(|o| {
+            o.exec_id == "ex"
+                && matches!(o.outcome, Outcome::Applied)
+                && o.event_family == "Approved"
+        })
         .count();
     assert_eq!(applied, 0, "no Applied observation for the approval event");
     // 원장 무기록 — grant 자체가 없으므로 예약/소비 기록 부재.
-    assert!(hook.0.recovery_scan().unwrap().is_empty(), "no ledger writes");
+    assert!(
+        hook.0.recovery_scan().unwrap().is_empty(),
+        "no ledger writes"
+    );
 }
 
 /// ③ 유효하지만 타스코프의 grant — 거부·상태 불변.
@@ -73,9 +94,21 @@ fn g3_case3_wrong_scope_grant_refused() {
     });
     ledger.issue_grant("g-w", "tok-w", &wrong).unwrap();
     let mut hook = LedgerHook(ledger);
-    let grant = GrantRef { grant_id: "g-w".into() };
-    let r = e.dispatch_live("g3-o", "ex", &approval_event("ship", "dig-1"), 1, Some(&grant), &mut hook);
-    assert!(matches!(r, Err(EngineError::AuthorizationRefused { .. })), "{r:?}");
+    let grant = GrantRef {
+        grant_id: "g-w".into(),
+    };
+    let r = e.dispatch_live(
+        "g3-o",
+        "ex",
+        &approval_event("ship", "dig-1"),
+        1,
+        Some(&grant),
+        &mut hook,
+    );
+    assert!(
+        matches!(r, Err(EngineError::AuthorizationRefused { .. })),
+        "{r:?}"
+    );
     assert_eq!(e.order("g3-o").unwrap().state(), OrderState::FurnaceHold);
 }
 
@@ -91,11 +124,29 @@ fn g3_case4_valid_grant_applies_and_consumes() {
     });
     ledger.issue_grant("g-r", "tok-r", &right).unwrap();
     let mut hook = LedgerHook(ledger);
-    let grant = GrantRef { grant_id: "g-r".into() };
-    let out = e.dispatch_live("g3-o", "ex", &approval_event("ship", "dig-1"), 1, Some(&grant), &mut hook).unwrap();
+    let grant = GrantRef {
+        grant_id: "g-r".into(),
+    };
+    let out = e
+        .dispatch_live(
+            "g3-o",
+            "ex",
+            &approval_event("ship", "dig-1"),
+            1,
+            Some(&grant),
+            &mut hook,
+        )
+        .unwrap();
     assert_eq!(out, Outcome::Applied);
     assert_eq!(e.order("g3-o").unwrap().state(), OrderState::Publishing);
-    assert_eq!(hook.0.get_grant("g-r").unwrap().state, foundry_approval::GrantState::Consumed, "CONSUMED");
+    assert_eq!(
+        hook.0.get_grant("g-r").unwrap().state,
+        foundry_approval::GrantState::Consumed,
+        "CONSUMED"
+    );
     // apply_intents 정리 — finalize 가 증거를 finalize_records 로.
-    assert!(!hook.0.apply_intent("g-r", "ex", 1).unwrap(), "intent cleaned");
+    assert!(
+        !hook.0.apply_intent("g-r", "ex", 1).unwrap(),
+        "intent cleaned"
+    );
 }

@@ -1,4 +1,8 @@
-use crate::{lifecycle::DispatchResult, ports::DispatchHost, types::{ExecutionIntent, Receipt}};
+use crate::{
+    lifecycle::DispatchResult,
+    ports::DispatchHost,
+    types::{ExecutionIntent, Receipt},
+};
 
 /// S4 storage contract: durable owner of host acceptance receipts and results.
 /// The owner must serialize the complete load/accept/work/save sequence for each
@@ -65,7 +69,10 @@ pub struct HostResult {
 // result as data, leaving the pack to choose the next graph node.
 impl From<HostResult> for DispatchResult {
     fn from(result: HostResult) -> Self {
-        Self { receipts: vec![Receipt::Host(result)], ..Self::default() }
+        Self {
+            receipts: vec![Receipt::Host(result)],
+            ..Self::default()
+        }
     }
 }
 
@@ -80,6 +87,17 @@ pub enum HostError {
     Acceptance(String),
     Worker(String),
     Persistence(String),
+}
+
+impl From<String> for HostError {
+    fn from(value: String) -> Self {
+        Self::Persistence(value)
+    }
+}
+impl From<&str> for HostError {
+    fn from(value: &str) -> Self {
+        Self::Persistence(value.to_owned())
+    }
 }
 
 /// Adapts a synchronous Die worker to the execution host port.
@@ -98,7 +116,11 @@ pub struct DieHostAdapter<'a, W: DieWorker, L: HostLedger> {
 
 impl<'a, W: DieWorker, L: HostLedger> DieHostAdapter<'a, W, L> {
     pub fn new(worker: &'a mut W, ledger: &'a mut L) -> Self {
-        Self { worker, ledger, dispatch_count: 0 }
+        Self {
+            worker,
+            ledger,
+            dispatch_count: 0,
+        }
     }
 
     pub fn accepted(&self, intent: &ExecutionIntent) -> bool {
@@ -113,8 +135,13 @@ impl<'a, W: DieWorker, L: HostLedger> DieHostAdapter<'a, W, L> {
 
         self.ledger.accept(&key).map_err(HostError::Acceptance)?;
         self.dispatch_count += 1;
-        let result = self.worker.run(&key, &intent.external_ref).map_err(HostError::Worker)?;
-        self.ledger.save(&key, &result).map_err(HostError::Persistence)?;
+        let result = self
+            .worker
+            .run(&key, &intent.external_ref)
+            .map_err(HostError::Worker)?;
+        self.ledger
+            .save(&key, &result)
+            .map_err(HostError::Persistence)?;
         Ok(result)
     }
 }
@@ -123,7 +150,8 @@ impl<W: DieWorker, L: HostLedger> DispatchHost for DieHostAdapter<'_, W, L> {
     type Result = DispatchResult;
 
     fn dispatch(&mut self, intent: &ExecutionIntent) -> Self::Result {
-        self.try_dispatch(intent).unwrap_or_else(|error| panic!("host dispatch failed: {error:?}"))
+        self.try_dispatch(intent)
+            .unwrap_or_else(|error| panic!("host dispatch failed: {error:?}"))
     }
 
     fn try_dispatch(&mut self, intent: &ExecutionIntent) -> Result<Self::Result, HostError> {

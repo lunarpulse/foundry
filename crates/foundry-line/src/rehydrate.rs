@@ -18,7 +18,9 @@ pub enum RehydrateError {
         order_id: String,
     },
     /// The approval gate has no matching durable review tuple.
-    ReviewEvidenceUnavailable { order_id: String },
+    ReviewEvidenceUnavailable {
+        order_id: String,
+    },
 }
 
 pub fn rehydrate(
@@ -55,7 +57,9 @@ pub fn rehydrate(
         if order.state() == OrderState::FurnaceHold {
             let attempt = order.attempt().max(1);
             let repo = foundry_domain::repo_path(&ro.order_id, attempt);
-            if repo.join(".git").exists() && let Ok(h) = git_head(&repo) {
+            if repo.join(".git").exists()
+                && let Ok(h) = git_head(&repo)
+            {
                 order.artifact_digest = Some(h);
             }
             if order.artifact_digest.is_none() {
@@ -64,13 +68,22 @@ pub fn rehydrate(
                 });
             }
         }
-        if matches!(order.state(), OrderState::FurnaceHold | OrderState::Publishing | OrderState::Unknown | OrderState::Shipped) {
+        if matches!(
+            order.state(),
+            OrderState::FurnaceHold
+                | OrderState::Publishing
+                | OrderState::Unknown
+                | OrderState::Shipped
+        ) {
             let attempt = order.attempt();
             let digest = order.artifact_digest.as_deref().unwrap_or_default();
-            let tuple = tuples.latest_promoted(&OrderId(order.id.clone()), Attempt(attempt as u64))
+            let tuple = tuples
+                .latest_promoted(&OrderId(order.id.clone()), Attempt(attempt as u64))
                 .map_err(|e| RehydrateError::Replay(format!("tuple read failed: {e:?}")))?;
             if digest.is_empty() || !tuple.is_some_and(|tuple| tuple.immutable_commit.0 == digest) {
-                return Err(RehydrateError::ReviewEvidenceUnavailable { order_id: ro.order_id.clone() });
+                return Err(RehydrateError::ReviewEvidenceUnavailable {
+                    order_id: ro.order_id.clone(),
+                });
             }
         }
         out.push(order);
@@ -137,10 +150,33 @@ mod tests {
         // FurnaceHold without a workdir → DigestUnavailable (by design)
         struct EmptyTuples;
         impl TupleStore for EmptyTuples {
-            fn record(&self, _: &foundry_exec::ArtifactTuple) -> Result<foundry_exec::Recorded, foundry_exec::PortError> { Ok(foundry_exec::Recorded) }
-            fn latest(&self, _: &OrderId, _: Attempt) -> Result<Option<foundry_exec::ArtifactTuple>, foundry_exec::PortError> { Ok(None) }
-            fn latest_promoted(&self, _: &OrderId, _: Attempt) -> Result<Option<foundry_exec::ArtifactTuple>, foundry_exec::PortError> { Ok(None) }
-            fn promote(&self, _: &foundry_exec::ArtifactTupleKey, _: &foundry_exec::EmitReceipt) -> Result<(), foundry_exec::PortError> { Ok(()) }
+            fn record(
+                &self,
+                _: &foundry_exec::ArtifactTuple,
+            ) -> Result<foundry_exec::Recorded, foundry_exec::PortError> {
+                Ok(foundry_exec::Recorded)
+            }
+            fn latest(
+                &self,
+                _: &OrderId,
+                _: Attempt,
+            ) -> Result<Option<foundry_exec::ArtifactTuple>, foundry_exec::PortError> {
+                Ok(None)
+            }
+            fn latest_promoted(
+                &self,
+                _: &OrderId,
+                _: Attempt,
+            ) -> Result<Option<foundry_exec::ArtifactTuple>, foundry_exec::PortError> {
+                Ok(None)
+            }
+            fn promote(
+                &self,
+                _: &foundry_exec::ArtifactTupleKey,
+                _: &foundry_exec::EmitReceipt,
+            ) -> Result<(), foundry_exec::PortError> {
+                Ok(())
+            }
         }
         match rehydrate(&led, Path::new("/tmp"), &EmptyTuples) {
             Err(RehydrateError::DigestUnavailable { order_id }) => assert_eq!(order_id, oid),

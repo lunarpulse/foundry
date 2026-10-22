@@ -70,7 +70,10 @@ pub enum CursorError {
     /// 요청 seq가 터미널 커밋먼트 범위 밖 — 발급 거부 (v6 C′).
     OutsideTrustedScope { requested: i64, committed: i64 },
     /// 커밋먼트와 실제 체인이 불일치 — 신뢰 원천 오염.
-    CommitmentMismatch { expected_head: String, observed_head: String },
+    CommitmentMismatch {
+        expected_head: String,
+        observed_head: String,
+    },
     /// 행 부재 (order_id/seq 조합).
     RowNotFound { order_id: String, seq: i64 },
 }
@@ -85,10 +88,17 @@ pub fn issue_replay_cursor(
 ) -> Result<VerifiedReplayCursor, CursorError> {
     // (i) 범위 — 커밋먼트가 커버하는 max_seq까지만 발급.
     if seq > commitment.max_seq {
-        return Err(CursorError::OutsideTrustedScope { requested: seq, committed: commitment.max_seq });
+        return Err(CursorError::OutsideTrustedScope {
+            requested: seq,
+            committed: commitment.max_seq,
+        });
     }
     // (ii) 접두사 재검산 — 커밋먼트 시점까지의 행 수·헤드가 정확히 일치.
-    let prefix: Vec<LedgerRow> = rows.iter().filter(|r| r.seq <= commitment.max_seq).cloned().collect();
+    let prefix: Vec<LedgerRow> = rows
+        .iter()
+        .filter(|r| r.seq <= commitment.max_seq)
+        .cloned()
+        .collect();
     if prefix.len() as i64 != commitment.count {
         return Err(CursorError::CommitmentMismatch {
             expected_head: commitment.chain_head.clone(),
@@ -97,7 +107,10 @@ pub fn issue_replay_cursor(
     }
     let observed_head = prefix.last().map(|r| r.hash.clone()).unwrap_or_default();
     if observed_head != commitment.chain_head {
-        return Err(CursorError::CommitmentMismatch { expected_head: commitment.chain_head.clone(), observed_head });
+        return Err(CursorError::CommitmentMismatch {
+            expected_head: commitment.chain_head.clone(),
+            observed_head,
+        });
     }
     // 행 해시 연쇄 재검산 — 위조 접미·재정렬은 여기서 검출된다.
     if !foundry_ledger::sqlite::SqliteLedger::verify_rows(&prefix) {
@@ -110,7 +123,10 @@ pub fn issue_replay_cursor(
     let row = rows
         .iter()
         .find(|r| r.seq == seq && r.order_id == order_id)
-        .ok_or(CursorError::RowNotFound { order_id: order_id.into(), seq })?;
+        .ok_or(CursorError::RowNotFound {
+            order_id: order_id.into(),
+            seq,
+        })?;
     // **커서 위치 핀** (astra T56 r3 MAJOR): pin 은 커밋먼트 터미널 헤드가
     // 아니라 **커서가 가리키는 행 시점의 체인 헤드**(=요청 행 해시)다 —
     // 발급과 dispatch 의 검증 의미론이 일치해야 한다(터미널 헤드를 쓰면
@@ -187,9 +203,11 @@ impl WorkflowEngine {
         }
         // 커서-행 결속: 커서가 가리키는 행이 저널에 존재하고 해시가 정확히
         // 일치해야 한다. 위조·대체·타 저널 커서 전부 거부.
-        let rows = journal.read_all().map_err(|e| crate::EngineError::EncodingDrift {
-            detail: format!("replay journal unreadable: {e:?}"),
-        })?;
+        let rows = journal
+            .read_all()
+            .map_err(|e| crate::EngineError::EncodingDrift {
+                detail: format!("replay journal unreadable: {e:?}"),
+            })?;
         // GENESIS 시점 커서: 이 주문의 행이 저널에 아직 없다 (다른 주문의
         // 행은 있을 수 있다 — 공유 저널).
         let order_has_rows = rows.iter().any(|r| r.order_id == order_id);
@@ -213,7 +231,10 @@ impl WorkflowEngine {
         // (astra T56 r4 조건) 저장 해시만 믿지 않는다 — 선택 행을 **재해시**
         // 해 대조: 페이로드 변조(event/from/to/at)가 저장 hash 를 그대로
         // 보존한 채 남아 있으면 여기서 잡힌다.
-        let idx = rows.iter().position(|r| r.seq == ctx.cursor.seq && r.order_id == order_id).unwrap();
+        let idx = rows
+            .iter()
+            .position(|r| r.seq == ctx.cursor.seq && r.order_id == order_id)
+            .unwrap();
         let recomputed = foundry_ledger::sqlite::SqliteLedger::row_hash_at(&rows[..=idx]);
         if recomputed.as_deref() != Some(row.hash.as_str()) {
             return Err(crate::EngineError::EncodingDrift {
@@ -246,8 +267,10 @@ impl WorkflowEngine {
     /// 재구현 금지 계약: foundry-ledger replay(도메인 상태머신 재현) 재사용.
     pub fn rebuild(&mut self, ledger: &foundry_ledger::SqliteLedger) -> Result<usize, String> {
         let rows = ledger.read_all().map_err(|e| format!("{e:?}"))?;
-        let replayed = foundry_ledger::replay::replay(&rows, |rs| foundry_ledger::sqlite::SqliteLedger::verify_rows(rs))
-            .map_err(|e| format!("{e:?}"))?;
+        let replayed = foundry_ledger::replay::replay(&rows, |rs| {
+            foundry_ledger::sqlite::SqliteLedger::verify_rows(rs)
+        })
+        .map_err(|e| format!("{e:?}"))?;
         let mut n = 0;
         for ro in replayed {
             self.orders.insert(ro.order_id.clone(), ro.order);
@@ -279,7 +302,6 @@ pub(crate) fn journal_append(
         .append(order_id, event, from, to, &handle.actor, at)
         .map_err(|e| format!("{e:?}"))
 }
-
 
 /// (M7 T57 C′) 핸드오프 로그 포트 — foundry-workflow 는 오케스트레이션
 /// 저장소를 이 포트로만 본다 (구현은 오케스트레이션 크레이트가 주입 —

@@ -23,7 +23,11 @@ use foundry_ledger::sqlite::SqliteLedger;
 use foundry_workflow::WorkflowEngine;
 
 fn make_actor() -> ActorId {
-    ActorId { kind: ActorKind::Agent, source: "g1".into(), id: "agent-1".into() }
+    ActorId {
+        kind: ActorKind::Agent,
+        source: "g1".into(),
+        id: "agent-1".into(),
+    }
 }
 
 fn tmp_path(tag: &str) -> std::path::PathBuf {
@@ -43,8 +47,13 @@ fn scenarios() -> Vec<(&'static str, Vec<OrderEvent>)> {
                 OrderEvent::DieStarted,
                 OrderEvent::DieSucceeded { attempt: 1 },
                 OrderEvent::InspectionPassed,
-                OrderEvent::Approved { intent: "ship".into(), artifact_digest: "d1".into() },
-                OrderEvent::PublishConfirmed { pr_url: "https://pr/1".into() },
+                OrderEvent::Approved {
+                    intent: "ship".into(),
+                    artifact_digest: "d1".into(),
+                },
+                OrderEvent::PublishConfirmed {
+                    pr_url: "https://pr/1".into(),
+                },
             ],
         ),
         (
@@ -52,11 +61,20 @@ fn scenarios() -> Vec<(&'static str, Vec<OrderEvent>)> {
             vec![
                 OrderEvent::Queued,
                 OrderEvent::DieStarted,
-                OrderEvent::DieFailed { attempt: 1, reason: "transient".into() },
+                OrderEvent::DieFailed {
+                    attempt: 1,
+                    reason: "transient".into(),
+                },
                 OrderEvent::DieStarted, // attempt 2
-                OrderEvent::DieFailed { attempt: 2, reason: "again".into() },
+                OrderEvent::DieFailed {
+                    attempt: 2,
+                    reason: "again".into(),
+                },
                 OrderEvent::DieStarted, // attempt 3
-                OrderEvent::DieFailed { attempt: 3, reason: "last".into() }, // → Failed
+                OrderEvent::DieFailed {
+                    attempt: 3,
+                    reason: "last".into(),
+                }, // → Failed
             ],
         ),
         (
@@ -65,7 +83,9 @@ fn scenarios() -> Vec<(&'static str, Vec<OrderEvent>)> {
                 OrderEvent::Queued,
                 OrderEvent::DieStarted,
                 OrderEvent::DieSucceeded { attempt: 1 },
-                OrderEvent::InspectionFailed { reason: "no-op: empty diff".into() },
+                OrderEvent::InspectionFailed {
+                    reason: "no-op: empty diff".into(),
+                },
             ],
         ),
         (
@@ -75,12 +95,19 @@ fn scenarios() -> Vec<(&'static str, Vec<OrderEvent>)> {
                 OrderEvent::DieStarted,
                 OrderEvent::DieSucceeded { attempt: 1 },
                 OrderEvent::InspectionPassed,
-                OrderEvent::Rejected { intent: "not needed".into() },
+                OrderEvent::Rejected {
+                    intent: "not needed".into(),
+                },
             ],
         ),
         (
             "cancel-early",
-            vec![OrderEvent::Queued, OrderEvent::Canceled { reason: "user".into() }],
+            vec![
+                OrderEvent::Queued,
+                OrderEvent::Canceled {
+                    reason: "user".into(),
+                },
+            ],
         ),
         (
             "unknown-then-confirm",
@@ -89,9 +116,16 @@ fn scenarios() -> Vec<(&'static str, Vec<OrderEvent>)> {
                 OrderEvent::DieStarted,
                 OrderEvent::DieSucceeded { attempt: 1 },
                 OrderEvent::InspectionPassed,
-                OrderEvent::Approved { intent: "ship".into(), artifact_digest: "d2".into() },
-                OrderEvent::PublishUnknown { operation_id: "op-9".into() },
-                OrderEvent::PublishConfirmed { pr_url: "https://pr/2".into() },
+                OrderEvent::Approved {
+                    intent: "ship".into(),
+                    artifact_digest: "d2".into(),
+                },
+                OrderEvent::PublishUnknown {
+                    operation_id: "op-9".into(),
+                },
+                OrderEvent::PublishConfirmed {
+                    pr_url: "https://pr/2".into(),
+                },
             ],
         ),
         (
@@ -161,7 +195,10 @@ fn g1_journal_bytes_identical_direct_vs_engine() {
                 let commit = foundry_workflow::replay::TerminalCommitment {
                     max_seq: rows_now.last().map(|r| r.seq).unwrap_or(0),
                     count: rows_now.len() as i64,
-                    chain_head: rows_now.last().map(|r| r.hash.clone()).unwrap_or_else(|| "GENESIS".into()),
+                    chain_head: rows_now
+                        .last()
+                        .map(|r| r.hash.clone())
+                        .unwrap_or_else(|| "GENESIS".into()),
                 };
                 let last_mine = rows_now.iter().filter(|r| r.order_id == oid).next_back();
                 let ctx = foundry_workflow::replay::ReplayContext {
@@ -189,9 +226,10 @@ fn g1_journal_bytes_identical_direct_vs_engine() {
                     // 스코프는 이벤트에서 실측 (Approved 는 intent+digest,
                     // Rejected 는 intent — 도메인 승인이 소비하는 값).
                     let (intent, digest) = match ev {
-                        foundry_domain::OrderEvent::Approved { intent, artifact_digest } => {
-                            (intent.clone(), artifact_digest.clone())
-                        }
+                        foundry_domain::OrderEvent::Approved {
+                            intent,
+                            artifact_digest,
+                        } => (intent.clone(), artifact_digest.clone()),
                         foundry_domain::OrderEvent::Rejected { intent } => {
                             (intent.clone(), String::new())
                         }
@@ -207,11 +245,15 @@ fn g1_journal_bytes_identical_direct_vs_engine() {
                             }),
                         )
                         .unwrap();
-                    let mut hook =
-                        foundry_workflow::ApprovalLedgerAdapter(ledger_g);
+                    let mut hook = foundry_workflow::ApprovalLedgerAdapter(ledger_g);
                     let _ = engine.dispatch_live(
-                        &oid, "exec-g1", ev, claim,
-                        Some(&foundry_workflow::GrantRef { grant_id: format!("g1-gate-{oid}") }),
+                        &oid,
+                        "exec-g1",
+                        ev,
+                        claim,
+                        Some(&foundry_workflow::GrantRef {
+                            grant_id: format!("g1-gate-{oid}"),
+                        }),
                         &mut hook,
                     );
                 } else {
@@ -228,7 +270,8 @@ fn g1_journal_bytes_identical_direct_vs_engine() {
                 let _ = direct.transition(ev.clone(), direct.attempt().max(1));
             }
             assert_eq!(
-                final_engine, direct.state(),
+                final_engine,
+                direct.state(),
                 "engine internal state must equal direct replay state for {oid}"
             );
         }
@@ -247,10 +290,17 @@ fn g1_journal_bytes_identical_direct_vs_engine() {
     use sha2::Digest as _;
     let ha = format!("{:x}", sha2::Sha256::digest(&bytes_a));
     let hb = format!("{:x}", sha2::Sha256::digest(&bytes_b));
-    assert_eq!(ha, hb, "G1 FAILED: journal bytes differ (direct {ha} vs engine {hb})");
+    assert_eq!(
+        ha, hb,
+        "G1 FAILED: journal bytes differ (direct {ha} vs engine {hb})"
+    );
     // 그리고 저널은 비어있지 않다 (진짜 재생이 일어났다)
     let rows = SqliteLedger::open(&path_a).unwrap().read_all().unwrap();
-    assert!(rows.len() >= 30, "expected a substantial journal, got {}", rows.len());
+    assert!(
+        rows.len() >= 30,
+        "expected a substantial journal, got {}",
+        rows.len()
+    );
     let _ = journaled_a;
 }
 

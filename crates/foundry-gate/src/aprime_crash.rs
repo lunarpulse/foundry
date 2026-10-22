@@ -5,8 +5,8 @@
 //! fail-closed 손실 — apply_intents 감사 증거와 함께).
 
 use crate::common::{actor, approval_event, file_journal, furnace_order};
-use foundry_domain::ports::Ledger as _;
 use foundry_domain::OrderState;
+use foundry_domain::ports::Ledger as _;
 use foundry_workflow::recovery::RecoveryRunner;
 use foundry_workflow::{ApprovalLedgerAdapter as LedgerHook, GrantRef, Outcome, WorkflowEngine};
 
@@ -31,7 +31,10 @@ fn restart_and_assert(
 ) -> foundry_workflow::recovery::RecoveryReport {
     let mut ap = foundry_approval::ApprovalLedger::open(ap_path).unwrap();
     let jr = foundry_ledger::SqliteLedger::open(jr_path).unwrap();
-    assert!(jr.verify_chain().unwrap(), "journal chain verifies after restart");
+    assert!(
+        jr.verify_chain().unwrap(),
+        "journal chain verifies after restart"
+    );
     let mut fresh = WorkflowEngine::embedded_default();
     let report = RecoveryRunner::run(&mut ap, &jr, &mut fresh).unwrap();
     assert!(report.journal_verified, "journal verified in report");
@@ -40,7 +43,10 @@ fn restart_and_assert(
     if !allow_consumed_without_transition {
         let g = ap.get_grant("g-a").unwrap();
         if g.state == foundry_approval::GrantState::Consumed {
-            assert!(has_transition, "CONSUMED without transition — invariant broken");
+            assert!(
+                has_transition,
+                "CONSUMED without transition — invariant broken"
+            );
         }
     }
     report
@@ -56,9 +62,16 @@ fn aprime_p1_crash_after_reserve_recovery_releases() {
     ap.reserve_grant("g-a", &sc("o-a"), "ex", 1).unwrap();
     drop(ap);
     let report = restart_and_assert(&ap_path, &jr_path, false);
-    assert_eq!(report.released, vec!["g-a".to_string()], "pending reservation released");
+    assert_eq!(
+        report.released,
+        vec!["g-a".to_string()],
+        "pending reservation released"
+    );
     let ap = foundry_approval::ApprovalLedger::open(&ap_path).unwrap();
-    assert_eq!(ap.get_grant("g-a").unwrap().state, foundry_approval::GrantState::Issued);
+    assert_eq!(
+        ap.get_grant("g-a").unwrap().state,
+        foundry_approval::GrantState::Issued
+    );
 }
 
 /// ② precheck 실패(해제 경로) — precheck 결격 디스패치는 grant 를 Issued 로.
@@ -72,8 +85,17 @@ fn aprime_p2_precheck_failure_leaves_no_reservation() {
     e.enroll(o);
     e.acquire("o-a2", "ex").unwrap();
     let mut hook = LedgerHook(ap);
-    let grant = GrantRef { grant_id: "g-a".into() };
-    let out = e.dispatch_live("o-a2", "ex", &approval_event("ship", "dig-a"), 1, Some(&grant), &mut hook);
+    let grant = GrantRef {
+        grant_id: "g-a".into(),
+    };
+    let out = e.dispatch_live(
+        "o-a2",
+        "ex",
+        &approval_event("ship", "dig-a"),
+        1,
+        Some(&grant),
+        &mut hook,
+    );
     assert_eq!(out.unwrap(), Outcome::NoEdge);
     assert_eq!(
         hook.0.get_grant("g-a").unwrap().state,
@@ -100,7 +122,10 @@ fn aprime_p3_crash_after_begin_apply_fails_closed() {
         foundry_approval::GrantState::Consumed,
         "APPLYING completed to CONSUMED (fail-closed)"
     );
-    assert!(ap.apply_intent("g-a", "ex", 1).unwrap(), "audit evidence retained");
+    assert!(
+        ap.apply_intent("g-a", "ex", 1).unwrap(),
+        "audit evidence retained"
+    );
 }
 
 /// ④ 전이 적용·finalize 직전 크래시 — **실제 저널 append 후** (astra T56
@@ -113,8 +138,9 @@ fn aprime_p4_crash_before_finalize() {
 
     let jr_path = std::env::temp_dir().join(format!("gate-ap4-j-{}.db", std::process::id()));
     let _ = std::fs::remove_file(&jr_path);
-    let jr_static: &'static mut foundry_ledger::SqliteLedger =
-        Box::leak(Box::new(foundry_ledger::SqliteLedger::open(&jr_path).unwrap()));
+    let jr_static: &'static mut foundry_ledger::SqliteLedger = Box::leak(Box::new(
+        foundry_ledger::SqliteLedger::open(&jr_path).unwrap(),
+    ));
     let mut e = WorkflowEngine::embedded_default();
     e.set_ledger(jr_static, actor("p4"));
     e.set_clock(chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap());
@@ -124,13 +150,23 @@ fn aprime_p4_crash_before_finalize() {
     e.enroll(o);
     e.acquire("o-a", "ex").unwrap();
     use foundry_domain::OrderEvent as OE;
-    for ev in [OE::Queued, OE::DieStarted, OE::DieSucceeded { attempt: 1 }, OE::InspectionPassed] {
+    for ev in [
+        OE::Queued,
+        OE::DieStarted,
+        OE::DieSucceeded { attempt: 1 },
+        OE::InspectionPassed,
+    ] {
         let att = e.order("o-a").unwrap().attempt().max(1);
-        let rows = foundry_ledger::SqliteLedger::open(&jr_path).unwrap().read_all().unwrap();
+        let rows = foundry_ledger::SqliteLedger::open(&jr_path)
+            .unwrap()
+            .read_all()
+            .unwrap();
         let ctx = crate::common::replay_ctx_for("o-a", &rows);
-        let jr_ro: &'static mut foundry_ledger::SqliteLedger =
-            Box::leak(Box::new(foundry_ledger::SqliteLedger::open(&jr_path).unwrap()));
-        e.dispatch_replay_ctx("o-a", "ex", &ev, att, &ctx, jr_ro).unwrap();
+        let jr_ro: &'static mut foundry_ledger::SqliteLedger = Box::leak(Box::new(
+            foundry_ledger::SqliteLedger::open(&jr_path).unwrap(),
+        ));
+        e.dispatch_replay_ctx("o-a", "ex", &ev, att, &ctx, jr_ro)
+            .unwrap();
     }
     // 승인 전이 — dispatch_live 는 begin_apply~finalize 를 원자적으로 마는데,
     // 크래시 지점 재현: reserve+begin_apply 만 수동 수행 후 **전이를 엔진이
@@ -140,10 +176,29 @@ fn aprime_p4_crash_before_finalize() {
     // 전이 적용 (도메인 직접 — 엔진을 거치지 않는 크래시 경계 시뮬레이션).
     drop(e); // 엔진 폐기 — 쓰기 핸들 해제.
     let mut dom = furnace_order("o-a"); // FurnaceHold 현재 상태
-    let to = dom.transition(OE::Approved { intent: "ship".into(), artifact_digest: "dig-a".into() }, 1).unwrap();
+    let to = dom
+        .transition(
+            OE::Approved {
+                intent: "ship".into(),
+                artifact_digest: "dig-a".into(),
+            },
+            1,
+        )
+        .unwrap();
     let mut jr_w = foundry_ledger::SqliteLedger::open(&jr_path).unwrap();
     use foundry_domain::ports::Ledger as _;
-    jr_w.append("o-a", &OE::Approved { intent: "ship".into(), artifact_digest: "dig-a".into() }, foundry_domain::OrderState::FurnaceHold, to, &actor("p4"), chrono::Utc::now()).unwrap();
+    jr_w.append(
+        "o-a",
+        &OE::Approved {
+            intent: "ship".into(),
+            artifact_digest: "dig-a".into(),
+        },
+        foundry_domain::OrderState::FurnaceHold,
+        to,
+        &actor("p4"),
+        chrono::Utc::now(),
+    )
+    .unwrap();
     drop(jr_w);
     drop(ap);
     // 재시작 — 저널 검증·재구축(Publishing)·APPLYING→CONSUMED.
@@ -153,8 +208,16 @@ fn aprime_p4_crash_before_finalize() {
     let mut fresh = WorkflowEngine::embedded_default();
     let report = RecoveryRunner::run(&mut ap2, &jr2, &mut fresh).unwrap();
     assert_eq!(report.rebuilt_orders, 1);
-    assert_eq!(fresh.order("o-a").unwrap().state(), OrderState::Publishing, "transition survived in journal");
-    assert_eq!(ap2.get_grant("g-a").unwrap().state, foundry_approval::GrantState::Consumed, "APPLYING completed — no transition-without-consumption");
+    assert_eq!(
+        fresh.order("o-a").unwrap().state(),
+        OrderState::Publishing,
+        "transition survived in journal"
+    );
+    assert_eq!(
+        ap2.get_grant("g-a").unwrap().state,
+        foundry_approval::GrantState::Consumed,
+        "APPLYING completed — no transition-without-consumption"
+    );
 }
 
 /// ⑤ finalize 커밋 직후 — 이미 CONSUMED: 회복은 무연산 (멱등).
@@ -172,8 +235,14 @@ fn aprime_p5_crash_after_finalize_idempotent() {
     // wired 테스트가 소유. 여기선 회복 멱등성만.
     let _ = restart_and_assert(&ap_path, &jr_path, true);
     let ap = foundry_approval::ApprovalLedger::open(&ap_path).unwrap();
-    assert_eq!(ap.get_grant("g-a").unwrap().state, foundry_approval::GrantState::Consumed);
-    assert!(!ap.apply_intent("g-a", "ex", 1).unwrap(), "intent cleaned after finalize");
+    assert_eq!(
+        ap.get_grant("g-a").unwrap().state,
+        foundry_approval::GrantState::Consumed
+    );
+    assert!(
+        !ap.apply_intent("g-a", "ex", 1).unwrap(),
+        "intent cleaned after finalize"
+    );
 }
 
 /// 교차 경쟁 — X 예약→회복 릴리즈→Y 예약→X 확정 시도 = fence 거부.
@@ -184,10 +253,19 @@ fn aprime_cross_race_fence_refusal() {
     let x = ap.reserve_grant("g-a", &sc("o-a"), "ex-X", 1).unwrap();
     ap.recovery_scan().unwrap();
     let y = ap.reserve_grant("g-a", &sc("o-a"), "ex-Y", 1).unwrap();
-    assert_ne!(x.fence_token, y.fence_token, "new reservation gets a NEW fence");
-    let err = ap.finalize_grant("g-a", "ex-X", 1, x.fence_token).unwrap_err();
+    assert_ne!(
+        x.fence_token, y.fence_token,
+        "new reservation gets a NEW fence"
+    );
+    let err = ap
+        .finalize_grant("g-a", "ex-X", 1, x.fence_token)
+        .unwrap_err();
     assert!(
-        matches!(err, foundry_approval::LedgerError::FenceStale { .. } | foundry_approval::LedgerError::ReservationConflict { .. }),
+        matches!(
+            err,
+            foundry_approval::LedgerError::FenceStale { .. }
+                | foundry_approval::LedgerError::ReservationConflict { .. }
+        ),
         "stale owner fence-refused: {err:?}"
     );
 }
@@ -200,8 +278,9 @@ fn aprime_wired_engine_full_recovery_cycle() {
 
     let jr_path = std::env::temp_dir().join(format!("gate-apw-{}.db", std::process::id()));
     let _ = std::fs::remove_file(&jr_path);
-    let jr_static: &'static mut foundry_ledger::SqliteLedger =
-        Box::leak(Box::new(foundry_ledger::SqliteLedger::open(&jr_path).unwrap()));
+    let jr_static: &'static mut foundry_ledger::SqliteLedger = Box::leak(Box::new(
+        foundry_ledger::SqliteLedger::open(&jr_path).unwrap(),
+    ));
     let mut e = WorkflowEngine::embedded_default();
     e.set_ledger(jr_static, actor("aprime"));
     e.set_clock(chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap());
@@ -212,21 +291,53 @@ fn aprime_wired_engine_full_recovery_cycle() {
     e.enroll(o);
     e.acquire("o-a", "ex").unwrap();
     // 자율 구간 — 커서 소유 재생 경로 (저널 배선이 append).
-    for ev in [OE::Queued, OE::DieStarted, OE::DieSucceeded { attempt: 1 }, OE::InspectionPassed] {
+    for ev in [
+        OE::Queued,
+        OE::DieStarted,
+        OE::DieSucceeded { attempt: 1 },
+        OE::InspectionPassed,
+    ] {
         let att = e.order("o-a").unwrap().attempt().max(1);
-        let ctx = crate::common::replay_ctx_for("o-a", &foundry_ledger::SqliteLedger::open(&jr_path).unwrap().read_all().unwrap());
-        let journal_ro: &'static mut foundry_ledger::SqliteLedger =
-            Box::leak(Box::new(foundry_ledger::SqliteLedger::open(&jr_path).unwrap()));
-        e.dispatch_replay_ctx("o-a", "ex", &ev, att, &ctx, journal_ro).unwrap();
+        let ctx = crate::common::replay_ctx_for(
+            "o-a",
+            &foundry_ledger::SqliteLedger::open(&jr_path)
+                .unwrap()
+                .read_all()
+                .unwrap(),
+        );
+        let journal_ro: &'static mut foundry_ledger::SqliteLedger = Box::leak(Box::new(
+            foundry_ledger::SqliteLedger::open(&jr_path).unwrap(),
+        ));
+        e.dispatch_replay_ctx("o-a", "ex", &ev, att, &ctx, journal_ro)
+            .unwrap();
     }
-    assert_eq!(e.order("o-a").unwrap().state(), OrderState::FurnaceHold, "autonomous leg done");
+    assert_eq!(
+        e.order("o-a").unwrap().state(),
+        OrderState::FurnaceHold,
+        "autonomous leg done"
+    );
     let mut hook = LedgerHook(ap);
-    let grant = GrantRef { grant_id: "g-a".into() };
-    let out = e.dispatch_live("o-a", "ex", &approval_event("ship", "dig-a"), 1, Some(&grant), &mut hook);
+    let grant = GrantRef {
+        grant_id: "g-a".into(),
+    };
+    let out = e.dispatch_live(
+        "o-a",
+        "ex",
+        &approval_event("ship", "dig-a"),
+        1,
+        Some(&grant),
+        &mut hook,
+    );
     assert_eq!(out.unwrap(), Outcome::Applied);
     assert_eq!(e.order("o-a").unwrap().state(), OrderState::Publishing);
-    let rows = foundry_ledger::SqliteLedger::open(&jr_path).unwrap().read_all().unwrap();
-    assert!(rows.iter().any(|r| r.event.contains("Approved")), "approval transition journaled");
+    let rows = foundry_ledger::SqliteLedger::open(&jr_path)
+        .unwrap()
+        .read_all()
+        .unwrap();
+    assert!(
+        rows.iter().any(|r| r.event.contains("Approved")),
+        "approval transition journaled"
+    );
     drop(hook);
 
     let report = restart_and_assert(&ap_path, &jr_path, false);

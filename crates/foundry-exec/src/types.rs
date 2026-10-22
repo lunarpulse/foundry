@@ -122,7 +122,11 @@ impl SessionReceipt {
                 self.session_id.as_str(),
                 self.order.0.as_str(),
                 &self.run.0.to_string(),
-                if self.restored_from.is_some() { "some" } else { "none" },
+                if self.restored_from.is_some() {
+                    "some"
+                } else {
+                    "none"
+                },
                 self.restored_from.as_deref().unwrap_or(""),
                 &self.at.to_rfc3339(),
             ],
@@ -131,7 +135,12 @@ impl SessionReceipt {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "receipt", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(
+    tag = "kind",
+    content = "receipt",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum Receipt {
     /// Complete durable worker output; this receipt does not choose graph routing.
     Host(crate::host::HostResult),

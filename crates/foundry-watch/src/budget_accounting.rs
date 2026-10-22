@@ -32,10 +32,14 @@ impl Amount {
         Amount { points: p }
     }
     pub fn add(self, o: Amount) -> Amount {
-        Amount { points: self.points.saturating_add(o.points) }
+        Amount {
+            points: self.points.saturating_add(o.points),
+        }
     }
     pub fn sub(self, o: Amount) -> Option<Amount> {
-        self.points.checked_sub(o.points).map(|p| Amount { points: p })
+        self.points
+            .checked_sub(o.points)
+            .map(|p| Amount { points: p })
     }
 }
 
@@ -47,9 +51,18 @@ pub enum BudgetEvent {
     /// ["factory","control"]). Control-plane subtrees live OUTSIDE the
     /// workload admission tree by convention: path[1] == "control".
     SetLimit { scope: Vec<String>, amount: Amount },
-    Reserve { id: String, scope: Vec<String>, amount: Amount, epoch: u64 },
+    Reserve {
+        id: String,
+        scope: Vec<String>,
+        amount: Amount,
+        epoch: u64,
+    },
     /// settle a reservation to actual usage (<= reserved normally)
-    Commit { id: String, used: Amount, epoch: u64 },
+    Commit {
+        id: String,
+        used: Amount,
+        epoch: u64,
+    },
     /// give back an uncommitted reservation
     Release { id: String, epoch: u64 },
     /// provider completed/charged AFTER our timeout — reconciled into
@@ -65,26 +78,60 @@ pub enum BudgetEvent {
 impl std::fmt::Display for BudgetError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NoExplicitLimit { scope } => write!(f, "no explicit limit covers {scope:?} — fail closed"),
-            Self::OverLimit { scope, would, limit } => write!(f, "{scope:?}: would use {would} > limit {limit}"),
+            Self::NoExplicitLimit { scope } => {
+                write!(f, "no explicit limit covers {scope:?} — fail closed")
+            }
+            Self::OverLimit {
+                scope,
+                would,
+                limit,
+            } => write!(f, "{scope:?}: would use {would} > limit {limit}"),
             Self::UnknownReservation { id } => write!(f, "unknown reservation {id}"),
-            Self::StaleEpoch { id, got, want } => write!(f, "reservation {id}: stale epoch {got} != {want} (fenced)"),
-            Self::CommitExceedsReservation { id, used, reserved } => write!(f, "{id}: commit {used} > reserved {reserved}"),
-            Self::CancelAfterSettlement { run } => write!(f, "run {run} already settled — not cancellable"),
-            Self::CancelConfirmedWithoutRequest { run } => write!(f, "cancel confirmation without request for {run}"),
+            Self::StaleEpoch { id, got, want } => {
+                write!(f, "reservation {id}: stale epoch {got} != {want} (fenced)")
+            }
+            Self::CommitExceedsReservation { id, used, reserved } => {
+                write!(f, "{id}: commit {used} > reserved {reserved}")
+            }
+            Self::CancelAfterSettlement { run } => {
+                write!(f, "run {run} already settled — not cancellable")
+            }
+            Self::CancelConfirmedWithoutRequest { run } => {
+                write!(f, "cancel confirmation without request for {run}")
+            }
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum BudgetError {
-    NoExplicitLimit { scope: Vec<String> },
-    OverLimit { scope: Vec<String>, would: u64, limit: u64 },
-    UnknownReservation { id: String },
-    StaleEpoch { id: String, got: u64, want: u64 },
-    CommitExceedsReservation { id: String, used: u64, reserved: u64 },
-    CancelAfterSettlement { run: String },
-    CancelConfirmedWithoutRequest { run: String },
+    NoExplicitLimit {
+        scope: Vec<String>,
+    },
+    OverLimit {
+        scope: Vec<String>,
+        would: u64,
+        limit: u64,
+    },
+    UnknownReservation {
+        id: String,
+    },
+    StaleEpoch {
+        id: String,
+        got: u64,
+        want: u64,
+    },
+    CommitExceedsReservation {
+        id: String,
+        used: u64,
+        reserved: u64,
+    },
+    CancelAfterSettlement {
+        run: String,
+    },
+    CancelConfirmedWithoutRequest {
+        run: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -130,9 +177,7 @@ impl BudgetLedger {
     }
 
     fn ancestors(path: &[String]) -> Vec<String> {
-        (1..=path.len())
-            .map(|n| key(&path[..n]))
-            .collect()
+        (1..=path.len()).map(|n| key(&path[..n])).collect()
     }
 
     fn run_key_of(id: &str) -> String {
@@ -171,14 +216,20 @@ impl BudgetLedger {
             .filter(|k| self.limits.contains_key(k))
             .collect();
         if covering.is_empty() {
-            return Err(BudgetError::NoExplicitLimit { scope: scope.to_vec() });
+            return Err(BudgetError::NoExplicitLimit {
+                scope: scope.to_vec(),
+            });
         }
         for k in covering {
             let limit = self.limits[&k].points;
             let used = self.used_against(&k);
             let would = used.saturating_add(amount.points);
             if would > limit {
-                return Err(BudgetError::OverLimit { scope: k.split('/').map(|s| s.to_string()).collect(), would, limit });
+                return Err(BudgetError::OverLimit {
+                    scope: k.split('/').map(|s| s.to_string()).collect(),
+                    would,
+                    limit,
+                });
             }
         }
         Ok(())
@@ -190,11 +241,20 @@ impl BudgetLedger {
                 self.limits.insert(key(&scope), amount);
                 Ok(())
             }
-            BudgetEvent::Reserve { id, scope, amount, epoch } => {
+            BudgetEvent::Reserve {
+                id,
+                scope,
+                amount,
+                epoch,
+            } => {
                 let rk = Self::run_key_of(&id);
                 if let Some(&cur) = self.epochs.get(&rk) {
                     if epoch != cur {
-                        return Err(BudgetError::StaleEpoch { id, got: epoch, want: cur });
+                        return Err(BudgetError::StaleEpoch {
+                            id,
+                            got: epoch,
+                            want: cur,
+                        });
                     }
                 }
                 // control-plane subtree only accepts reserves whose own
@@ -202,9 +262,12 @@ impl BudgetLedger {
                 // capacity: separate admission trees).
                 self.admit(&scope, amount)?;
                 if self.reservations.contains_key(&id) {
-                    return Err(BudgetError::UnknownReservation { id: format!("{id}: duplicate") });
+                    return Err(BudgetError::UnknownReservation {
+                        id: format!("{id}: duplicate"),
+                    });
                 }
-                self.reservations.insert(id, (scope, ResState::Active { reserved: amount }));
+                self.reservations
+                    .insert(id, (scope, ResState::Active { reserved: amount }));
                 Ok(())
             }
             BudgetEvent::Commit { id, used, epoch } => {
@@ -217,20 +280,31 @@ impl BudgetLedger {
                 if let Some(&cur) = self.epochs.get(&rk) {
                     if epoch != cur {
                         // property 5: a commit racing a cancel is fenced
-                        return Err(BudgetError::StaleEpoch { id, got: epoch, want: cur });
+                        return Err(BudgetError::StaleEpoch {
+                            id,
+                            got: epoch,
+                            want: cur,
+                        });
                     }
                 }
                 match st {
                     ResState::Active { reserved } => {
                         if used.points > reserved.points {
-                            return Err(BudgetError::CommitExceedsReservation { id, used: used.points, reserved: reserved.points });
+                            return Err(BudgetError::CommitExceedsReservation {
+                                id,
+                                used: used.points,
+                                reserved: reserved.points,
+                            });
                         }
-                        self.reservations.insert(id, (scope, ResState::Settled { used }));
+                        self.reservations
+                            .insert(id, (scope, ResState::Settled { used }));
                         self.settled_runs.insert(rk);
                         Ok(())
                     }
                     ResState::Settled { .. } | ResState::Released => {
-                        Err(BudgetError::UnknownReservation { id: format!("{id}: already settled") })
+                        Err(BudgetError::UnknownReservation {
+                            id: format!("{id}: already settled"),
+                        })
                     }
                 }
             }
@@ -243,11 +317,17 @@ impl BudgetLedger {
                 let rk = Self::run_key_of(&id);
                 if let Some(&cur) = self.epochs.get(&rk) {
                     if epoch != cur {
-                        return Err(BudgetError::StaleEpoch { id, got: epoch, want: cur });
+                        return Err(BudgetError::StaleEpoch {
+                            id,
+                            got: epoch,
+                            want: cur,
+                        });
                     }
                 }
                 if matches!(st, ResState::Settled { .. }) {
-                    return Err(BudgetError::UnknownReservation { id: format!("{id}: settled, cannot release") });
+                    return Err(BudgetError::UnknownReservation {
+                        id: format!("{id}: settled, cannot release"),
+                    });
                 }
                 self.reservations.insert(id, (scope, ResState::Released));
                 Ok(())
@@ -266,7 +346,11 @@ impl BudgetLedger {
                     }
                 };
                 // charge the deepest non-run scope (the lineage)
-                let lineage = if scope.len() > 1 { key(&scope[..scope.len() - 1]) } else { key(&scope) };
+                let lineage = if scope.len() > 1 {
+                    key(&scope[..scope.len() - 1])
+                } else {
+                    key(&scope)
+                };
                 let entry = self.overdraw.entry(lineage).or_insert(Amount::default());
                 *entry = entry.add(amount);
                 Ok(())
@@ -297,10 +381,20 @@ impl BudgetLedger {
     }
 
     /// convenience: try a reserve, journaling on success
-    pub fn try_reserve(&mut self, id: &str, scope: &[&str], amount: Amount) -> Result<(), BudgetError> {
+    pub fn try_reserve(
+        &mut self,
+        id: &str,
+        scope: &[&str],
+        amount: Amount,
+    ) -> Result<(), BudgetError> {
         let sc: Vec<String> = scope.iter().map(|s| s.to_string()).collect();
         let epoch = *self.epochs.get(&Self::run_key_of(id)).unwrap_or(&0);
-        let e = BudgetEvent::Reserve { id: id.into(), scope: sc, amount, epoch };
+        let e = BudgetEvent::Reserve {
+            id: id.into(),
+            scope: sc,
+            amount,
+            epoch,
+        };
         self.apply(e.clone())?;
         self.journal.push(e);
         Ok(())
@@ -308,7 +402,11 @@ impl BudgetLedger {
 
     pub fn try_commit(&mut self, id: &str, used: Amount) -> Result<(), BudgetError> {
         let epoch = *self.epochs.get(&Self::run_key_of(id)).unwrap_or(&0);
-        let e = BudgetEvent::Commit { id: id.into(), used, epoch };
+        let e = BudgetEvent::Commit {
+            id: id.into(),
+            used,
+            epoch,
+        };
         self.apply(e.clone())?;
         self.journal.push(e);
         Ok(())
@@ -327,7 +425,10 @@ mod tests {
 
     fn ledger_with_factory(pts: u64) -> BudgetLedger {
         let mut l = BudgetLedger::new();
-        let e = BudgetEvent::SetLimit { scope: vec!["factory".into()], amount: Amount::pts(pts) };
+        let e = BudgetEvent::SetLimit {
+            scope: vec!["factory".into()],
+            amount: Amount::pts(pts),
+        };
         l.apply(e.clone()).unwrap();
         l.journal.push(e);
         l
@@ -337,21 +438,60 @@ mod tests {
     fn admission_is_atomic_under_contention() {
         // two overlapping reserves, 60+60 against 100: exactly one fits
         let mut l = ledger_with_factory(100);
-        assert!(l.try_reserve("r1/op", &["factory", "casting", "lineage-a", "run-r1"], Amount::pts(60)).is_ok());
-        let second = l.try_reserve("r2/op", &["factory", "casting", "lineage-b", "run-r2"], Amount::pts(60));
-        assert!(matches!(second, Err(BudgetError::OverLimit { would: 120, limit: 100, .. })),
-            "the SECOND reservation must be the one rejected — no overcommit");
+        assert!(
+            l.try_reserve(
+                "r1/op",
+                &["factory", "casting", "lineage-a", "run-r1"],
+                Amount::pts(60)
+            )
+            .is_ok()
+        );
+        let second = l.try_reserve(
+            "r2/op",
+            &["factory", "casting", "lineage-b", "run-r2"],
+            Amount::pts(60),
+        );
+        assert!(
+            matches!(
+                second,
+                Err(BudgetError::OverLimit {
+                    would: 120,
+                    limit: 100,
+                    ..
+                })
+            ),
+            "the SECOND reservation must be the one rejected — no overcommit"
+        );
     }
 
     #[test]
     fn children_count_against_ancestors() {
         let mut l = ledger_with_factory(100);
         // lineage-level limit 40; two runs under it consume it together
-        l.apply(BudgetEvent::SetLimit { scope: vec!["factory".into(), "casting".into(), "lineage-a".into()], amount: Amount::pts(40) }).unwrap();
-        assert!(l.try_reserve("r1/op", &["factory", "casting", "lineage-a", "run-r1"], Amount::pts(25)).is_ok());
+        l.apply(BudgetEvent::SetLimit {
+            scope: vec!["factory".into(), "casting".into(), "lineage-a".into()],
+            amount: Amount::pts(40),
+        })
+        .unwrap();
+        assert!(
+            l.try_reserve(
+                "r1/op",
+                &["factory", "casting", "lineage-a", "run-r1"],
+                Amount::pts(25)
+            )
+            .is_ok()
+        );
         assert!(matches!(
-            l.try_reserve("r2/op", &["factory", "casting", "lineage-a", "run-r2"], Amount::pts(25)),
-            Err(BudgetError::OverLimit { would: 50, limit: 40, .. })
+            l.try_reserve(
+                "r2/op",
+                &["factory", "casting", "lineage-a", "run-r2"],
+                Amount::pts(25)
+            ),
+            Err(BudgetError::OverLimit {
+                would: 50,
+                limit: 40,
+                ..
+            })
         ));
         assert_eq!(l.available(&["factory", "casting", "lineage-a"]), Some(15));
     }
@@ -361,12 +501,25 @@ mod tests {
         // the evasion: burn the lineage limit, "retry" with a fresh
         // run id hoping for a clean slate. Rolling limits say no.
         let mut l = ledger_with_factory(1000);
-        l.apply(BudgetEvent::SetLimit { scope: vec!["factory".into(), "casting".into(), "lineage-x".into()], amount: Amount::pts(100) }).unwrap();
-        l.try_reserve("r1/all", &["factory", "casting", "lineage-x", "run-r1"], Amount::pts(100)).unwrap();
+        l.apply(BudgetEvent::SetLimit {
+            scope: vec!["factory".into(), "casting".into(), "lineage-x".into()],
+            amount: Amount::pts(100),
+        })
+        .unwrap();
+        l.try_reserve(
+            "r1/all",
+            &["factory", "casting", "lineage-x", "run-r1"],
+            Amount::pts(100),
+        )
+        .unwrap();
         l.try_commit("r1/all", Amount::pts(100)).unwrap();
         // retry with a NEW run id — usage lives at the lineage, sticks
         assert!(matches!(
-            l.try_reserve("r999/fresh", &["factory", "casting", "lineage-x", "run-r999"], Amount::pts(1)),
+            l.try_reserve(
+                "r999/fresh",
+                &["factory", "casting", "lineage-x", "run-r999"],
+                Amount::pts(1)
+            ),
             Err(BudgetError::OverLimit { limit: 100, .. })
         ));
     }
@@ -374,11 +527,16 @@ mod tests {
     #[test]
     fn rehydration_after_restart_binds_the_same() {
         let mut l = ledger_with_factory(100);
-        l.try_reserve("r1/op", &["factory", "casting", "run-r1"], Amount::pts(70)).unwrap();
+        l.try_reserve("r1/op", &["factory", "casting", "run-r1"], Amount::pts(70))
+            .unwrap();
         let log = l.journal.clone();
         // process dies; a new one replays
         let mut l2 = BudgetLedger::rehydrate(&log).unwrap();
-        assert_eq!(l2.available(&["factory"]), Some(30), "reservations survive restart");
+        assert_eq!(
+            l2.available(&["factory"]),
+            Some(30),
+            "reservations survive restart"
+        );
         assert!(matches!(
             l2.try_reserve("r2/op", &["factory", "casting", "run-r2"], Amount::pts(31)),
             Err(BudgetError::OverLimit { .. })
@@ -387,22 +545,42 @@ mod tests {
         let mut truncated = log.clone();
         truncated.pop();
         let l3 = BudgetLedger::rehydrate(&truncated).unwrap();
-        assert_eq!(l3.available(&["factory"]), Some(100), "truncated log rehydrates to LESS state — the gap is the point: journal completeness is the caller's chain contract (T49a)");
+        assert_eq!(
+            l3.available(&["factory"]),
+            Some(100),
+            "truncated log rehydrates to LESS state — the gap is the point: journal completeness is the caller's chain contract (T49a)"
+        );
     }
 
     #[test]
     fn post_timeout_charge_is_reconciled_not_dropped() {
         let mut l = ledger_with_factory(100);
-        l.try_reserve("r1/op", &["factory", "casting", "lineage-t", "run-r1"], Amount::pts(50)).unwrap();
+        l.try_reserve(
+            "r1/op",
+            &["factory", "casting", "lineage-t", "run-r1"],
+            Amount::pts(50),
+        )
+        .unwrap();
         l.try_commit("r1/op", Amount::pts(50)).unwrap();
         // provider finishes AFTER our timeout and charges 20 more
-        let e = BudgetEvent::TimeoutCharge { id: "r1/op".into(), amount: Amount::pts(20) };
+        let e = BudgetEvent::TimeoutCharge {
+            id: "r1/op".into(),
+            amount: Amount::pts(20),
+        };
         l.apply(e.clone()).unwrap();
         l.journal.push(e);
         // the overdraw lands on the lineage and eats future capacity
         assert!(matches!(
-            l.try_reserve("r2/op", &["factory", "casting", "lineage-t", "run-r2"], Amount::pts(31)),
-            Err(BudgetError::OverLimit { would: 101, limit: 100, .. })
+            l.try_reserve(
+                "r2/op",
+                &["factory", "casting", "lineage-t", "run-r2"],
+                Amount::pts(31)
+            ),
+            Err(BudgetError::OverLimit {
+                would: 101,
+                limit: 100,
+                ..
+            })
         ));
         // 30 remains at factory level: 100 - (50 committed + 20 overdraw)
         assert_eq!(l.available(&["factory"]), Some(30));
@@ -411,20 +589,26 @@ mod tests {
     #[test]
     fn cancel_request_is_not_confirmation() {
         let mut l = ledger_with_factory(100);
-        l.try_reserve("r1/op", &["factory", "casting", "run-r1"], Amount::pts(10)).unwrap();
+        l.try_reserve("r1/op", &["factory", "casting", "run-r1"], Amount::pts(10))
+            .unwrap();
         // confirm without request: refused
         assert!(matches!(
             l.apply(BudgetEvent::CancelConfirmed { run: "r1".into() }),
             Err(BudgetError::CancelConfirmedWithoutRequest { .. })
         ));
-        l.apply(BudgetEvent::CancelRequest { run: "r1".into() }).unwrap();
+        l.apply(BudgetEvent::CancelRequest { run: "r1".into() })
+            .unwrap();
         // request alone does NOT free capacity
         assert_eq!(l.available(&["factory"]), Some(90));
-        l.apply(BudgetEvent::CancelConfirmed { run: "r1".into() }).unwrap();
+        l.apply(BudgetEvent::CancelConfirmed { run: "r1".into() })
+            .unwrap();
         // still held until release/settle: confirmation kills the RUN
         // (fences commits), the accounting entry is settled by the
         // reaper via Release with the NEW epoch
-        let e = BudgetEvent::Release { id: "r1/op".into(), epoch: 1 };
+        let e = BudgetEvent::Release {
+            id: "r1/op".into(),
+            epoch: 1,
+        };
         l.apply(e.clone()).unwrap();
         l.journal.push(e);
         assert_eq!(l.available(&["factory"]), Some(100));
@@ -433,28 +617,41 @@ mod tests {
     #[test]
     fn late_commit_is_fenced_by_epoch() {
         let mut l = ledger_with_factory(100);
-        l.try_reserve("r1/op", &["factory", "casting", "run-r1"], Amount::pts(10)).unwrap();
-        l.apply(BudgetEvent::CancelRequest { run: "r1".into() }).unwrap(); // epoch 0 -> 1
+        l.try_reserve("r1/op", &["factory", "casting", "run-r1"], Amount::pts(10))
+            .unwrap();
+        l.apply(BudgetEvent::CancelRequest { run: "r1".into() })
+            .unwrap(); // epoch 0 -> 1
         // in-flight commit carrying the PRE-cancel epoch (0): fenced.
         // try_commit() fetches the current epoch by design; the racing
         // commit is one captured BEFORE the cancel, so we replay the
         // raw event with its stale epoch.
-        let stale = BudgetEvent::Commit { id: "r1/op".into(), used: Amount::pts(5), epoch: 0 };
+        let stale = BudgetEvent::Commit {
+            id: "r1/op".into(),
+            used: Amount::pts(5),
+            epoch: 0,
+        };
         assert!(matches!(
             l.apply(stale),
-            Err(BudgetError::StaleEpoch { got: 0, want: 1, .. })
+            Err(BudgetError::StaleEpoch {
+                got: 0,
+                want: 1,
+                ..
+            })
         ));
         // cancel is idempotent: a second request is a no-op-ish bump,
         // and confirming once is enough
-        l.apply(BudgetEvent::CancelConfirmed { run: "r1".into() }).unwrap();
-        l.apply(BudgetEvent::CancelConfirmed { run: "r1".into() }).unwrap();
+        l.apply(BudgetEvent::CancelConfirmed { run: "r1".into() })
+            .unwrap();
+        l.apply(BudgetEvent::CancelConfirmed { run: "r1".into() })
+            .unwrap();
     }
 
     #[test]
     fn cancel_vs_promotion_linearized() {
         // promotion settles the run: cancel afterwards is refused
         let mut l = ledger_with_factory(100);
-        l.try_reserve("r1/op", &["factory", "casting", "run-r1"], Amount::pts(10)).unwrap();
+        l.try_reserve("r1/op", &["factory", "casting", "run-r1"], Amount::pts(10))
+            .unwrap();
         l.try_commit("r1/op", Amount::pts(10)).unwrap(); // settled = promoted/published
         assert!(matches!(
             l.apply(BudgetEvent::CancelRequest { run: "r1".into() }),
@@ -465,10 +662,19 @@ mod tests {
     #[test]
     fn control_plane_capacity_survives_workload_exhaustion() {
         let mut l = BudgetLedger::new();
-        l.apply(BudgetEvent::SetLimit { scope: vec!["factory".into()], amount: Amount::pts(100) }).unwrap();
-        l.apply(BudgetEvent::SetLimit { scope: vec!["factory".into(), "control".into()], amount: Amount::pts(10) }).unwrap();
+        l.apply(BudgetEvent::SetLimit {
+            scope: vec!["factory".into()],
+            amount: Amount::pts(100),
+        })
+        .unwrap();
+        l.apply(BudgetEvent::SetLimit {
+            scope: vec!["factory".into(), "control".into()],
+            amount: Amount::pts(10),
+        })
+        .unwrap();
         // workloads exhaust the factory's workload headroom...
-        l.try_reserve("r1/a", &["factory", "casting", "run-r1"], Amount::pts(90)).unwrap();
+        l.try_reserve("r1/a", &["factory", "casting", "run-r1"], Amount::pts(90))
+            .unwrap();
         assert!(matches!(
             l.try_reserve("r2/a", &["factory", "casting", "run-r2"], Amount::pts(11)),
             Err(BudgetError::OverLimit { .. })
@@ -477,11 +683,22 @@ mod tests {
         // control reserves are checked against the control limit AND
         // factory: 90 + 10 <= 100 — the reserve DENSITY was planned so
         // the control subtree always fits. Pin that planning invariant:
-        assert!(l.try_reserve("ctl/auth-1", &["factory", "control", "auth"], Amount::pts(10)).is_ok(),
-            "control-plane admission must survive workload exhaustion");
+        assert!(
+            l.try_reserve(
+                "ctl/auth-1",
+                &["factory", "control", "auth"],
+                Amount::pts(10)
+            )
+            .is_ok(),
+            "control-plane admission must survive workload exhaustion"
+        );
         // and a workload cannot hide inside the control subtree
         assert!(matches!(
-            l.try_reserve("r3/sneaky", &["factory", "control", "casting"], Amount::pts(1)),
+            l.try_reserve(
+                "r3/sneaky",
+                &["factory", "control", "casting"],
+                Amount::pts(1)
+            ),
             Err(BudgetError::OverLimit { .. })
         ));
     }
@@ -498,10 +715,15 @@ mod tests {
     #[test]
     fn commit_cannot_exceed_reservation() {
         let mut l = ledger_with_factory(100);
-        l.try_reserve("r1/op", &["factory", "casting", "run-r1"], Amount::pts(10)).unwrap();
+        l.try_reserve("r1/op", &["factory", "casting", "run-r1"], Amount::pts(10))
+            .unwrap();
         assert!(matches!(
             l.try_commit("r1/op", Amount::pts(11)),
-            Err(BudgetError::CommitExceedsReservation { used: 11, reserved: 10, .. })
+            Err(BudgetError::CommitExceedsReservation {
+                used: 11,
+                reserved: 10,
+                ..
+            })
         ));
     }
 }

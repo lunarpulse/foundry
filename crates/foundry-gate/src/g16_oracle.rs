@@ -22,19 +22,34 @@ mod oracle {
 
     /// 성공 경로 기대치 — 유효 grant + 올바른 스코프.
     pub fn success() -> Expectation {
-        Expectation { applied: true, final_state: "publishing", grant_consumed: true, fence_used: 1 }
+        Expectation {
+            applied: true,
+            final_state: "publishing",
+            grant_consumed: true,
+            fence_used: 1,
+        }
     }
 
     /// 거부 경로 기대치 — grant 부재/타스코프: 전이 없음·소비 없음.
     pub fn refusal() -> Expectation {
-        Expectation { applied: false, final_state: "furnace_hold", grant_consumed: false, fence_used: 0 }
+        Expectation {
+            applied: false,
+            final_state: "furnace_hold",
+            grant_consumed: false,
+            fence_used: 0,
+        }
     }
 
     /// 회복 경로 기대치 — 크래시 후 APPLYING 은 CONSUMED 로 완결 (fail-closed).
     /// fence_used 는 '기대 고정값'이 아니라 **단조성 기준점** 으로 사용
     /// (전역 카운터 — 첫 예약이 항상 1은 아님).
     pub fn recovery() -> Expectation {
-        Expectation { applied: true, final_state: "publishing", grant_consumed: true, fence_used: 0 }
+        Expectation {
+            applied: true,
+            final_state: "publishing",
+            grant_consumed: true,
+            fence_used: 0,
+        }
     }
 }
 
@@ -62,10 +77,25 @@ fn g16_success_path_matches_oracle() {
     let mut ledger = foundry_approval::ApprovalLedger::open_in_memory().unwrap();
     ledger.issue_grant("g-s", "tok-s", &sc("g16-s")).unwrap();
     let mut hook = LedgerHook(ledger);
-    let grant = GrantRef { grant_id: "g-s".into() };
-    let out = e.dispatch_live("g16-s", "ex", &approval_event("ship", "dig-1"), 1, Some(&grant), &mut hook);
-    assert_eq!(out.unwrap() == foundry_workflow::Outcome::Applied, expect.applied);
-    assert_eq!(state_name(e.order("g16-s").unwrap().state()), expect.final_state);
+    let grant = GrantRef {
+        grant_id: "g-s".into(),
+    };
+    let out = e.dispatch_live(
+        "g16-s",
+        "ex",
+        &approval_event("ship", "dig-1"),
+        1,
+        Some(&grant),
+        &mut hook,
+    );
+    assert_eq!(
+        out.unwrap() == foundry_workflow::Outcome::Applied,
+        expect.applied
+    );
+    assert_eq!(
+        state_name(e.order("g16-s").unwrap().state()),
+        expect.final_state
+    );
     assert_eq!(
         hook.0.get_grant("g-s").unwrap().state == foundry_approval::GrantState::Consumed,
         expect.grant_consumed
@@ -80,9 +110,19 @@ fn g16_refusal_path_matches_oracle() {
     e.enroll(furnace_order("g16-r"));
     e.acquire("g16-r", "ex").unwrap();
     let mut hook = LedgerHook(foundry_approval::ApprovalLedger::open_in_memory().unwrap());
-    let r = e.dispatch_live("g16-r", "ex", &approval_event("ship", "dig-1"), 1, None, &mut hook);
+    let r = e.dispatch_live(
+        "g16-r",
+        "ex",
+        &approval_event("ship", "dig-1"),
+        1,
+        None,
+        &mut hook,
+    );
     assert!(r.is_err(), "refused");
-    assert_eq!(state_name(e.order("g16-r").unwrap().state()), expect.final_state);
+    assert_eq!(
+        state_name(e.order("g16-r").unwrap().state()),
+        expect.final_state
+    );
 }
 
 /// 회복 경로 — begin_apply 커밋 후 "크래시": 회복은 CONSUMED 완결.
@@ -92,7 +132,11 @@ fn g16_recovery_path_matches_oracle() {
     let mut ledger = foundry_approval::ApprovalLedger::open_in_memory().unwrap();
     ledger.issue_grant("g-c", "tok-c", &sc("g16-c")).unwrap();
     let r = ledger.reserve_grant("g-c", &sc("g16-c"), "ex", 1).unwrap();
-    assert!(r.fence_token >= 1, "fence is positive and monotonic (got {})", r.fence_token);
+    assert!(
+        r.fence_token >= 1,
+        "fence is positive and monotonic (got {})",
+        r.fence_token
+    );
     ledger.begin_apply("g-c", "ex", 1, r.fence_token).unwrap();
     // "크래시" — finalize 없이 회복 스캔.
     let released = ledger.recovery_scan().unwrap();

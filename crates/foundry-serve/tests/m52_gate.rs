@@ -18,14 +18,14 @@ static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct FastHasher;
 impl foundry_serve::identity::PasswordHasher for FastHasher {
-    fn hash(&self, pw: &str) -> String {
+    fn hash(&self, pw: &str) -> Result<String, String> {
         use sha2::Digest as _;
         let mut h = sha2::Sha256::new();
         h.update(pw.as_bytes());
-        format!("{:x}", h.finalize())
+        Ok(format!("{:x}", h.finalize()))
     }
-    fn verify(&self, pw: &str, hash: &str) -> bool {
-        self.hash(pw) == hash
+    fn verify(&self, pw: &str, hash: &str) -> Result<bool, String> {
+        Ok(self.hash(pw)? == hash)
     }
 }
 
@@ -62,8 +62,10 @@ async fn ctx() -> Ctx {
     // owner + live session (V4: roles never ride the request)
     let token = {
         let mut id = st.identity.lock().await;
-        id.bootstrap_owner("owner-1", "correct horse battery staple", &FastHasher).unwrap();
-        id.login("owner-1", "correct horse battery staple", &FastHasher, 3600).unwrap()
+        id.bootstrap_owner("owner-1", "correct horse battery staple", &FastHasher)
+            .unwrap();
+        id.login("owner-1", "correct horse battery staple", &FastHasher, 3600)
+            .unwrap()
     };
     Ctx { st, dir, token }
 }
@@ -122,7 +124,9 @@ async fn v1_write_ahead_ordering_over_http() {
                 evidence: e,
                 proposal: Some(PolicyDiff {
                     target: "poll_interval".into(),
-                    changes: [("max_retries".to_string(), "2".to_string())].into_iter().collect(),
+                    changes: [("max_retries".to_string(), "2".to_string())]
+                        .into_iter()
+                        .collect(),
                 }),
                 prediction: Some(Prediction {
                     metric: "retry_rate_by_task_class".into(),
@@ -134,21 +138,40 @@ async fn v1_write_ahead_ordering_over_http() {
             })
             .expect("honest claim passes the real reader");
         // digest computed from the SAME production pipeline
-        let digest = foundry_watch::command_binding::HardenedApply::command_digest_for(&pipeline, "I1", 0).unwrap();
+        let digest =
+            foundry_watch::command_binding::HardenedApply::command_digest_for(&pipeline, "I1", 0)
+                .unwrap();
         let body = CMD_JSON.replace("prop-gate", &digest);
         drop(pipeline);
         let (code, msg) = post(&c.st, Some(&c.token), &body).await;
-        assert_eq!(code, StatusCode::OK, "owner session applies policy over HTTP: {msg}");
+        assert_eq!(
+            code,
+            StatusCode::OK,
+            "owner session applies policy over HTTP: {msg}"
+        );
     }
     // journal: Pending(seq a) BEFORE Committed(seq b), real timestamps
     {
         let coord = c.st.policy.coordinator.lock().await;
         let stream = coord.replay().unwrap();
-        assert!(stream.len() >= 2, "intent+effect pair on the journal: {:?}", stream);
+        assert!(
+            stream.len() >= 2,
+            "intent+effect pair on the journal: {:?}",
+            stream
+        );
         let phases: Vec<&Phase> = stream.iter().map(|e| &e.phase).collect();
-        let i_pending = phases.iter().position(|p| matches!(p, Phase::Pending)).expect("Pending exists");
-        let i_committed = phases.iter().position(|p| matches!(p, Phase::Committed)).expect("Committed exists");
-        assert!(i_pending < i_committed, "N1: intent precedes effect (write-ahead)");
+        let i_pending = phases
+            .iter()
+            .position(|p| matches!(p, Phase::Pending))
+            .expect("Pending exists");
+        let i_committed = phases
+            .iter()
+            .position(|p| matches!(p, Phase::Committed))
+            .expect("Committed exists");
+        assert!(
+            i_pending < i_committed,
+            "N1: intent precedes effect (write-ahead)"
+        );
         assert!(stream[i_pending].seq < stream[i_committed].seq);
         assert!(
             !stream[i_pending].at.contains("T00:00:00"),
@@ -165,16 +188,30 @@ async fn v2_principals_never_ride_the_request() {
     // inert: this very request SUCCEEDS as owner despite claiming
     // Observer, proving the body fields are not consulted.
     let c = ctx().await;
-    assert!(CMD_JSON.contains("\"role\":\"Observer\""), "fixture claims Observer");
+    assert!(
+        CMD_JSON.contains("\"role\":\"Observer\""),
+        "fixture claims Observer"
+    );
     let (code, msg) = post(&c.st, Some(&c.token), CMD_JSON).await;
     // unknown digest -> refused DOWNSTREAM of auth: the refusal
     // message proves we passed the owner gate (not a role refusal)
-    assert_ne!(code, StatusCode::FORBIDDEN, "Observer-in-body must NOT cause 403: {msg}");
+    assert_ne!(
+        code,
+        StatusCode::FORBIDDEN,
+        "Observer-in-body must NOT cause 403: {msg}"
+    );
     {
         let coord = c.st.policy.coordinator.lock().await;
         for e in coord.replay().unwrap() {
-            assert!(e.actor.contains("owner-1"), "journal actor is the session principal: {}", e.actor);
-            assert!(!e.actor.contains("WHOMEVER"), "body approver never reaches the journal");
+            assert!(
+                e.actor.contains("owner-1"),
+                "journal actor is the session principal: {}",
+                e.actor
+            );
+            assert!(
+                !e.actor.contains("WHOMEVER"),
+                "body approver never reaches the journal"
+            );
         }
     }
 }
@@ -189,7 +226,11 @@ async fn v3_route_registered_and_guards() {
     let (code2, _) = post(&c.st, Some("forged-token"), CMD_JSON).await;
     assert_eq!(code2, StatusCode::UNAUTHORIZED, "forged session: 401");
     let coord = c.st.policy.coordinator.lock().await;
-    assert_eq!(coord.replay().unwrap().len(), 0, "zero journal events without a live session");
+    assert_eq!(
+        coord.replay().unwrap().len(),
+        0,
+        "zero journal events without a live session"
+    );
 }
 
 #[tokio::test]
@@ -224,7 +265,9 @@ async fn v4_real_reader_backs_the_pipeline() {
         evidence: e,
         proposal: Some(PolicyDiff {
             target: "poll_interval".into(),
-            changes: [("max_retries".to_string(), "99".to_string())].into_iter().collect(),
+            changes: [("max_retries".to_string(), "99".to_string())]
+                .into_iter()
+                .collect(),
         }),
         prediction: Some(Prediction {
             metric: "retry_rate_by_task_class".into(),
@@ -234,7 +277,11 @@ async fn v4_real_reader_backs_the_pipeline() {
         }),
         n: 20,
     });
-    assert!(res.is_err(), "false ledger-head claim REFUSED by the real reader: {:?}", res.err());
+    assert!(
+        res.is_err(),
+        "false ledger-head claim REFUSED by the real reader: {:?}",
+        res.err()
+    );
 }
 
 #[tokio::test]
@@ -281,7 +328,10 @@ async fn v5_chain_head_pins_content() {
     .unwrap();
     let err = foundry_watch::audit_precision::audit(&fake, &pin).unwrap_err();
     assert!(
-        matches!(&err, foundry_watch::audit_precision::AuditError::ContentSubstitution { .. }),
+        matches!(
+            &err,
+            foundry_watch::audit_precision::AuditError::ContentSubstitution { .. }
+        ),
         "same-shape substitution named: {err:?}"
     );
 }
@@ -309,7 +359,10 @@ async fn v6_governance_db_is_the_production_journal() {
     let path = c.dir.join("gov.db");
     assert!(path.exists(), "journal file exists on disk");
     let reopened = GovernanceCoordinator::open(&path).unwrap();
-    assert!(reopened.replay().unwrap().iter().any(|e| e.op_id == "dur"), "durable across reopen");
+    assert!(
+        reopened.replay().unwrap().iter().any(|e| e.op_id == "dur"),
+        "durable across reopen"
+    );
 }
 
 use foundry_watch::coordinator::GovernanceCoordinator;
@@ -325,11 +378,23 @@ async fn v7_v8_summary() {
     // V8: linearization + group-kill covered by t60g tests.
     let t56 = include_str!("../../foundry-watch/tests/t56w_docker_mandatory.rs");
     assert!(t56.contains("probe-done"), "probe sentinel present");
-    assert!(!t56.contains(".unwrap_or_default()"), "N3 regression: unwrap_or_default back in t56w");
+    assert!(
+        !t56.contains(".unwrap_or_default()"),
+        "N3 regression: unwrap_or_default back in t56w"
+    );
     let t60g = include_str!("../../foundry-watch/tests/t60g_stress_linearization.rs");
     assert!(t60g.contains("exactly ONE promotion wins"), "L1a present");
-    assert!(t60g.contains("-{pgid}") || t60g.contains("kill"), "group kill present");
+    assert!(
+        t60g.contains("-{pgid}") || t60g.contains("kill"),
+        "group kill present"
+    );
     let main_rs = include_str!("../../foundry/src/main.rs");
-    assert!(main_rs.contains("profile_from_bundle"), "casting main wired through the routing layer");
-    assert!(main_rs.contains("LegacyNotPromotable") || main_rs.contains("legacy_profile"), "legacy route journaled");
+    assert!(
+        main_rs.contains("profile_from_bundle"),
+        "casting main wired through the routing layer"
+    );
+    assert!(
+        main_rs.contains("LegacyNotPromotable") || main_rs.contains("legacy_profile"),
+        "legacy route journaled"
+    );
 }

@@ -17,14 +17,14 @@ use std::collections::BTreeMap;
 
 use foundry_watch::budget_accounting::{Amount, BudgetEvent, BudgetLedger};
 use foundry_watch::bundles::{BundleProfile, BundleStore, CandidateBundle, DependencyPins};
-use foundry_watch::evaluation_protocol::{frozen_policy_graph, frozen_protocol_v1, Partition};
-use foundry_watch::governance_events::{
-    recover, verify_stream, GovernanceEvent, OpKind, Phase,
-};
+use foundry_watch::evaluation_protocol::{Partition, frozen_policy_graph, frozen_protocol_v1};
+use foundry_watch::governance_events::{GovernanceEvent, OpKind, Phase, recover, verify_stream};
 use foundry_watch::integration_eval::{FinalEvaluationInput, IntegrationGate, ItemResult};
 use foundry_watch::lessons::{ApprovalRef, BundleIndex, LessonSealInput, LessonStore};
 use foundry_watch::policy_apply::{ApplyCommand, PolicyApplicationLayer, Role};
-use foundry_watch::retro::{EvidenceEnvelope, InsightPipeline, InsightRecord, PolicyDiff, Prediction, QueryCatalog};
+use foundry_watch::retro::{
+    EvidenceEnvelope, InsightPipeline, InsightRecord, PolicyDiff, Prediction, QueryCatalog,
+};
 use foundry_watch::synthesis::{SynthesisRequest, Synthesizer};
 
 // ---- fixtures -------------------------------------------------------------
@@ -42,7 +42,10 @@ fn protocol() -> foundry_watch::evaluation_protocol::EvaluationProtocol {
 
 fn sealed_lessons() -> LessonStore {
     let mut s = LessonStore::new();
-    for (id, content) in [("L1", "prefer map_err over unwrap"), ("L2", "keep diffs minimal")] {
+    for (id, content) in [
+        ("L1", "prefer map_err over unwrap"),
+        ("L2", "keep diffs minimal"),
+    ] {
         let _ = s.seal(
             LessonSealInput {
                 lesson_id: id.into(),
@@ -70,9 +73,15 @@ fn sealed_lessons() -> LessonStore {
 
 struct NoBundles;
 impl BundleIndex for NoBundles {
-    fn lessons_of_candidate(&self, _: &str) -> Vec<String> { vec![] }
-    fn token_binding(&self, _: &str) -> Option<String> { None }
-    fn active_candidates(&self) -> Vec<String> { vec![] }
+    fn lessons_of_candidate(&self, _: &str) -> Vec<String> {
+        vec![]
+    }
+    fn token_binding(&self, _: &str) -> Option<String> {
+        None
+    }
+    fn active_candidates(&self) -> Vec<String> {
+        vec![]
+    }
 }
 
 fn pins() -> DependencyPins {
@@ -122,7 +131,8 @@ fn run_lifecycle() -> Vec<GovernanceEvent> {
     let mut bundles = BundleStore::default();
     let mut synth_journal = Vec::new();
     {
-        let mut synth = Synthesizer::new(&lessons, &p, &mut budgets, &mut bundles, &mut synth_journal);
+        let mut synth =
+            Synthesizer::new(&lessons, &p, &mut budgets, &mut bundles, &mut synth_journal);
         synth
             .synthesize(
                 &SynthesisRequest {
@@ -146,11 +156,7 @@ fn run_lifecycle() -> Vec<GovernanceEvent> {
     }
 
     // 3. final evaluation over the holdout — promotable
-    let digest = bundles
-        .by_digest_keys()
-        .into_iter()
-        .next()
-        .unwrap();
+    let digest = bundles.by_digest_keys().into_iter().next().unwrap();
     let mut eval_journal = Vec::new();
     {
         let mut gate = IntegrationGate::new(&p, &bundles, &mut eval_journal);
@@ -159,7 +165,11 @@ fn run_lifecycle() -> Vec<GovernanceEvent> {
                 bundle_digest: digest.clone(),
                 items: ["m-hold-1", "m-hold-2", "m-hold-3"]
                     .iter()
-                    .map(|m| ItemResult { manifest: (*m).into(), passed: true, output_excerpt: format!("out {m}") })
+                    .map(|m| ItemResult {
+                        manifest: (*m).into(),
+                        passed: true,
+                        output_excerpt: format!("out {m}"),
+                    })
                     .collect(),
                 new_serious_failure_classes: vec![],
                 shipped_to_failed_regressions: 0,
@@ -167,7 +177,10 @@ fn run_lifecycle() -> Vec<GovernanceEvent> {
                 min_coverage: 0.8,
             })
             .unwrap();
-        assert_eq!(out.verdict, foundry_watch::integration_eval::IntegrationVerdict::Promotable);
+        assert_eq!(
+            out.verdict,
+            foundry_watch::integration_eval::IntegrationVerdict::Promotable
+        );
     }
 
     // 4. retro: a Supported insight on an Operational target, applied by owner
@@ -195,7 +208,9 @@ fn run_lifecycle() -> Vec<GovernanceEvent> {
             evidence: env,
             proposal: Some(PolicyDiff {
                 target: "poll_interval".into(),
-                changes: [("max_retries".to_string(), "2".to_string())].into_iter().collect(),
+                changes: [("max_retries".to_string(), "2".to_string())]
+                    .into_iter()
+                    .collect(),
             }),
             prediction: Some(Prediction {
                 metric: "retry_rate_by_task_class".into(),
@@ -256,11 +271,17 @@ fn run_lifecycle() -> Vec<GovernanceEvent> {
 #[test]
 fn a_full_lifecycle_merges_into_one_valid_journal() {
     let j = run_lifecycle();
-    assert!(j.len() >= 10, "a full lifecycle produces a real journal: {} events", j.len());
+    assert!(
+        j.len() >= 10,
+        "a full lifecycle produces a real journal: {} events",
+        j.len()
+    );
     let states = verify_stream(&j).expect("the merged M5 journal verifies");
     // nothing left pending at the end of a clean run
     assert!(
-        states.iter().all(|s| !matches!(s, foundry_watch::governance_events::OpState::Pending { .. })),
+        states
+            .iter()
+            .all(|s| !matches!(s, foundry_watch::governance_events::OpState::Pending { .. })),
         "clean run leaves no pending intents"
     );
     // every op kind the lifecycle touched appears
@@ -294,19 +315,34 @@ fn b_crash_at_every_prefix_is_detectable_and_recoverable() {
                     .filter(|e| e.phase == Phase::Pending)
                     .filter(|e| {
                         // pending = its op_id never saw an effect
-                        !prefix.iter().any(|f| f.op_id == e.op_id && f.phase != Phase::Pending)
+                        !prefix
+                            .iter()
+                            .any(|f| f.op_id == e.op_id && f.phase != Phase::Pending)
                     })
                     .collect();
                 for pe in pending {
                     let r = recover(pe, (prefix.len() + 1) as i64);
                     match pe.op {
                         // human-bound effects NEVER auto-apply
-                        OpKind::PolicyApplication | OpKind::CandidateActivate | OpKind::LessonSeal | OpKind::LessonRevoke => {
-                            assert_eq!(r.phase, Phase::Aborted, "crash-cut {cut}: {} must AbortAndSurface", pe.op_id);
+                        OpKind::PolicyApplication
+                        | OpKind::CandidateActivate
+                        | OpKind::LessonSeal
+                        | OpKind::LessonRevoke => {
+                            assert_eq!(
+                                r.phase,
+                                Phase::Aborted,
+                                "crash-cut {cut}: {} must AbortAndSurface",
+                                pe.op_id
+                            );
                         }
                         // idempotent effects roll forward deterministically
                         OpKind::PredictionScore => {
-                            assert_eq!(r.phase, Phase::Committed, "crash-cut {cut}: {} rolls forward", pe.op_id);
+                            assert_eq!(
+                                r.phase,
+                                Phase::Committed,
+                                "crash-cut {cut}: {} rolls forward",
+                                pe.op_id
+                            );
                         }
                         _ => {}
                     }
@@ -358,23 +394,37 @@ fn c_single_byte_tamper_anywhere_is_detected() {
                 honest != *states
             }
         };
-        assert!(differs, "tamper at event {i} (payload) must not verify identically");
+        assert!(
+            differs,
+            "tamper at event {i} (payload) must not verify identically"
+        );
     }
     // and dropping an event (the completeness attack) is caught by seq
     let mut dropped = j.clone();
     dropped.remove(3);
-    assert!(verify_stream(&dropped).is_err(), "dropped event detected via seq gap");
+    assert!(
+        verify_stream(&dropped).is_err(),
+        "dropped event detected via seq gap"
+    );
 }
 
 #[test]
 fn d_budget_rehydration_matches_live_state() {
     // the budget layer is its own journal; rehydrate binds identically
     let mut b = BudgetLedger::new();
-    let lim = BudgetEvent::SetLimit { scope: vec!["factory".into()], amount: Amount::pts(100) };
+    let lim = BudgetEvent::SetLimit {
+        scope: vec!["factory".into()],
+        amount: Amount::pts(100),
+    };
     b.apply(lim.clone()).unwrap();
     b.journal.push(lim);
-    b.try_reserve("r1/op", &["factory", "run-r1"], Amount::pts(70)).unwrap();
+    b.try_reserve("r1/op", &["factory", "run-r1"], Amount::pts(70))
+        .unwrap();
     let live = b.available(&["factory"]);
     let re = BudgetLedger::rehydrate(&b.journal).unwrap();
-    assert_eq!(live, re.available(&["factory"]), "restart = same reservations");
+    assert_eq!(
+        live,
+        re.available(&["factory"]),
+        "restart = same reservations"
+    );
 }

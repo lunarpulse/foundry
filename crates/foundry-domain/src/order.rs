@@ -141,7 +141,9 @@ pub enum OrderEvent {
         reason: String,
     },
     InspectionPassed,
-    ReviewHeld { reason: String },
+    ReviewHeld {
+        reason: String,
+    },
     InspectionFailed {
         reason: String,
     },

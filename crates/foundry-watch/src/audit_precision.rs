@@ -26,7 +26,7 @@
 //! structural verification (verify_stream) — precise errors, never
 //! "invalid" as one blob.
 use crate::coordinator::GovernanceCoordinator;
-use crate::governance_events::{verify_stream, GovernanceEvent, VerifyError};
+use crate::governance_events::{GovernanceEvent, VerifyError, verify_stream};
 
 /// T60e: the cumulative content commitment of a stream. Each event
 /// folds into the running hash over its FULL canonical content —
@@ -71,23 +71,39 @@ pub enum AuditError {
     Structural(Vec<VerifyError>),
     /// the stream ends before the pinned checkpoint — a valid prefix
     /// is being served as the whole history
-    Truncated { pin_max_seq: i64, observed_max_seq: i64, observed_count: i64 },
+    Truncated {
+        pin_max_seq: i64,
+        observed_max_seq: i64,
+        observed_count: i64,
+    },
     /// count disagrees with the pin at equal/greater max_seq —
     /// rows were deleted and seqs renumbered, or rows injected
-    WholesaleTamper { pin_count: i64, observed_count: i64, observed_max_seq: i64 },
+    WholesaleTamper {
+        pin_count: i64,
+        observed_count: i64,
+        observed_max_seq: i64,
+    },
     /// the stream mutated between snapshot and re-read
-    ConcurrentMutation { before_count: usize, after_count: usize },
+    ConcurrentMutation {
+        before_count: usize,
+        after_count: usize,
+    },
     /// T60e: shape matches the pin but the CONTENT does not — a
     /// same-length substitution (rewritten stream)
-    ContentSubstitution { pin_chain_head: String, observed_chain_head: String },
+    ContentSubstitution {
+        pin_chain_head: String,
+        observed_chain_head: String,
+    },
 }
 
-pub fn audit(
-    coordinator: &GovernanceCoordinator,
-    pin: &HeadPin,
-) -> Result<(), AuditError> {
+pub fn audit(coordinator: &GovernanceCoordinator, pin: &HeadPin) -> Result<(), AuditError> {
     // snapshot 1
-    let before = coordinator.replay().map_err(|_| AuditError::ConcurrentMutation { before_count: 0, after_count: 0 })?;
+    let before = coordinator
+        .replay()
+        .map_err(|_| AuditError::ConcurrentMutation {
+            before_count: 0,
+            after_count: 0,
+        })?;
     // structural verification on snapshot 1
     if let Err(errs) = verify_stream(&before) {
         return Err(AuditError::Structural(errs));
@@ -111,7 +127,11 @@ pub fn audit(
         // max_seq = pin_max - k < pin_max (caught as Truncated).
         // What survives to HERE: injected rows -> count grew while
         // max grew: WholesaleTamper (injection variant).
-        return Err(AuditError::WholesaleTamper { pin_count: pin.count, observed_count, observed_max_seq });
+        return Err(AuditError::WholesaleTamper {
+            pin_count: pin.count,
+            observed_count,
+            observed_max_seq,
+        });
     }
     // T60e: shape MATCHES the pin — the content commitment is now
     // the discriminator. A same-length/same-seq rewritten stream
@@ -124,9 +144,17 @@ pub fn audit(
         });
     }
     // snapshot 2: the stream must not have moved mid-audit
-    let after = coordinator.replay().map_err(|_| AuditError::ConcurrentMutation { before_count: before.len(), after_count: 0 })?;
+    let after = coordinator
+        .replay()
+        .map_err(|_| AuditError::ConcurrentMutation {
+            before_count: before.len(),
+            after_count: 0,
+        })?;
     if before != after {
-        return Err(AuditError::ConcurrentMutation { before_count: before.len(), after_count: after.len() });
+        return Err(AuditError::ConcurrentMutation {
+            before_count: before.len(),
+            after_count: after.len(),
+        });
     }
     Ok(())
 }
@@ -161,7 +189,11 @@ mod tests {
     fn pin_of(c: &GovernanceCoordinator) -> HeadPin {
         let (max_seq, count) = c.head().unwrap();
         let chain_head = chain_head(&c.replay().unwrap());
-        HeadPin { max_seq, count, chain_head }
+        HeadPin {
+            max_seq,
+            count,
+            chain_head,
+        }
     }
 
     #[test]
@@ -182,7 +214,11 @@ mod tests {
         cut.append(ev("a", Phase::Committed, "h")).unwrap();
         assert_eq!(
             audit(&cut, &pin),
-            Err(AuditError::Truncated { pin_max_seq: 4, observed_max_seq: 2, observed_count: 2 }),
+            Err(AuditError::Truncated {
+                pin_max_seq: 4,
+                observed_max_seq: 2,
+                observed_count: 2
+            }),
             "a VALID PREFIX is not the whole history — named precisely"
         );
     }
@@ -200,11 +236,17 @@ mod tests {
         let pin = pin_of(&full);
         let mut injected = GovernanceCoordinator::open_in_memory().unwrap();
         for i in 0..6 {
-            injected.append(ev(&format!("x{i}"), Phase::Pending, "h")).unwrap();
+            injected
+                .append(ev(&format!("x{i}"), Phase::Pending, "h"))
+                .unwrap();
         }
         assert!(matches!(
             audit(&injected, &pin),
-            Err(AuditError::WholesaleTamper { pin_count: 4, observed_count: 6, .. })
+            Err(AuditError::WholesaleTamper {
+                pin_count: 4,
+                observed_count: 6,
+                ..
+            })
         ));
     }
 
@@ -224,7 +266,10 @@ mod tests {
         // the external appender lands BETWEEN the two reads
         grown.append(ev("mid", Phase::Pending, "h")).unwrap();
         let after = grown.replay().unwrap();
-        assert_ne!(before, after, "mid-audit append observed — the double-read shape");
+        assert_ne!(
+            before, after,
+            "mid-audit append observed — the double-read shape"
+        );
         assert_eq!(after.len(), 5);
         // the audit function's own double-read would surface this as
         // ConcurrentMutation; here we assert the observable fact it
@@ -250,11 +295,17 @@ mod tests {
         // attacker rewrite: 4 different valid events
         let mut fake = GovernanceCoordinator::open_in_memory().unwrap();
         for i in 0..2 {
-            fake.append(ev(&format!("evil{i}"), Phase::Pending, "forged")).unwrap();
-            fake.append(ev(&format!("evil{i}"), Phase::Committed, "forged")).unwrap();
+            fake.append(ev(&format!("evil{i}"), Phase::Pending, "forged"))
+                .unwrap();
+            fake.append(ev(&format!("evil{i}"), Phase::Committed, "forged"))
+                .unwrap();
         }
         let (fake_max, fake_count) = fake.head().unwrap();
-        assert_eq!((fake_max, fake_count), (4, 4), "same shape as the pinned stream");
+        assert_eq!(
+            (fake_max, fake_count),
+            (4, 4),
+            "same shape as the pinned stream"
+        );
         let err = audit(&fake, &pin).unwrap_err();
         assert!(
             matches!(&err, AuditError::ContentSubstitution { pin_chain_head, observed_chain_head } if pin_chain_head != observed_chain_head),

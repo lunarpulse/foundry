@@ -1,5 +1,5 @@
-use crate::types::{Attempt, OrderId, RunId};
 use crate::ports::PortError;
+use crate::types::{Attempt, OrderId, RunId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,7 +75,11 @@ pub fn cas_hold(expected: &HoldInstanceId, presented: &HoldCommand) -> HoldCasOu
 
 /// Validates and computes the transition a HoldStore must atomically persist.
 /// Stores must persist `cmd` in `HoldState::resolution` with a resolution.
-pub fn apply_hold(state: &HoldState, cmd: &HoldCommand, expected: &HoldInstanceId) -> Result<HoldApplied, PortError> {
+pub fn apply_hold(
+    state: &HoldState,
+    cmd: &HoldCommand,
+    expected: &HoldInstanceId,
+) -> Result<HoldApplied, PortError> {
     if cas_hold(expected, cmd) != HoldCasOutcome::Applied || state.instance != *expected {
         return Err(PortError::HoldConflict(HoldCasOutcome::Conflict {
             observed_instance: cmd.instance.clone(),
@@ -87,9 +91,11 @@ pub fn apply_hold(state: &HoldState, cmd: &HoldCommand, expected: &HoldInstanceI
     if let HoldStatus::Resolved(applied) = &state.status {
         return if matches!(cmd.op, HoldOperation::Approve | HoldOperation::Reject)
             && state.resolution.as_ref() == Some(cmd)
-            && matches!((cmd.op, applied),
-                (HoldOperation::Approve, HoldApplied::Approved) | (HoldOperation::Reject, HoldApplied::Rejected))
-        {
+            && matches!(
+                (cmd.op, applied),
+                (HoldOperation::Approve, HoldApplied::Approved)
+                    | (HoldOperation::Reject, HoldApplied::Rejected)
+            ) {
             Ok(applied.clone())
         } else {
             Err(PortError::AlreadyResolved)
@@ -102,9 +108,15 @@ pub fn apply_hold(state: &HoldState, cmd: &HoldCommand, expected: &HoldInstanceI
         HoldOperation::Approve => HoldApplied::Approved,
         HoldOperation::Reject => HoldApplied::Rejected,
         HoldOperation::Amend => {
-            let resume_to = cmd.resume_to.as_deref().map(str::trim)
-                .filter(|destination| !destination.is_empty()).ok_or(PortError::ResumeDestinationRequired)?;
-            HoldApplied::Amended { resume_to: resume_to.to_owned() }
+            let resume_to = cmd
+                .resume_to
+                .as_deref()
+                .map(str::trim)
+                .filter(|destination| !destination.is_empty())
+                .ok_or(PortError::ResumeDestinationRequired)?;
+            HoldApplied::Amended {
+                resume_to: resume_to.to_owned(),
+            }
         }
         HoldOperation::Info => unreachable!(),
     };

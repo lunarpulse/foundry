@@ -10,16 +10,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{TimeZone, Utc};
 use foundry_exec::host::{DieHostAdapter, DieWorker, HostKey, HostLedger, HostResult};
+use foundry_exec::types::Generation;
 use foundry_exec::{
     Attempt, DispatchHost, DispatchResult, Epoch, ExecutionIntent, ExecutionOutcome, Executor,
     IntentLog, OrderId, OutcomeStore, ResumeAction, RunId,
 };
-use foundry_exec::types::Generation;
 
 fn note_path(path: &Path) {
     if let Some(inventory) = std::env::var_os("FOUNDRY_EXEC_TEST_INVENTORY") {
         use std::io::Write;
-        let mut file = fs::OpenOptions::new().create(true).append(true).open(inventory).unwrap();
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(inventory)
+            .unwrap();
         writeln!(file, "{}", path.display()).unwrap();
     }
 }
@@ -45,7 +49,9 @@ impl Drop for TestDir {
         fn record_tree(path: &Path) {
             note_path(path);
             if path.is_dir() {
-                for entry in fs::read_dir(path).unwrap() { record_tree(&entry.unwrap().path()); }
+                for entry in fs::read_dir(path).unwrap() {
+                    record_tree(&entry.unwrap().path());
+                }
             }
         }
         record_tree(&self.0);
@@ -60,22 +66,34 @@ struct FileLedger {
 impl FileLedger {
     fn new(dir: &Path) -> Self {
         fs::create_dir_all(dir).unwrap();
-        Self { dir: dir.to_path_buf() }
+        Self {
+            dir: dir.to_path_buf(),
+        }
     }
 
     fn path(&self, key: &HostKey, suffix: &str) -> PathBuf {
         let encoded = serde_json::to_vec(key).unwrap();
-        let encoded = encoded.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        let encoded = encoded
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         self.dir.join(format!("{encoded}.{suffix}"))
     }
 
     fn exists(path: &Path) -> bool {
-        path.try_exists().unwrap_or_else(|error| panic!("durable host lookup failed: {error}"))
+        path.try_exists()
+            .unwrap_or_else(|error| panic!("durable host lookup failed: {error}"))
     }
 
     fn crash_at(path: &Path, phase: &str) {
-        let target = if path.extension().is_some_and(|suffix| suffix == "accepted") { "accept" } else { "result" };
-        if std::env::var("FOUNDRY_EXEC_CRASH_STAGE").ok().as_deref() == Some(&format!("{target}:{phase}")) {
+        let target = if path.extension().is_some_and(|suffix| suffix == "accepted") {
+            "accept"
+        } else {
+            "result"
+        };
+        if std::env::var("FOUNDRY_EXEC_CRASH_STAGE").ok().as_deref()
+            == Some(&format!("{target}:{phase}"))
+        {
             std::process::exit(73);
         }
     }
@@ -135,7 +153,10 @@ impl HostLedger for FileLedger {
         if Self::exists(&path) {
             return Ok(());
         }
-        self.atomic_write(&path, &serde_json::to_vec(result).map_err(|error| error.to_string())?)
+        self.atomic_write(
+            &path,
+            &serde_json::to_vec(result).map_err(|error| error.to_string())?,
+        )
     }
 
     fn load(&self, key: &HostKey) -> Option<HostResult> {
@@ -165,10 +186,17 @@ impl DieWorker for Worker {
         if let Some(path) = &self.effects_path {
             note_path(path);
             use std::io::Write;
-            let mut file = fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .unwrap();
             file.write_all(b"effect\n").unwrap();
             file.sync_all().unwrap();
-            File::open(path.parent().unwrap()).unwrap().sync_all().unwrap();
+            File::open(path.parent().unwrap())
+                .unwrap()
+                .sync_all()
+                .unwrap();
         }
         if let Some(path) = &self.receipt_path {
             self.saw_receipt_before_work = path.exists();
@@ -237,10 +265,19 @@ fn dispatch_persists_receipt_before_work_and_result_before_return_and_reuses_res
     {
         let mut ledger = FileLedger::new(&dir.0);
         let mut host = DieHostAdapter::new(&mut worker, &mut ledger);
-        assert_eq!(host.dispatch(&work), DispatchResult::from(expected_result()));
+        assert_eq!(
+            host.dispatch(&work),
+            DispatchResult::from(expected_result())
+        );
         assert!(host.accepted(&work));
-        assert_eq!(host.recover_result(&work), Some(DispatchResult::from(expected_result())));
-        assert_eq!(host.dispatch(&work), DispatchResult::from(expected_result()));
+        assert_eq!(
+            host.recover_result(&work),
+            Some(DispatchResult::from(expected_result()))
+        );
+        assert_eq!(
+            host.dispatch(&work),
+            DispatchResult::from(expected_result())
+        );
         assert_eq!(host.dispatch_count(), 1);
     }
     assert_eq!(worker.calls, 1);
@@ -248,7 +285,10 @@ fn dispatch_persists_receipt_before_work_and_result_before_return_and_reuses_res
     assert!(worker.saw_no_result_before_work);
     let mut ledger = FileLedger::new(&dir.0);
     assert!(ledger.is_accepted(&key));
-    let conflicting_result = HostResult { result_commit: "must-not-replace".into(), ..expected_result() };
+    let conflicting_result = HostResult {
+        result_commit: "must-not-replace".into(),
+        ..expected_result()
+    };
     ledger.save(&key, &conflicting_result).unwrap();
     assert_eq!(ledger.load(&key), Some(expected_result()));
 }
@@ -268,15 +308,22 @@ fn worker_failure_keeps_receipt_without_result_and_retry_runs_worker_again() {
     let dir = TestDir::new();
     let work = intent();
     let key = host_key(&work);
-    let mut worker = Worker { fail_once: true, ..Worker::default() };
+    let mut worker = Worker {
+        fail_once: true,
+        ..Worker::default()
+    };
     {
         let mut ledger = FileLedger::new(&dir.0);
         let mut host = DieHostAdapter::new(&mut worker, &mut ledger);
-        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| host.dispatch(&work)));
+        let failed =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| host.dispatch(&work)));
         assert!(failed.is_err());
         assert!(host.accepted(&work));
         assert_eq!(host.recover_result(&work), None);
-        assert_eq!(host.dispatch(&work), DispatchResult::from(expected_result()));
+        assert_eq!(
+            host.dispatch(&work),
+            DispatchResult::from(expected_result())
+        );
     }
     assert_eq!(worker.calls, 2);
     let reopened = FileLedger::new(&dir.0);
@@ -291,13 +338,22 @@ fn saved_result_is_recovered_after_adapter_drop_and_reopen() {
     let mut worker = Worker::default();
     {
         let mut ledger = FileLedger::new(&dir.0);
-        assert_eq!(DieHostAdapter::new(&mut worker, &mut ledger).dispatch(&work), DispatchResult::from(expected_result()));
+        assert_eq!(
+            DieHostAdapter::new(&mut worker, &mut ledger).dispatch(&work),
+            DispatchResult::from(expected_result())
+        );
     }
     let mut worker_after_restart = Worker::default();
     let mut ledger_after_restart = FileLedger::new(&dir.0);
     let mut host = DieHostAdapter::new(&mut worker_after_restart, &mut ledger_after_restart);
-    assert_eq!(host.recover_result(&work), Some(DispatchResult::from(expected_result())));
-    assert_eq!(host.dispatch(&work), DispatchResult::from(expected_result()));
+    assert_eq!(
+        host.recover_result(&work),
+        Some(DispatchResult::from(expected_result()))
+    );
+    assert_eq!(
+        host.dispatch(&work),
+        DispatchResult::from(expected_result())
+    );
     assert_eq!(host.dispatch_count(), 0);
     assert_eq!(worker_after_restart.calls, 0);
 }
@@ -311,15 +367,24 @@ struct MemoryIntents {
 }
 
 impl IntentLog for MemoryIntents {
-    fn append(&mut self, intent: &ExecutionIntent) { self.rows.push(intent.clone()); }
+    fn append(&mut self, intent: &ExecutionIntent) {
+        self.rows.push(intent.clone());
+    }
     fn mark_started(&mut self, key: &IntentKey, activation: u64) {
         self.started.insert((key.clone(), activation));
     }
     fn latest(&self, key: &IntentKey) -> Option<ExecutionIntent> {
-        self.rows.iter().rev().find(|row| intent_key(row) == *key).cloned()
+        self.rows
+            .iter()
+            .rev()
+            .find(|row| intent_key(row) == *key)
+            .cloned()
     }
     fn get(&self, key: &IntentKey, activation: u64) -> Option<ExecutionIntent> {
-        self.rows.iter().find(|row| intent_key(row) == *key && row.activation == activation).cloned()
+        self.rows
+            .iter()
+            .find(|row| intent_key(row) == *key && row.activation == activation)
+            .cloned()
     }
     fn is_started(&self, key: &IntentKey, activation: u64) -> bool {
         self.started.contains(&(key.clone(), activation))
@@ -338,9 +403,15 @@ impl DispatchHost for ResumeHost {
         self.calls += 1;
         DispatchResult::default()
     }
-    fn dispatch_count(&self) -> u64 { self.calls }
-    fn accepted(&self, _: &ExecutionIntent) -> bool { self.accepted }
-    fn recover_result(&mut self, _: &ExecutionIntent) -> Option<Self::Result> { None }
+    fn dispatch_count(&self) -> u64 {
+        self.calls
+    }
+    fn accepted(&self, _: &ExecutionIntent) -> bool {
+        self.accepted
+    }
+    fn recover_result(&mut self, _: &ExecutionIntent) -> Option<Self::Result> {
+        None
+    }
 }
 
 #[derive(Default)]
@@ -348,10 +419,15 @@ struct MemoryOutcomes(HashMap<(IntentKey, u64), ExecutionOutcome>);
 
 impl OutcomeStore for MemoryOutcomes {
     fn commit(&mut self, outcome: &ExecutionOutcome) {
-        self.0.entry((outcome.intent_key.clone(), outcome.activation)).or_insert_with(|| outcome.clone());
+        self.0
+            .entry((outcome.intent_key.clone(), outcome.activation))
+            .or_insert_with(|| outcome.clone());
     }
     fn latest(&self, key: &IntentKey) -> Option<ExecutionOutcome> {
-        self.0.iter().filter(|((row_key, _), _)| row_key == key).max_by_key(|((_, activation), _)| activation)
+        self.0
+            .iter()
+            .filter(|((row_key, _), _)| row_key == key)
+            .max_by_key(|((_, activation), _)| activation)
             .map(|(_, outcome)| outcome.clone())
     }
     fn get(&self, key: &IntentKey, activation: u64) -> Option<ExecutionOutcome> {
@@ -370,7 +446,10 @@ fn resume_waits_for_accepted_host_and_redispatches_when_receipt_is_absent() {
     let mut intents = MemoryIntents::default();
     intents.append(&work);
     intents.mark_started(&key, work.activation);
-    let mut host = ResumeHost { accepted: true, ..ResumeHost::default() };
+    let mut host = ResumeHost {
+        accepted: true,
+        ..ResumeHost::default()
+    };
     let mut outcomes = MemoryOutcomes::default();
     let mut executor = Executor::new(&mut intents, &mut host, &mut outcomes);
     assert_eq!(executor.resume(&key), ResumeAction::AwaitResult);
@@ -400,12 +479,21 @@ fn b3a_adapter_drives_executor_and_preserves_complete_result_without_repeat_effe
     assert!(outcome.cursor.is_none());
     assert!(outcome.next_activation.is_none());
     let json = serde_json::to_value(outcome).unwrap();
-    assert_eq!(json["receipts"], serde_json::json!([{
-        "kind": "host", "receipt": expected_result(),
-    }]));
-    assert_eq!(serde_json::from_value::<ExecutionOutcome>(json).unwrap(), *outcome);
+    assert_eq!(
+        json["receipts"],
+        serde_json::json!([{
+            "kind": "host", "receipt": expected_result(),
+        }])
+    );
+    assert_eq!(
+        serde_json::from_value::<ExecutionOutcome>(json).unwrap(),
+        *outcome
+    );
     assert_eq!(executor.run(work), Ok(first.clone()));
-    assert_eq!(executor.resume(&key), ResumeAction::AlreadyBound(outcome.clone()));
+    assert_eq!(
+        executor.resume(&key),
+        ResumeAction::AlreadyBound(outcome.clone())
+    );
     assert_eq!(executor.dispatch_count(), 1);
     drop(executor);
     drop(host);
@@ -415,15 +503,26 @@ fn b3a_adapter_drives_executor_and_preserves_complete_result_without_repeat_effe
     let mut host = DieHostAdapter::new(&mut restarted_worker, &mut restarted_ledger);
     let mut executor = Executor::new(&mut intents, &mut host, &mut outcomes);
     assert_eq!(executor.run(intent()), Ok(first));
-    assert!(matches!(executor.resume(&key), ResumeAction::AlreadyBound(_)));
+    assert!(matches!(
+        executor.resume(&key),
+        ResumeAction::AlreadyBound(_)
+    ));
     drop(executor);
     drop(host);
     assert_eq!(restarted_worker.calls, 0);
 }
 
 #[derive(Clone, Copy, Debug)]
-enum Failure { AcceptBefore, AcceptAfter, SaveBefore, SaveAfter }
-struct FailingLedger { inner: FileLedger, failure: Option<Failure> }
+enum Failure {
+    AcceptBefore,
+    AcceptAfter,
+    SaveBefore,
+    SaveAfter,
+}
+struct FailingLedger {
+    inner: FileLedger,
+    failure: Option<Failure>,
+}
 impl HostLedger for FailingLedger {
     fn accept(&mut self, key: &HostKey) -> Result<(), String> {
         if matches!(self.failure, Some(Failure::AcceptBefore)) {
@@ -437,7 +536,9 @@ impl HostLedger for FailingLedger {
         }
         Ok(())
     }
-    fn is_accepted(&self, key: &HostKey) -> bool { self.inner.is_accepted(key) }
+    fn is_accepted(&self, key: &HostKey) -> bool {
+        self.inner.is_accepted(key)
+    }
     fn save(&mut self, key: &HostKey, result: &HostResult) -> Result<(), String> {
         if matches!(self.failure, Some(Failure::SaveBefore)) {
             self.failure = None;
@@ -450,7 +551,9 @@ impl HostLedger for FailingLedger {
         }
         Ok(())
     }
-    fn load(&self, key: &HostKey) -> Option<HostResult> { self.inner.load(key) }
+    fn load(&self, key: &HostKey) -> Option<HostResult> {
+        self.inner.load(key)
+    }
 }
 
 fn assert_ledger_error_interrupts(failure: Failure, via_resume: bool) {
@@ -458,10 +561,15 @@ fn assert_ledger_error_interrupts(failure: Failure, via_resume: bool) {
     let work = intent();
     let key = intent_key(&work);
     let mut worker = Worker::default();
-    let mut ledger = FailingLedger { inner: FileLedger::new(&dir.0), failure: Some(failure) };
+    let mut ledger = FailingLedger {
+        inner: FileLedger::new(&dir.0),
+        failure: Some(failure),
+    };
     let mut intents = MemoryIntents::default();
     let mut outcomes = MemoryOutcomes::default();
-    if via_resume { intents.append(&work); }
+    if via_resume {
+        intents.append(&work);
+    }
     let mut host = DieHostAdapter::new(&mut worker, &mut ledger);
     let mut executor = Executor::new(&mut intents, &mut host, &mut outcomes);
     let returned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -470,7 +578,9 @@ fn assert_ledger_error_interrupts(failure: Failure, via_resume: bool) {
                 ResumeAction::Interrupted(error) => Err(error),
                 other => panic!("expected interruption, got {other:?}"),
             }
-        } else { executor.run(work.clone()) }
+        } else {
+            executor.run(work.clone())
+        }
     }));
     assert!(returned.is_ok(), "{failure:?} escaped as panic");
     let error = returned.unwrap().unwrap_err();
@@ -488,31 +598,52 @@ fn assert_ledger_error_interrupts(failure: Failure, via_resume: bool) {
     };
     assert_eq!(executor.resume(&key), expected);
     if expected == ResumeAction::AwaitResult {
-        assert!(matches!(executor.run(work), Err(foundry_exec::LifecycleError::AwaitResult(11))));
+        assert!(matches!(
+            executor.run(work),
+            Err(foundry_exec::LifecycleError::AwaitResult(11))
+        ));
         assert_eq!(executor.resume(&key), ResumeAction::AwaitResult);
     } else {
-        assert!(matches!(executor.resume(&key), ResumeAction::AlreadyBound(_)));
+        assert!(matches!(
+            executor.resume(&key),
+            ResumeAction::AlreadyBound(_)
+        ));
     }
     drop(executor);
     drop(host);
-    assert_eq!(worker.calls, if matches!(failure, Failure::AcceptAfter) { 0 } else { 1 });
+    assert_eq!(
+        worker.calls,
+        if matches!(failure, Failure::AcceptAfter) {
+            0
+        } else {
+            1
+        }
+    );
 }
 
 #[test]
 fn b3a_accept_before_error_interrupts() {
-    for via_resume in [false, true] { assert_ledger_error_interrupts(Failure::AcceptBefore, via_resume); }
+    for via_resume in [false, true] {
+        assert_ledger_error_interrupts(Failure::AcceptBefore, via_resume);
+    }
 }
 #[test]
 fn b3a_accept_after_error_interrupts() {
-    for via_resume in [false, true] { assert_ledger_error_interrupts(Failure::AcceptAfter, via_resume); }
+    for via_resume in [false, true] {
+        assert_ledger_error_interrupts(Failure::AcceptAfter, via_resume);
+    }
 }
 #[test]
 fn b3a_save_before_error_interrupts() {
-    for via_resume in [false, true] { assert_ledger_error_interrupts(Failure::SaveBefore, via_resume); }
+    for via_resume in [false, true] {
+        assert_ledger_error_interrupts(Failure::SaveBefore, via_resume);
+    }
 }
 #[test]
 fn b3a_save_after_error_interrupts() {
-    for via_resume in [false, true] { assert_ledger_error_interrupts(Failure::SaveAfter, via_resume); }
+    for via_resume in [false, true] {
+        assert_ledger_error_interrupts(Failure::SaveAfter, via_resume);
+    }
 }
 
 #[test]
@@ -520,14 +651,18 @@ fn b3a_worker_error_interrupts_without_panic_and_restart_waits() {
     let dir = TestDir::new();
     let work = intent();
     let key = intent_key(&work);
-    let mut worker = Worker { fail_once: true, ..Worker::default() };
+    let mut worker = Worker {
+        fail_once: true,
+        ..Worker::default()
+    };
     let mut ledger = FileLedger::new(&dir.0);
     let mut intents = MemoryIntents::default();
     let mut outcomes = MemoryOutcomes::default();
     {
         let mut host = DieHostAdapter::new(&mut worker, &mut ledger);
         let mut executor = Executor::new(&mut intents, &mut host, &mut outcomes);
-        let returned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| executor.run(work.clone())));
+        let returned =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| executor.run(work.clone())));
         assert!(returned.is_ok(), "worker Err escaped as panic");
         assert!(format!("{:?}", returned.unwrap().unwrap_err()).contains("Worker"));
         assert!(executor.outcome(&key).is_none());
@@ -538,7 +673,10 @@ fn b3a_worker_error_interrupts_without_panic_and_restart_waits() {
     let mut host = DieHostAdapter::new(&mut fresh_worker, &mut fresh_ledger);
     let mut executor = Executor::new(&mut intents, &mut host, &mut outcomes);
     assert_eq!(executor.resume(&key), ResumeAction::AwaitResult);
-    assert_eq!(executor.run(work), Err(foundry_exec::LifecycleError::AwaitResult(11)));
+    assert_eq!(
+        executor.run(work),
+        Err(foundry_exec::LifecycleError::AwaitResult(11))
+    );
     drop(executor);
     drop(host);
     assert_eq!(fresh_worker.calls, 0);
@@ -552,7 +690,10 @@ fn b3a_unreadable_receipt_is_not_reported_absent() {
     fs::remove_dir(&storage).unwrap();
     fs::write(&storage, b"not a directory").unwrap();
     let returned = std::panic::catch_unwind(|| ledger.is_accepted(&host_key(&intent())));
-    assert!(returned.is_err(), "I/O error was silently converted to no receipt");
+    assert!(
+        returned.is_err(),
+        "I/O error was silently converted to no receipt"
+    );
 }
 
 #[test]
@@ -586,9 +727,15 @@ fn b3a_actual_adapter_partitions_receipts_and_results_by_every_identity_field() 
     for other in variants {
         assert!(!host.accepted(&other));
         assert_eq!(host.recover_result(&other), None);
-        assert_eq!(host.dispatch(&other), DispatchResult::from(expected_result()));
+        assert_eq!(
+            host.dispatch(&other),
+            DispatchResult::from(expected_result())
+        );
         assert!(host.accepted(&other));
-        assert_eq!(host.recover_result(&other), Some(DispatchResult::from(expected_result())));
+        assert_eq!(
+            host.recover_result(&other),
+            Some(DispatchResult::from(expected_result()))
+        );
     }
     assert_eq!(host.dispatch_count(), 5);
 }
@@ -596,9 +743,14 @@ fn b3a_actual_adapter_partitions_receipts_and_results_by_every_identity_field() 
 // Invoked in a separate process; exit at a publication boundary skips all Drop.
 #[test]
 fn b3a_crash_child() {
-    let Some(dir) = std::env::var_os("FOUNDRY_EXEC_CRASH_DIR") else { return; };
+    let Some(dir) = std::env::var_os("FOUNDRY_EXEC_CRASH_DIR") else {
+        return;
+    };
     let dir = PathBuf::from(dir);
-    let mut worker = Worker { effects_path: Some(dir.join("effects.log")), ..Worker::default() };
+    let mut worker = Worker {
+        effects_path: Some(dir.join("effects.log")),
+        ..Worker::default()
+    };
     let mut ledger = FileLedger::new(&dir);
     DieHostAdapter::new(&mut worker, &mut ledger).dispatch(&intent());
 }
@@ -626,40 +778,68 @@ fn b3a_process_crashes_observe_only_published_receipts_and_results_without_repea
             .args(["--exact", "b3a_crash_child", "--nocapture"])
             .env("FOUNDRY_EXEC_CRASH_DIR", &dir.0)
             .env("FOUNDRY_EXEC_CRASH_STAGE", format!("{target}:{phase}"))
-            .output().unwrap();
-        assert_eq!(status.status.code(), Some(73), "child missed {target}:{phase}: {}",
-            String::from_utf8_lossy(&status.stdout));
+            .output()
+            .unwrap();
+        assert_eq!(
+            status.status.code(),
+            Some(73),
+            "child missed {target}:{phase}: {}",
+            String::from_utf8_lossy(&status.stdout)
+        );
         let work = intent();
         let host_key = host_key(&work);
         let mut ledger = FileLedger::new(&dir.0);
         assert_eq!(ledger.is_accepted(&host_key), accepted, "{target}:{phase}");
         assert_eq!(ledger.load(&host_key), saved.then(expected_result));
         assert_eq!(effect_count(&dir.0), effects);
-        let pending: Vec<_> = fs::read_dir(&dir.0).unwrap().map(|entry| entry.unwrap().path())
-            .filter(|path| path.extension().unwrap_or_default().to_string_lossy().starts_with("pending-"))
+        let pending: Vec<_> = fs::read_dir(&dir.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.extension()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .starts_with("pending-")
+            })
             .collect();
         assert_eq!(pending.len(), usize::from(phase == "before-rename"));
         // A crash may leave even an undecodable partial temporary. Reads must
         // ignore it rather than publish it as an acceptance or result.
-        for path in pending { fs::write(path, b"{partial").unwrap(); }
+        for path in pending {
+            fs::write(path, b"{partial").unwrap();
+        }
         let key = intent_key(&work);
         let mut intents = MemoryIntents::default();
         intents.append(&work);
         intents.mark_started(&key, work.activation);
         let mut outcomes = MemoryOutcomes::default();
-        let mut worker = Worker { effects_path: Some(dir.0.join("effects.log")), ..Worker::default() };
+        let mut worker = Worker {
+            effects_path: Some(dir.0.join("effects.log")),
+            ..Worker::default()
+        };
         let mut host = DieHostAdapter::new(&mut worker, &mut ledger);
         let mut executor = Executor::new(&mut intents, &mut host, &mut outcomes);
-        let expected = if saved { ResumeAction::ReBind }
-            else if accepted { ResumeAction::AwaitResult } else { ResumeAction::ReDispatch };
+        let expected = if saved {
+            ResumeAction::ReBind
+        } else if accepted {
+            ResumeAction::AwaitResult
+        } else {
+            ResumeAction::ReDispatch
+        };
         assert_eq!(executor.resume(&key), expected, "{target}:{phase}");
         if expected == ResumeAction::AwaitResult {
-            assert_eq!(executor.run(work), Err(foundry_exec::LifecycleError::AwaitResult(11)));
+            assert_eq!(
+                executor.run(work),
+                Err(foundry_exec::LifecycleError::AwaitResult(11))
+            );
             assert_eq!(executor.resume(&key), ResumeAction::AwaitResult);
             assert!(executor.outcome(&key).is_none());
         } else {
             let foundry_exec::RunStep::Bound(bound) = executor.run(work).unwrap();
-            assert_eq!(bound.receipts, DispatchResult::from(expected_result()).receipts);
+            assert_eq!(
+                bound.receipts,
+                DispatchResult::from(expected_result()).receipts
+            );
             assert_eq!(executor.resume(&key), ResumeAction::AlreadyBound(bound));
         }
         drop(executor);
@@ -675,37 +855,65 @@ fn b3a_actual_adapter_run_and_resume_cover_all_reachable_receipt_states() {
         // Receipt/result with no started marker is unreachable: Executor durably
         // marks started before the adapter can accept, and these facts persist.
         for (started, accepted, saved) in [
-            (false, false, false), (true, false, false),
-            (true, true, false), (true, true, true),
+            (false, false, false),
+            (true, false, false),
+            (true, true, false),
+            (true, true, true),
         ] {
             let dir = TestDir::new();
             let work = intent();
             let key = intent_key(&work);
             let mut intents = MemoryIntents::default();
             intents.append(&work);
-            if started { intents.mark_started(&key, work.activation); }
+            if started {
+                intents.mark_started(&key, work.activation);
+            }
             let mut ledger = FileLedger::new(&dir.0);
-            if accepted { ledger.accept(&host_key(&work)).unwrap(); }
-            if saved { ledger.save(&host_key(&work), &expected_result()).unwrap(); }
+            if accepted {
+                ledger.accept(&host_key(&work)).unwrap();
+            }
+            if saved {
+                ledger.save(&host_key(&work), &expected_result()).unwrap();
+            }
             let mut outcomes = MemoryOutcomes::default();
             let mut worker = Worker::default();
             let mut host = DieHostAdapter::new(&mut worker, &mut ledger);
             let mut executor = Executor::new(&mut intents, &mut host, &mut outcomes);
             if via_resume {
-                assert_eq!(executor.resume(&key), if saved { ResumeAction::ReBind }
-                    else if accepted { ResumeAction::AwaitResult } else { ResumeAction::ReDispatch });
+                assert_eq!(
+                    executor.resume(&key),
+                    if saved {
+                        ResumeAction::ReBind
+                    } else if accepted {
+                        ResumeAction::AwaitResult
+                    } else {
+                        ResumeAction::ReDispatch
+                    }
+                );
             } else if accepted && !saved {
-                assert_eq!(executor.run(work.clone()), Err(foundry_exec::LifecycleError::AwaitResult(11)));
+                assert_eq!(
+                    executor.run(work.clone()),
+                    Err(foundry_exec::LifecycleError::AwaitResult(11))
+                );
             } else {
-                assert!(matches!(executor.run(work.clone()), Ok(foundry_exec::RunStep::Bound(_))));
+                assert!(matches!(
+                    executor.run(work.clone()),
+                    Ok(foundry_exec::RunStep::Bound(_))
+                ));
             }
             if accepted && !saved {
                 assert_eq!(executor.resume(&key), ResumeAction::AwaitResult);
-                assert_eq!(executor.run(work), Err(foundry_exec::LifecycleError::AwaitResult(11)));
+                assert_eq!(
+                    executor.run(work),
+                    Err(foundry_exec::LifecycleError::AwaitResult(11))
+                );
                 assert!(executor.outcome(&key).is_none());
             } else {
                 let bound = executor.outcome(&key).unwrap();
-                assert_eq!(bound.receipts, DispatchResult::from(expected_result()).receipts);
+                assert_eq!(
+                    bound.receipts,
+                    DispatchResult::from(expected_result()).receipts
+                );
                 assert_eq!(executor.resume(&key), ResumeAction::AlreadyBound(bound));
                 assert!(executor.run(work).is_ok());
             }
@@ -729,32 +937,56 @@ fn b3a_real_host_w1_w2_recovery_reopens_ledger_and_repeats_no_completed_work() {
         {
             let mut ledger = FileLedger::new(&dir.0);
             let mut host = DieHostAdapter::new(&mut worker, &mut ledger);
-            let mut executor = Executor::with_faults(&mut intents, &mut host, &mut outcomes,
-                foundry_exec::FaultInjector::armed_at(point));
-            assert_eq!(executor.run(work.clone()), Err(foundry_exec::LifecycleError::Crash(point)));
+            let mut executor = Executor::with_faults(
+                &mut intents,
+                &mut host,
+                &mut outcomes,
+                foundry_exec::FaultInjector::armed_at(point),
+            );
+            assert_eq!(
+                executor.run(work.clone()),
+                Err(foundry_exec::LifecycleError::Crash(point))
+            );
             assert!(executor.outcome(&key).is_none());
         }
-        assert_eq!(worker.calls, u64::from(point == foundry_exec::CrashPoint::W2));
+        assert_eq!(
+            worker.calls,
+            u64::from(point == foundry_exec::CrashPoint::W2)
+        );
         let mut fresh_worker = Worker::default();
         let mut reopened = FileLedger::new(&dir.0);
         let mut host = DieHostAdapter::new(&mut fresh_worker, &mut reopened);
         let mut executor = Executor::new(&mut intents, &mut host, &mut outcomes);
-        assert_eq!(executor.resume(&key), if point == foundry_exec::CrashPoint::W1 {
-            ResumeAction::ReDispatch
-        } else { ResumeAction::ReBind });
+        assert_eq!(
+            executor.resume(&key),
+            if point == foundry_exec::CrashPoint::W1 {
+                ResumeAction::ReDispatch
+            } else {
+                ResumeAction::ReBind
+            }
+        );
         let bound = executor.outcome(&key).unwrap();
-        assert_eq!(bound.receipts, DispatchResult::from(expected_result()).receipts);
+        assert_eq!(
+            bound.receipts,
+            DispatchResult::from(expected_result()).receipts
+        );
         assert_eq!(executor.resume(&key), ResumeAction::AlreadyBound(bound));
         assert!(executor.run(work).is_ok());
         drop(executor);
         drop(host);
-        assert_eq!(fresh_worker.calls, u64::from(point == foundry_exec::CrashPoint::W1));
+        assert_eq!(
+            fresh_worker.calls,
+            u64::from(point == foundry_exec::CrashPoint::W1)
+        );
     }
 }
 
 #[test]
 fn b3a_conversion_retains_nonzero_exit_and_all_metadata_without_routing_changes() {
-    let result = HostResult { exit_code: 137, ..expected_result() };
+    let result = HostResult {
+        exit_code: 137,
+        ..expected_result()
+    };
     let dispatch = DispatchResult::from(result.clone());
     assert_eq!(dispatch.receipts, vec![foundry_exec::Receipt::Host(result)]);
     assert_eq!(dispatch.cursor, None);
@@ -765,8 +997,10 @@ fn b3a_conversion_retains_nonzero_exit_and_all_metadata_without_routing_changes(
 fn b3a_host_receipt_rejects_unknown_fields_inside_an_outcome() {
     let work = intent();
     let outcome = ExecutionOutcome {
-        intent_key: intent_key(&work), activation: work.activation,
-        cursor: None, next_activation: None,
+        intent_key: intent_key(&work),
+        activation: work.activation,
+        cursor: None,
+        next_activation: None,
         receipts: vec![foundry_exec::Receipt::Host(expected_result())],
     };
     let mut json = serde_json::to_value(outcome).unwrap();

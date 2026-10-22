@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+p2-test-support = ["foundry-ledger/p2-test-support", "foundry-line/p2-test-support", "foundry-serve/p2-test-support"]
+
 [[bin]]
 name = "foundry"
 path = "src/main.rs"
@@ -28,6 +32,11 @@ tokio.workspace = true
 foundry-serve = { version = "0.1.0", path = "../foundry-serve" }
 axum = "0.8.9"
 serde_json.workspace = true
+serde.workspace = true
+rand_core = { version = "=0.6.4", features = ["getrandom"] }
+
+[dev-dependencies]
+rusqlite.workspace = true
 
 [target.x86_64-unknown-linux-gnu.dependencies]
 libc = "0.2.190"
