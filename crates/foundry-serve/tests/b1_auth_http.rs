@@ -434,6 +434,63 @@ async fn registered_product_approval_route_consumes_genuine_result_and_replays_e
             .unwrap()
     };
 
+    // A genuine result-set corruption is checked by the approval route too.
+    // Pair it with a caller expected-attempt mismatch: both must fail closed,
+    // produce the same external conflict, and leave approval participants
+    // untouched before the original winner is restored.
+    let conn = rusqlite::Connection::open(&fixture.db_path).unwrap();
+    conn.execute("DROP TRIGGER product_result_bindings_no_update", [])
+        .unwrap();
+    assert_eq!(
+        conn.execute(
+            "UPDATE product_result_bindings_v1 SET binding_digest=?1 WHERE result_id=?2",
+            rusqlite::params!["0".repeat(64), before.0],
+        )
+        .unwrap(),
+        1
+    );
+    drop(conn);
+    let corrupt = app.clone().oneshot(approve_request()).await.unwrap();
+    assert_eq!(corrupt.status(), StatusCode::CONFLICT);
+    let mut mismatch_json: serde_json::Value = serde_json::from_str(&approval_payload).unwrap();
+    mismatch_json["expected_attempt"] = serde_json::json!(99);
+    let mismatch = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/product/orders/{}/approve", fixture.identity.order_id))
+                .header("authorization", format!("Bearer {token}"))
+                .header("idempotency-key", "genuine-http-approval")
+                .header("content-type", "application/json")
+                .body(Body::from(mismatch_json.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(mismatch.status(), StatusCode::CONFLICT);
+    let failed_counts: (i64, i64, i64) = rusqlite::Connection::open(&fixture.db_path)
+        .unwrap()
+        .query_row(
+            "SELECT (SELECT count(*) FROM product_token_consumptions_v1),(SELECT count(*) FROM product_outcomes_v1),(SELECT count(*) FROM ledger WHERE to_state='publishing')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(failed_counts, (0, 0, 0));
+    let conn = rusqlite::Connection::open(&fixture.db_path).unwrap();
+    conn.execute(
+        "UPDATE product_result_bindings_v1 SET binding_digest=?1 WHERE result_id=?2",
+        rusqlite::params![before.1, before.0],
+    )
+    .unwrap();
+    conn.execute(
+        "CREATE TRIGGER product_result_bindings_no_update BEFORE UPDATE ON product_result_bindings_v1 BEGIN SELECT RAISE(ABORT,'product result is immutable'); END",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
     let first = app.clone().oneshot(approve_request()).await.unwrap();
     assert_eq!(first.status(), StatusCode::OK);
     let first_bytes = first.into_body().collect().await.unwrap().to_bytes();
@@ -446,6 +503,15 @@ async fn registered_product_approval_route_consumes_genuine_result_and_replays_e
         first_json["receipt"]["sequence"].as_i64().unwrap()
     );
 
+    let retry_before: (i64, i64, i64) = rusqlite::Connection::open(&fixture.db_path)
+        .unwrap()
+        .query_row(
+            "SELECT (SELECT count(*) FROM product_token_consumptions_v1),(SELECT count(*) FROM product_outcomes_v1),(SELECT count(*) FROM ledger WHERE to_state='publishing')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(retry_before, (1, 1, 1));
     let retry = app.clone().oneshot(approve_request()).await.unwrap();
     assert_eq!(retry.status(), StatusCode::OK);
     let retry_bytes = retry.into_body().collect().await.unwrap().to_bytes();
@@ -455,6 +521,16 @@ async fn registered_product_approval_route_consumes_genuine_result_and_replays_e
         first_bytes, retry_bytes,
         "full HTTP response body replays exactly"
     );
+    let retry_after: (i64, i64, i64) = rusqlite::Connection::open(&fixture.db_path)
+        .unwrap()
+        .query_row(
+            "SELECT (SELECT count(*) FROM product_token_consumptions_v1),(SELECT count(*) FROM product_outcomes_v1),(SELECT count(*) FROM ledger WHERE to_state='publishing')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(retry_after, (1, 1, 1), "approval retry retains exactly one consumption and outcome");
+    assert_eq!(retry_after.2 - retry_before.2, 0, "approval retry adds zero publishing rows");
 
     let conn = rusqlite::Connection::open(&fixture.db_path).unwrap();
     let participants: (i64, i64, i64, i64, i64) = conn.query_row(
@@ -522,6 +598,15 @@ async fn registered_product_approval_route_consumes_genuine_result_and_replays_e
     .unwrap();
     let reopened_state = foundry_serve::auth_http::ProductHttpState::new(reopened);
     let reopened_app = foundry_serve::http::product_router(reopened_state.clone());
+    let reopen_before: (i64, i64, i64) = rusqlite::Connection::open(&fixture.db_path)
+        .unwrap()
+        .query_row(
+            "SELECT (SELECT count(*) FROM product_token_consumptions_v1),(SELECT count(*) FROM product_outcomes_v1),(SELECT count(*) FROM ledger WHERE to_state='publishing')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(reopen_before, (1, 1, 1));
     let post_reopen = reopened_app
         .clone()
         .oneshot(approve_request())
@@ -530,6 +615,16 @@ async fn registered_product_approval_route_consumes_genuine_result_and_replays_e
     assert_eq!(post_reopen.status(), StatusCode::OK);
     let post_reopen_bytes = post_reopen.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(first_bytes, post_reopen_bytes);
+    let reopen_after: (i64, i64, i64) = rusqlite::Connection::open(&fixture.db_path)
+        .unwrap()
+        .query_row(
+            "SELECT (SELECT count(*) FROM product_token_consumptions_v1),(SELECT count(*) FROM product_outcomes_v1),(SELECT count(*) FROM ledger WHERE to_state='publishing')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(reopen_after, (1, 1, 1), "reopened replay retains exactly one consumption and outcome");
+    assert_eq!(reopen_after.2 - reopen_before.2, 0, "reopened replay adds zero publishing rows");
     let conn = rusqlite::Connection::open(&fixture.db_path).unwrap();
     let replay_counts: (i64, i64, i64, i64, i64) = conn.query_row(
         "SELECT (SELECT count(*) FROM product_token_consumptions_v1),(SELECT count(*) FROM product_outcomes_v1),(SELECT count(*) FROM ledger WHERE to_state='publishing'),(SELECT count(*) FROM product_approval_result_bindings_v1),(SELECT count(*) FROM product_transition_receipts_v1 WHERE operation='human-approval')",

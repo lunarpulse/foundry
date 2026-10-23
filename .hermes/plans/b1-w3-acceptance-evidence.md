@@ -1048,3 +1048,26 @@ All four round94 EFFECTIVE-GAP rows now PASS with file:line evidence:
 
 **Rubric v1 Gate1 status: 13/13 measured rows PASS; G17 deferred to the
 Gate3 UNMEASURED wave (documented waiver). No outstanding rubric gaps.**
+
+## Gate2 — consumer/root/integrity bundle (2026-10-23)
+
+Frozen rubric: `.hermes/plans/b1-w3-gate2-plan-and-rubric-v1.md` (R1–R9), frozen by user approval Discord 1562994515545956506 ("1a 2a 3 승인"): defect #6 option A, CLI approve root (a) production-unchanged (contract line 1215 — approval consumes the validated stored set; file verification is confined to result reads per PT-10), rubric v1 freeze.
+
+Chain: ADD86 (luna94, TEST-ONLY, b1_product_artifacts.rs + b1_auth_http.rs only; per-row audit ledger produced) → parent round97 (3 lanes; loopback real-socket C test PASSED on real TCP bind incl. login/metadata/artifact/grant/approve/exact replay/reopen replay; b1_scope_cli sandbox-bind failures resolved as sandbox-only; sole failure = artifact-SHA metadata cell) → adjudication: **production defect #6** — `read_product_result` (result.rs:1286) validated binding/tuple/host but no artifact rows/bytes, returning metadata 200 while the artifact set was corrupt (partial success; contract 548/1215). Parent fix (result.rs:1346+): every payload-bound artifact row (9-field equality) plus `read_confined_artifact` digest verified in the same snapshot; mismatch → CorruptEvidence (404), missing root → Storage (503). One test-only correction cycle (ancestor-replacement cell setup missing parent-dir creation). dbg102/dbg103 http lanes green → **parent round98: all nine lanes exit 0** — http 6/0 (+2 new tests: G-final stored-evidence mutations incl. artifact-SHA/provenance/path/file-bytes with metadata+artifact rejection and restore, PT-10 root/ancestor/FIFO guards; real-loopback-socket test), restore 10+10/0, cli 7/0, h-hx 41/0, ledger 4/0, core 406/0, watch 17/0, cli-default 9/0.
+
+R8 measured by parent: external probe crate (scratch/p2-support-probe, path dep) — default features → E0432 ×3 (unresolved `P2ReviewPreparation`) + E0599 (`prepare_p2_review_fixture`), exit 101; `support` feature → compiles, exit 0.
+
+Known host limitation: PT-10 device-leaf cell (mknod c 1 3) unmeasurable on this host (user lacks CAP_MKNOD; sudo requires interactive auth). The test's deny branch asserts no leftover artifact; full device measurement requires a CAP_MKNOD-capable host.
+
+### Gate2 remediation cycle (2026-10-23, sol round99 → ADD87 → round100)
+- sol round99 (proc 3799655): REJECT — 4 PASS (R1/R5/R8/R9) / 5 EFFECTIVE-GAP (R2 new-source metadata 404 only post-corruption; R3 file-byte cell artifact-route-only; R4 mknod-denied leaf left absent + ancestor cell no restored-200; R6 rubric text conflicted with contract 563; R7 unauthorized+file-byte combo absent). Defect #6 production fix itself unopposed.
+- User approval "A" (Discord 1563076393028558919): R6 rubric amended in the frozen doc (success approval = exactly 1 consumption + 1 outcome row; read paths and refusal/retry/reopen add 0; anchor recorded in the rubric file).
+- ADD87 (test-only, 2 serve test files): four cell extensions implemented by luna95 (proc 4064165, EXIT 0): intact-fixture new-source metadata 404; file-byte cell extended to metadata 404 + uniform foreign body; FIFO/mknod denied branches restore leaf + assert_clean; ancestor cell restored root + 200 + assert_clean; approval retry/reopen assert consumption/outcome stay 1/1 and publishing 0.
+- Parent round100 (proc 4071715): all nine lanes exit 0 — http-enabled 6/0 (3+3), restore 10+10/0, cli-enabled 7/0, h-hx 41/0, ledger 4/0, core 406/0, watch 17/0, cli-default 9/0.
+
+### Gate2 final adjudication (2026-10-23, sol round101→103)
+- sol round101 (proc 4125698): REJECT — R2/R3/R6/R7 PASS, R4 EFFECTIVE-GAP (denied/unavailable FIFO+device branches restored without fail-closed measurement; conditional FIFO creation bypassed the rejection measurement). ADD87 patch integrity verified (no seeding/deletion-to-green; result.rs identical).
+- User approval (Discord 1563123240056922133): explicit exception to the one-correction-cycle cap; ADD88 micro-batch authorized (test-only, one file).
+- ADD88 (luna96, proc 55768, EXIT 0): all four platform-denied/unavailable branches now assert authenticated GET → 404 + no artifact prefix before restoring the leaf; success branches byte-identical.
+- Parent round102 (proc 60024): http-enabled lane exit 0 (3/0 + 3/0), denied-device branch executed and passed the new assertions. Round100's other eight lanes remain valid (ADD88 touched only the PT-10 cell inside b1_product_artifacts.rs, exercised only in the http lane).
+- sol round103 (proc 62667): **APPROVE — R4 PASS**. All four fallback branches measured fail-closed (FIFO:1363/1377, device:1411/1425) with assert_clean restoration; ADD88 audit: 32 inserted lines, zero deletions, no weakening. **Gate2 rubric R1–R9: all PASS.**

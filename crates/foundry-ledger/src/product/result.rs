@@ -1347,6 +1347,70 @@ impl ProductStore {
         if payload.order_id != order_id || payload.source_instance_id != scoped.source_instance_id {
             return Err(ProductResultError::CorruptEvidence);
         }
+        // Defect 6 (Gate2 rubric R3, contract lines 548/1215): result metadata
+        // must not be a partial success that hides artifact-set or file
+        // corruption until the artifact route is hit. Validate every
+        // payload-bound artifact row and its confined bytes in this same
+        // snapshot before returning metadata; row/byte mismatch is
+        // CorruptEvidence (404), a missing artifact root is Storage (503).
+        let root = self
+            .artifact_root_handle
+            .as_deref()
+            .ok_or(ProductResultError::Storage)?;
+        for artifact in &payload.artifacts {
+            let row: Option<(String, String, String, String, String, i64, String, String, String)> =
+                tx.query_row(
+                    "SELECT provenance_digest,artifact_sha256,order_id,source_instance_id,repository_key,admission_seq,admission_hash,run_id,relative_path FROM product_artifacts_v1 WHERE artifact_id=?1 AND order_id=?2",
+                    params![artifact.artifact_id, order_id],
+                    |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                            r.get(6)?,
+                            r.get(7)?,
+                            r.get(8)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|_| ProductResultError::Storage)?;
+            let Some((
+                provenance,
+                sha,
+                stored_order,
+                source,
+                repository,
+                admission_seq,
+                admission_hash,
+                journal_run,
+                path,
+            )) = row
+            else {
+                return Err(ProductResultError::CorruptEvidence);
+            };
+            if provenance != artifact.provenance_digest
+                || sha != artifact.artifact_sha256
+                || stored_order != artifact.order_id
+                || source != artifact.source_instance_id
+                || repository != artifact.repository_key
+                || admission_seq != artifact.admission_seq
+                || admission_hash != artifact.admission_hash
+                || journal_run != artifact.journal_run
+                || path != artifact.relative_path
+            {
+                return Err(ProductResultError::CorruptEvidence);
+            }
+            review::read_confined_artifact(
+                root,
+                &artifact.relative_path,
+                &artifact.artifact_sha256,
+            )
+            .map_err(|_| ProductResultError::CorruptEvidence)?;
+        }
         tx.commit().map_err(|_| ProductResultError::Storage)?;
         Ok(info)
     }
