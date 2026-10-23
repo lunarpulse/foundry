@@ -1,14 +1,20 @@
-// External compile probes for the cfg-gated support API (documented, not run
-// in this batch): with a scratch probe crate whose only source is
+// Gate3 T4 external compile probes for the cfg-gated support API (documented,
+// not run in this batch): with a scratch probe crate whose only source is
 // `use foundry_ledger::{AdmissionReceipt, P2ReviewPreparation, ProductServiceContext, ProductStore}; fn probe(s:&mut ProductStore,c:&ProductServiceContext,a:&AdmissionReceipt,d:&str,t:P2ReviewPreparation){ let _=s.prepare_p2_review_fixture(c,a,d,t); } fn main(){}`
 // and whose Cargo.toml is
 // `[package]\nname="p2-support-probe"\nversion="0.0.0"\nedition="2024"\n[features]\ndefault=[]\nsupport=["foundry-ledger/p2-test-support"]\n[dependencies]\nfoundry-ledger={path="/home/cosmo/foundry/crates/foundry-ledger",default-features=false}`:
 // `cargo check --manifest-path /home/cosmo/.hermes/cache/scratch/p2-support-probe/Cargo.toml --locked --offline --no-default-features`
-// must fail with E0432 (unresolved import `P2ReviewPreparation`) and E0599
-// (no method `prepare_p2_review_fixture`);
+// must fail with both E0432 (unresolved import `P2ReviewPreparation`) and
+// E0599 (no method `prepare_p2_review_fixture`); the separate
 // `cargo check --manifest-path /home/cosmo/.hermes/cache/scratch/p2-support-probe/Cargo.toml --locked --offline --features support`
-// must compile. The probe crate uses a path dependency to this workspace's
-// `crates/foundry-ledger`; the feature is not a product HTTP route or CLI.
+// must compile as the enabled-feature positive. Adapter unreachability on
+// normal HTTP/CLI/startup is evidenced by
+// crates/foundry-serve/src/http.rs product route composition,
+// crates/foundry/src/main.rs command dispatch/ProductStore constructors, and
+// crates/foundry-ledger/src/product/result.rs feature-gated API declaration:
+// those normal paths do not call `prepare_p2_review_fixture`. The probe crate
+// uses a path dependency to this workspace's `crates/foundry-ledger`; this
+// feature does not add a product HTTP route, CLI command, or startup adapter.
 use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},

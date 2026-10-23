@@ -1090,6 +1090,333 @@ fn separate_processes_replaying_same_key_return_the_exact_committed_receipt() {
 }
 
 #[test]
+fn approval_commit_write_failure_rolls_back_and_reopen_commits_once() {
+    let mut fixture = genuine_result_finalized(genuine_host_done(FixtureIdentity::new(
+        ProductConfig {
+            installation_id: "result-approval-io-install".into(),
+            database_id: "result-approval-io-db".into(),
+        },
+        "result-approval-io-source",
+        "result-approval-io-order",
+    )));
+    let path = fixture.db_path.clone();
+    let order = fixture.identity.order_id.clone();
+    let intent = fixture.approval.clone();
+    let operation_id = fixture.approval_operation_id.clone().unwrap();
+    let baseline_results = product_result_counts(&path, &order);
+    let baseline_approval = approval_participants(&path, &intent, &operation_id);
+
+    let mut store = fixture.result_store.take().unwrap();
+    let proof = store
+        .prepare_approval(&fixture.human_session_digest, &intent)
+        .unwrap();
+    // sol round107 gap 1: lock contention (BUSY) is not a filesystem I/O
+    // failure. True COMMIT-I/O injection: this store keeps the default
+    // rollback journal (journal_mode is never set to WAL on this path), so
+    // the journal file is created when the first approval INSERT takes the
+    // RESERVED lock, and the commit's final act is unlinking that journal —
+    // a directory operation. A watcher thread waits for the journal to
+    // appear, makes the directory read-only, and only then releases a
+    // second connection that has been holding a SHARED read lock (so every
+    // approval statement succeeds under RESERVED and the COMMIT is paused
+    // at its EXCLUSIVE promotion until the injection lands). The commit
+    // then acquires EXCLUSIVE, flushes its pages, and fails the journal
+    // unlink with EACCES — a real filesystem I/O error at the actual commit
+    // write — and the production ambiguous-commit recovery path (reopen,
+    // inspect the authoritative outcome, never rerun blindly) executes for
+    // real under the injected fault.
+    let dir = path.parent().unwrap().to_path_buf();
+    let dir_mode = {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(&dir).unwrap().permissions().mode()
+    };
+    let journal = path.with_file_name(format!(
+        "{}-journal",
+        path.file_name().unwrap().to_str().unwrap()
+    ));
+    let blocker = Connection::open(&path).unwrap();
+    blocker
+        .execute_batch("BEGIN; SELECT count(*) FROM sqlite_master;")
+        .unwrap();
+    let blocker = std::sync::Arc::new(std::sync::Mutex::new(Some(blocker)));
+    let watcher_blocker = blocker.clone();
+    let watcher_dir = dir.clone();
+    let watcher = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !journal.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "approval journal was never created; the write path never started"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            &watcher_dir,
+            std::fs::Permissions::from_mode(dir_mode & !0o222),
+        )
+        .unwrap();
+        drop(watcher_blocker.lock().unwrap().take());
+    });
+    match store.approve_product(&fixture.human_session_digest, &intent, &proof) {
+        Err(foundry_ledger::ProductError::Database(error)) => {
+            assert!(
+                matches!(
+                    &error,
+                    rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error {
+                            code: rusqlite::ffi::ErrorCode::SystemIoFailure,
+                            ..
+                        },
+                        _
+                    )
+                ),
+                "the commit must fail with a filesystem I/O error at the commit write, got {error:?}"
+            );
+        }
+        other => panic!(
+            "commit-time I/O failure must propagate a Database error, got {other:?}"
+        ),
+    }
+    watcher.join().unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(dir_mode)).unwrap();
+    }
+    drop(store);
+    assert_eq!(product_result_counts(&path, &order), baseline_results);
+    assert_eq!(
+        approval_participants(&path, &intent, &operation_id),
+        baseline_approval,
+        "every result and approval participant returns to its pre-call baseline"
+    );
+
+    let mut reopened = configured_reopen(&fixture);
+    let proof = reopened
+        .prepare_approval(&fixture.human_session_digest, &intent)
+        .unwrap();
+    let receipt = reopened
+        .approve_product(&fixture.human_session_digest, &intent, &proof)
+        .unwrap();
+    assert_eq!(receipt.operation_id, operation_id);
+    assert_eq!(product_result_counts(&path, &order), (1, 1, 4, 4, 3, 5));
+    assert_eq!(
+        approval_participants(&path, &intent, &operation_id),
+        (1, 1, 1, 1, 1, 1, "consumed".into(), "completed".into())
+    );
+    drop(reopened);
+    drop(fixture);
+}
+
+#[test]
+fn recovery_lookup_io_failure_propagates_error_not_absence() {
+    // Gate3 rubric T2 cell 3 (ADD91, Discord 1563206386211496081; absent at
+    // sol round105 gap 2): database-file page corruption (invalid b-tree
+    // page type on this fixture's data pages) must surface as a propagated
+    // storage error on the recovery lookup — never as Ok(None), which would
+    // misclassify an I/O failure as honest absence. Every SQL error on the
+    // lookup path maps to ProductResultError::Storage (result.rs
+    // service_result_error / verified_order_in / read_stored_result_in).
+    let mut fixture = genuine_result_finalized(genuine_host_done(FixtureIdentity::new(
+        ProductConfig {
+            installation_id: "result-lookup-io-install".into(),
+            database_id: "result-lookup-io-db".into(),
+        },
+        "result-lookup-io-source",
+        "result-lookup-io-order",
+    )));
+    let path = fixture.db_path.clone();
+    let now = fixture.now;
+    let service = fixture.service.clone();
+    let expected = fixture.expected.clone();
+    drop(fixture.result_store.take());
+    drop(fixture);
+
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(
+        bytes.len() > 16 * 1024,
+        "genuine fixture database must span multiple pages"
+    );
+    // sol round107 gap 2: the previous middle-third corruption could trip
+    // during reopen, and an early-return arm accepted that outcome without
+    // ever executing the lookup — a vacuous pass. Targeted injection
+    // instead: every database page whose payload mentions this fixture's
+    // order gets an invalid b-tree page-type byte (0x7F). Page 1 (the
+    // sqlite_master schema page) is never touched, so reopening the store
+    // must succeed, and the first lookup statement that walks an affected
+    // table fails structurally — the lookup itself has to propagate the
+    // error; there is no acceptable early return.
+    let page_size = {
+        let raw = u16::from_be_bytes([bytes[16], bytes[17]]) as usize;
+        if raw == 1 {
+            65536
+        } else {
+            raw
+        }
+    };
+    assert!(
+        page_size >= 512 && bytes.len() > page_size,
+        "invalid page size or single-page database"
+    );
+    let needle = b"result-lookup-io-order";
+    let mut page_starts = std::collections::BTreeSet::new();
+    for (offset, window) in bytes.windows(needle.len()).enumerate() {
+        if window == needle {
+            page_starts.insert((offset / page_size) * page_size);
+        }
+    }
+    assert!(
+        page_starts.range(page_size..).next().is_some(),
+        "fixture order payload must live on a data page beyond the schema page"
+    );
+    let mut corrupted = bytes;
+    for page_start in page_starts.range(page_size..) {
+        corrupted[*page_start] = 0x7F;
+    }
+    std::fs::write(&path, &corrupted).unwrap();
+
+    let mut store = ProductStore::open_with_clock(
+        &path,
+        ProductConfig {
+            installation_id: "result-lookup-io-install".into(),
+            database_id: "result-lookup-io-db".into(),
+        },
+        std::sync::Arc::new(FixtureClock(now)),
+    )
+    .expect("the schema page is intact, so reopening the corrupted store must succeed");
+    match store.lookup_product_review_result(&service, &expected) {
+        Err(foundry_ledger::ProductResultError::Storage) => {}
+        other => panic!(
+            "corrupt payload must propagate Err(Storage) on the recovery lookup, never Ok(None), got {other:?}"
+        ),
+    }
+    drop(store);
+}
+
+#[test]
+fn v2_migration_cutoff_bounds_legacy_replay_and_postcutoff_rejection() {
+    // Mechanics-only v3->v2 downgrade of a GENUINE approval (Gate3 rubric T3,
+    // Decision 2-A, Discord 1563171600449413234): historical-origin evidence
+    // remains denied; this cell measures only the migrate_product_results_v2
+    // cutoff consumer predicate inside approve_product (product.rs:3452-3474).
+    let mut fixture = genuine_result_finalized(genuine_host_done(FixtureIdentity::new(
+        ProductConfig {
+            installation_id: "result-cutoff-install".into(),
+            database_id: "result-cutoff-db".into(),
+        },
+        "result-cutoff-source",
+        "result-cutoff-order",
+    )));
+    let path = fixture.db_path.clone();
+    let intent = fixture.approval.clone();
+    let operation_id = fixture.approval_operation_id.clone().unwrap();
+    drop(fixture.host.take());
+    // 1. Genuine v3 approval commit through the public API.
+    let mut store = fixture.result_store.take().unwrap();
+    let proof = store
+        .prepare_approval(&fixture.human_session_digest, &intent)
+        .unwrap();
+    let first = store
+        .approve_product(&fixture.human_session_digest, &intent, &proof)
+        .unwrap();
+    drop(store);
+    let first_wire = serde_json::to_string(&first).unwrap();
+    // 2. The approval event is the ledger tail; its seq becomes the cutoff.
+    let approval_seq: i64 = Connection::open(&path)
+        .unwrap()
+        .query_row("SELECT MAX(seq) FROM ledger", [], |r| r.get(0))
+        .unwrap();
+    // 3. Downgrade drops the approval side binding; migration seals the cutoff.
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "DROP TRIGGER product_result_meta_no_update; DROP TRIGGER product_result_meta_no_delete; DROP TRIGGER product_result_meta_no_replace; DROP TRIGGER product_result_legacy_hosts_no_insert; DROP TRIGGER product_result_legacy_hosts_no_update; DROP TRIGGER product_result_legacy_hosts_no_delete; DROP TRIGGER product_result_legacy_tuples_no_insert; DROP TRIGGER product_result_legacy_tuples_no_update; DROP TRIGGER product_result_legacy_tuples_no_delete; DROP TRIGGER product_review_authority_no_update; DROP TRIGGER product_review_authority_no_delete; DROP TRIGGER product_review_authority_no_replace; DROP TRIGGER product_review_authority_no_legacy; DROP TRIGGER product_result_bindings_no_update; DROP TRIGGER product_result_bindings_no_delete; DROP TRIGGER product_result_bindings_no_replace; DROP TRIGGER product_result_bindings_no_legacy_tuple; DROP TRIGGER product_approval_result_bindings_no_update; DROP TRIGGER product_approval_result_bindings_no_delete; DROP TRIGGER product_approval_result_bindings_no_replace; DROP TRIGGER product_tuples_no_update; DROP TRIGGER product_tuples_no_delete; DROP TRIGGER product_tuples_no_replace; DROP TABLE product_approval_result_bindings_v1; DROP TABLE product_result_bindings_v1; DROP TABLE product_review_authority_v1; DROP TABLE product_result_legacy_hosts_v1; DROP TABLE product_result_legacy_tuples_v1; DROP TABLE product_result_meta_v1; UPDATE product_meta_v1 SET schema_version=2;",
+        )
+        .unwrap();
+    foundry_ledger::ProductStore::migrate_product_results_v2(&path, &fixture.config).unwrap();
+    let cutoff: i64 = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT legacy_approval_cutoff_seq FROM product_result_meta_v1 WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        cutoff, approval_seq,
+        "cutoff equals MAX(seq) at migration time; boundary equality keeps the legacy approval covered"
+    );
+    // 4. INCLUDED side: replay returns the exact committed receipt through the
+    //    legacy branch (no side binding, seq == cutoff, evidence complete).
+    let mut reopened = configured_reopen(&fixture);
+    let replay_proof = reopened
+        .prepare_approval(&fixture.human_session_digest, &intent)
+        .unwrap();
+    let replay = reopened
+        .approve_product(&fixture.human_session_digest, &intent, &replay_proof)
+        .unwrap();
+    assert_eq!(serde_json::to_string(&replay).unwrap(), first_wire);
+    // 5. Legacy evidence negative: consumed grant tampered -> the same replay
+    //    is rejected as incomplete legacy evidence, not treated as absence.
+    let grant: String = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT grant_id FROM product_operations_v1 WHERE operation_id=?1",
+            [&operation_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    Connection::open(&path)
+        .unwrap()
+        .execute("UPDATE product_grants_v1 SET state='revoked' WHERE grant_id=?1", [&grant])
+        .unwrap();
+    let tampered_proof = reopened
+        .prepare_approval(&fixture.human_session_digest, &intent)
+        .unwrap();
+    match reopened.approve_product(&fixture.human_session_digest, &intent, &tampered_proof) {
+        Err(foundry_ledger::ProductError::Invariant(message))
+            if message.contains("legacy approval evidence is incomplete") => {}
+        other => panic!("tampered legacy evidence must reject with the incomplete-evidence invariant, got {other:?}"),
+    }
+    Connection::open(&path)
+        .unwrap()
+        .execute("UPDATE product_grants_v1 SET state='consumed' WHERE grant_id=?1", [&grant])
+        .unwrap();
+    let restored_proof = reopened
+        .prepare_approval(&fixture.human_session_digest, &intent)
+        .unwrap();
+    let restored = reopened
+        .approve_product(&fixture.human_session_digest, &intent, &restored_proof)
+        .unwrap();
+    assert_eq!(serde_json::to_string(&restored).unwrap(), first_wire);
+    // 6. EXCLUDED side: cutoff lowered below the approval seq -> the same
+    //    replay is rejected as a post-cutoff approval lacking side binding.
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "DROP TRIGGER product_result_meta_no_update; DROP TRIGGER product_result_meta_no_delete; DROP TRIGGER product_result_meta_no_replace;",
+        )
+        .unwrap();
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(&format!(
+            "UPDATE product_result_meta_v1 SET legacy_approval_cutoff_seq={}",
+            cutoff - 1
+        ))
+        .unwrap();
+    let excluded_proof = reopened
+        .prepare_approval(&fixture.human_session_digest, &intent)
+        .unwrap();
+    match reopened.approve_product(&fixture.human_session_digest, &intent, &excluded_proof) {
+        Err(foundry_ledger::ProductError::Invariant(message))
+            if message.contains("post-cutoff approval lacks result side binding") => {}
+        other => panic!("post-cutoff replay without binding must reject with the post-cutoff invariant, got {other:?}"),
+    }
+    drop(reopened);
+    drop(fixture);
+}
+
+#[test]
 fn sigkill_before_commit_rolls_back_and_after_commit_preserves_exact_set() {
     let executable = std::env::var_os("B1_LEDGER_TEST_EXE")
         .map(PathBuf::from)

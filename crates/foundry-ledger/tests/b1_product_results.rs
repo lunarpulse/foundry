@@ -87,6 +87,149 @@ fn explicit_v2_migration_censuses_history_and_is_idempotent() {
 }
 
 #[test]
+fn v2_migration_cas_and_missing_table_failures_leave_zero_partial_state() {
+    // Gate3 rubric T3 cell 1 (Discord 1563206386211496081): mechanics-only
+    // v3->v2 downgrade fixture; a CAS miss must roll back every intermediate
+    // write, and a missing required table must reject before any write.
+    let root = scratch();
+    let db = root.join("product.sqlite");
+    drop(ProductStore::open(&db, config()).unwrap());
+    {
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("DROP TRIGGER product_result_meta_no_update; DROP TRIGGER product_result_meta_no_delete; DROP TRIGGER product_result_meta_no_replace; DROP TRIGGER product_result_legacy_hosts_no_insert; DROP TRIGGER product_result_legacy_hosts_no_update; DROP TRIGGER product_result_legacy_hosts_no_delete; DROP TRIGGER product_result_legacy_tuples_no_insert; DROP TRIGGER product_result_legacy_tuples_no_update; DROP TRIGGER product_result_legacy_tuples_no_delete; DROP TRIGGER product_review_authority_no_update; DROP TRIGGER product_review_authority_no_delete; DROP TRIGGER product_review_authority_no_replace; DROP TRIGGER product_review_authority_no_legacy; DROP TRIGGER product_result_bindings_no_update; DROP TRIGGER product_result_bindings_no_delete; DROP TRIGGER product_result_bindings_no_replace; DROP TRIGGER product_result_bindings_no_legacy_tuple; DROP TRIGGER product_approval_result_bindings_no_update; DROP TRIGGER product_approval_result_bindings_no_delete; DROP TRIGGER product_approval_result_bindings_no_replace; DROP TRIGGER product_tuples_no_update; DROP TRIGGER product_tuples_no_delete; DROP TRIGGER product_tuples_no_replace; DROP TABLE product_approval_result_bindings_v1; DROP TABLE product_result_bindings_v1; DROP TABLE product_review_authority_v1; DROP TABLE product_result_legacy_hosts_v1; DROP TABLE product_result_legacy_tuples_v1; DROP TABLE product_result_meta_v1; UPDATE product_meta_v1 SET schema_version=2;").unwrap();
+    }
+    // sol round105 gap 3: setting schema_version=1 only trips the entry guard
+    // (result.rs:553) before any write. Instead a trigger aborts the final CAS
+    // UPDATE (schema_version 2->3) itself: DDL, population, census sealing,
+    // and the cutoff insert have all executed when the CAS statement fails,
+    // so zero-partial-state now measures rollback of real intermediate
+    // writes. (The version row is locked by the migration's own transaction,
+    // so a mid-flight changed!=1 is structurally unreachable; aborting the
+    // UPDATE measures the same rollback obligation at the exact CAS site.)
+    Connection::open(&db)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER test_abort_v2_to_v3_cas BEFORE UPDATE ON product_meta_v1\n             WHEN NEW.schema_version=3\n             BEGIN SELECT RAISE(ABORT,'injected v2->v3 cas failure'); END;",
+        )
+        .unwrap();
+    assert!(ProductStore::migrate_product_results_v2(&db, &config()).is_err());
+    {
+        let conn = Connection::open(&db).unwrap();
+        let schema: i64 = conn
+            .query_row(
+                "SELECT schema_version FROM product_meta_v1 WHERE singleton=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let partial: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('product_result_meta_v1','product_result_legacy_hosts_v1','product_result_legacy_tuples_v1','product_result_bindings_v1','product_approval_result_bindings_v1','product_review_authority_v1')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let sealed: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'product_result_legacy_%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            (schema, partial, sealed),
+            (2, 0, 0),
+            "CAS failure after full DDL/population/cutoff must roll back every intermediate migration write"
+        );
+        conn.execute_batch("DROP TRIGGER test_abort_v2_to_v3_cas;")
+            .unwrap();
+        // Missing required table at v2: rejected before any migration write.
+        conn.execute("DROP TABLE product_outcomes_v1", []).unwrap();
+    }
+    assert!(ProductStore::migrate_product_results_v2(&db, &config()).is_err());
+    {
+        let conn = Connection::open(&db).unwrap();
+        let schema: i64 = conn
+            .query_row(
+                "SELECT schema_version FROM product_meta_v1 WHERE singleton=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let partial: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='product_result_meta_v1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            (schema, partial),
+            (2, 0),
+            "missing required table must leave zero partial migration state"
+        );
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn v2_migration_seals_legacy_census_with_exact_rows() {
+    // Gate3 rubric T3 cell 2 (Discord 1563206386211496081): the migrated
+    // census equals its source rows exactly and all six sealing triggers
+    // reject INSERT/UPDATE/DELETE afterwards.
+    let root = scratch();
+    let db = root.join("product.sqlite");
+    drop(ProductStore::open(&db, config()).unwrap());
+    {
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("DROP TRIGGER product_result_meta_no_update; DROP TRIGGER product_result_meta_no_delete; DROP TRIGGER product_result_meta_no_replace; DROP TRIGGER product_result_legacy_hosts_no_insert; DROP TRIGGER product_result_legacy_hosts_no_update; DROP TRIGGER product_result_legacy_hosts_no_delete; DROP TRIGGER product_result_legacy_tuples_no_insert; DROP TRIGGER product_result_legacy_tuples_no_update; DROP TRIGGER product_result_legacy_tuples_no_delete; DROP TRIGGER product_review_authority_no_update; DROP TRIGGER product_review_authority_no_delete; DROP TRIGGER product_review_authority_no_replace; DROP TRIGGER product_review_authority_no_legacy; DROP TRIGGER product_result_bindings_no_update; DROP TRIGGER product_result_bindings_no_delete; DROP TRIGGER product_result_bindings_no_replace; DROP TRIGGER product_result_bindings_no_legacy_tuple; DROP TRIGGER product_approval_result_bindings_no_update; DROP TRIGGER product_approval_result_bindings_no_delete; DROP TRIGGER product_approval_result_bindings_no_replace; DROP TRIGGER product_tuples_no_update; DROP TRIGGER product_tuples_no_delete; DROP TRIGGER product_tuples_no_replace; DROP TABLE product_approval_result_bindings_v1; DROP TABLE product_result_bindings_v1; DROP TABLE product_review_authority_v1; DROP TABLE product_result_legacy_hosts_v1; DROP TABLE product_result_legacy_tuples_v1; DROP TABLE product_result_meta_v1; UPDATE product_meta_v1 SET schema_version=2;").unwrap();
+        conn.execute(
+            "INSERT INTO artifact_tuples VALUES('seal-order',1,3,0,?1,'/old/evidence.log','[{\"generation\":0,\"commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"fix_log_path\":\"\"}]')",
+            ["a".repeat(40)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO product_review_host_accept_v1(order_id,attempt,run_id,activation) VALUES('seal-order',1,3,1)",
+            [],
+        )
+        .unwrap();
+    }
+    ProductStore::migrate_product_results_v2(&db, &config()).unwrap();
+    let conn = Connection::open(&db).unwrap();
+    let host: (String, i64, i64, i64) = conn
+        .query_row(
+            "SELECT order_id,attempt,run_id,activation FROM product_result_legacy_hosts_v1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    let tuple: (String, i64, i64, i64) = conn
+        .query_row(
+            "SELECT order_id,attempt,run_id,generation FROM product_result_legacy_tuples_v1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(host, ("seal-order".into(), 1, 3, 1));
+    assert_eq!(tuple, ("seal-order".into(), 1, 3, 0));
+    for sql in [
+        "INSERT INTO product_result_legacy_hosts_v1(order_id,attempt,run_id,activation) VALUES('x',9,9,9)",
+        "UPDATE product_result_legacy_hosts_v1 SET activation=2",
+        "DELETE FROM product_result_legacy_hosts_v1",
+        "INSERT INTO product_result_legacy_tuples_v1(order_id,attempt,run_id,generation) VALUES('x',9,9,9)",
+        "UPDATE product_result_legacy_tuples_v1 SET generation=2",
+        "DELETE FROM product_result_legacy_tuples_v1",
+    ] {
+        assert!(
+            conn.execute(sql, []).is_err(),
+            "sealed census must reject: {sql}"
+        );
+    }
+    drop(conn);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn typed_tuple_digest_uses_nonempty_exec_generation_encoding() {
     let tuple = ArtifactTuple {
         order: OrderId("colon:order".into()),
