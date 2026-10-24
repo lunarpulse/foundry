@@ -1,6 +1,6 @@
 #![cfg(feature = "p2-test-support")]
 
-use foundry_ledger::{ProductConfig, ScopeSourceManifest};
+use foundry_ledger::{ProductConfig, ProductPublishStart, ScopeSourceManifest};
 use std::{
     io::Write,
     path::{Path, PathBuf},
@@ -301,6 +301,17 @@ fn publish_rows(db: &Path) -> (i64, i64, Option<String>) {
     ).unwrap()
 }
 
+fn publish_snapshot(db: &Path, operation_id: &str) -> (String, String) {
+    rusqlite::Connection::open(db)
+        .unwrap()
+        .query_row(
+            "SELECT state,receipt_json FROM product_publish_outcomes_v1 WHERE operation_id=?1",
+            [operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+}
+
 fn registry_pr_count(registry: &Path) -> usize {
     std::fs::read_dir(registry)
         .unwrap()
@@ -318,6 +329,18 @@ fn publisher_call_count(registry: &Path) -> usize {
     std::fs::read_to_string(registry.join("publisher-invocations.log"))
         .map(|calls| calls.lines().count())
         .unwrap_or(0)
+}
+
+fn seed_closed_unmerged_pr(registry: &Path, operation_id: &str) -> String {
+    use sha2::Digest;
+    std::fs::create_dir_all(registry).unwrap();
+    let url = format!("https://example.invalid/pr/{operation_id}");
+    let path = registry.join(format!(
+        "{}.pr",
+        hex::encode(sha2::Sha256::digest(operation_id.as_bytes()))
+    ));
+    std::fs::write(path, format!("{url}\nclosed-unmerged\n")).unwrap();
+    url
 }
 
 #[test]
@@ -417,4 +440,44 @@ fn v4_publish_denials_leave_no_rows_or_prs() {
     assert_eq!(publish_rows(&approved.db).0, 0);
     assert_eq!(registry_pr_count(&registry), 0);
     assert_eq!(publisher_call_count(&registry), 0);
+}
+
+#[test]
+fn w4_cli_reports_rejected_without_side_effects() {
+    let approved = genuine_approved("w4-rejected");
+    let args = publish_args_for(&approved, "w4-rejected");
+    let registry = approved.root.join("test-pr-registry");
+    let bearer = std::fs::read_to_string(&approved.session).unwrap();
+    let receipt: foundry_ledger::ProductApprovalReceipt =
+        serde_json::from_slice(&std::fs::read(&approved.receipt).unwrap()).unwrap();
+    let config = ProductConfig {
+        installation_id: "publish-install-w4-rejected".into(),
+        database_id: "publish-db-w4-rejected".into(),
+    };
+    let mut store = foundry_ledger::ProductStore::open(&approved.db, config).unwrap();
+    use sha2::Digest;
+    let session_digest = hex::encode(sha2::Sha256::digest(bearer.trim_end().as_bytes()));
+    assert_eq!(
+        store
+            .begin_product_publish(&session_digest, &receipt, chrono::Utc::now())
+            .unwrap(),
+        ProductPublishStart::Started
+    );
+    drop(store);
+
+    let url = seed_closed_unmerged_pr(&registry, &approved.operation_id);
+    let before = publish_snapshot(&approved.db, &approved.operation_id);
+    assert_eq!(before.0, "pending");
+    assert_eq!(publisher_call_count(&registry), 0);
+    assert_eq!(registry_pr_count(&registry), 1);
+
+    let rejected = publish(&approved, &args, Some(&registry));
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains(&format!(
+        "external PR closed without merge: {url}; stored pending; a new approval is required to retry"
+    )));
+    assert_eq!(publish_snapshot(&approved.db, &approved.operation_id), before);
+    assert_eq!(publish_rows(&approved.db).0, 1);
+    assert_eq!(publisher_call_count(&registry), 0);
+    assert_eq!(registry_pr_count(&registry), 1);
 }

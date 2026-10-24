@@ -11,8 +11,32 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProductPublishReconcileOutcome {
     Confirmed { pr_url: String },
+    /// The adapter found the operation's PR, but it is closed without merge.
+    /// This is not an accepted external effect and never authorizes a retry.
+    Rejected { pr_url: String },
     NotFound,
     Unknown,
+}
+
+/// Result of the durable product publish composition. The shared
+/// `PublishOutcome` port remains unchanged; rejection is an explicit business
+/// result because a closed, unmerged PR requires a new human approval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProductPublishResult {
+    Published(PublishOutcome),
+    Rejected { pr_url: String },
+}
+
+impl PartialEq<PublishOutcome> for ProductPublishResult {
+    fn eq(&self, other: &PublishOutcome) -> bool {
+        matches!(self, Self::Published(outcome) if outcome == other)
+    }
+}
+
+impl From<PublishOutcome> for ProductPublishResult {
+    fn from(outcome: PublishOutcome) -> Self {
+        Self::Published(outcome)
+    }
 }
 
 /// Narrow local adapter seam for looking up an operation after a response
@@ -177,7 +201,7 @@ impl ProductProjection {
         publisher: &P,
         reconciler: &R,
         now: chrono::DateTime<chrono::Utc>,
-    ) -> PortResult<PublishOutcome>
+    ) -> PortResult<ProductPublishResult>
     where
         P: Publisher,
         R: ProductPublishReconciler,
@@ -196,7 +220,7 @@ impl ProductProjection {
             .map_err(|_| PortError::Permanent("product publish authorization denied".into()))?;
         match start {
             ProductPublishStart::Confirmed { pr_url } => {
-                Ok(PublishOutcome::Confirmed { pr_url })
+                Ok(ProductPublishResult::Published(PublishOutcome::Confirmed { pr_url }))
             }
             ProductPublishStart::Started => {
                 Self::guarded_publish(store, publisher, receipt, now).await
@@ -207,11 +231,17 @@ impl ProductProjection {
                         store
                             .settle_product_publish(&receipt.operation_id, &pr_url)
                             .map_err(|_| PortError::Permanent("product publish settlement failed".into()))?;
-                        Ok(PublishOutcome::Confirmed { pr_url })
+                        Ok(ProductPublishResult::Published(PublishOutcome::Confirmed { pr_url }))
+                    }
+                    ProductPublishReconcileOutcome::Rejected { pr_url } => {
+                        // A closed unmerged PR is neither a confirmed effect
+                        // nor proof of absence. Keep the durable start pending
+                        // and require a fresh approval before any new effect.
+                        Ok(ProductPublishResult::Rejected { pr_url })
                     }
                     ProductPublishReconcileOutcome::Unknown => Ok(PublishOutcome::Unknown {
                         operation_id: receipt.operation_id.clone(),
-                    }),
+                    }.into()),
                     ProductPublishReconcileOutcome::NotFound => {
                         // Fence the durable state before any external retry:
                         // a concurrent caller may have confirmed and settled
@@ -226,7 +256,7 @@ impl ProductProjection {
                                 )
                             })? {
                             ProductPublishStart::Confirmed { pr_url } => {
-                                Ok(PublishOutcome::Confirmed { pr_url })
+                                Ok(ProductPublishResult::Published(PublishOutcome::Confirmed { pr_url }))
                             }
                             ProductPublishStart::Started => {
                                 Self::guarded_publish(store, publisher, receipt, now).await
@@ -235,9 +265,9 @@ impl ProductProjection {
                             // Reconcile; treat it defensively as an Unknown
                             // (pending is preserved for the next pass).
                             ProductPublishStart::Reconcile => {
-                                Ok(PublishOutcome::Unknown {
+                                Ok(ProductPublishResult::Published(PublishOutcome::Unknown {
                                     operation_id: receipt.operation_id.clone(),
-                                })
+                                }))
                             }
                         }
                     }
@@ -259,18 +289,20 @@ impl ProductProjection {
         publisher: &P,
         receipt: &ProductApprovalReceipt,
         now: chrono::DateTime<chrono::Utc>,
-    ) -> PortResult<PublishOutcome> {
+    ) -> PortResult<ProductPublishResult> {
         match store
             .claim_product_publish_retry(receipt)
             .map_err(|_| PortError::Permanent("product publish retry fence failed".into()))? {
-            ProductPublishStart::Confirmed { pr_url } => Ok(PublishOutcome::Confirmed { pr_url }),
+            ProductPublishStart::Confirmed { pr_url } => Ok(ProductPublishResult::Published(PublishOutcome::Confirmed { pr_url })),
             ProductPublishStart::Started => {
                 let bound_order = Self::bound_publishing_order(receipt, now)?;
-                Self::call_product_publisher(store, publisher, &bound_order, receipt).await
+                Self::call_product_publisher(store, publisher, &bound_order, receipt)
+                    .await
+                    .map(ProductPublishResult::Published)
             }
-            ProductPublishStart::Reconcile => Ok(PublishOutcome::Unknown {
+            ProductPublishStart::Reconcile => Ok(ProductPublishResult::Published(PublishOutcome::Unknown {
                 operation_id: receipt.operation_id.clone(),
-            }),
+            })),
         }
     }
 

@@ -6,7 +6,10 @@ use foundry_ledger::{
     ScopeMutation,
 };
 use foundry_line::{
-    product::{ProductProjection, ProductPublishReconcileOutcome, ProductPublishReconciler},
+    product::{
+        ProductProjection, ProductPublishReconcileOutcome, ProductPublishReconciler,
+        ProductPublishResult,
+    },
 };
 use rusqlite::Connection;
 use std::path::Path;
@@ -24,7 +27,7 @@ struct LocalPublisher {
     /// Operation-keyed PR registry: one PR per operation_id. A retry of the
     /// same operation reuses its PR (idempotent); only a distinct operation
     /// opens a distinct PR.
-    opened_prs: Mutex<std::collections::HashMap<String, String>>,
+    opened_prs: Arc<Mutex<std::collections::HashMap<String, LocalPr>>>,
     /// Race hook: when armed with (db, install, database, url), the next
     /// publish() call performs a GENUINE concurrent settle of the same URL
     /// from a separate ProductStore connection at call entry — simulating
@@ -35,6 +38,31 @@ struct LocalPublisher {
 impl LocalPublisher {
     fn distinct_prs(&self) -> usize {
         self.opened_prs.lock().unwrap().len()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalPrState {
+    Open,
+    ClosedMerged,
+    ClosedUnmerged,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LocalPr {
+    url: String,
+    state: LocalPrState,
+}
+
+impl LocalPublisher {
+    fn register_pr(&self, operation_id: &str, url: &str, state: LocalPrState) {
+        self.opened_prs.lock().unwrap().insert(
+            operation_id.to_owned(),
+            LocalPr {
+                url: url.to_owned(),
+                state,
+            },
+        );
     }
 }
 
@@ -73,7 +101,13 @@ impl Publisher for LocalPublisher {
             drop(other);
             {
                 let mut opened = self.opened_prs.lock().unwrap();
-                opened.insert(operation_id.to_string(), url.clone());
+                opened.insert(
+                    operation_id.to_string(),
+                    LocalPr {
+                        url: url.clone(),
+                        state: LocalPrState::Open,
+                    },
+                );
             }
             self.calls.fetch_add(1, Ordering::SeqCst);
             PublishOutcome::Confirmed { pr_url: url }
@@ -81,9 +115,10 @@ impl Publisher for LocalPublisher {
             {
                 let mut opened = self.opened_prs.lock().unwrap();
                 let seq = opened.len() + 1;
-                opened
-                    .entry(operation_id.to_string())
-                    .or_insert_with(|| format!("https://example.invalid/pr/open-{seq}"));
+                opened.entry(operation_id.to_string()).or_insert_with(|| LocalPr {
+                    url: format!("https://example.invalid/pr/open-{seq}"),
+                    state: LocalPrState::Open,
+                });
             }
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.outcome.lock().unwrap().take().unwrap()
@@ -96,6 +131,7 @@ impl Publisher for LocalPublisher {
 struct LocalReconciler {
     calls: Arc<AtomicUsize>,
     outcome: Arc<Mutex<ProductPublishReconcileOutcome>>,
+    registry: Option<Arc<Mutex<std::collections::HashMap<String, LocalPr>>>>,
     /// Race hook: when armed with (db, install, database, url), the next
     /// reconcile() call performs a GENUINE concurrent settle of that URL
     /// from a separate ProductStore connection BEFORE returning its outcome
@@ -126,7 +162,19 @@ impl ProductPublishReconciler for LocalReconciler {
             .unwrap();
             other.settle_product_publish(operation_id, &url).unwrap();
         }
-        let outcome = self.outcome.lock().unwrap().clone();
+        let outcome = self
+            .registry
+            .as_ref()
+            .and_then(|registry| registry.lock().unwrap().get(operation_id).cloned())
+            .map(|pr| match pr.state {
+                LocalPrState::Open | LocalPrState::ClosedMerged => {
+                    ProductPublishReconcileOutcome::Confirmed { pr_url: pr.url }
+                }
+                LocalPrState::ClosedUnmerged => {
+                    ProductPublishReconcileOutcome::Rejected { pr_url: pr.url }
+                }
+            })
+            .unwrap_or_else(|| self.outcome.lock().unwrap().clone());
         async move { Ok(outcome) }
     }
 }
@@ -205,6 +253,17 @@ fn publish_counts(db: &Path) -> (i64, i64, i64) {
              FROM product_publish_outcomes_v1",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap()
+}
+
+fn stored_publish_row(db: &Path, operation_id: &str) -> (String, String) {
+    Connection::open(db)
+        .unwrap()
+        .query_row(
+            "SELECT state,receipt_json FROM product_publish_outcomes_v1 WHERE operation_id=?1",
+            [operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap()
 }
@@ -525,7 +584,7 @@ fn revalidation_and_capability_gate_before_any_start() {
     let publisher = LocalPublisher {
         db: queued.db_path.clone(),
         calls: AtomicUsize::new(0),
-        opened_prs: Mutex::new(std::collections::HashMap::new()),
+        opened_prs: Arc::new(Mutex::new(std::collections::HashMap::new())),
         interleave_settle: Mutex::new(None),
         outcome: Mutex::new(Some(PublishOutcome::Confirmed {
             pr_url: "https://example.invalid/pr/1".into(),
@@ -534,6 +593,7 @@ fn revalidation_and_capability_gate_before_any_start() {
     let reconciler = LocalReconciler {
         calls: Arc::new(AtomicUsize::new(0)),
         outcome: Arc::new(Mutex::new(ProductPublishReconcileOutcome::Unknown)),
+        registry: None,
         interleave_settle: Arc::new(Mutex::new(None)),
     };
     let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
@@ -721,7 +781,7 @@ fn start_commits_before_external_call_and_survives_crash() {
     let publisher = LocalPublisher {
         db: approved.fixture.db_path.clone(),
         calls: AtomicUsize::new(0),
-        opened_prs: Mutex::new(std::collections::HashMap::new()),
+        opened_prs: Arc::new(Mutex::new(std::collections::HashMap::new())),
         interleave_settle: Mutex::new(None),
         outcome: Mutex::new(Some(PublishOutcome::Unknown {
             operation_id: approved.receipt.operation_id.clone(),
@@ -730,6 +790,7 @@ fn start_commits_before_external_call_and_survives_crash() {
     let reconciler = LocalReconciler {
         calls: Arc::new(AtomicUsize::new(0)),
         outcome: Arc::new(Mutex::new(ProductPublishReconcileOutcome::NotFound)),
+        registry: None,
         interleave_settle: Arc::new(Mutex::new(None)),
     };
     let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
@@ -819,7 +880,7 @@ fn response_loss_unknown_keeps_pending_and_reconciles() {
     let publisher = LocalPublisher {
         db: approved.fixture.db_path.clone(),
         calls: AtomicUsize::new(0),
-        opened_prs: Mutex::new(std::collections::HashMap::new()),
+        opened_prs: Arc::new(Mutex::new(std::collections::HashMap::new())),
         interleave_settle: Mutex::new(None),
         outcome: Mutex::new(Some(PublishOutcome::Unknown {
             operation_id: approved.receipt.operation_id.clone(),
@@ -830,6 +891,7 @@ fn response_loss_unknown_keeps_pending_and_reconciles() {
         outcome: Arc::new(Mutex::new(ProductPublishReconcileOutcome::Confirmed {
             pr_url: "https://example.invalid/pr/3".into(),
         })),
+        registry: None,
         interleave_settle: Arc::new(Mutex::new(None)),
     };
     let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
@@ -903,7 +965,7 @@ fn confirmed_is_never_reexecuted() {
     let publisher = LocalPublisher {
         db: approved.fixture.db_path.clone(),
         calls: AtomicUsize::new(0),
-        opened_prs: Mutex::new(std::collections::HashMap::new()),
+        opened_prs: Arc::new(Mutex::new(std::collections::HashMap::new())),
         interleave_settle: Mutex::new(None),
         outcome: Mutex::new(Some(PublishOutcome::Confirmed {
             pr_url: "https://example.invalid/pr/4".into(),
@@ -912,6 +974,7 @@ fn confirmed_is_never_reexecuted() {
     let reconciler = LocalReconciler {
         calls: Arc::new(AtomicUsize::new(0)),
         outcome: Arc::new(Mutex::new(ProductPublishReconcileOutcome::Unknown)),
+        registry: None,
         interleave_settle: Arc::new(Mutex::new(None)),
     };
     let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
@@ -1061,6 +1124,165 @@ fn confirmed_is_never_reexecuted() {
     close(approved);
 }
 
+fn start_pending_publish(approved: &mut ApprovedFixture) {
+    assert_eq!(
+        approved
+            .store
+            .begin_product_publish(
+                &approved.fixture.human_session_digest,
+                &approved.receipt,
+                approved.fixture.now,
+            )
+            .unwrap(),
+        ProductPublishStart::Started
+    );
+    assert_eq!(publish_counts(&approved.fixture.db_path), (1, 1, 0));
+}
+
+fn reconcile_with_registry(
+    registry: Arc<Mutex<std::collections::HashMap<String, LocalPr>>>,
+) -> LocalReconciler {
+    LocalReconciler {
+        calls: Arc::new(AtomicUsize::new(0)),
+        outcome: Arc::new(Mutex::new(ProductPublishReconcileOutcome::NotFound)),
+        registry: Some(registry),
+        interleave_settle: Arc::new(Mutex::new(None)),
+    }
+}
+
+fn local_publisher(approved: &ApprovedFixture) -> LocalPublisher {
+    LocalPublisher {
+        db: approved.fixture.db_path.clone(),
+        calls: AtomicUsize::new(0),
+        opened_prs: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        interleave_settle: Mutex::new(None),
+        outcome: Mutex::new(Some(PublishOutcome::Confirmed {
+            pr_url: "https://example.invalid/pr/must-not-publish".into(),
+        })),
+    }
+}
+
+/// W1: a pending local operation reconciles an already-existing operation PR
+/// to the same URL and settles exactly once without opening another PR.
+#[test]
+fn existing_pr_reconciles_confirmed() {
+    let mut approved = approved_fixture("w1-existing-pr", true);
+    start_pending_publish(&mut approved);
+    let publisher = local_publisher(&approved);
+    let url = format!("https://example.invalid/pr/{}", approved.receipt.operation_id);
+    publisher.register_pr(&approved.receipt.operation_id, &url, LocalPrState::Open);
+    let registry = publisher.opened_prs.clone();
+    let registry_before = registry.lock().unwrap().clone();
+    let receipt_json = stored_publish_row(&approved.fixture.db_path, &approved.receipt.operation_id).1;
+    let reconciler = reconcile_with_registry(registry.clone());
+    let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+
+    assert_eq!(
+        runtime
+            .block_on(ProductProjection::publish_product_approved(
+                &mut approved.store,
+                &approved.fixture.human_session_digest,
+                &approved.receipt,
+                &publisher,
+                &reconciler,
+                approved.fixture.now,
+            ))
+            .unwrap(),
+        PublishOutcome::Confirmed { pr_url: url }
+    );
+    assert_eq!(publish_counts(&approved.fixture.db_path), (1, 0, 1));
+    assert_eq!(stored_publish_row(&approved.fixture.db_path, &approved.receipt.operation_id).1, receipt_json);
+    assert_eq!(*registry.lock().unwrap(), registry_before);
+    assert_eq!(publisher.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(publisher.distinct_prs(), 1);
+    close(approved);
+}
+
+/// W2: a closed and merged PR is an accepted external effect and recovers via
+/// the same Confirmed idempotent path, without a new publish call.
+#[test]
+fn closed_merged_reconciles_confirmed() {
+    let mut approved = approved_fixture("w2-closed-merged", true);
+    start_pending_publish(&mut approved);
+    let publisher = local_publisher(&approved);
+    let url = format!("https://example.invalid/pr/{}", approved.receipt.operation_id);
+    publisher.register_pr(
+        &approved.receipt.operation_id,
+        &url,
+        LocalPrState::ClosedMerged,
+    );
+    let registry = publisher.opened_prs.clone();
+    let registry_before = registry.lock().unwrap().clone();
+    let receipt_json = stored_publish_row(&approved.fixture.db_path, &approved.receipt.operation_id).1;
+    let reconciler = reconcile_with_registry(registry.clone());
+    let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+
+    assert_eq!(
+        runtime
+            .block_on(ProductProjection::publish_product_approved(
+                &mut approved.store,
+                &approved.fixture.human_session_digest,
+                &approved.receipt,
+                &publisher,
+                &reconciler,
+                approved.fixture.now,
+            ))
+            .unwrap(),
+        PublishOutcome::Confirmed { pr_url: url }
+    );
+    assert_eq!(publish_counts(&approved.fixture.db_path), (1, 0, 1));
+    assert_eq!(stored_publish_row(&approved.fixture.db_path, &approved.receipt.operation_id).1, receipt_json);
+    assert_eq!(*registry.lock().unwrap(), registry_before);
+    assert_eq!(publisher.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(publisher.distinct_prs(), 1);
+    close(approved);
+}
+
+/// W3: closed without merge is an explicit business rejection. It never
+/// settles the pending row or invokes Publisher; replay returns the same
+/// result with the durable receipt and external registry unchanged.
+#[test]
+fn closed_unmerged_rejected_keeps_pending() {
+    let mut approved = approved_fixture("w3-closed-unmerged", true);
+    start_pending_publish(&mut approved);
+    let publisher = local_publisher(&approved);
+    let url = format!("https://example.invalid/pr/{}", approved.receipt.operation_id);
+    publisher.register_pr(
+        &approved.receipt.operation_id,
+        &url,
+        LocalPrState::ClosedUnmerged,
+    );
+    let registry = publisher.opened_prs.clone();
+    let registry_before = registry.lock().unwrap().clone();
+    let row_before = stored_publish_row(&approved.fixture.db_path, &approved.receipt.operation_id);
+    let reconciler = reconcile_with_registry(registry.clone());
+    let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let expected = ProductPublishResult::Rejected { pr_url: url };
+
+    for _ in 0..2 {
+        assert_eq!(
+            runtime
+                .block_on(ProductProjection::publish_product_approved(
+                    &mut approved.store,
+                    &approved.fixture.human_session_digest,
+                    &approved.receipt,
+                    &publisher,
+                    &reconciler,
+                    approved.fixture.now,
+                ))
+                .unwrap(),
+            expected
+        );
+        assert_eq!(stored_publish_row(&approved.fixture.db_path, &approved.receipt.operation_id), row_before);
+        assert_eq!(publish_counts(&approved.fixture.db_path), (1, 1, 0));
+        assert_eq!(*registry.lock().unwrap(), registry_before);
+        assert_eq!(publisher.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(publisher.distinct_prs(), 1);
+    }
+    assert_eq!(reconciler.calls.load(Ordering::SeqCst), 2);
+    close(approved);
+}
+
 
 /// Child role for the SIGKILL crash cell. Runs ONLY when the orchestrator
 /// spawns this test binary with the B1_PUBLISH_CRASH_* environment armed;
@@ -1138,7 +1360,7 @@ fn crash_between_start_and_external_call_survives_sigkill() {
     let publisher = LocalPublisher {
         db: db_path.clone(),
         calls: AtomicUsize::new(0),
-        opened_prs: Mutex::new(std::collections::HashMap::new()),
+        opened_prs: Arc::new(Mutex::new(std::collections::HashMap::new())),
         interleave_settle: Mutex::new(None),
         outcome: Mutex::new(Some(PublishOutcome::Confirmed {
             pr_url: "https://example.invalid/pr/post-crash".into(),
@@ -1147,6 +1369,7 @@ fn crash_between_start_and_external_call_survives_sigkill() {
     let reconciler = LocalReconciler {
         calls: Arc::new(AtomicUsize::new(0)),
         outcome: Arc::new(Mutex::new(ProductPublishReconcileOutcome::NotFound)),
+        registry: None,
         interleave_settle: Arc::new(Mutex::new(None)),
     };
     let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
@@ -1196,6 +1419,7 @@ fn fence_observes_concurrent_settle_during_reconcile() {
     let reconciler = LocalReconciler {
         calls: Arc::new(AtomicUsize::new(0)),
         outcome: Arc::new(Mutex::new(ProductPublishReconcileOutcome::NotFound)),
+        registry: None,
         interleave_settle: Arc::new(Mutex::new(Some((
             approved.fixture.db_path.clone(),
             approved.fixture.config.installation_id.clone(),
@@ -1206,7 +1430,7 @@ fn fence_observes_concurrent_settle_during_reconcile() {
     let publisher = LocalPublisher {
         db: approved.fixture.db_path.clone(),
         calls: AtomicUsize::new(0),
-        opened_prs: Mutex::new(std::collections::HashMap::new()),
+        opened_prs: Arc::new(Mutex::new(std::collections::HashMap::new())),
         interleave_settle: Mutex::new(None),
         outcome: Mutex::new(Some(PublishOutcome::Confirmed {
             pr_url: "https://example.invalid/pr/must-not-open".into(),
@@ -1244,7 +1468,7 @@ fn concurrent_settle_during_publisher_call_is_idempotent() {
     let publisher = LocalPublisher {
         db: approved.fixture.db_path.clone(),
         calls: AtomicUsize::new(0),
-        opened_prs: Mutex::new(std::collections::HashMap::new()),
+        opened_prs: Arc::new(Mutex::new(std::collections::HashMap::new())),
         interleave_settle: Mutex::new(Some((
             approved.fixture.db_path.clone(),
             approved.fixture.config.installation_id.clone(),
@@ -1256,6 +1480,7 @@ fn concurrent_settle_during_publisher_call_is_idempotent() {
     let reconciler = LocalReconciler {
         calls: Arc::new(AtomicUsize::new(0)),
         outcome: Arc::new(Mutex::new(ProductPublishReconcileOutcome::Unknown)),
+        registry: None,
         interleave_settle: Arc::new(Mutex::new(None)),
     };
     let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();

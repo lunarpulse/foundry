@@ -1091,13 +1091,21 @@ async fn product_publish_cmd(
         )
         .await
         {
-            Ok(foundry_domain::ports::PublishOutcome::Confirmed { pr_url }) => {
+            Ok(foundry_line::product::ProductPublishResult::Published(
+                foundry_domain::ports::PublishOutcome::Confirmed { pr_url },
+            )) => {
                 println!("{pr_url}");
                 0
             }
-            Ok(foundry_domain::ports::PublishOutcome::Unknown { operation_id }) => {
+            Ok(foundry_line::product::ProductPublishResult::Published(
+                foundry_domain::ports::PublishOutcome::Unknown { operation_id },
+            )) => {
                 println!("publish outcome unknown; retry operation {operation_id}");
                 0
+            }
+            Ok(foundry_line::product::ProductPublishResult::Rejected { pr_url }) => {
+                eprintln!("external PR closed without merge: {pr_url}; stored pending; a new approval is required to retry");
+                1
             }
             Err(_) => {
                 eprintln!("product publish unavailable");
@@ -1117,6 +1125,20 @@ struct FileRegistryPublishAdapter {
 }
 
 #[cfg(feature = "p2-test-support")]
+#[derive(Clone, Copy)]
+enum FileRegistryPrState {
+    Open,
+    ClosedMerged,
+    ClosedUnmerged,
+}
+
+#[cfg(feature = "p2-test-support")]
+struct FileRegistryPr {
+    url: String,
+    state: FileRegistryPrState,
+}
+
+#[cfg(feature = "p2-test-support")]
 impl FileRegistryPublishAdapter {
     fn from_env() -> Option<Self> {
         let root = std::env::var_os("B1_PUBLISH_TEST_DIR")?;
@@ -1132,12 +1154,24 @@ impl FileRegistryPublishAdapter {
             .join(format!("{}.pr", sha256_hex(operation_id.as_bytes())))
     }
 
-    fn read_pr(&self, operation_id: &str) -> Option<String> {
+    fn read_pr(&self, operation_id: &str) -> Option<FileRegistryPr> {
         let value = std::fs::read_to_string(self.registry_path(operation_id)).ok()?;
-        let value = value.trim_end_matches(['\r', '\n']);
-        value
-            .starts_with("https://example.invalid/pr/")
-            .then(|| value.to_owned())
+        let mut lines = value.lines();
+        let url = lines.next()?.to_owned();
+        if !url.starts_with("https://example.invalid/pr/") {
+            return None;
+        }
+        // One-line entries from earlier local fixtures represent an open PR.
+        let state = match lines.next().unwrap_or("open") {
+            "open" => FileRegistryPrState::Open,
+            "closed-merged" => FileRegistryPrState::ClosedMerged,
+            "closed-unmerged" => FileRegistryPrState::ClosedUnmerged,
+            _ => return None,
+        };
+        if lines.next().is_some() {
+            return None;
+        }
+        Some(FileRegistryPr { url, state })
     }
 
     fn record_invocation(&self, operation_id: &str) -> std::io::Result<()> {
@@ -1166,8 +1200,8 @@ impl Publisher for FileRegistryPublishAdapter {
         let path = self.registry_path(operation_id);
         let result = (|| {
             self.record_invocation(operation_id)?;
-            if let Some(url) = self.read_pr(operation_id) {
-                return Ok(PublishOutcome::Confirmed { pr_url: url });
+            if let Some(pr) = self.read_pr(operation_id) {
+                return Ok(PublishOutcome::Confirmed { pr_url: pr.url });
             }
             let url = format!("https://example.invalid/pr/{operation_id}");
             let mut options = std::fs::OpenOptions::new();
@@ -1181,12 +1215,12 @@ impl Publisher for FileRegistryPublishAdapter {
                 Ok(mut file) => {
                     use std::io::Write;
                     file.write_all(url.as_bytes())?;
-                    file.write_all(b"\n")?;
+                    file.write_all(b"\nopen\n")?;
                     Ok(PublishOutcome::Confirmed { pr_url: url })
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => self
                     .read_pr(operation_id)
-                    .map(|pr_url| PublishOutcome::Confirmed { pr_url })
+                    .map(|pr| PublishOutcome::Confirmed { pr_url: pr.url })
                     .ok_or_else(|| std::io::Error::other("test PR registry entry is invalid")),
                 Err(error) => Err(error),
             }
@@ -1207,9 +1241,14 @@ impl foundry_line::product::ProductPublishReconciler for FileRegistryPublishAdap
         Output = PortResult<foundry_line::product::ProductPublishReconcileOutcome>,
     > + Send {
         let outcome = match self.read_pr(operation_id) {
-            Some(pr_url) => {
-                foundry_line::product::ProductPublishReconcileOutcome::Confirmed { pr_url }
-            }
+            Some(FileRegistryPr {
+                url: pr_url,
+                state: FileRegistryPrState::Open | FileRegistryPrState::ClosedMerged,
+            }) => foundry_line::product::ProductPublishReconcileOutcome::Confirmed { pr_url },
+            Some(FileRegistryPr {
+                url: pr_url,
+                state: FileRegistryPrState::ClosedUnmerged,
+            }) => foundry_line::product::ProductPublishReconcileOutcome::Rejected { pr_url },
             None => foundry_line::product::ProductPublishReconcileOutcome::NotFound,
         };
         async move { Ok(outcome) }
