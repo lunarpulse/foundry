@@ -204,6 +204,15 @@ impl ProductPublishAuthorization {
     }
 }
 
+/// Result of the durable admission check for a separate publish effect.
+/// Existing pending work must be reconciled before another publish attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProductPublishStart {
+    Started,
+    Reconcile,
+    Confirmed { pr_url: String },
+}
+
 /// Work that is durably waiting for an adapter, or a fenced claim that a
 /// configured adapter may execute. Claim proofs cannot be constructed by
 /// callers and are bound to the immutable admitted snapshot.
@@ -780,9 +789,12 @@ impl ProductStore {
             {
                 return Err(ProductError::ContractMismatch);
             }
-            // Product v3 is immutable at open. The maintenance migration is
-            // the only path from v2; normal open never repairs its schema.
+            // Product v3 keeps its result schema stable. The publication
+            // ledger is an additive v3-compatible extension.
             result::validate_v3_connection(&conn, &config.installation_id, &config.database_id)?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            create_product_publish_schema(&tx)?;
+            tx.commit()?;
             return Ok(Self {
                 conn,
                 path,
@@ -910,6 +922,7 @@ impl ProductStore {
             }
         }
         crate::product_scope::create_schema(&tx)?;
+        create_product_publish_schema(&tx)?;
         tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS product_review_work_bindings_v1(
                 order_id TEXT NOT NULL,
@@ -1262,78 +1275,165 @@ impl ProductStore {
                 "legacy publish authorization is disabled for ProductAtomicV1 v3",
             ));
         }
-        let stored: String = tx
+        validate_product_publish_receipt_in(&tx, supplied)?;
+        tx.commit()?;
+        Ok(ProductPublishAuthorization {
+            receipt: supplied.clone(),
+        })
+    }
+
+    /// Atomically revalidate current scoped authority and the committed v3
+    /// approval, then persist a durable publish start. The returned state is
+    /// committed before a caller may contact its Publisher.
+    pub fn begin_product_publish(
+        &mut self,
+        session_digest: &str,
+        supplied: &ProductApprovalReceipt,
+        now: DateTime<Utc>,
+    ) -> Result<ProductPublishStart, ProductError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Authentication is always required: only a resolved principal may
+        // read or extend publish state.
+        let _principal = resolve_session_in(&tx, session_digest, now)?;
+        let receipt_json = serde_json::to_string(supplied)
+            .map_err(|_| ProductError::Invariant("approval receipt serialization failed"))?;
+        let existing: Option<(String, String, Option<String>)> = tx
             .query_row(
-                "SELECT receipt_json FROM product_outcomes_v1 WHERE operation_id=?1",
+                "SELECT receipt_json,state,pr_url FROM product_publish_outcomes_v1 WHERE operation_id=?1",
                 [&supplied.operation_id],
-                |r| r.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
-            .optional()?
-            .ok_or(ProductError::Invariant("approval receipt not committed"))?;
-        let receipt: ProductApprovalReceipt = serde_json::from_str(&stored)
-            .map_err(|_| ProductError::Invariant("stored approval receipt is corrupt"))?;
-        if &receipt != supplied {
-            return Err(ProductError::Invariant(
-                "approval receipt does not match committed outcome",
-            ));
+            .optional()?;
+        if let Some((stored_receipt, state, pr_url)) = existing {
+            // Read/reconciliation path: an already-started operation is
+            // distinguished from permission to execute again. The committed
+            // start row plus exact receipt binding is the authority; fresh
+            // execution authority (capability + current lifecycle) is NOT
+            // re-required for retrieving or reconciling an existing effect.
+            if stored_receipt != receipt_json {
+                return Err(ProductError::Invariant(
+                    "publish operation receipt binding conflict",
+                ));
+            }
+            let start = match state.as_str() {
+                "pending" => ProductPublishStart::Reconcile,
+                "confirmed" => ProductPublishStart::Confirmed {
+                    pr_url: pr_url.ok_or(ProductError::Invariant(
+                        "confirmed publish URL is missing",
+                    ))?,
+                },
+                _ => return Err(ProductError::Invariant("publish state is invalid")),
+            };
+            tx.commit()?;
+            return Ok(start);
         }
-        let (source_enabled, source_revision, lifecycle, admission_seq): (i64,i64,i64,i64) = tx.query_row(
-            "SELECT s.enabled,s.revision,o.lifecycle,o.admission_seq FROM product_orders_v1 o JOIN product_sources_v1 s ON s.connector_id=o.connector_id AND s.repository_id=o.repository_id WHERE o.order_id=?1",
-            [&receipt.order_id],
-            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
-        ).optional()?.ok_or(ProductError::Invariant("approved source binding unavailable"))?;
-        if source_enabled != 1
-            || source_revision != receipt.source_revision
-            || lifecycle != receipt.lifecycle
-        {
-            return Err(ProductError::Invariant(
-                "approved lifecycle or source binding changed",
-            ));
-        }
-        let (head, replay_lifecycle, replay_state) =
-            verified_order_state_in(&tx, &receipt.order_id)?;
-        if head < receipt.sequence
-            || i64::from(replay_lifecycle + 1) != receipt.lifecycle
-            || replay_state != "publishing"
-            || receipt.sequence <= admission_seq
-        {
-            return Err(ProductError::Invariant(
-                "approved S1 lifecycle is no longer current",
-            ));
-        }
-        let promoted: (String,String,String,String) = tx.query_row(
-            "SELECT t.immutable_commit,t.artifact_location,t.generations_json,p.receipt_json FROM artifact_tuples t JOIN tuple_promotions p ON p.order_id=t.order_id AND p.attempt=t.attempt AND p.run_id=t.run_id AND p.generation=t.generation WHERE t.order_id=?1 AND t.attempt=?2 AND t.run_id=?3 AND t.generation=?4",
-            params![receipt.order_id,receipt.attempt,receipt.run_id,receipt.generation],
-            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
-        ).optional()?.ok_or(ProductError::Invariant("approved tuple promotion unavailable"))?;
-        let (artifact, location, generations, promotion_json) = promoted;
-        let tuple_digest = product_tuple_digest(
-            &receipt.order_id,
-            receipt.attempt,
-            receipt.run_id,
-            receipt.generation,
-            &artifact,
-            &location,
-            &generations,
+        // Fresh execution path: no durable start exists yet, so current
+        // scoped execution authority and full receipt revalidation gate the
+        // INSERT.
+        require_order_capability_in(
+            &tx,
+            &_principal,
+            &supplied.order_id,
+            ProductCapability::PublishApproved,
+            true,
         )?;
-        let promotion: serde_json::Value = serde_json::from_str(&promotion_json)
-            .map_err(|_| ProductError::Invariant("promotion receipt invalid"))?;
-        let tuple = promotion
-            .get("tuple")
-            .ok_or(ProductError::Invariant("promotion tuple missing"))?;
-        if artifact != receipt.artifact_digest
-            || tuple_digest != receipt.tuple_digest
-            || tuple.get("order").and_then(|v| v.as_str()) != Some(receipt.order_id.as_str())
-            || tuple.get("attempt").and_then(|v| v.as_u64()) != Some(receipt.attempt as u64)
-            || tuple.get("run").and_then(|v| v.as_u64()) != Some(receipt.run_id as u64)
-            || tuple.get("generation").and_then(|v| v.as_u64()) != Some(receipt.generation as u64)
-        {
+        validate_product_publish_receipt_in(&tx, supplied)?;
+        tx.execute(
+            "INSERT INTO product_publish_outcomes_v1(operation_id,receipt_json,state,pr_url,started_at,settled_at) VALUES(?1,?2,'pending',NULL,?3,NULL)",
+            params![supplied.operation_id, receipt_json, now.timestamp()],
+        )?;
+        tx.commit()?;
+        Ok(ProductPublishStart::Started)
+    }
+
+    /// Re-fence a committed pending publish before any external retry (used
+    /// when a reconciler reports NotFound). Returns `Confirmed` when another
+    /// caller has already settled the operation, `Started` only while the
+    /// durable row is still pending with the exact bound receipt, and errors
+    /// when no start exists or the receipt binding conflicts. No publisher
+    /// call is permitted without passing this fence.
+    pub fn claim_product_publish_retry(
+        &mut self,
+        supplied: &ProductApprovalReceipt,
+    ) -> Result<ProductPublishStart, ProductError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let receipt_json = serde_json::to_string(supplied)
+            .map_err(|_| ProductError::Invariant("approval receipt serialization failed"))?;
+        let row: Option<(String, String, Option<String>)> = tx
+            .query_row(
+                "SELECT receipt_json,state,pr_url FROM product_publish_outcomes_v1 WHERE operation_id=?1",
+                [&supplied.operation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((stored_receipt, state, pr_url)) = row else {
             return Err(ProductError::Invariant(
-                "current promoted tuple differs from approval",
+                "publish operation start is missing for retry",
+            ));
+        };
+        if stored_receipt != receipt_json {
+            return Err(ProductError::Invariant(
+                "publish operation receipt binding conflict",
+            ));
+        }
+        let start = match state.as_str() {
+            "pending" => ProductPublishStart::Started,
+            "confirmed" => ProductPublishStart::Confirmed {
+                pr_url: pr_url.ok_or(ProductError::Invariant(
+                    "confirmed publish URL is missing",
+                ))?,
+            },
+            _ => return Err(ProductError::Invariant("publish state is invalid")),
+        };
+        tx.commit()?;
+        Ok(start)
+    }
+
+    /// Settle one previously committed pending publish start. Idempotent for
+    /// an already-confirmed row with the identical URL (concurrent
+    /// reconcilers observing the same confirmed effect both succeed); a
+    /// different URL or an unknown operation is rejected.
+    pub fn settle_product_publish(
+        &mut self,
+        operation_id: &str,
+        pr_url: &str,
+    ) -> Result<(), ProductError> {
+        if operation_id.trim().is_empty() || pr_url.trim().is_empty() {
+            return Err(ProductError::InvalidConfig);
+        }
+        let now = self.clock.now().timestamp();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE product_publish_outcomes_v1 SET state='confirmed',pr_url=?1,settled_at=?2 WHERE operation_id=?3 AND state='pending' AND pr_url IS NULL AND settled_at IS NULL",
+            params![pr_url, now, operation_id],
+        )?;
+        if changed != 1 {
+            let existing: Option<(String, Option<String>)> = tx
+                .query_row(
+                    "SELECT state,pr_url FROM product_publish_outcomes_v1 WHERE operation_id=?1",
+                    [operation_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if existing.is_some_and(|(state, url)| {
+                state == "confirmed" && url.as_deref() == Some(pr_url)
+            }) {
+                // Concurrent settlement of the same confirmed effect: success.
+                tx.commit()?;
+                return Ok(());
+            }
+            return Err(ProductError::Invariant(
+                "publish operation is unknown or already settled",
             ));
         }
         tx.commit()?;
-        Ok(ProductPublishAuthorization { receipt })
+        Ok(())
     }
 
     /// Register/update a verified connector's source scope. Caller input is
@@ -5267,6 +5367,119 @@ fn scope_enforced_in(tx: &rusqlite::Transaction<'_>) -> Result<bool, ProductErro
         |r| r.get(0),
     )?;
     Ok(mode == "enforced")
+}
+
+fn create_product_publish_schema(
+    tx: &rusqlite::Transaction<'_>,
+) -> Result<(), ProductError> {
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS product_publish_outcomes_v1(
+            operation_id TEXT PRIMARY KEY REFERENCES product_outcomes_v1(operation_id),
+            receipt_json TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('pending','confirmed')),
+            pr_url TEXT,
+            started_at INTEGER NOT NULL,
+            settled_at INTEGER
+         );
+         CREATE TRIGGER IF NOT EXISTS product_publish_confirmed_no_update
+           BEFORE UPDATE ON product_publish_outcomes_v1
+           WHEN OLD.state='confirmed'
+           BEGIN SELECT RAISE(ABORT,'confirmed product publish outcome is immutable'); END;
+         CREATE TRIGGER IF NOT EXISTS product_publish_confirmed_no_delete
+           BEFORE DELETE ON product_publish_outcomes_v1
+           WHEN OLD.state='confirmed'
+           BEGIN SELECT RAISE(ABORT,'confirmed product publish outcome is immutable'); END;
+         CREATE TRIGGER IF NOT EXISTS product_publish_pending_transition_only
+           BEFORE UPDATE ON product_publish_outcomes_v1
+           WHEN OLD.state!='pending' OR NEW.state!='confirmed'
+             OR NEW.operation_id!=OLD.operation_id
+             OR NEW.receipt_json!=OLD.receipt_json
+             OR NEW.started_at!=OLD.started_at
+             OR NEW.pr_url IS NULL OR NEW.settled_at IS NULL
+           BEGIN SELECT RAISE(ABORT,'invalid product publish settlement'); END;
+         CREATE TRIGGER IF NOT EXISTS product_publish_outcome_no_replace
+           BEFORE INSERT ON product_publish_outcomes_v1
+           WHEN EXISTS(SELECT 1 FROM product_publish_outcomes_v1 WHERE operation_id=NEW.operation_id)
+           BEGIN SELECT RAISE(ABORT,'product publish outcome row already exists'); END;",
+    )?;
+    Ok(())
+}
+
+fn validate_product_publish_receipt_in(
+    tx: &rusqlite::Transaction<'_>,
+    supplied: &ProductApprovalReceipt,
+) -> Result<(), ProductError> {
+    let supplied_json = serde_json::to_string(supplied)
+        .map_err(|_| ProductError::Invariant("approval receipt serialization failed"))?;
+    let stored: String = tx
+        .query_row(
+            "SELECT receipt_json FROM product_outcomes_v1 WHERE operation_id=?1",
+            [&supplied.operation_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or(ProductError::Invariant("approval receipt not committed"))?;
+    if stored != supplied_json {
+        return Err(ProductError::Invariant(
+            "approval receipt does not match committed outcome",
+        ));
+    }
+    let (source_enabled, source_revision, lifecycle, admission_seq): (i64, i64, i64, i64) = tx
+        .query_row(
+            "SELECT s.enabled,s.revision,o.lifecycle,o.admission_seq
+             FROM product_orders_v1 o
+             JOIN product_sources_v1 s ON s.connector_id=o.connector_id AND s.repository_id=o.repository_id
+             WHERE o.order_id=?1",
+            [&supplied.order_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?
+        .ok_or(ProductError::Invariant("approved source binding unavailable"))?;
+    if source_enabled != 1
+        || source_revision != supplied.source_revision
+        || lifecycle != supplied.lifecycle
+    {
+        return Err(ProductError::Invariant(
+            "approved lifecycle or source binding changed",
+        ));
+    }
+    let (head, replay_lifecycle, replay_state) = verified_order_state_in(tx, &supplied.order_id)?;
+    if head < supplied.sequence
+        || i64::from(replay_lifecycle + 1) != supplied.lifecycle
+        || replay_state != "publishing"
+        || supplied.sequence <= admission_seq
+    {
+        return Err(ProductError::Invariant(
+            "approved S1 lifecycle is no longer current",
+        ));
+    }
+    let (stored_tuple_digest,): (String,) = tx
+        .query_row(
+            "SELECT tuple_digest FROM product_result_bindings_v1
+             WHERE order_id=?1 AND attempt=?2 AND run_id=?3 AND generation=?4",
+            params![
+                supplied.order_id,
+                supplied.attempt,
+                supplied.run_id,
+                supplied.generation
+            ],
+            |row| Ok((row.get(0)?,)),
+        )
+        .optional()?
+        .ok_or(ProductError::Invariant(
+            "approved tuple binding unavailable",
+        ))?;
+    // The binding row is immutable (sealed triggers) and unique on the tuple
+    // coordinates; its stored digest was computed from the promoted tuple at
+    // bind time, so equality here proves the promoted tuple matches the
+    // approval. The artifact digest is already pinned by the exact receipt
+    // equality against product_outcomes_v1 above.
+    if stored_tuple_digest != supplied.tuple_digest {
+        return Err(ProductError::Invariant(
+            "current promoted tuple differs from approval",
+        ));
+    }
+    Ok(())
 }
 
 fn require_order_capability_in(

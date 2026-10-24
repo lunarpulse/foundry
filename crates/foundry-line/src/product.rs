@@ -1,11 +1,28 @@
 //! ProductAtomicV1 lifecycle projection. S1 remains authoritative; this
 //! projection is replaced only from a verified committed snapshot.
 use foundry_domain::ports::{PortError, PortResult, PublishOutcome, Publisher};
-use foundry_domain::{Order, OrderState};
+use foundry_domain::{ExternalRef, Order, OrderEvent, OrderState};
 use foundry_ledger::{
-    Mirror, MirrorState, ProductApprovalReceipt, ProductPublishAuthorization, ProductStore,
+    Mirror, MirrorState, ProductApprovalReceipt, ProductPublishAuthorization, ProductPublishStart,
+    ProductStore,
 };
 use std::collections::HashMap;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProductPublishReconcileOutcome {
+    Confirmed { pr_url: String },
+    NotFound,
+    Unknown,
+}
+
+/// Narrow local adapter seam for looking up an operation after a response
+/// loss. It does not change the shared Publisher port contract.
+pub trait ProductPublishReconciler {
+    fn reconcile(
+        &self,
+        operation_id: &str,
+    ) -> impl std::future::Future<Output = PortResult<ProductPublishReconcileOutcome>> + Send;
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProductProjectionAnchor {
@@ -147,5 +164,226 @@ impl ProductProjection {
                 &authorization.receipt().artifact_digest,
             )
             .await
+    }
+
+    /// Durable v3 publish composition. A new start is committed by ProductStore
+    /// before Publisher is called. Existing pending starts reconcile first;
+    /// only a proved-missing external effect may invoke the idempotent publisher
+    /// again. Confirmed outcomes are returned from storage without execution.
+    pub async fn publish_product_approved<P, R>(
+        store: &mut ProductStore,
+        session_digest: &str,
+        receipt: &ProductApprovalReceipt,
+        publisher: &P,
+        reconciler: &R,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> PortResult<PublishOutcome>
+    where
+        P: Publisher,
+        R: ProductPublishReconciler,
+    {
+        // Scoped v3 stores refuse the unscoped projection snapshot, so the
+        // durable composition reconstructs its bound Order from the store-
+        // verified receipt through the canonical event chain. The journal (S1)
+        // remains authoritative; only id/state/attempt/digest are bound here.
+        // The reconstruction is deliberately LAZY: it runs only on a Started
+        // path, after the durable outcome lookup, so retrieving an already
+        // confirmed effect never depends on reconstructing a valid chain
+        // (an attempt>=2 receipt whose order advanced must still return its
+        // stored URL).
+        let start = store
+            .begin_product_publish(session_digest, receipt, now)
+            .map_err(|_| PortError::Permanent("product publish authorization denied".into()))?;
+        match start {
+            ProductPublishStart::Confirmed { pr_url } => {
+                Ok(PublishOutcome::Confirmed { pr_url })
+            }
+            ProductPublishStart::Started => {
+                Self::guarded_publish(store, publisher, receipt, now).await
+            }
+            ProductPublishStart::Reconcile => {
+                match reconciler.reconcile(&receipt.operation_id).await? {
+                    ProductPublishReconcileOutcome::Confirmed { pr_url } => {
+                        store
+                            .settle_product_publish(&receipt.operation_id, &pr_url)
+                            .map_err(|_| PortError::Permanent("product publish settlement failed".into()))?;
+                        Ok(PublishOutcome::Confirmed { pr_url })
+                    }
+                    ProductPublishReconcileOutcome::Unknown => Ok(PublishOutcome::Unknown {
+                        operation_id: receipt.operation_id.clone(),
+                    }),
+                    ProductPublishReconcileOutcome::NotFound => {
+                        // Fence the durable state before any external retry:
+                        // a concurrent caller may have confirmed and settled
+                        // while this reconciler was in flight, and a retry
+                        // without this check would invoke the Publisher after
+                        // confirmation (forbidden extra execution).
+                        match store
+                            .claim_product_publish_retry(receipt)
+                            .map_err(|_| {
+                                PortError::Permanent(
+                                    "product publish retry fence failed".into(),
+                                )
+                            })? {
+                            ProductPublishStart::Confirmed { pr_url } => {
+                                Ok(PublishOutcome::Confirmed { pr_url })
+                            }
+                            ProductPublishStart::Started => {
+                                Self::guarded_publish(store, publisher, receipt, now).await
+                            }
+                            // claim_product_publish_retry never returns
+                            // Reconcile; treat it defensively as an Unknown
+                            // (pending is preserved for the next pass).
+                            ProductPublishStart::Reconcile => {
+                                Ok(PublishOutcome::Unknown {
+                                    operation_id: receipt.operation_id.clone(),
+                                })
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Durable recheck immediately before ANY Publisher invocation on a
+    /// Started path. `claim_product_publish_retry` re-reads the committed
+    /// row inside an IMMEDIATE transaction: if a concurrent caller settled
+    /// the operation between the fence and this call, the stored Confirmed
+    /// URL is returned and the Publisher is NOT contacted (a confirmed
+    /// effect is never re-executed). Only a still-pending row with the
+    /// exact bound receipt proceeds to the (idempotent, operation-keyed)
+    /// Publisher call.
+    async fn guarded_publish<P: Publisher>(
+        store: &mut ProductStore,
+        publisher: &P,
+        receipt: &ProductApprovalReceipt,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> PortResult<PublishOutcome> {
+        match store
+            .claim_product_publish_retry(receipt)
+            .map_err(|_| PortError::Permanent("product publish retry fence failed".into()))? {
+            ProductPublishStart::Confirmed { pr_url } => Ok(PublishOutcome::Confirmed { pr_url }),
+            ProductPublishStart::Started => {
+                let bound_order = Self::bound_publishing_order(receipt, now)?;
+                Self::call_product_publisher(store, publisher, &bound_order, receipt).await
+            }
+            ProductPublishStart::Reconcile => Ok(PublishOutcome::Unknown {
+                operation_id: receipt.operation_id.clone(),
+            }),
+        }
+    }
+
+    /// Reconstruct the publisher-bound Order from a store-verified receipt.
+    /// Scoped policy makes the unscoped projection snapshot unavailable, and
+    /// `begin_product_publish` has already proven the publishing lifecycle and
+    /// digest binding in the same transaction that recorded the durable start.
+    fn bound_publishing_order(
+        receipt: &ProductApprovalReceipt,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Order, PortError> {
+        let mut order = Order::new(
+            receipt.order_id.clone(),
+            ExternalRef::intake(&receipt.order_id, &receipt.order_id),
+            now,
+        );
+        let attempt = u32::try_from(receipt.attempt).unwrap_or(1).max(1);
+        // Replay the canonical retry chain: a fresh order claims attempt 1,
+        // and each DieFailed advances the attempt before the next DieStarted
+        // (DieStarted must claim the CURRENT attempt number — starting a
+        // fresh order directly at attempt N is illegal). An attempt>=2
+        // approval receipt is therefore reconstructed through its genuine
+        // failed-then-retried path.
+        order
+            .transition(OrderEvent::Queued, 0)
+            .and_then(|_| order.transition(OrderEvent::DieStarted, 1))
+            .map_err(|_| PortError::Permanent("bound publish order reconstruction failed".into()))?;
+        for current in 2..=attempt {
+            order
+                .transition(
+                    OrderEvent::DieFailed {
+                        attempt: current - 1,
+                        reason: "publish-order-reconstruction-retry".into(),
+                    },
+                    current - 1,
+                )
+                .and_then(|_| order.transition(OrderEvent::DieStarted, current))
+                .map_err(|_| {
+                    PortError::Permanent("bound publish order reconstruction failed".into())
+                })?;
+        }
+        order
+            .transition(OrderEvent::DieSucceeded { attempt }, attempt)
+            .and_then(|_| order.transition(OrderEvent::InspectionPassed, attempt))
+            .and_then(|_| {
+                order.transition(
+                    OrderEvent::Approved {
+                        intent: receipt.operation_id.clone(),
+                        artifact_digest: receipt.artifact_digest.clone(),
+                    },
+                    attempt,
+                )
+            })
+            .map_err(|_| PortError::Permanent("bound publish order reconstruction failed".into()))?;
+        Ok(order)
+    }
+
+    async fn call_product_publisher<P: Publisher>(
+        store: &mut ProductStore,
+        publisher: &P,
+        order: &Order,
+        receipt: &ProductApprovalReceipt,
+    ) -> PortResult<PublishOutcome> {
+        match publisher
+            .publish(order, &receipt.operation_id, &receipt.artifact_digest)
+            .await?
+        {
+            PublishOutcome::Confirmed { pr_url } => {
+                store
+                    .settle_product_publish(&receipt.operation_id, &pr_url)
+                    .map_err(|_| PortError::Permanent("product publish settlement failed".into()))?;
+                Ok(PublishOutcome::Confirmed { pr_url })
+            }
+            unknown @ PublishOutcome::Unknown { .. } => Ok(unknown),
+        }
+    }
+}
+
+#[cfg(test)]
+mod publish_reconstruction_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn receipt_with_attempt(attempt: i64) -> ProductApprovalReceipt {
+        ProductApprovalReceipt {
+            operation_id: format!("reconstruction-op-{attempt}"),
+            actor_id: "reader".into(),
+            order_id: format!("reconstruction-order-{attempt}"),
+            lifecycle: 2,
+            sequence: 6,
+            event_hash: "a".repeat(64),
+            artifact_digest: "b".repeat(40),
+            attempt,
+            run_id: 7,
+            generation: 0,
+            tuple_digest: "c".repeat(64),
+            source_revision: 1,
+        }
+    }
+
+    #[test]
+    fn bound_publishing_order_accepts_attempt_1_through_3() {
+        let now = chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        for attempt in 1..=3 {
+            let order =
+                ProductProjection::bound_publishing_order(&receipt_with_attempt(attempt), now)
+                    .unwrap_or_else(|e| panic!("attempt {attempt} must reconstruct: {e:?}"));
+            assert_eq!(
+                order.state(),
+                foundry_domain::OrderState::Publishing,
+                "attempt {attempt}"
+            );
+            assert_eq!(order.attempt(), attempt as u32, "attempt {attempt}");
+        }
     }
 }

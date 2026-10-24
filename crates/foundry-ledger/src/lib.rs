@@ -31,7 +31,7 @@ pub use product::P2ReviewPreparation;
 pub use product::{
     AdmissionReceipt, ProductApprovalIntent, ProductApprovalReceipt, ProductArtifactContent,
     ProductArtifactInfo, ProductClock, ProductConfig, ProductError, ProductHoldAcceptance,
-    ProductHoldDecision, ProductHoldExpectation, ProductPublishAuthorization,
+    ProductHoldDecision, ProductHoldExpectation, ProductPublishAuthorization, ProductPublishStart,
     ProductResultArtifactContent, ProductResultError, ProductResultExpectation, ProductResultInfo,
     ProductReviewConfig, ProductServiceAction, ProductServiceContext, ProductServiceCredential,
     ProductServiceGrant, ProductServiceReceipt, ProductServiceView, ProductStore, ProductWorkClaim,

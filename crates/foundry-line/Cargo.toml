@@ -37,3 +37,8 @@ required-features = ["p2-test-support"]
 name = "b1_product_result_processes"
 path = "tests/b1_product_result_processes.rs"
 required-features = ["p2-test-support"]
+
+[[test]]
+name = "b1_product_publish"
+path = "tests/b1_product_publish.rs"
+required-features = ["p2-test-support"]
