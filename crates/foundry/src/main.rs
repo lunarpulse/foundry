@@ -288,6 +288,14 @@ enum Cmd {
         intent: String,
         #[arg(long)]
         idempotency_key: String,
+        /// Write the canonical approval receipt to a new mode-0600 file.
+        #[arg(long)]
+        receipt_out: Option<String>,
+    },
+    /// ProductAtomicV1 operations.
+    Product {
+        #[command(subcommand)]
+        command: ProductCmd,
     },
     /// Query product holds/progress or accept an authenticated hold decision.
     /// Resume requires the configured ProductAtomicV1 frozen-pack runtime.
@@ -393,6 +401,23 @@ enum Cmd {
         actions: Option<String>,
         #[arg(long)]
         credential_file: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProductCmd {
+    /// Publish a previously approved receipt through an explicitly configured adapter.
+    Publish {
+        #[arg(long)]
+        db: String,
+        #[arg(long)]
+        installation_id: String,
+        #[arg(long)]
+        database_id: String,
+        #[arg(long)]
+        session_file: String,
+        #[arg(long)]
+        receipt_file: String,
     },
 }
 
@@ -896,6 +921,7 @@ fn product_approve_cmd(
     tuple_digest: String,
     intent_text: String,
     request_key: String,
+    receipt_out: Option<&str>,
 ) -> i32 {
     let bearer = match read_private(session_file) {
         Ok(v) if v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit()) => v,
@@ -945,6 +971,19 @@ fn product_approve_cmd(
         .and_then(|proof| store.approve_product(&digest, &approval, &proof));
     match result {
         Ok(receipt) => {
+            if let Some(path) = receipt_out {
+                let encoded = match serde_json::to_string(&receipt) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        eprintln!("approval receipt unavailable");
+                        return 1;
+                    }
+                };
+                if private_file(path, &encoded).is_err() {
+                    eprintln!("approval receipt file unavailable");
+                    return 1;
+                }
+            }
             println!("approval recorded: {}", receipt.event_hash);
             0
         }
@@ -952,6 +991,228 @@ fn product_approve_cmd(
             eprintln!("product approval unavailable");
             1
         }
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictProductApprovalReceipt {
+    operation_id: String,
+    actor_id: String,
+    order_id: String,
+    lifecycle: i64,
+    sequence: i64,
+    event_hash: String,
+    artifact_digest: String,
+    attempt: i64,
+    run_id: i64,
+    generation: i64,
+    tuple_digest: String,
+    source_revision: i64,
+}
+
+impl From<StrictProductApprovalReceipt> for foundry_ledger::ProductApprovalReceipt {
+    fn from(receipt: StrictProductApprovalReceipt) -> Self {
+        Self {
+            operation_id: receipt.operation_id,
+            actor_id: receipt.actor_id,
+            order_id: receipt.order_id,
+            lifecycle: receipt.lifecycle,
+            sequence: receipt.sequence,
+            event_hash: receipt.event_hash,
+            artifact_digest: receipt.artifact_digest,
+            attempt: receipt.attempt,
+            run_id: receipt.run_id,
+            generation: receipt.generation,
+            tuple_digest: receipt.tuple_digest,
+            source_revision: receipt.source_revision,
+        }
+    }
+}
+
+async fn product_publish_cmd(
+    db: &str,
+    installation_id: &str,
+    database_id: &str,
+    session_file: &str,
+    receipt_file: &str,
+) -> i32 {
+    let bearer = match read_private(session_file) {
+        Ok(value) if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) => {
+            value
+        }
+        _ => {
+            eprintln!("private session file rejected");
+            return 1;
+        }
+    };
+    let receipt_bytes = match std::fs::read(receipt_file) {
+        Ok(bytes) if !bytes.is_empty() && bytes.len() <= 64 * 1024 => bytes,
+        _ => {
+            eprintln!("approval receipt file rejected");
+            return 1;
+        }
+    };
+    let strict: StrictProductApprovalReceipt = match serde_json::from_slice(&receipt_bytes) {
+        Ok(receipt) => receipt,
+        Err(_) => {
+            eprintln!("approval receipt file rejected");
+            return 1;
+        }
+    };
+    let receipt = foundry_ledger::ProductApprovalReceipt::from(strict);
+    #[allow(unused_mut)]
+    let mut store = match foundry_ledger::ProductStore::open(
+        std::path::Path::new(db),
+        product_config(installation_id, database_id),
+    ) {
+        Ok(store) => store,
+        Err(_) => {
+            eprintln!("product database rejected");
+            return 1;
+        }
+    };
+    if !matches!(store.scope_policy_enforced(), Ok(true)) {
+        eprintln!("product scope setup or migration required");
+        return 1;
+    }
+
+    #[cfg(feature = "p2-test-support")]
+    if let Some(adapter) = FileRegistryPublishAdapter::from_env() {
+        let session_digest = sha256_hex(bearer.as_bytes());
+        let now = chrono::Utc::now();
+        return match foundry_line::product::ProductProjection::publish_product_approved(
+            &mut store,
+            &session_digest,
+            &receipt,
+            &adapter,
+            &adapter,
+            now,
+        )
+        .await
+        {
+            Ok(foundry_domain::ports::PublishOutcome::Confirmed { pr_url }) => {
+                println!("{pr_url}");
+                0
+            }
+            Ok(foundry_domain::ports::PublishOutcome::Unknown { operation_id }) => {
+                println!("publish outcome unknown; retry operation {operation_id}");
+                0
+            }
+            Err(_) => {
+                eprintln!("product publish unavailable");
+                1
+            }
+        };
+    }
+
+    let _ = (bearer, receipt, store);
+    eprintln!("no publish adapter configured — external publishing arrives in W6");
+    1
+}
+
+#[cfg(feature = "p2-test-support")]
+struct FileRegistryPublishAdapter {
+    root: std::path::PathBuf,
+}
+
+#[cfg(feature = "p2-test-support")]
+impl FileRegistryPublishAdapter {
+    fn from_env() -> Option<Self> {
+        let root = std::env::var_os("B1_PUBLISH_TEST_DIR")?;
+        let root = std::path::PathBuf::from(root);
+        if root.as_os_str().is_empty() || std::fs::create_dir_all(&root).is_err() {
+            return None;
+        }
+        Some(Self { root })
+    }
+
+    fn registry_path(&self, operation_id: &str) -> std::path::PathBuf {
+        self.root
+            .join(format!("{}.pr", sha256_hex(operation_id.as_bytes())))
+    }
+
+    fn read_pr(&self, operation_id: &str) -> Option<String> {
+        let value = std::fs::read_to_string(self.registry_path(operation_id)).ok()?;
+        let value = value.trim_end_matches(['\r', '\n']);
+        value
+            .starts_with("https://example.invalid/pr/")
+            .then(|| value.to_owned())
+    }
+
+    fn record_invocation(&self, operation_id: &str) -> std::io::Result<()> {
+        use std::io::Write;
+        let path = self.root.join("publisher-invocations.log");
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(path)?;
+        writeln!(file, "{operation_id}")
+    }
+}
+
+#[cfg(feature = "p2-test-support")]
+impl Publisher for FileRegistryPublishAdapter {
+    fn publish(
+        &self,
+        _order: &Order,
+        operation_id: &str,
+        _expected_digest: &str,
+    ) -> impl std::future::Future<Output = PortResult<PublishOutcome>> + Send {
+        let path = self.registry_path(operation_id);
+        let result = (|| {
+            self.record_invocation(operation_id)?;
+            if let Some(url) = self.read_pr(operation_id) {
+                return Ok(PublishOutcome::Confirmed { pr_url: url });
+            }
+            let url = format!("https://example.invalid/pr/{operation_id}");
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&path) {
+                Ok(mut file) => {
+                    use std::io::Write;
+                    file.write_all(url.as_bytes())?;
+                    file.write_all(b"\n")?;
+                    Ok(PublishOutcome::Confirmed { pr_url: url })
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => self
+                    .read_pr(operation_id)
+                    .map(|pr_url| PublishOutcome::Confirmed { pr_url })
+                    .ok_or_else(|| std::io::Error::other("test PR registry entry is invalid")),
+                Err(error) => Err(error),
+            }
+        })()
+        .map_err(|_| {
+            foundry_domain::ports::PortError::Permanent("test publish adapter unavailable".into())
+        });
+        async move { result }
+    }
+}
+
+#[cfg(feature = "p2-test-support")]
+impl foundry_line::product::ProductPublishReconciler for FileRegistryPublishAdapter {
+    fn reconcile(
+        &self,
+        operation_id: &str,
+    ) -> impl std::future::Future<
+        Output = PortResult<foundry_line::product::ProductPublishReconcileOutcome>,
+    > + Send {
+        let outcome = match self.read_pr(operation_id) {
+            Some(pr_url) => {
+                foundry_line::product::ProductPublishReconcileOutcome::Confirmed { pr_url }
+            }
+            None => foundry_line::product::ProductPublishReconcileOutcome::NotFound,
+        };
+        async move { Ok(outcome) }
     }
 }
 
@@ -1916,23 +2177,47 @@ async fn main() {
             tuple_digest,
             intent,
             idempotency_key,
-        } => product_approve_cmd(
-            &expand(&db),
-            &installation_id,
-            &database_id,
-            &expand(&session_file),
-            order,
-            grant_id,
-            &expand(&grant_file),
-            expected_source_revision,
-            expected_attempt,
-            run_id,
-            generation,
-            artifact_digest,
-            tuple_digest,
-            intent,
-            idempotency_key,
-        ),
+            receipt_out,
+        } => {
+            let receipt_out = receipt_out.map(|path| expand(&path));
+            product_approve_cmd(
+                &expand(&db),
+                &installation_id,
+                &database_id,
+                &expand(&session_file),
+                order,
+                grant_id,
+                &expand(&grant_file),
+                expected_source_revision,
+                expected_attempt,
+                run_id,
+                generation,
+                artifact_digest,
+                tuple_digest,
+                intent,
+                idempotency_key,
+                receipt_out.as_deref(),
+            )
+        }
+        Cmd::Product {
+            command:
+                ProductCmd::Publish {
+                    db,
+                    installation_id,
+                    database_id,
+                    session_file,
+                    receipt_file,
+                },
+        } => {
+            product_publish_cmd(
+                &expand(&db),
+                &installation_id,
+                &database_id,
+                &expand(&session_file),
+                &expand(&receipt_file),
+            )
+            .await
+        }
         Cmd::ProductReview {
             db,
             installation_id,

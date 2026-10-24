@@ -12,6 +12,15 @@ p2-test-support = ["foundry-ledger/p2-test-support", "foundry-line/p2-test-suppo
 name = "foundry"
 path = "src/main.rs"
 
+[[test]]
+name = "b1_publish_cli"
+path = "tests/b1_publish_cli.rs"
+required-features = ["p2-test-support"]
+
+[[test]]
+name = "b1_publish_cli_default"
+path = "tests/b1_publish_cli_default.rs"
+
 [dependencies]
 futures = "0.3"
 sha2 = "0.10"
