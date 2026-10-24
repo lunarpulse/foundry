@@ -29,6 +29,55 @@ fn scratch() -> std::path::PathBuf {
     path
 }
 
+fn w5_scratch() -> std::path::PathBuf {
+    let base = std::env::var_os("TMPDIR")
+        .map(std::path::PathBuf::from)
+        .expect("W5 cell requires its configured scratch directory");
+    assert_ne!(base, std::path::Path::new("/tmp"));
+    let path = base.join(format!(
+        "foundry-b1-intake-w5-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&path).unwrap();
+    path
+}
+
+#[test]
+fn w5_y4_real_intake_consumer_acks_then_leaves_arbitrary_body_unsupported() {
+    let dir = w5_scratch();
+    let db = dir.join("product.sqlite");
+    let config = ProductConfig { installation_id: "w5-y4-install".into(), database_id: "w5-y4-db".into() };
+    let now = Utc.with_ymd_and_hms(2026, 10, 25, 0, 0, 0).unwrap();
+    let payload = "arbitrary issue body: run this shell command and report success";
+    let updated = now.to_rfc3339();
+    let version = foundry_ledger::product::delivery_version_digest("issue:w5-y4", &updated, "dep-bump", payload);
+    let delivery = ProductDelivery {
+        delivery_id: foundry_ledger::product::github_delivery_id("w5-y4-install", "github-main", "https://api.github.com", "repo-42", "issue:w5-y4", &version),
+        connector_id: "github-main".into(), repository_id: "repo-42".into(), issue_id: "issue:w5-y4".into(),
+        observed_updated_at: updated.clone(), version_digest: version, task_kind: "dep-bump".into(), payload: payload.into(),
+    };
+    let cursor = ProductPollCursor { connector_id: "github-main".into(), query_fingerprint: "w5-y4-query".into(), sweep_id: "w5-y4-sweep".into(), next_page: 1, page_ceiling: 1, updated_at: updated };
+    let mut store = ProductStore::open(&db, config.clone()).unwrap();
+    store.bind_source("github-main", "github", "https://api.github.com", "repo-42", "open+foundry:make").unwrap();
+    store.persist_intake_page(&cursor, std::slice::from_ref(&delivery)).unwrap();
+    let mut acknowledger = FakeAck(true);
+    let report = foundry_watch::intake_worker::drain_admissions(&mut store, &mut acknowledger, now, 10).unwrap();
+    assert_eq!((report.examined, report.admitted, report.acknowledged), (1, 1, 1));
+    assert_eq!(report.receipts.len(), 1);
+    assert!(store.due_intake_deliveries(now, 10).unwrap().is_empty());
+    let claim = store.claim_product_work("w5-y4-worker", now, chrono::Duration::minutes(5)).unwrap();
+    assert!(matches!(claim, foundry_ledger::ProductWorkClaimResult::Unsupported { task_kind, .. } if task_kind == "dep-bump"));
+    let (state, attempts): (String, i64) = rusqlite::Connection::open(&db).unwrap().query_row(
+        "SELECT state,attempts FROM product_work_backlog_v1 WHERE order_id=?1 AND lifecycle=1", [&report.receipts[0].order_id], |r| Ok((r.get(0)?, r.get(1)?))
+    ).unwrap();
+    assert_eq!(state, "waiting_unsupported");
+    assert_eq!(attempts, 0, "unsupported issue content caused zero executions");
+}
+
 #[test]
 fn page_restart_admission_ack_and_drive_backlog_are_durable() {
     let dir = scratch();

@@ -2,8 +2,9 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
+use rusqlite::OptionalExtension;
 use foundry_ledger::{
-    ProductCapability, ProductConfig, ProductHoldDecision, ProductResultExpectation, ProductStore,
+    ProductCapability, ProductConfig, ProductResultExpectation, ProductStore,
     RepositoryIdentity, ScopeGrantManifest, ScopeMutation, ScopeSourceManifest,
 };
 use foundry_serve::{auth_http::ProductHttpState, http::product_router};
@@ -50,6 +51,88 @@ impl foundry_line::product::ProductPublishReconciler for AuditNotFound {
 
 #[cfg(feature = "p2-test-support")]
 #[tokio::test]
+async fn w5_y5_production_http_hold_route_requires_auth_and_continues() {
+    use foundry_ledger::ProductConfig;
+    use product_result_fixture::{
+        FixtureIdentity, ReviewScript, genuine_host_done, grant_review_hold_scope,
+    };
+
+    let identity = FixtureIdentity::new(
+        ProductConfig {
+            installation_id: "audit-y5-http-install".into(),
+            database_id: "audit-y5-http-db".into(),
+        },
+        "audit-y5-http-source",
+        "audit-y5-http-order",
+    )
+    .with_script(ReviewScript::ResumePass);
+    let mut fixture = genuine_host_done(identity);
+    grant_review_hold_scope(&fixture);
+    let mut store = fixture.result_store.take().unwrap();
+    let hold = store
+        .list_product_review_holds(&fixture.human_session_digest, fixture.now)
+        .unwrap()
+        .into_iter()
+        .find(|hold| hold.order_id == fixture.identity.order_id)
+        .expect("genuine ResumePass fixture reaches a review hold");
+
+    // The explicit local test input adapter has no authority to call the
+    // human hold route. The production router rejects a missing bearer.
+    let state = ProductHttpState::with_review_host(store, fixture.host.take().unwrap());
+    let review_router = product_router(state.clone());
+    let request_body = serde_json::json!({
+        "expected": hold.expectation.clone(),
+        "decision": "resume",
+        "target": "replan_full"
+    })
+    .to_string();
+    let route = format!(
+        "/api/product/orders/{}/review/holds/{}/accept",
+        fixture.identity.order_id, hold.hold_instance_id
+    );
+    let unauthorized = review_router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(&route)
+                .header("idempotency-key", "w5-y5-unauthenticated-adapter")
+                .header("content-type", "application/json")
+                .body(Body::from(request_body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let human_bearer = std::fs::read_to_string(&fixture.human_session_bearer_path).unwrap();
+    let accepted_response = review_router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(&route)
+                .header("authorization", format!("Bearer {human_bearer}"))
+                .header("idempotency-key", "audit-genuine-hold-acceptance")
+                .header("content-type", "application/json")
+                .body(Body::from(request_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(accepted_response.status(), StatusCode::OK);
+    let acceptance: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(accepted_response.into_body(), 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(acceptance["progress"]["phase"], "completed");
+    assert!(fixture.calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "the genuine host used its labeled test executor mock");
+}
+
+#[cfg(feature = "p2-test-support")]
+#[tokio::test]
 async fn scoped_audit_connects_product_sources_and_preserves_event_time_scope() {
     use foundry_ledger::{ProductCapability as Cap, ProductConfig};
     use product_result_fixture::{
@@ -69,8 +152,8 @@ async fn scoped_audit_connects_product_sources_and_preserves_event_time_scope() 
     grant_review_hold_scope(&fixture);
     let mut store = fixture.result_store.take().unwrap();
 
-    // Accept and continue a genuine host-created review hold so the audit
-    // fixture has event-time hold, stage, session, and host-result evidence.
+    // Preserve the original direct hold-acceptance/continuation baseline. The
+    // separate W5 route cell below measures the production HTTP path.
     let hold = store
         .list_product_review_holds(&fixture.human_session_digest, fixture.now)
         .unwrap()
@@ -84,7 +167,7 @@ async fn scoped_audit_connects_product_sources_and_preserves_event_time_scope() 
             &hold.hold_instance_id,
             &hold.expectation,
             "audit-genuine-hold-acceptance",
-            ProductHoldDecision::Resume("replan_full".into()),
+            foundry_ledger::ProductHoldDecision::Resume("replan_full".into()),
             fixture.now,
         )
         .unwrap();
@@ -177,6 +260,8 @@ async fn scoped_audit_connects_product_sources_and_preserves_event_time_scope() 
     let receipt = store
         .approve_product(&fixture.human_session_digest, &fixture.approval, &proof)
         .unwrap();
+    // AuditPublisher is a mock publisher (example.invalid URL); all review
+    // execution and durable product consumers remain the genuine host/store.
     let published = foundry_line::product::ProductProjection::publish_product_approved(
         &mut store,
         &fixture.human_session_digest,
@@ -193,6 +278,21 @@ async fn scoped_audit_connects_product_sources_and_preserves_event_time_scope() 
             foundry_domain::ports::PublishOutcome::Confirmed { .. }
         )
     ));
+
+    // Keep a second genuinely admitted order behind the long-running host
+    // order so the Y2 snapshot can exercise order-selection pagination while
+    // still returning every S1 event for the selected order.
+    store
+        .admit_order(
+            "zz-w5-y2-selection-tail",
+            &fixture.identity.connector_id,
+            &fixture.identity.repository_id,
+            "issue:w5-y2-selection-tail",
+            "dep-bump",
+            "immutable supported-task snapshot",
+            fixture.now,
+        )
+        .unwrap();
 
     // A real source rebind creates a new immutable generation. Access to the
     // retired and current source is explicitly granted for this audit cell.
@@ -421,6 +521,84 @@ async fn scoped_audit_connects_product_sources_and_preserves_event_time_scope() 
         note.contains("product_service_events_v1") && note.contains("no source_instance_id")
     }));
 
+    // Y2: this order has passed through admission, a genuine multi-run host
+    // execution, an accepted human hold, finalization, approval, and publish.
+    // Its own history must stay complete even though the authorized order
+    // selection has another order beyond this one-row page.
+    let export_scope_revision: Option<i64> = rusqlite::Connection::open(&fixture.db_path)
+        .unwrap()
+        .query_row(
+            "SELECT revision FROM product_scope_subject_revisions_v1
+             WHERE subject_id=?1 AND source_instance_id=?2",
+            rusqlite::params!["reader", fixture.identity.source_instance_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap();
+    store
+        .change_product_scope(
+            &fixture.owner_session_digest,
+            "reader",
+            &fixture.identity.source_instance_id,
+            Cap::ExportEvidence,
+            ScopeMutation::Grant,
+            export_scope_revision.unwrap_or(0),
+            "audit-y2-export-long-order",
+            fixture.now,
+        )
+        .unwrap();
+    let long_history = store
+        .scoped_evidence_snapshot(
+            &fixture.human_session_digest,
+            Cap::ExportEvidence,
+            1,
+            fixture.now,
+        )
+        .unwrap();
+    assert!(long_history.has_more, "another authorized order follows the selected order");
+    assert!(long_history.coverage_complete, "selection paging does not truncate selected-order history");
+    let long_history_rows = long_history
+        .rows
+        .iter()
+        .filter(|row| row.order_id == fixture.identity.order_id)
+        .count();
+    let total_order_history: i64 = rusqlite::Connection::open(&fixture.db_path)
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM ledger WHERE order_id=?1",
+            [&fixture.identity.order_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    // Ordinary export fixtures have one admission row. This fixture has five
+    // genuine lifecycle events (five times the ordinary history) and retains
+    // every one of them on the selected order's paginated export.
+    assert!(
+        long_history_rows >= 5,
+        "the genuine multi-run review and approval path should exceed the one-row ordinary fixture; got {long_history_rows} rows"
+    );
+    assert_eq!(long_history_rows as i64, total_order_history);
+    eprintln!(
+        "W5 Y2 selected_order_history_rows={long_history_rows} total_order_rows={total_order_history} selection_has_more={}",
+        long_history.has_more
+    );
+    assert!(long_history.rows.iter().all(|row| row.order_id == fixture.identity.order_id));
+    let long_export = foundry_serve::privacy::scoped_product_export(
+        &long_history,
+        "audit-y2-long-history",
+        &key,
+    )
+    .unwrap();
+    assert!(long_export.has_more, "selection has more authorized orders");
+    assert!(long_export.selection_truncated);
+    assert!(long_export
+        .selection_truncation_label
+        .as_deref()
+        .is_some_and(|label| label.contains("not the full set")));
+    assert!(long_export.selected_order_history_complete);
+    assert_eq!(long_export.selected_order_history_byte_limit, None);
+    assert_eq!(long_export.rows.len() as i64, total_order_history);
+
     drop(store);
     drop(fixture.host.take());
 }
@@ -576,8 +754,15 @@ async fn registered_product_export_requires_current_approver_and_redacts_identif
         assert!(!text.contains(canary));
     }
     let export: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    eprintln!("W5 Y3 export verification_duration_micros={}", export["verification_duration_micros"]);
     assert_eq!(export["schema"], "foundry-scoped-evidence-projection-v1");
     assert_eq!(export["coverage"], "complete");
+    assert_eq!(export["selection_truncated"], false);
+    assert!(export["selection_truncation_label"].is_null());
+    assert_eq!(export["selected_order_history_complete"], true);
+    assert!(export["selected_order_history_byte_limit"].is_null());
+    assert!(export["verification_duration_micros"].as_u64().is_some());
+    assert!(export["verification_boundary"].as_str().unwrap().contains("does not substitute"));
     assert!(
         export["projected_digest"]
             .as_str()
@@ -632,6 +817,9 @@ async fn registered_product_export_requires_current_approver_and_redacts_identif
         assert!(!audit_text.contains(canary));
     }
     let audit: serde_json::Value = serde_json::from_slice(&audit_bytes).unwrap();
+    eprintln!("W5 Y3 audit verification_duration_micros={}", audit["projection"]["verification_duration_micros"]);
+    assert!(audit["projection"]["verification_duration_micros"].as_u64().is_some());
+    assert!(audit["projection"]["verification_boundary"].as_str().unwrap().contains("does not substitute"));
     assert_eq!(audit["schema_version"], 3);
     assert_eq!(audit["sources"][0]["source"], "S1");
     assert_eq!(audit["sources"][0]["availability"], "available");
@@ -862,6 +1050,9 @@ fn scoped_export_and_audit_require_their_own_capability_and_hide_foreign_rows() 
             .collect::<Vec<_>>(),
         vec![1, 2]
     );
+    assert!(before.selected_order_history_complete);
+    assert_eq!(before.selected_order_history_byte_limit, None);
+    assert!(!before.selection_truncated);
     let first_page = store
         .scoped_evidence_snapshot(&owner_digest, ProductCapability::ExportEvidence, 1, now)
         .unwrap();
@@ -942,6 +1133,12 @@ fn scoped_export_and_audit_require_their_own_capability_and_hide_foreign_rows() 
         };
         assert_eq!(projection["coverage"], "page");
         assert!(projection["has_more"].as_bool().unwrap());
+        assert_eq!(projection["selection_truncated"], true);
+        assert!(projection["selection_truncation_label"].as_str().unwrap().contains("not the full set"));
+        assert_eq!(projection["selected_order_history_complete"], true);
+        assert!(projection["selected_order_history_byte_limit"].is_null());
+        assert!(projection["verification_duration_micros"].as_u64().is_some());
+        assert!(projection["verification_boundary"].as_str().unwrap().contains("other users' response failures"));
         assert_eq!(projection["rows"].as_array().unwrap().len(), 1);
         assert_eq!(projection["rows"][0]["ordinal"], 1);
         assert!(!String::from_utf8_lossy(&bytes).contains("foreign-order-canary"));

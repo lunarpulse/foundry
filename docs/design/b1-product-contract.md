@@ -86,6 +86,43 @@ event-time source attribution described above. W5 Gate2 owns the export MUST
 requirements and product-server P1/P2 acceptance; Gate1 does not claim those
 items complete.
 
+## W5 Gate2 export selection and verification boundary
+
+Export and audit responses now state separately whether the authorized order
+selection is truncated (`selection_truncated` and
+`selection_truncation_label`) and whether each selected order's full S1 history
+is included (`selected_order_history_complete`, with a null byte limit). The
+legacy `coverage` value and projected digest semantics are unchanged. A selected
+order's history has no byte cap; the 1–100 limit applies to selected orders.
+Responses record the measured duration of the ProductStore scoped snapshot and
+projection work in `verification_duration_micros`.
+
+This request-local result does not substitute for whole-ledger operational
+verification. It verifies S1 for this request's snapshot; service-wide
+verification outcomes are coupled to other users' response failures, and the
+scoped response does not establish verification of unmounted sources.
+
+Cursor and response-budget policy is a PROPOSAL ONLY for a separate explicit
+decision. The measured interface is one page, at most 100 selected orders, and
+there is no cursor or offset today. Responses record verification durations;
+those values are resource evidence, not a selected budget or a policy decision.
+The bounded test output did not retain numeric samples, so no duration-based
+budget recommendation is made here. No cursor is implemented by Gate2.
+
+## W5 Gate2 P1/P2 acceptance boundary
+
+The P1 cell re-verifies the real durable inbox consumer through admission and
+acknowledgement to `waiting_unsupported`; an arbitrary GitHub issue body is not
+executed as a task. The P2 cell reuses the explicit local test input, genuine
+host, durable human hold/approval transaction, artifact evidence, and product
+publish consumer. The test input has no human authority: the production hold
+route rejects a request without a current bearer. Its executor and publisher
+are test doubles, and the publisher target is `example.invalid`.
+
+These P1 and P2 acceptance cells are not real issue-to-PR integration. Ordinary
+GitHub intake remains `waiting_unsupported`; a real issue-to-PR adapter remains
+W6 under separate approval. The mock publisher performs no external call.
+
 - The ordinary board HTTP and `foundry approve` CLI still use legacy sidecar identity/scope stores. ProductAtomicV1 has an authenticated receipt-file `foundry product publish` CLI path and durable publish outcome; builds without a configured adapter fail closed. Local mock coverage verifies existing-PR and closed+merged recovery through the Confirmed idempotent path, while closed+unmerged is reported Rejected and leaves the outcome pending, grants no fresh execution authority, and requires a new approval to retry. Target-repository verification is bound to the configured adapter and remains for W6 because no durable target-repository configuration exists today. A real external adapter remains W6 under separate approval; approval does not trigger publishing.
 - Durable GitHub polling, restart cursor, inbox admission/local acknowledgement, basic rate-limit retry, CLI watch integration, and ProductStore-backed fenced work claims are present. A claimable row currently requires an explicit adapter state; production admissions remain unsupported because the repository does not define an issue-to-dep-bump payload grammar or a safe adapter mapping. Retry jitter and complete-sweep/non-starvation coverage remain incomplete. The bounded fake-server tests use explicit loopback HTTP opt-in; the product CLI does not expose that opt-in.
 - Product hold acceptance, genuine host registration, authenticated HTTP/CLI endpoints, and accepted Resume through the existing host algorithm have a focused route test. Remaining work includes explicit recovery reconciliation after ambiguous stages and further followup-cycle route coverage. Separate-process service revoke/source rebind ordering around host stage start is covered in both commit orders by `b1_service_review`; human acceptance-versus-revoke ordering remains in-process. Scoped export/audit have focused capability, foreign-row, alias, and partial-source coverage tests; the CLI-launched loopback request test needs rerun where sandbox loopback binding is permitted. Product approval projection and ordered mirror catch-up have focused tests; injected publishing has positive and denial composition tests but no external adapter invocation.

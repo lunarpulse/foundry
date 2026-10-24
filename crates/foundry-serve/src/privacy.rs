@@ -382,6 +382,21 @@ pub struct ScopedProductExportDocument {
     /// `page` means more authorized orders exist beyond it.
     pub coverage: String,
     pub has_more: bool,
+    /// Explicitly states whether this response omits authorized orders.
+    pub selection_truncated: bool,
+    /// Human-readable truncation label, separate from the legacy `coverage`.
+    pub selection_truncation_label: Option<String>,
+    /// Selected orders include all their S1 rows; this is independent of the
+    /// page boundary between selected orders.
+    pub selected_order_history_complete: bool,
+    /// No byte cap is applied to the history of each selected order.
+    pub selected_order_history_byte_limit: Option<u64>,
+    /// Set by the registered HTTP adapter around ProductStore's full S1
+    /// verification and snapshot operation.
+    pub verification_duration_micros: Option<u64>,
+    /// Scoped responses are not a substitute for whole-ledger operational
+    /// verification, whose outcome is coupled to other users' responses.
+    pub verification_boundary: String,
     pub source_coverage_complete: bool,
     pub projected_digest: String,
     pub rows: Vec<ScopedProductExportRow>,
@@ -444,6 +459,14 @@ pub fn scoped_product_export(
         export_context: export_context.to_owned(),
         coverage: coverage.to_owned(),
         has_more: snapshot.has_more,
+        selection_truncated: snapshot.has_more,
+        selection_truncation_label: snapshot
+            .has_more
+            .then(|| "truncated selection; this is not the full set".to_owned()),
+        selected_order_history_complete: snapshot.coverage_complete,
+        selected_order_history_byte_limit: None,
+        verification_duration_micros: None,
+        verification_boundary: "This user's response does not substitute for whole-ledger verification; service-wide verification outcomes are coupled to other users' response failures.".to_owned(),
         source_coverage_complete: snapshot.coverage_complete,
         projected_digest,
         rows,

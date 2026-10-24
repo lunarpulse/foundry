@@ -42,6 +42,7 @@ async fn audit(
     headers: HeaderMap,
     Query(query): Query<ScopedReadQuery>,
 ) -> impl IntoResponse {
+    let verification_started = std::time::Instant::now();
     let Some(session) = bearer_digest(&headers) else {
         return (
             StatusCode::UNAUTHORIZED,
@@ -91,7 +92,7 @@ async fn audit(
                 .into_response();
         }
     };
-    let report =
+    let mut report =
         match crate::audit_report::scoped_product_inventory_v3(&snapshot, now, &context, &key) {
             Ok(report) => report,
             Err(_) => {
@@ -102,6 +103,12 @@ async fn audit(
                     .into_response();
             }
         };
+    report.projection.verification_duration_micros = Some(
+        verification_started
+            .elapsed()
+            .as_micros()
+            .min(u64::MAX as u128) as u64,
+    );
     let mut response = (StatusCode::OK, Json(report)).into_response();
     response.headers_mut().insert(
         header::CACHE_CONTROL,
@@ -115,6 +122,7 @@ async fn export(
     headers: HeaderMap,
     Query(query): Query<ScopedReadQuery>,
 ) -> impl IntoResponse {
+    let verification_started = std::time::Instant::now();
     let Some(session) = bearer_digest(&headers) else {
         return (
             StatusCode::UNAUTHORIZED,
@@ -163,7 +171,7 @@ async fn export(
                 .into_response();
         }
     };
-    let document = match crate::privacy::scoped_product_export(&snapshot, &context, &key) {
+    let mut document = match crate::privacy::scoped_product_export(&snapshot, &context, &key) {
         Ok(document) => document,
         Err(_) => {
             return (
@@ -173,6 +181,12 @@ async fn export(
                 .into_response();
         }
     };
+    document.verification_duration_micros = Some(
+        verification_started
+            .elapsed()
+            .as_micros()
+            .min(u64::MAX as u128) as u64,
+    );
     let mut response = (StatusCode::OK, Json(document)).into_response();
     response.headers_mut().insert(
         header::CACHE_CONTROL,
