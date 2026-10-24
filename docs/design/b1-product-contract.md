@@ -31,10 +31,31 @@ and accepts 1..100, following the existing order selection budget.
 `coverage=complete` means all visible orders fit; `coverage=page` with
 `has_more=true` marks a truncated first page. There is no continuation cursor
 yet. Source coverage is partial if a selected row lacks verifiable lifecycle
-provenance. S1 is the only connected audit source; S2/S3/S4/S5/S6/M6,
-governance, and casting report individual unavailable reasons. This is
-operational evidence scoped to the caller's grants, not an organization-wide
-security audit.
+provenance. The additive W5 Gate1 inventory connects the authorized in-store
+S4 hold/run/stage/session/result tables, S6 tuple/result bindings, approval and
+grant/token/outcome tables, scope/service event and recovery tables, and S5
+local publish outcomes. Every table summary reports availability, row count,
+SHA-256 content digest over deterministic sorted row serialization, and its
+measured schema. Zero rows remain `available, 0 rows`. Summaries are computed
+inside the same authenticated ProductStore read transaction and only for
+orders/sources visible through the caller's current `ReadOperationalAudit`
+grants; raw rows are not returned. The frozen v3 `sources` values remain for
+wire compatibility; `connected_sources` is the additive current inventory.
+
+S5 is explicitly local publish history. Remote verification remains a
+separate unavailable source because no remote adapter is configured. S2/S3
+are not connected because no verified snapshot adapters exist. Casting is
+not applicable to the measured ProductAtomicV1 store: `casting_runs` is
+absent there and `CastingLedger` opens a separate SQLite file; if a casting
+table is present in a ProductAtomicV1 file, its rows still lack product
+order/source provenance and are not included in this scoped report. M6
+standalone ledger/replay evidence is not mounted through ProductStore.
+Governance evidence is distinct: the governance journal is opened by the
+standalone serve state and is not part of this authenticated ProductStore
+snapshot. Scope and source-change events retain their event-row source IDs and
+revisions; service events do not store a source ID, and the audit does not
+infer one from current grants. This is operational evidence scoped to the
+caller's grants, not an organization-wide security audit.
 
 ## Product routes and CLI wired in this checkpoint
 
@@ -51,7 +72,7 @@ security audit.
 - The ordinary `foundry serve` mode, `ServeState`, legacy `http::router`, and `foundry approve` CLI still use the older sidecar identity/scope stores and Line approval path. Product mode is explicit; the legacy routes are not a ProductAtomicV1 read/hold/policy/export surface.
 - Product login throttling, logout, account create/role/disable administration, local reset, current-session resolution, scoped order/source management, export, and operational audit are wired. Product policy remains unavailable in product mode.
 - `foundry product-watch --once` and its long-running form use the ProductStore-backed GitHub tick. The tick verifies the repository locator against the configured stable ID, fetches at most five 100-item pages, commits page snapshots plus cursor, and admits the original issue snapshot through the existing product inbox/S1 path. A local acknowledgement records only the exact durable admission receipt; intake uses GET requests only and never mutates GitHub. It requires a preconfigured `github-primary` ProductAtomicV1 source binding. The connector token is resolved from the named environment variable only at run time. Durable retry state handles transport/5xx/429 and rate-limit 403 responses with exponential delay capped at one hour and GitHub Retry-After/reset capped at 24 hours; a committed page clears it. Malformed individual issue items advance with a durable digest-only rejection record. Work claims use a persisted epoch, fence, lease and source-revision check; expired claims can be reclaimed and stale proofs fail. Ordinary GitHub admissions remain `waiting_unsupported`; this build does not claim arbitrary issue bodies or review packs execute.
-- The product publish authorization gate and injected-Publisher composition are implemented and narrowly tested. The authenticated `foundry product publish` CLI path consumes a receipt file and fails closed when no adapter is configured; its local mock also distinguishes an existing PR and closed+merged PR (both recover through Confirmed) from closed+unmerged (reported Rejected, durable outcome stays pending, and a new approval is required before retry). Target-repository verification is bound to the configured adapter and lands with the real W6 adapter; there is no durable target-repository configuration today. The real external adapter remains W6 under separate approval. Post-commit Line projection and ordered mirror catch-up are implemented and narrowly tested. Product hold HTTP/CLI query, accept, and progress are wired; explicit ambiguous continuation recovery and the full v2 audit source inventory remain absent.
+- The product publish authorization gate and injected-Publisher composition are implemented and narrowly tested. The authenticated `foundry product publish` CLI path consumes a receipt file and fails closed when no adapter is configured; its local mock also distinguishes an existing PR and closed+merged PR (both recover through Confirmed) from closed+unmerged (reported Rejected, durable outcome stays pending, and a new approval is required before retry). Target-repository verification is bound to the configured adapter and lands with the real W6 adapter; there is no durable target-repository configuration today. The real external adapter remains W6 under separate approval. Post-commit Line projection and ordered mirror catch-up are implemented and narrowly tested. Product hold HTTP/CLI query, accept, and progress are wired; explicit ambiguous continuation recovery remains incomplete.
 - Jira intake remains backlog. B2 multi-pack/order-stream selection and worker/container separation remain out of scope.
 
 ## Jira backlog
@@ -59,6 +80,11 @@ security audit.
 Jira adapter/store/routes/tests remain deferred. No Jira-specific behavior is implemented or implied by the GitHub work. B2 multi-pack/order-stream selection and worker/container separation remain out of scope.
 
 ## Remaining B1 acceptance gaps
+
+W5 Gate1 connects the in-store audit source summaries and immutable
+event-time source attribution described above. W5 Gate2 owns the export MUST
+requirements and product-server P1/P2 acceptance; Gate1 does not claim those
+items complete.
 
 - The ordinary board HTTP and `foundry approve` CLI still use legacy sidecar identity/scope stores. ProductAtomicV1 has an authenticated receipt-file `foundry product publish` CLI path and durable publish outcome; builds without a configured adapter fail closed. Local mock coverage verifies existing-PR and closed+merged recovery through the Confirmed idempotent path, while closed+unmerged is reported Rejected and leaves the outcome pending, grants no fresh execution authority, and requires a new approval to retry. Target-repository verification is bound to the configured adapter and remains for W6 because no durable target-repository configuration exists today. A real external adapter remains W6 under separate approval; approval does not trigger publishing.
 - Durable GitHub polling, restart cursor, inbox admission/local acknowledgement, basic rate-limit retry, CLI watch integration, and ProductStore-backed fenced work claims are present. A claimable row currently requires an explicit adapter state; production admissions remain unsupported because the repository does not define an issue-to-dep-bump payload grammar or a safe adapter mapping. Retry jitter and complete-sweep/non-starvation coverage remain incomplete. The bounded fake-server tests use explicit loopback HTTP opt-in; the product CLI does not expose that opt-in.

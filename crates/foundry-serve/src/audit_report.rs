@@ -60,6 +60,48 @@ pub struct ScopedProductAuditReportV3 {
     pub generated_at: String,
     pub projection: crate::privacy::ScopedProductExportDocument,
     pub sources: Vec<ScopedProductAuditSourceV3>,
+    /// Additive current inventory. `sources` above retains its frozen v3
+    /// compatibility values; this field reports the tables actually read
+    /// from the same authorized ProductStore snapshot.
+    #[serde(default)]
+    pub connected_sources: Vec<ScopedProductAuditConnectedSourceV3>,
+    /// Event-time scope copied from immutable event rows, with request-local
+    /// source aliases and ordinals so global source identifiers and sequence
+    /// numbers do not escape the scoped response.
+    #[serde(default)]
+    pub event_scope: Vec<ScopedProductAuditEventScopeV3>,
+    #[serde(default)]
+    pub event_scope_notes: Vec<String>,
+    /// Investigated absences are separate from connected zero-row sources.
+    #[serde(default)]
+    pub unavailable_sources: Vec<ScopedProductAuditUnavailableV3>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScopedProductAuditConnectedSourceV3 {
+    pub source: String,
+    pub availability: String,
+    pub row_count: i64,
+    pub content_digest: String,
+    pub schema_description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScopedProductAuditUnavailableV3 {
+    pub source: String,
+    pub availability: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScopedProductAuditEventScopeV3 {
+    pub event_ordinal: usize,
+    pub event_source: String,
+    pub source_alias: Option<String>,
+    pub previous_source_alias: Option<String>,
+    pub source_revision: Option<i64>,
+    pub scope_revision: Option<i64>,
+    pub operation: String,
 }
 
 pub fn scoped_product_inventory_v3(
@@ -131,11 +173,86 @@ pub fn scoped_product_inventory_v3(
             missing_reason: Some(reason.into()),
         });
     }
+    let connected_sources = snapshot
+        .audit_sources
+        .iter()
+        .map(|source| ScopedProductAuditConnectedSourceV3 {
+            source: source.source.clone(),
+            availability: "available".into(),
+            row_count: source.row_count,
+            content_digest: source.digest.clone(),
+            schema_description: source.schema_description.clone(),
+        })
+        .collect();
+    let unavailable_sources = vec![
+        ScopedProductAuditUnavailableV3 {
+            source: "S2".into(),
+            availability: "not_connected".into(),
+            reason: "no verified ProductAtomicV1 S2 snapshot adapter is configured".into(),
+        },
+        ScopedProductAuditUnavailableV3 {
+            source: "S3".into(),
+            availability: "not_connected".into(),
+            reason: "no verified ProductAtomicV1 S3 snapshot adapter is configured".into(),
+        },
+        ScopedProductAuditUnavailableV3 {
+            source: "S5.remote_verification".into(),
+            availability: "unavailable".into(),
+            reason: "the ProductStore contains local publish outcomes only; no remote verification adapter is configured".into(),
+        },
+        ScopedProductAuditUnavailableV3 {
+            source: "casting".into(),
+            availability: "not_applicable".into(),
+            reason: if snapshot.casting_journal_present {
+                "casting_runs exists in this ProductAtomicV1 file, but its rows have no product order/source provenance and cannot be safely included in this scoped audit".into()
+            } else {
+                "measured ProductAtomicV1 inventory has no casting_runs table; CastingLedger opens a separate SQLite file and no casting adapter is mounted".into()
+            },
+        },
+        ScopedProductAuditUnavailableV3 {
+            source: "M6".into(),
+            availability: "not_connected".into(),
+            reason: "M6 standalone ledger/replay behavior is not exposed as a ProductStore audit snapshot adapter".into(),
+        },
+        ScopedProductAuditUnavailableV3 {
+            source: "governance".into(),
+            availability: "not_connected".into(),
+            reason: "the governance journal is opened by the standalone serve state and is not mounted in the authenticated ProductStore read transaction".into(),
+        },
+    ];
+    let event_scope = snapshot
+        .event_scope
+        .iter()
+        .enumerate()
+        .map(|(index, event)| ScopedProductAuditEventScopeV3 {
+            event_ordinal: index + 1,
+            event_source: event.event_source.clone(),
+            source_alias: event
+                .source_instance_id
+                .as_deref()
+                .map(|source_id| key.alias(context, "source_instance", source_id)),
+            previous_source_alias: event
+                .previous_source_instance_id
+                .as_deref()
+                .map(|source_id| key.alias(context, "source_instance", source_id)),
+            source_revision: event.source_revision,
+            scope_revision: event.scope_revision,
+            operation: event.operation.clone(),
+        })
+        .collect();
     Ok(ScopedProductAuditReportV3 {
         schema_version: 3,
         generated_at: generated_at.to_rfc3339(),
         projection,
         sources,
+        connected_sources,
+        event_scope,
+        event_scope_notes: vec![
+            "product_scope_events_v1 stores source_instance_id and scope_revision on each event row".into(),
+            "product_scope_source_events_v1 stores old/new source instance IDs and source_revision on each event row; the new ID is the event's resulting source scope".into(),
+            "product_service_events_v1 stores service_id and service revision but has no source_instance_id column; source attribution is not inferred from current service grants".into(),
+        ],
+        unavailable_sources,
     })
 }
 

@@ -2122,11 +2122,16 @@ impl ProductStore {
             .collect::<Result<Vec<_>, _>>()?;
         drop(evidence_stmt);
         let coverage_complete = rows.len() as i64 == selected_total;
+        let (audit_sources, event_scope, casting_journal_present) =
+            crate::product_scope::scoped_audit_sources_in(&tx, &principal.actor_id)?;
         tx.commit()?;
         Ok(ScopedEvidenceSnapshot {
             rows,
             has_more,
             coverage_complete,
+            audit_sources,
+            event_scope,
+            casting_journal_present,
         })
     }
 

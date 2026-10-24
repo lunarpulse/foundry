@@ -330,6 +330,289 @@ pub struct ScopedEvidenceSnapshot {
     /// False if any journal rows for selected orders lack matching immutable
     /// lifecycle provenance and a verified transition receipt.
     pub coverage_complete: bool,
+    /// Read-only, capability-scoped summaries of the ProductAtomicV1 tables
+    /// connected to the operational audit. The table contents never leave
+    /// ProductStore; only schema, row count, and deterministic digest do.
+    pub audit_sources: Vec<ScopedAuditSourceSnapshot>,
+    /// Source attribution copied from immutable event rows. Service events
+    /// whose schema has no source-instance field are intentionally omitted.
+    pub event_scope: Vec<ScopedAuditEventScope>,
+    /// Whether this exact ProductAtomicV1 database contains a casting journal
+    /// table; separate CastingLedger files are never opened or attached.
+    pub casting_journal_present: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopedAuditSourceSnapshot {
+    pub source: String,
+    pub row_count: i64,
+    pub digest: String,
+    pub schema_description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopedAuditEventScope {
+    pub event_source: String,
+    pub event_sequence: i64,
+    pub source_instance_id: Option<String>,
+    pub previous_source_instance_id: Option<String>,
+    pub source_revision: Option<i64>,
+    pub scope_revision: Option<i64>,
+    pub operation: String,
+}
+
+/// Summarize the in-store evidence visible through at least one current
+/// ReadOperationalAudit source grant. This stays inside the authenticated
+/// ProductStore read transaction; only aggregate metadata escapes.
+pub(crate) fn scoped_audit_sources_in(
+    tx: &rusqlite::Transaction<'_>,
+    actor_id: &str,
+) -> rusqlite::Result<(
+    Vec<ScopedAuditSourceSnapshot>,
+    Vec<ScopedAuditEventScope>,
+    bool,
+)> {
+    const ORDER_SCOPE: &str = "t.order_id IN (
+        SELECT p.order_id FROM product_scope_order_provenance_v1 p
+        JOIN product_scope_grants_v1 g ON g.source_instance_id=p.source_instance_id
+        WHERE g.subject_id=?1 AND g.capability='read_operational_audit'
+          AND g.enabled=1 AND p.verified=1)";
+    const SOURCE_SCOPE: &str = "t.source_instance_id IN (
+        SELECT source_instance_id FROM product_scope_grants_v1
+        WHERE subject_id=?1 AND capability='read_operational_audit' AND enabled=1)";
+    const SERVICE_SCOPE: &str = "t.service_id IN (
+        SELECT sg.service_id FROM product_service_grants_v1 sg
+        JOIN product_scope_grants_v1 g ON g.source_instance_id=sg.source_instance_id
+        WHERE g.subject_id=?1 AND g.capability='read_operational_audit'
+          AND g.enabled=1)";
+
+    let mut tables: Vec<(&str, &str, &str)> = vec![
+        (
+            "S4.product_review_holds_v1",
+            "product_review_holds_v1",
+            ORDER_SCOPE,
+        ),
+        (
+            "S4.product_review_hold_acceptances_v1",
+            "product_review_hold_acceptances_v1",
+            ORDER_SCOPE,
+        ),
+        (
+            "S4.product_review_hold_progress_v1",
+            "product_review_hold_progress_v1",
+            "t.operation_id IN (SELECT a.operation_id FROM product_review_hold_acceptances_v1 a WHERE a.order_id IN (SELECT p.order_id FROM product_scope_order_provenance_v1 p JOIN product_scope_grants_v1 g ON g.source_instance_id=p.source_instance_id WHERE g.subject_id=?1 AND g.capability='read_operational_audit' AND g.enabled=1 AND p.verified=1))",
+        ),
+        (
+            "S4.product_review_runs_v1",
+            "product_review_runs_v1",
+            ORDER_SCOPE,
+        ),
+        (
+            "S4.product_review_stages_v1",
+            "product_review_stages_v1",
+            ORDER_SCOPE,
+        ),
+        (
+            "S4.product_review_sessions_v1",
+            "product_review_sessions_v1",
+            ORDER_SCOPE,
+        ),
+        (
+            "S4.product_review_host_results_v1",
+            "product_review_host_results_v1",
+            ORDER_SCOPE,
+        ),
+        (
+            "S4.product_review_work_bindings_v1",
+            "product_review_work_bindings_v1",
+            ORDER_SCOPE,
+        ),
+        (
+            "S6.product_result_bindings_v1",
+            "product_result_bindings_v1",
+            ORDER_SCOPE,
+        ),
+        (
+            "S6.product_approval_result_bindings_v1",
+            "product_approval_result_bindings_v1",
+            "t.operation_id IN (SELECT o.operation_id FROM product_operations_v1 o JOIN product_scope_order_provenance_v1 p ON p.order_id=o.order_id JOIN product_scope_grants_v1 g ON g.source_instance_id=p.source_instance_id WHERE g.subject_id=?1 AND g.capability='read_operational_audit' AND g.enabled=1 AND p.verified=1)",
+        ),
+        ("S6.artifact_tuples", "artifact_tuples", ORDER_SCOPE),
+        (
+            "approval.product_outcomes_v1",
+            "product_outcomes_v1",
+            "t.operation_id IN (SELECT o.operation_id FROM product_operations_v1 o WHERE EXISTS(SELECT 1 FROM product_scope_order_provenance_v1 p JOIN product_scope_grants_v1 g ON g.source_instance_id=p.source_instance_id WHERE p.order_id=o.order_id AND g.subject_id=?1 AND g.capability='read_operational_audit' AND g.enabled=1 AND p.verified=1))",
+        ),
+        (
+            "approval.product_grants_v1",
+            "product_grants_v1",
+            ORDER_SCOPE,
+        ),
+        (
+            "approval.product_token_consumptions_v1",
+            "product_token_consumptions_v1",
+            "t.operation_id IN (SELECT o.operation_id FROM product_operations_v1 o WHERE EXISTS(SELECT 1 FROM product_scope_order_provenance_v1 p JOIN product_scope_grants_v1 g ON g.source_instance_id=p.source_instance_id WHERE p.order_id=o.order_id AND g.subject_id=?1 AND g.capability='read_operational_audit' AND g.enabled=1 AND p.verified=1))",
+        ),
+        (
+            "approval.product_service_operations_v1",
+            "product_service_operations_v1",
+            "EXISTS(SELECT 1 FROM product_service_events_v1 e WHERE e.actor_id=t.actor_id AND e.request_key=t.request_key AND e.service_id IN (SELECT sg.service_id FROM product_service_grants_v1 sg JOIN product_scope_grants_v1 g ON g.source_instance_id=sg.source_instance_id WHERE g.subject_id=?1 AND g.capability='read_operational_audit' AND g.enabled=1))",
+        ),
+        (
+            "scope.product_scope_events_v1",
+            "product_scope_events_v1",
+            SOURCE_SCOPE,
+        ),
+        (
+            "scope.product_scope_source_events_v1",
+            "product_scope_source_events_v1",
+            "(t.old_source_instance_id IN (SELECT source_instance_id FROM product_scope_grants_v1 WHERE subject_id=?1 AND capability='read_operational_audit' AND enabled=1) OR t.new_source_instance_id IN (SELECT source_instance_id FROM product_scope_grants_v1 WHERE subject_id=?1 AND capability='read_operational_audit' AND enabled=1))",
+        ),
+        (
+            "scope.product_service_events_v1",
+            "product_service_events_v1",
+            SERVICE_SCOPE,
+        ),
+        (
+            "scope.product_scope_migrations_v1",
+            "product_scope_migrations_v1",
+            "EXISTS(SELECT 1 FROM product_scope_order_provenance_v1 p JOIN product_scope_grants_v1 g ON g.source_instance_id=p.source_instance_id WHERE g.subject_id=?1 AND g.capability='read_operational_audit' AND g.enabled=1 AND p.verified=1)",
+        ),
+        (
+            "scope.product_scope_quarantine_v1",
+            "product_scope_quarantine_v1",
+            ORDER_SCOPE,
+        ),
+        (
+            "S5.local_product_publish_outcomes_v1",
+            "product_publish_outcomes_v1",
+            "t.operation_id IN (SELECT o.operation_id FROM product_operations_v1 o WHERE EXISTS(SELECT 1 FROM product_scope_order_provenance_v1 p JOIN product_scope_grants_v1 g ON g.source_instance_id=p.source_instance_id WHERE p.order_id=o.order_id AND g.subject_id=?1 AND g.capability='read_operational_audit' AND g.enabled=1 AND p.verified=1))",
+        ),
+    ];
+
+    let mut summaries = Vec::with_capacity(tables.len());
+    for (source, table, filter) in tables.drain(..) {
+        let columns = {
+            let mut stmt = tx.prepare(&format!("PRAGMA table_info(\"{table}\")"))?;
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+        };
+        if columns.is_empty() {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let schema_description = columns
+            .iter()
+            .map(|(name, kind, required, primary)| {
+                format!("{name}:{kind}:not_null={required}:primary_key={primary}")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let order_by = columns
+            .iter()
+            .map(|(name, ..)| format!("\"{}\"", name.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("SELECT * FROM \"{table}\" AS t WHERE {filter} ORDER BY {order_by}");
+        let mut stmt = tx.prepare(&sql)?;
+        let mut rows = stmt.query([actor_id])?;
+        let mut row_count = 0_i64;
+        let mut digest = Sha256::new();
+        digest.update(b"foundry-product-audit-table-v1\0");
+        digest.update(source.as_bytes());
+        digest.update(b"\0");
+        digest.update(schema_description.as_bytes());
+        while let Some(row) = rows.next()? {
+            let mut values = Vec::with_capacity(columns.len());
+            for index in 0..columns.len() {
+                let value = match row.get_ref(index)? {
+                    rusqlite::types::ValueRef::Null => serde_json::Value::Null,
+                    rusqlite::types::ValueRef::Integer(value) => serde_json::json!(value),
+                    rusqlite::types::ValueRef::Real(value) => serde_json::Number::from_f64(value)
+                        .map(serde_json::Value::Number)
+                        .unwrap_or(serde_json::Value::Null),
+                    rusqlite::types::ValueRef::Text(value) => {
+                        serde_json::Value::String(String::from_utf8_lossy(value).into_owned())
+                    }
+                    rusqlite::types::ValueRef::Blob(value) => {
+                        serde_json::Value::String(format!("blob:{}", hex::encode(value)))
+                    }
+                };
+                values.push(value);
+            }
+            let serialized = serde_json::to_vec(&values)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            digest.update((serialized.len() as u64).to_be_bytes());
+            digest.update(serialized);
+            row_count += 1;
+        }
+        summaries.push(ScopedAuditSourceSnapshot {
+            source: source.to_owned(),
+            row_count,
+            digest: hex::encode(digest.finalize()),
+            schema_description,
+        });
+    }
+
+    let mut event_scope = Vec::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT event_seq,source_instance_id,scope_revision,operation FROM product_scope_events_v1
+             WHERE source_instance_id IN (SELECT source_instance_id FROM product_scope_grants_v1 WHERE subject_id=?1 AND capability='read_operational_audit' AND enabled=1)
+             ORDER BY event_seq",
+        )?;
+        event_scope.extend(
+            stmt.query_map([actor_id], |row| {
+                Ok(ScopedAuditEventScope {
+                    event_source: "product_scope_events_v1".into(),
+                    event_sequence: row.get(0)?,
+                    source_instance_id: Some(row.get(1)?),
+                    previous_source_instance_id: None,
+                    source_revision: None,
+                    scope_revision: Some(row.get(2)?),
+                    operation: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?,
+        );
+    }
+    {
+        let mut stmt = tx.prepare(
+            "SELECT event_seq,old_source_instance_id,new_source_instance_id,source_revision,operation FROM product_scope_source_events_v1
+             WHERE old_source_instance_id IN (SELECT source_instance_id FROM product_scope_grants_v1 WHERE subject_id=?1 AND capability='read_operational_audit' AND enabled=1)
+                OR new_source_instance_id IN (SELECT source_instance_id FROM product_scope_grants_v1 WHERE subject_id=?1 AND capability='read_operational_audit' AND enabled=1)
+             ORDER BY event_seq",
+        )?;
+        event_scope.extend(
+            stmt.query_map([actor_id], |row| {
+                Ok(ScopedAuditEventScope {
+                    event_source: "product_scope_source_events_v1".into(),
+                    event_sequence: row.get(0)?,
+                    previous_source_instance_id: row.get(1)?,
+                    source_instance_id: Some(row.get(2)?),
+                    source_revision: Some(row.get(3)?),
+                    scope_revision: None,
+                    operation: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?,
+        );
+    }
+    event_scope.sort_by(|left, right| {
+        (&left.event_source, left.event_sequence).cmp(&(&right.event_source, right.event_sequence))
+    });
+    let casting_journal_present: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='casting_runs')",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok((summaries, event_scope, casting_journal_present))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

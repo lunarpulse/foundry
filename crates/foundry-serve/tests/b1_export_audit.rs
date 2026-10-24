@@ -3,11 +3,427 @@ use axum::{
     http::{Request, StatusCode},
 };
 use foundry_ledger::{
-    ProductCapability, ProductConfig, ProductStore, RepositoryIdentity, ScopeGrantManifest,
-    ScopeSourceManifest,
+    ProductCapability, ProductConfig, ProductHoldDecision, ProductResultExpectation, ProductStore,
+    RepositoryIdentity, ScopeGrantManifest, ScopeMutation, ScopeSourceManifest,
 };
 use foundry_serve::{auth_http::ProductHttpState, http::product_router};
 use tower::ServiceExt;
+
+#[cfg(feature = "p2-test-support")]
+#[path = "../../foundry-line/tests/support/product_result_fixture.rs"]
+mod product_result_fixture;
+
+#[cfg(feature = "p2-test-support")]
+struct AuditPublisher;
+
+#[cfg(feature = "p2-test-support")]
+impl foundry_domain::ports::Publisher for AuditPublisher {
+    fn publish(
+        &self,
+        _order: &foundry_domain::Order,
+        operation_id: &str,
+        _expected_digest: &str,
+    ) -> impl std::future::Future<
+        Output = foundry_domain::ports::PortResult<foundry_domain::ports::PublishOutcome>,
+    > + Send {
+        let url = format!("https://example.invalid/audit/{operation_id}");
+        async move { Ok(foundry_domain::ports::PublishOutcome::Confirmed { pr_url: url }) }
+    }
+}
+
+#[cfg(feature = "p2-test-support")]
+struct AuditNotFound;
+
+#[cfg(feature = "p2-test-support")]
+impl foundry_line::product::ProductPublishReconciler for AuditNotFound {
+    fn reconcile(
+        &self,
+        _operation_id: &str,
+    ) -> impl std::future::Future<
+        Output = foundry_domain::ports::PortResult<
+            foundry_line::product::ProductPublishReconcileOutcome,
+        >,
+    > + Send {
+        async { Ok(foundry_line::product::ProductPublishReconcileOutcome::NotFound) }
+    }
+}
+
+#[cfg(feature = "p2-test-support")]
+#[tokio::test]
+async fn scoped_audit_connects_product_sources_and_preserves_event_time_scope() {
+    use foundry_ledger::{ProductCapability as Cap, ProductConfig};
+    use product_result_fixture::{
+        FixtureIdentity, ReviewScript, genuine_host_done, grant_review_hold_scope,
+    };
+
+    let identity = FixtureIdentity::new(
+        ProductConfig {
+            installation_id: "audit-gate1-install".into(),
+            database_id: "audit-gate1-db".into(),
+        },
+        "audit-source-a",
+        "audit-order-genuine",
+    )
+    .with_script(ReviewScript::ResumePass);
+    let mut fixture = genuine_host_done(identity);
+    grant_review_hold_scope(&fixture);
+    let mut store = fixture.result_store.take().unwrap();
+
+    // Accept and continue a genuine host-created review hold so the audit
+    // fixture has event-time hold, stage, session, and host-result evidence.
+    let hold = store
+        .list_product_review_holds(&fixture.human_session_digest, fixture.now)
+        .unwrap()
+        .into_iter()
+        .find(|hold| hold.order_id == fixture.identity.order_id)
+        .expect("genuine ResumePass fixture reaches a review hold");
+    let acceptance = store
+        .accept_product_review_hold(
+            &fixture.human_session_digest,
+            &fixture.identity.order_id,
+            &hold.hold_instance_id,
+            &hold.expectation,
+            "audit-genuine-hold-acceptance",
+            ProductHoldDecision::Resume("replan_full".into()),
+            fixture.now,
+        )
+        .unwrap();
+    let mut host = fixture.host.take().unwrap();
+    host.continue_accepted_product_hold(
+        &fixture.human_session_digest,
+        &acceptance.operation_id,
+        fixture.now,
+    )
+    .unwrap();
+    drop(host);
+    let (final_run, result_json): (i64, String) = rusqlite::Connection::open(&fixture.db_path)
+        .unwrap()
+        .query_row(
+            "SELECT run_id,result_json FROM product_review_host_results_v1
+             WHERE order_id=?1 AND attempt=1 ORDER BY CAST(run_id AS INTEGER) DESC LIMIT 1",
+            [&fixture.identity.order_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let terminal: foundry_exec::HostResult = serde_json::from_str(&result_json).unwrap();
+    fixture.expected = ProductResultExpectation {
+        host_key: foundry_exec::HostKey {
+            order: fixture.identity.order_id.clone(),
+            attempt: 1,
+            run: u64::try_from(final_run).unwrap(),
+            activation: 3,
+        },
+        host_result_digest: foundry_ledger::product_host_result_digest(&terminal).unwrap(),
+    };
+    fixture.approval.run_id = final_run;
+    fixture.terminal = Some(terminal);
+    let finalized = store
+        .finalize_product_review_result(&fixture.service, &fixture.expected)
+        .unwrap();
+    fixture.approval.grant_id = format!("{}-grant", fixture.identity.order_id);
+    fixture.approval.token_digest = "a".repeat(64);
+    fixture.approval.artifact_digest = fixture.terminal.as_ref().unwrap().result_commit.clone();
+    fixture.approval.tuple_digest = finalized.tuple_digest;
+
+    // The real host fixture supplies bootstrap, admitted order, accepted
+    // hold, resumed run, stages, host result, promoted tuple, and service
+    // history. Add current audit and publish capabilities through the
+    // production scope-change path.
+    let scope_revision: i64 = rusqlite::Connection::open(&fixture.db_path)
+        .unwrap()
+        .query_row(
+            "SELECT revision FROM product_scope_subject_revisions_v1
+             WHERE subject_id='reader' AND source_instance_id=?1",
+            [&fixture.identity.source_instance_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    store
+        .change_product_scope(
+            &fixture.owner_session_digest,
+            "reader",
+            &fixture.identity.source_instance_id,
+            Cap::ReadOperationalAudit,
+            ScopeMutation::Grant,
+            scope_revision,
+            "audit-reader-source-a",
+            fixture.now,
+        )
+        .unwrap();
+    store
+        .change_product_scope(
+            &fixture.owner_session_digest,
+            "reader",
+            &fixture.identity.source_instance_id,
+            Cap::PublishApproved,
+            ScopeMutation::Grant,
+            scope_revision + 1,
+            "audit-reader-publish",
+            fixture.now,
+        )
+        .unwrap();
+    store
+        .issue_approval_grant(
+            &fixture.human_session_digest,
+            &fixture.approval.grant_id,
+            &fixture.approval.token_digest,
+            &fixture.identity.order_id,
+            fixture.now,
+        )
+        .unwrap();
+    let proof = store
+        .prepare_approval(&fixture.human_session_digest, &fixture.approval)
+        .unwrap();
+    let receipt = store
+        .approve_product(&fixture.human_session_digest, &fixture.approval, &proof)
+        .unwrap();
+    let published = foundry_line::product::ProductProjection::publish_product_approved(
+        &mut store,
+        &fixture.human_session_digest,
+        &receipt,
+        &AuditPublisher,
+        &AuditNotFound,
+        fixture.now,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        published,
+        foundry_line::product::ProductPublishResult::Published(
+            foundry_domain::ports::PublishOutcome::Confirmed { .. }
+        )
+    ));
+
+    // A real source rebind creates a new immutable generation. Access to the
+    // retired and current source is explicitly granted for this audit cell.
+    let expected_revision = rusqlite::Connection::open(&fixture.db_path)
+        .unwrap()
+        .query_row(
+            "SELECT revision FROM product_sources_v1 WHERE connector_id=?1",
+            [&fixture.identity.connector_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    let source_b = store
+        .configure_scoped_source(
+            &fixture.owner_session_digest,
+            &fixture.identity.connector_id,
+            RepositoryIdentity::canonicalized(
+                &fixture.identity.repository_owner,
+                "github",
+                &fixture.identity.api_origin,
+                "repo:2",
+            )
+            .unwrap(),
+            &fixture.identity.repository_owner,
+            "repo-renamed",
+            "repo:2",
+            "open+foundry:make",
+            true,
+            expected_revision,
+            "audit-source-rebind-a-to-b",
+            fixture.now,
+        )
+        .unwrap();
+    store
+        .change_product_scope(
+            &fixture.owner_session_digest,
+            "reader",
+            &source_b.source_instance_id,
+            Cap::ReadOperationalAudit,
+            foundry_ledger::ScopeMutation::Grant,
+            0,
+            "audit-reader-source-b",
+            fixture.now,
+        )
+        .unwrap();
+
+    let snapshot = store
+        .scoped_evidence_snapshot(
+            &fixture.human_session_digest,
+            Cap::ReadOperationalAudit,
+            100,
+            fixture.now,
+        )
+        .unwrap();
+    let key = foundry_serve::privacy::ExportKey::generate().unwrap();
+    let report = foundry_serve::audit_report::scoped_product_inventory_v3(
+        &snapshot,
+        fixture.now,
+        "audit-gate1-context",
+        &key,
+    )
+    .unwrap();
+    assert!(!snapshot.casting_journal_present);
+    let repeat_snapshot = store
+        .scoped_evidence_snapshot(
+            &fixture.human_session_digest,
+            Cap::ReadOperationalAudit,
+            100,
+            fixture.now,
+        )
+        .unwrap();
+    let repeat_report = foundry_serve::audit_report::scoped_product_inventory_v3(
+        &repeat_snapshot,
+        fixture.now,
+        "audit-gate1-context",
+        &key,
+    )
+    .unwrap();
+    assert_eq!(report.connected_sources, repeat_report.connected_sources);
+    assert_eq!(report.event_scope, repeat_report.event_scope);
+
+    let source = |name: &str| {
+        report
+            .connected_sources
+            .iter()
+            .find(|entry| entry.source == name)
+            .unwrap_or_else(|| panic!("missing connected source {name}"))
+    };
+    for name in [
+        "S4.product_review_holds_v1",
+        "S4.product_review_hold_acceptances_v1",
+        "S4.product_review_hold_progress_v1",
+        "S4.product_review_runs_v1",
+        "S4.product_review_stages_v1",
+        "S4.product_review_sessions_v1",
+        "S4.product_review_host_results_v1",
+        "S6.product_result_bindings_v1",
+        "S6.product_approval_result_bindings_v1",
+        "S6.artifact_tuples",
+        "approval.product_outcomes_v1",
+        "approval.product_grants_v1",
+        "approval.product_token_consumptions_v1",
+        "approval.product_service_operations_v1",
+        "scope.product_scope_events_v1",
+        "scope.product_scope_source_events_v1",
+        "scope.product_service_events_v1",
+        "scope.product_scope_migrations_v1",
+        "scope.product_scope_quarantine_v1",
+        "S5.local_product_publish_outcomes_v1",
+    ] {
+        let entry = source(name);
+        assert_eq!(entry.availability, "available");
+        assert!(entry.row_count >= 0);
+        assert_eq!(entry.content_digest.len(), 64, "{name}");
+        assert!(!entry.schema_description.is_empty(), "{name}");
+    }
+    assert_eq!(source("S4.product_review_runs_v1").row_count, 2);
+    assert!(source("S4.product_review_stages_v1").row_count > 0);
+    assert_eq!(source("S6.product_result_bindings_v1").row_count, 1);
+    assert_eq!(source("approval.product_outcomes_v1").row_count, 1);
+    assert_eq!(
+        source("approval.product_token_consumptions_v1").row_count,
+        1
+    );
+    assert_eq!(source("S5.local_product_publish_outcomes_v1").row_count, 1);
+    assert!(source("S4.product_review_holds_v1").row_count > 0);
+    assert!(source("S4.product_review_hold_acceptances_v1").row_count > 0);
+    assert!(source("S4.product_review_hold_progress_v1").row_count > 0);
+
+    let transition = report
+        .event_scope
+        .iter()
+        .find(|event| {
+            event.event_source == "product_scope_source_events_v1"
+                && event.operation == "rebound"
+        })
+        .unwrap();
+    let source_a_alias = transition.previous_source_alias.as_deref().unwrap();
+    let source_b_alias = transition.source_alias.as_deref().unwrap();
+    assert_ne!(source_a_alias, source_b_alias);
+    assert!(transition.source_revision.is_some());
+
+    let source_events: Vec<_> = report
+        .event_scope
+        .iter()
+        .filter(|event| event.event_source == "product_scope_events_v1")
+        .collect();
+    assert!(source_events.len() >= 2, "scope grants for both sources are present");
+    assert!(source_events
+        .iter()
+        .any(|event| event.source_alias.as_deref() == Some(source_a_alias)));
+    assert!(source_events
+        .iter()
+        .any(|event| event.source_alias.as_deref() == Some(source_b_alias)));
+
+    // Repeated references to a stored source use the transition's same
+    // request-local alias, and no event attributed to the old source is
+    // reclassified as the new source.
+    let first_post_transition = source_events
+        .iter()
+        .position(|event| event.source_alias.as_deref() == Some(source_b_alias))
+        .unwrap();
+    let pre_transition_events = &source_events[..first_post_transition];
+    assert!(!pre_transition_events.is_empty());
+    assert!(pre_transition_events
+        .iter()
+        .all(|event| event.source_alias.as_deref() == Some(source_a_alias)));
+    assert_eq!(
+        transition.previous_source_alias.as_deref(),
+        pre_transition_events[0].source_alias.as_deref(),
+        "the same stored source has one alias throughout this response"
+    );
+    assert_eq!(
+        transition.source_alias.as_deref(),
+        source_events
+            .iter()
+            .find(|event| event.source_alias.as_deref() == Some(source_b_alias))
+            .unwrap()
+            .source_alias
+            .as_deref(),
+        "the rebound source alias matches its later scope event"
+    );
+    assert_eq!(
+        report
+            .event_scope
+            .iter()
+            .map(|event| event.event_ordinal)
+            .collect::<Vec<_>>(),
+        (1..=report.event_scope.len()).collect::<Vec<_>>()
+    );
+    let serialized_report = serde_json::to_string(&report).unwrap();
+    assert!(!serialized_report.contains("audit-source-a"));
+    assert!(!serialized_report.contains(&source_b.source_instance_id));
+    let serialized_event_scope = serde_json::to_string(&report.event_scope).unwrap();
+    assert!(!serialized_event_scope.contains("event_sequence"));
+    assert!(!serialized_event_scope.contains("event_seq"));
+
+    let local_publish = report
+        .connected_sources
+        .iter()
+        .find(|entry| entry.source == "S5.local_product_publish_outcomes_v1")
+        .unwrap();
+    assert!(local_publish.source.contains("local"));
+    let remote = report
+        .unavailable_sources
+        .iter()
+        .find(|entry| entry.source == "S5.remote_verification")
+        .unwrap();
+    assert_eq!(remote.availability, "unavailable");
+    assert!(remote.reason.contains("no remote verification adapter"));
+
+    let unavailable = |name: &str| {
+        report
+            .unavailable_sources
+            .iter()
+            .find(|entry| entry.source == name)
+            .unwrap_or_else(|| panic!("missing unavailable source {name}"))
+    };
+    assert_eq!(unavailable("S2").availability, "not_connected");
+    assert_eq!(unavailable("S3").availability, "not_connected");
+    assert_eq!(unavailable("M6").availability, "not_connected");
+    assert_eq!(unavailable("governance").availability, "not_connected");
+    assert_eq!(unavailable("casting").availability, "not_applicable");
+    assert_ne!(unavailable("M6").reason, unavailable("governance").reason);
+    assert_ne!(unavailable("S2").reason, unavailable("casting").reason);
+    assert!(report.event_scope_notes.iter().any(|note| {
+        note.contains("product_service_events_v1") && note.contains("no source_instance_id")
+    }));
+
+    drop(store);
+    drop(fixture.host.take());
+}
 
 fn request_method(
     app: &axum::Router,
