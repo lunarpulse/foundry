@@ -50,6 +50,17 @@ pub trait ProductPublishReconciler {
         &self,
         operation_id: &str,
     ) -> impl std::future::Future<Output = PortResult<ProductPublishReconcileOutcome>> + Send;
+
+    /// Reconcile an operation while binding the remote PR to the approved
+    /// artifact digest. Legacy adapters retain their existing behavior; real
+    /// remote adapters should override this method.
+    fn reconcile_bound(
+        &self,
+        operation_id: &str,
+        _expected_digest: &str,
+    ) -> impl std::future::Future<Output = PortResult<ProductPublishReconcileOutcome>> + Send {
+        self.reconcile(operation_id)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,7 +243,10 @@ impl ProductProjection {
                 Self::guarded_publish(store, publisher, receipt, now).await
             }
             ProductPublishStart::Reconcile => {
-                match reconciler.reconcile(&receipt.operation_id).await? {
+                match reconciler
+                    .reconcile_bound(&receipt.operation_id, &receipt.artifact_digest)
+                    .await?
+                {
                     ProductPublishReconcileOutcome::Confirmed { pr_url } => {
                         store
                             .settle_product_publish(&receipt.operation_id, &pr_url)

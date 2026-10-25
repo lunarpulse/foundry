@@ -19,7 +19,9 @@ pub mod dry_die;
 pub mod evaluation_protocol;
 pub mod evidence_recompute;
 pub mod gc;
+pub mod github_product_publisher;
 pub mod github_publisher;
+pub mod github_rest;
 pub mod governance_events;
 pub mod intake;
 pub mod intake_worker;
@@ -37,6 +39,11 @@ pub mod retro;
 pub mod synthesis;
 pub mod watch;
 
+pub use github_product_publisher::{GithubProductPublisher, GithubProductPublisherConfig};
 pub use github_publisher::GithubPublisher;
+pub use github_rest::{
+    GithubApiError, GithubApiErrorKind, GithubHttpResponse, GithubHttpTransport, GithubIssue,
+    GithubPullRequest, GithubRestClient, GithubRestConfig,
+};
 pub use intake::{GithubLabelIntake, IntakeConfig};
 pub use watch::{WatchConfig, run, tick};

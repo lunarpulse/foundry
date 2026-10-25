@@ -1125,6 +1125,55 @@ async fn product_publish_cmd(
         };
     }
 
+    match tokio::task::spawn_blocking(foundry_watch::GithubProductPublisher::from_env).await {
+        Err(_) => {
+            eprintln!("GitHub publisher initialization worker failed");
+            return 1;
+        }
+        Ok(Ok(Some(adapter))) => {
+            let session_digest = sha256_hex(bearer.as_bytes());
+            let now = chrono::Utc::now();
+            return match foundry_line::product::ProductProjection::publish_product_approved(
+                &mut store,
+                &session_digest,
+                &receipt,
+                &adapter,
+                &adapter,
+                now,
+            )
+            .await
+            {
+                Ok(foundry_line::product::ProductPublishResult::Published(
+                    foundry_domain::ports::PublishOutcome::Confirmed { pr_url },
+                )) => {
+                    println!("{pr_url}");
+                    0
+                }
+                Ok(foundry_line::product::ProductPublishResult::Published(
+                    foundry_domain::ports::PublishOutcome::Unknown { operation_id },
+                )) => {
+                    println!("publish outcome unknown; retry operation {operation_id}");
+                    0
+                }
+                Ok(foundry_line::product::ProductPublishResult::Rejected { pr_url }) => {
+                    eprintln!(
+                        "external PR closed without merge: {pr_url}; stored pending; a new approval is required to retry"
+                    );
+                    1
+                }
+                Err(_) => {
+                    eprintln!("product publish unavailable");
+                    1
+                }
+            };
+        }
+        Ok(Ok(None)) => {}
+        Ok(Err(_)) => {
+            eprintln!("GitHub publisher configuration rejected");
+            return 1;
+        }
+    }
+
     let _ = (bearer, receipt, store);
     eprintln!("no publish adapter configured — external publishing arrives in W6");
     1
