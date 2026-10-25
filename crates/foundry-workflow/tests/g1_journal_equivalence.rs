@@ -17,6 +17,8 @@
 //! 결정성 확보: `at`는 고정 시각(엔진이 시각을 만들지 않는다 —
 //! dispatch는 저널 파라미터에서 시각을 받지 않고, 심는 쪽이 준다).
 
+#![allow(clippy::filter_next)] // W6a clippy debt: preserve this existing test/example logic, assertions, and cell sequence
+
 use foundry_domain::order::{ExternalRef, Order, OrderEvent};
 use foundry_domain::ports::{ActorId, ActorKind, Ledger};
 use foundry_ledger::sqlite::SqliteLedger;

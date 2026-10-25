@@ -1,6 +1,9 @@
 //! ProductAtomicV1 implementation of the shared frozen review host port.
 //! All state stays in ProductStore's private connection. The artifact, session,
 //! and claim roots are pinned independently by `configure_review_backend`.
+#![allow(clippy::collapsible_if)] // W6a clippy debt: preserve explicit branch and short-circuit ordering
+#![allow(clippy::manual_range_contains)] // W6a clippy debt: preserve the existing bounds checks and edge behavior
+
 use super::{
     ProductArtifactContent, ProductArtifactInfo, ProductCapability, ProductHoldAcceptance,
     ProductHoldDecision, ProductStore, resolve_session_in,

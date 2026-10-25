@@ -23,6 +23,8 @@
 //!
 //! Multiple rounds with different kill delays exercise different
 //! interleavings; every round must satisfy A–E.
+#![allow(clippy::double_ended_iterator_last)] // W6a clippy debt: preserve this existing test/example logic, assertions, and cell sequence
+
 use std::process::{Command, Stdio};
 use std::time::Duration;
 

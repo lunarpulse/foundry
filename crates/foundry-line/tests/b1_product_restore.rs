@@ -1,3 +1,6 @@
+#![allow(clippy::cloned_ref_to_slice_refs)] // W6a clippy debt: preserve this existing test/example logic, assertions, and cell sequence
+#![allow(clippy::too_many_arguments)] // W6a clippy debt: preserve this existing test/example logic, assertions, and cell sequence
+
 use foundry_domain::Order;
 use foundry_domain::OrderState;
 use foundry_domain::ports::{PortError, PortResult, PublishOutcome, Publisher};

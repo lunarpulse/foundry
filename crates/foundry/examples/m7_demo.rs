@@ -6,6 +6,10 @@
 //!
 //! 실행: cargo run -p foundry --example m7_demo
 
+#![allow(clippy::redundant_closure)] // W6a clippy debt: preserve this existing test/example logic, assertions, and cell sequence
+#![allow(clippy::too_many_arguments)] // W6a clippy debt: preserve this existing test/example logic, assertions, and cell sequence
+#![allow(unused_imports)] // W6a clippy debt: preserve this existing test/example logic, assertions, and cell sequence
+
 use std::path::PathBuf;
 
 use foundry_domain::order::{ExternalRef, Order};

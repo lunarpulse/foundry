@@ -1,3 +1,7 @@
+#![allow(clippy::module_inception)] // W6a clippy debt: preserve this existing test/example logic, assertions, and cell sequence
+#![allow(clippy::needless_borrow)] // W6a clippy debt: preserve this existing test/example logic, assertions, and cell sequence
+#![allow(clippy::needless_borrows_for_generic_args)] // W6a clippy debt: preserve this existing test/example logic, assertions, and cell sequence
+
 #[cfg(test)]
 mod t60_scale3_epic {
     //! T60 — 스케일 3 + 에픽 종단 시나리오 (M7 플랜 v9 H절 T60 확장).

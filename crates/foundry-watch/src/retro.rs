@@ -14,6 +14,9 @@
 //! not exist here; the test proves the public surface.)
 //! Gate 18 hookup: a proposal targeting the protected judging-policy
 //! closure (T48a PolicyGraph) is refused at INGESTION.
+#![allow(clippy::collapsible_if)] // W6a clippy debt: preserve explicit branch and short-circuit ordering
+#![allow(unused_variables)] // W6a clippy debt: retain names used by conditional or diagnostic configurations
+
 use crate::evaluation_protocol::PolicyGraph;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

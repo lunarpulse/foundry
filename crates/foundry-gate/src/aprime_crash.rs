@@ -4,6 +4,9 @@
 //! rebuild. 단정: "전이∧미소비" 부재 (③ begin_apply 직후만 문서화된
 //! fail-closed 손실 — apply_intents 감사 증거와 함께).
 
+#![allow(dead_code)] // W6a clippy debt: retain conditional helpers used by other feature and test configurations
+#![allow(unused_imports)] // W6a clippy debt: retain the existing feature and test configuration import set
+
 use crate::common::{actor, approval_event, file_journal, furnace_order};
 use foundry_domain::OrderState;
 use foundry_domain::ports::Ledger as _;

@@ -1,3 +1,5 @@
+#![allow(clippy::type_complexity)] // W6a clippy debt: preserve this existing test/example logic, assertions, and cell sequence
+
 use chrono::{Duration, Utc};
 use foundry_ledger::product_identity::ProductPasswordKdf;
 use foundry_ledger::{

@@ -11,6 +11,11 @@
 //! - 스트림 활성화는 런타임 수명과 1:1 — leaked 저널 핸들은 활성 스트림
 //!   수만큼 유한(같은 root 재활성화는 새 런타임).
 
+#![allow(clippy::needless_borrows_for_generic_args)] // W6a clippy debt: preserve explicit generic-call borrow boundaries
+#![allow(unused_assignments)] // W6a clippy debt: retain the existing staged retry flow without restructuring it
+#![allow(unused_mut)] // W6a clippy debt: retain the existing mutation-ready fixture and branch structure
+#![allow(unused_variables)] // W6a clippy debt: retain names used by conditional or diagnostic configurations
+
 use crate::refusal::{RefusalCode, record_refusal};
 use crate::{OrchestrationKind, OrchestrationLog};
 use foundry_domain::order::Order;

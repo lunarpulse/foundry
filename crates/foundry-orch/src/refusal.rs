@@ -9,6 +9,9 @@
 //! - presets/README 의 진단 설명은 이 레지스트리에서 파생한다(단일
 //!   소스 — 드리프트 원천 차단).
 
+#![allow(dead_code)] // W6a clippy debt: retain conditional helpers used by other feature and test configurations
+#![allow(unused_imports)] // W6a clippy debt: retain the existing feature and test configuration import set
+
 use crate::OrchestrationKind;
 
 /// 거부 코드 — 인간 대면 거부 경로가 방출할 수 있는 전 집합.

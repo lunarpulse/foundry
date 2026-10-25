@@ -13,6 +13,10 @@
 //!      the stream is either clean or has DETECTABLE pending intents
 //!      with deterministic recovery — never a silent gap.
 //!   C. TAMPER: single-byte payload mutation anywhere is detected.
+#![allow(dead_code)] // W6a clippy debt: preserve this existing test/example logic, assertions, and cell sequence
+#![allow(clippy::needless_borrows_for_generic_args)] // W6a clippy debt: preserve this existing test/example logic, assertions, and cell sequence
+#![allow(unused_imports)] // W6a clippy debt: preserve this existing test/example logic, assertions, and cell sequence
+
 use std::collections::BTreeMap;
 
 use foundry_watch::budget_accounting::{Amount, BudgetEvent, BudgetLedger};

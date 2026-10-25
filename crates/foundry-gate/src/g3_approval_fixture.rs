@@ -4,6 +4,9 @@
 //! 상태 불변·관측 승인 0·원장 무기록 ③ 유효-타스코프 grant 거부 ④ 유효
 //! 인간 승인 → Applied·CONSUMED.
 
+#![allow(dead_code)] // W6a clippy debt: retain conditional helpers used by other feature and test configurations
+#![allow(unused_imports)] // W6a clippy debt: retain the existing feature and test configuration import set
+
 use crate::common::{actor, approval_event, engine, furnace_order};
 use foundry_domain::OrderState;
 use foundry_workflow::dsl::{PolicyLevel, WorkflowDoc};

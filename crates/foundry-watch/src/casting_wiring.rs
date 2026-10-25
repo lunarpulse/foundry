@@ -23,6 +23,11 @@
 //!          consumption record. This is the B8 fix: "a new local
 //!          string-token mechanism cannot substitute for the
 //!          existing domain token".
+#![allow(clippy::if_same_then_else)] // W6a clippy debt: preserve the explicit condition branches and resulting value
+#![allow(clippy::needless_borrows_for_generic_args)] // W6a clippy debt: preserve explicit generic-call borrow boundaries
+#![allow(unused_imports)] // W6a clippy debt: retain the existing feature and test configuration import set
+#![allow(unused_mut)] // W6a clippy debt: retain the existing mutation-ready fixture and branch structure
+
 use crate::bundles::{BundleProfile, BundleStore, DependencyPins};
 use crate::governance_events::{GovernanceEvent, OpKind, Phase};
 use foundry_domain::ApprovalToken;

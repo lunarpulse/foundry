@@ -245,15 +245,24 @@ fn p2_preparation_walks_s1_without_result_seeding() {
     ));
     let mut stale_admission = fixture.admission.clone();
     stale_admission.sequence += 1;
-    assert!(matches!(
-        fixture.result_store.as_mut().unwrap().prepare_p2_review_fixture(
-            &fixture.service, &stale_admission, &fixture.delivery_id,
-            foundry_ledger::P2ReviewPreparation::Waiting,
+    assert!(
+        matches!(
+            fixture
+                .result_store
+                .as_mut()
+                .unwrap()
+                .prepare_p2_review_fixture(
+                    &fixture.service,
+                    &stale_admission,
+                    &fixture.delivery_id,
+                    foundry_ledger::P2ReviewPreparation::Waiting,
+                ),
+            Err(foundry_ledger::ProductError::Invariant(
+                "P2 preparation requires exact acknowledged admission and fresh work"
+            ))
         ),
-        Err(foundry_ledger::ProductError::Invariant(
-            "P2 preparation requires exact acknowledged admission and fresh work"
-        ))
-    ), "stale admission sequence is rejected before any work preparation");
+        "stale admission sequence is rejected before any work preparation"
+    );
     // Probe the stale source binding on the fixture's independent, fresh
     // admission snapshot. It has no claim, preparation, or host completion,
     // so none of those predicates can explain the rejection.
@@ -271,7 +280,10 @@ fn p2_preparation_walks_s1_without_result_seeding() {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
             )
             .unwrap();
-    assert_eq!(source_probe_baseline, (0, 0, 0, 0, 0, "waiting_unsupported".into()));
+    assert_eq!(
+        source_probe_baseline,
+        (0, 0, 0, 0, 0, "waiting_unsupported".into())
+    );
     let mut owner = ProductStore::open(&fixture.preclaim_db_path, fixture.config.clone()).unwrap();
     let current_source_revision: i64 = Connection::open(&fixture.preclaim_db_path)
         .unwrap()
@@ -361,10 +373,10 @@ fn p2_preparation_walks_s1_without_result_seeding() {
     assert!(
         matches!(
             owner.prepare_p2_review_fixture(
-            &rebound_service,
-            &fixture.admission,
-            &fixture.delivery_id,
-            foundry_ledger::P2ReviewPreparation::Waiting,
+                &rebound_service,
+                &fixture.admission,
+                &fixture.delivery_id,
+                foundry_ledger::P2ReviewPreparation::Waiting,
             ),
             Err(foundry_ledger::ProductError::Invariant(
                 "P2 preparation requires exact acknowledged admission and fresh work"
@@ -386,7 +398,10 @@ fn p2_preparation_walks_s1_without_result_seeding() {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
             )
             .unwrap();
-    assert_eq!(source_probe_after, source_probe_baseline, "stale source rejection preserves the fresh unclaimed baseline");
+    assert_eq!(
+        source_probe_after, source_probe_baseline,
+        "stale source rejection preserves the fresh unclaimed baseline"
+    );
     let after: (i64, i64, i64, i64, i64, i64, i64, i64, i64) =
         Connection::open(&fixture.db_path)
             .unwrap()
@@ -404,7 +419,10 @@ fn p2_preparation_walks_s1_without_result_seeding() {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?)),
             )
             .unwrap();
-    assert_eq!(after, before, "duplicate preparation has no durable side effects");
+    assert_eq!(
+        after, before,
+        "duplicate preparation has no durable side effects"
+    );
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
     assert_eq!(fixture.restores.load(Ordering::SeqCst), 0);
     drop(owner);
@@ -491,7 +509,10 @@ fn activation_authority_insert_failure_rolls_back_the_complete_admission_set() {
         .try_dispatch_product_work(&fixture.intent, &fixture.claim);
     assert!(fixture.terminal.is_none());
     let error = format!("{dispatch:?}");
-    assert!(error.contains("injected activation authority insert failure"), "{error}");
+    assert!(
+        error.contains("injected activation authority insert failure"),
+        "{error}"
+    );
     let conn = Connection::open(&fixture.db_path).unwrap();
     let activation_rows: (i64, i64, i64, i64, i64, i64, i64) = conn
         .query_row(
@@ -503,7 +524,17 @@ fn activation_authority_insert_failure_rolls_back_the_complete_admission_set() {
                     (SELECT count(*) FROM product_review_authority_v1 WHERE order_id=?1),
                     (SELECT count(*) FROM product_review_run_reservations_v1 WHERE order_id=?1)",
             [&fixture.identity.order_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
         )
         .unwrap();
     assert_eq!(activation_rows, (0, 0, 0, 0, 0, 0, 0));
@@ -516,7 +547,16 @@ fn activation_authority_insert_failure_rolls_back_the_complete_admission_set() {
                     (SELECT count(*) FROM product_result_bindings_v1 WHERE order_id=?1),
                     (SELECT count(*) FROM product_review_hold_progress_v1)",
             [&fixture.identity.order_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
         )
         .unwrap();
     assert_eq!(budget_and_result, (0, 0, 0, 0, 0, 0));
@@ -802,14 +842,25 @@ fn genuine_host_result_finalizes_replays_and_preserves_selected_s1_anchor() {
         fault.execute_batch(drop).unwrap();
     }
     drop(fault);
-    let claim_before_finalize: (String, i64, i64, String, String, String) =
-        Connection::open(&db).unwrap().query_row(
+    let claim_before_finalize: (String, i64, i64, String, String, String) = Connection::open(&db)
+        .unwrap()
+        .query_row(
             "SELECT c.owner_id,c.epoch,c.fence,c.state,c.lease_until,b.state
              FROM product_work_claims_v1 c JOIN product_work_backlog_v1 b USING(order_id,lifecycle)
              WHERE c.order_id='result:order' AND c.lifecycle=1",
             [],
-            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)),
-        ).unwrap();
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
     let pre_finalize: (i64, i64, i64, i64, i64) = Connection::open(&db).unwrap()
         .query_row(
             "SELECT (SELECT count(*) FROM product_review_host_accept_v1 WHERE order_id='result:order'),
@@ -820,16 +871,38 @@ fn genuine_host_result_finalizes_replays_and_preserves_selected_s1_anchor() {
             [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
         ).unwrap();
     assert_eq!(pre_finalize, (1, 1, 1, 0, 0));
-    let persisted_coordinates: (String, String, i64, i64, i64, i64) =
-        Connection::open(&db).unwrap().query_row(
+    let persisted_coordinates: (String, String, i64, i64, i64, i64) = Connection::open(&db)
+        .unwrap()
+        .query_row(
             "SELECT r.run_id,a.journal_run,json_extract(a.key_json,'$.attempt'),
                     json_extract(a.key_json,'$.run'),json_extract(a.key_json,'$.activation'),
                     (SELECT run_id FROM product_review_host_accept_v1 WHERE order_id=r.order_id)
              FROM product_review_runs_v1 r JOIN product_review_active_v1 a USING(order_id)
              WHERE r.order_id='result:order'",
-            [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)),
-        ).unwrap();
-    assert_eq!(persisted_coordinates, ("result:order:1:7:3".into(), "result:order:1:7:3".into(), 1, 7, 3, 7));
+            [],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        persisted_coordinates,
+        (
+            "result:order:1:7:3".into(),
+            "result:order:1:7:3".into(),
+            1,
+            7,
+            3,
+            7
+        )
+    );
     let missing_initial = Connection::open(&db).unwrap();
     missing_initial
         .execute_batch(
@@ -911,7 +984,8 @@ fn genuine_host_result_finalizes_replays_and_preserves_selected_s1_anchor() {
         )
         .unwrap();
     assert_eq!(
-        result_store.finalize_product_review_result(&service, &replay_requested_coordinates_mismatch),
+        result_store
+            .finalize_product_review_result(&service, &replay_requested_coordinates_mismatch),
         Err(foundry_ledger::ProductResultError::StaleBinding),
         "verified-order replay with unoccupied caller attempt/run coordinates is stale while the stored winner remains valid"
     );
@@ -928,13 +1002,25 @@ fn genuine_host_result_finalizes_replays_and_preserves_selected_s1_anchor() {
         "the actual-attempt mismatch leaves the internally consistent winner bytes unchanged"
     );
     let claim_after_first_finalize: (String, i64, i64, String, String, String) =
-        Connection::open(&db).unwrap().query_row(
-            "SELECT c.owner_id,c.epoch,c.fence,c.state,c.lease_until,b.state
+        Connection::open(&db)
+            .unwrap()
+            .query_row(
+                "SELECT c.owner_id,c.epoch,c.fence,c.state,c.lease_until,b.state
              FROM product_work_claims_v1 c JOIN product_work_backlog_v1 b USING(order_id,lifecycle)
              WHERE c.order_id='result:order' AND c.lifecycle=1",
-            [],
-            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)),
-        ).unwrap();
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
     assert_eq!(
         claim_after_first_finalize, claim_before_finalize,
         "first successful finalization leaves the claim and backlog unchanged"
@@ -949,11 +1035,14 @@ fn genuine_host_result_finalizes_replays_and_preserves_selected_s1_anchor() {
             [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
         ).unwrap();
     assert_eq!(after_first_finalize, (1, 1, 1, 1, 1));
-    let persisted_intent_json: String = Connection::open(&db).unwrap().query_row(
-        "SELECT intent_json FROM product_review_bindings_v1 WHERE key_json=?1",
-        [serde_json::to_string(&expected.host_key).unwrap()],
-        |r| r.get(0),
-    ).unwrap();
+    let persisted_intent_json: String = Connection::open(&db)
+        .unwrap()
+        .query_row(
+            "SELECT intent_json FROM product_review_bindings_v1 WHERE key_json=?1",
+            [serde_json::to_string(&expected.host_key).unwrap()],
+            |r| r.get(0),
+        )
+        .unwrap();
     assert_eq!(
         serde_json::from_str::<foundry_exec::ExecutionIntent>(&persisted_intent_json).unwrap(),
         fixture.intent,
@@ -1007,15 +1096,15 @@ fn genuine_host_result_finalizes_replays_and_preserves_selected_s1_anchor() {
     let mut malformed_stored_rows = vec![
         (
             receipt_before_replay.0.clone(),
-            receipt_before_replay.1.replacen("\"version\":1", "\"version\":2", 1),
+            receipt_before_replay
+                .1
+                .replacen("\"version\":1", "\"version\":2", 1),
         ),
         (
             receipt_before_replay.0.clone(),
-            receipt_before_replay.1.replacen(
-                "local_review_result",
-                "execution_emit_receipt",
-                1,
-            ),
+            receipt_before_replay
+                .1
+                .replacen("local_review_result", "execution_emit_receipt", 1),
         ),
         (
             receipt_before_replay.0.clone(),
@@ -1026,7 +1115,9 @@ fn genuine_host_result_finalizes_replays_and_preserves_selected_s1_anchor() {
             ),
         ),
         (
-            receipt_before_replay.0.replacen("\"version\":1", "\"version\":2", 1),
+            receipt_before_replay
+                .0
+                .replacen("\"version\":1", "\"version\":2", 1),
             receipt_before_replay.1.clone(),
         ),
         (
@@ -1039,23 +1130,34 @@ fn genuine_host_result_finalizes_replays_and_preserves_selected_s1_anchor() {
         ),
         (
             receipt_before_replay.0.replacen(
-                &format!("\"intent\":{{\"order\":\"{}\",\"attempt\":1", expected.host_key.order),
-                &format!("\"intent\":{{\"order\":\"{}\",\"attempt\":-1", expected.host_key.order),
+                &format!(
+                    "\"intent\":{{\"order\":\"{}\",\"attempt\":1",
+                    expected.host_key.order
+                ),
+                &format!(
+                    "\"intent\":{{\"order\":\"{}\",\"attempt\":-1",
+                    expected.host_key.order
+                ),
                 1,
             ),
             receipt_before_replay.1.clone(),
         ),
         (
             receipt_before_replay.0.replacen(
-                &format!("\"intent\":{{\"order\":\"{}\",\"attempt\":1,\"run\":7", expected.host_key.order),
-                &format!("\"intent\":{{\"order\":\"{}\",\"attempt\":1,\"run\":-1", expected.host_key.order),
+                &format!(
+                    "\"intent\":{{\"order\":\"{}\",\"attempt\":1,\"run\":7",
+                    expected.host_key.order
+                ),
+                &format!(
+                    "\"intent\":{{\"order\":\"{}\",\"attempt\":1,\"run\":-1",
+                    expected.host_key.order
+                ),
                 1,
             ),
             receipt_before_replay.1.clone(),
         ),
     ];
-    let stored_payload: serde_json::Value =
-        serde_json::from_str(&receipt_before_replay.0).unwrap();
+    let stored_payload: serde_json::Value = serde_json::from_str(&receipt_before_replay.0).unwrap();
     // Each signed persisted coordinate is changed independently on the exact
     // committed winner. A reader must reject negative coordinates as corrupt
     // stored evidence without changing the winner or its participant set.
@@ -1070,12 +1172,18 @@ fn genuine_host_result_finalizes_replays_and_preserves_selected_s1_anchor() {
         "/artifacts/0/stage_sequence",
     ];
     for pointer in negative_coordinate_paths {
-        let mut changed: serde_json::Value = serde_json::from_str(&receipt_before_replay.0).unwrap();
-        assert!(changed.pointer(pointer).unwrap().as_i64().unwrap() >= 0, "coordinate exists: {pointer}");
+        let mut changed: serde_json::Value =
+            serde_json::from_str(&receipt_before_replay.0).unwrap();
+        assert!(
+            changed.pointer(pointer).unwrap().as_i64().unwrap() >= 0,
+            "coordinate exists: {pointer}"
+        );
         *changed.pointer_mut(pointer).unwrap() = serde_json::json!(-1);
         let changed = serde_json::to_string(&changed).unwrap();
         let corruption = Connection::open(&db).unwrap();
-        corruption.execute_batch("DROP TRIGGER product_result_bindings_no_update;").unwrap();
+        corruption
+            .execute_batch("DROP TRIGGER product_result_bindings_no_update;")
+            .unwrap();
         assert_eq!(corruption.execute(
             "UPDATE product_result_bindings_v1 SET payload_json=?1 WHERE order_id='result:order'",
             [&changed],
@@ -1114,8 +1222,14 @@ fn genuine_host_result_finalizes_replays_and_preserves_selected_s1_anchor() {
         .unwrap();
     malformed_stored_rows.push((
         receipt_before_replay.0.replacen(
-            &format!("\"artifact_sha256\":{}", serde_json::to_string(artifact_digest).unwrap()),
-            &format!("\"artifact_sha256\":{}", serde_json::to_string(&"0".repeat(64)).unwrap()),
+            &format!(
+                "\"artifact_sha256\":{}",
+                serde_json::to_string(artifact_digest).unwrap()
+            ),
+            &format!(
+                "\"artifact_sha256\":{}",
+                serde_json::to_string(&"0".repeat(64)).unwrap()
+            ),
             1,
         ),
         receipt_before_replay.1.clone(),
@@ -1156,14 +1270,17 @@ fn genuine_host_result_finalizes_replays_and_preserves_selected_s1_anchor() {
             .clone();
         let changed = match current {
             serde_json::Value::String(text) => serde_json::Value::String(format!("{text}-changed")),
-            serde_json::Value::Number(number) => serde_json::Value::Number(
-                serde_json::Number::from(number.as_i64().unwrap() + 1),
-            ),
+            serde_json::Value::Number(number) => {
+                serde_json::Value::Number(serde_json::Number::from(number.as_i64().unwrap() + 1))
+            }
             other => panic!("unexpected G08 member kind at {pointer}: {other}"),
         };
         *value.pointer_mut(pointer).unwrap() = changed;
         let payload = serde_json::to_string(&value).unwrap();
-        assert_ne!(payload, receipt_before_replay.0, "G08 member mutation is effective: {pointer}");
+        assert_ne!(
+            payload, receipt_before_replay.0,
+            "G08 member mutation is effective: {pointer}"
+        );
         malformed_stored_rows.push((payload, receipt_before_replay.1.clone()));
     }
     for (payload, receipt) in malformed_stored_rows.drain(..) {
@@ -1248,7 +1365,10 @@ fn genuine_host_result_finalizes_replays_and_preserves_selected_s1_anchor() {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(corrupted_receipt, wire, "the wire mutation must take effect");
+        assert_eq!(
+            corrupted_receipt, wire,
+            "the wire mutation must take effect"
+        );
         assert_eq!(
             result_store.lookup_product_review_result(&service, &expected),
             Err(foundry_ledger::ProductResultError::CorruptEvidence),
@@ -1308,18 +1428,36 @@ fn genuine_host_result_finalizes_replays_and_preserves_selected_s1_anchor() {
         )
         .unwrap();
     assert_eq!(after, (5, 1, 1, 0));
-    let claim_after_replay: (String, i64, i64, String, String, String) = conn.query_row(
-        "SELECT c.owner_id,c.epoch,c.fence,c.state,c.lease_until,b.state
+    let claim_after_replay: (String, i64, i64, String, String, String) = conn
+        .query_row(
+            "SELECT c.owner_id,c.epoch,c.fence,c.state,c.lease_until,b.state
          FROM product_work_claims_v1 c JOIN product_work_backlog_v1 b USING(order_id,lifecycle)
          WHERE c.order_id='result:order' AND c.lifecycle=1",
-        [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)),
-    ).unwrap();
-    assert_eq!(claim_after_replay, claim_before_finalize, "finalization and replay preserve the completed claim");
+            [],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        claim_after_replay, claim_before_finalize,
+        "finalization and replay preserve the completed claim"
+    );
     let receipt_after_replay: (String, String) = conn.query_row(
         "SELECT payload_json,receipt_json FROM product_result_bindings_v1 WHERE order_id='result:order'",
         [], |r| Ok((r.get(0)?,r.get(1)?)),
     ).unwrap();
-    assert_eq!(receipt_after_replay, receipt_before_replay, "replay preserves the exact stored payload and receipt bytes");
+    assert_eq!(
+        receipt_after_replay, receipt_before_replay,
+        "replay preserves the exact stored payload and receipt bytes"
+    );
     let finalized_counts: (i64, i64, i64, i64, i64) = conn.query_row(
         "SELECT (SELECT count(*) FROM product_review_host_accept_v1 WHERE order_id='result:order'),
                 (SELECT count(*) FROM product_review_host_results_v1 WHERE order_id='result:order'),
@@ -1580,13 +1718,20 @@ fn result_location_must_resolve_registered_terminal_evidence() {
                         |row| row.get(0),
                     )
                     .unwrap();
-                invalid.log_path = fixture.artifact_root.join(relative).to_string_lossy().into();
+                invalid.log_path = fixture
+                    .artifact_root
+                    .join(relative)
+                    .to_string_lossy()
+                    .into();
             }
             2 => invalid.log_path = "/outside/unregistered/review.json".into(),
             3 => invalid.log_path = "../registered/../../malformed-terminal.log".into(),
             _ => unreachable!(),
         }
-        assert_ne!(invalid.log_path, terminal.log_path, "the mutation is effective");
+        assert_ne!(
+            invalid.log_path, terminal.log_path,
+            "the mutation is effective"
+        );
         replace_host_result_evidence(&fixture.db_path, &fixture.expected.host_key, &invalid);
         let invalid_expectation = ProductResultExpectation {
             host_key: fixture.expected.host_key.clone(),
@@ -1610,7 +1755,15 @@ fn result_location_must_resolve_registered_terminal_evidence() {
                         (SELECT count(*) FROM product_result_bindings_v1 WHERE order_id=?1),
                         (SELECT count(*) FROM product_outcomes_v1)",
                 [&order],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .unwrap();
         assert_eq!(no_effect, (1, 1, 0, 0, 0));
@@ -1621,7 +1774,10 @@ fn result_location_must_resolve_registered_terminal_evidence() {
             .unwrap()
             .finalize_product_review_result(&fixture.service, &fixture.expected)
             .expect("restoring the exact producer bytes restores successful finalization");
-        assert_eq!(restored.host_result_digest, fixture.expected.host_result_digest);
+        assert_eq!(
+            restored.host_result_digest,
+            fixture.expected.host_result_digest
+        );
         let committed: (i64, i64) = Connection::open(&fixture.db_path)
             .unwrap()
             .query_row(
@@ -1724,16 +1880,28 @@ fn initial_completed_pending_result_rejects_each_lineage_human_authority_change(
         Err(foundry_ledger::ProductResultError::StaleBinding),
         "initial completed-pending finalizer rejects lineage human-account revision ABA"
     );
-    assert_eq!(result_store.lookup_product_review_result(&fixture.service, &fixture.expected), Ok(None));
+    assert_eq!(
+        result_store.lookup_product_review_result(&fixture.service, &fixture.expected),
+        Ok(None)
+    );
     db.execute(
         "UPDATE product_accounts_v1 SET role=?1,revision=?2,enabled=?3 WHERE actor_id=?4",
-        rusqlite::params![account_before.0, account_before.1, account_before.2, accepted.actor_id],
+        rusqlite::params![
+            account_before.0,
+            account_before.1,
+            account_before.2,
+            accepted.actor_id
+        ],
     )
     .unwrap();
     db.execute(
         "UPDATE product_scope_subject_revisions_v1 SET revision=?1
          WHERE subject_id=?2 AND source_instance_id=?3",
-        rusqlite::params![accepted.scope_revision + 1, accepted.actor_id, accepted.source_instance_id],
+        rusqlite::params![
+            accepted.scope_revision + 1,
+            accepted.actor_id,
+            accepted.source_instance_id
+        ],
     )
     .unwrap();
     assert_eq!(
@@ -1741,18 +1909,29 @@ fn initial_completed_pending_result_rejects_each_lineage_human_authority_change(
         Err(foundry_ledger::ProductResultError::StaleBinding),
         "initial completed-pending finalizer independently rejects lineage human-scope revision"
     );
-    assert_eq!(result_store.lookup_product_review_result(&fixture.service, &fixture.expected), Ok(None));
+    assert_eq!(
+        result_store.lookup_product_review_result(&fixture.service, &fixture.expected),
+        Ok(None)
+    );
     db.execute(
         "UPDATE product_scope_subject_revisions_v1 SET revision=?1
          WHERE subject_id=?2 AND source_instance_id=?3",
-        rusqlite::params![accepted.scope_revision, accepted.actor_id, accepted.source_instance_id],
+        rusqlite::params![
+            accepted.scope_revision,
+            accepted.actor_id,
+            accepted.source_instance_id
+        ],
     )
     .unwrap();
 
     db.execute(
         "UPDATE product_scope_grants_v1 SET grant_revision=?1
          WHERE subject_id=?2 AND source_instance_id=?3 AND capability='resolve_review_hold'",
-        rusqlite::params![accepted.grant_revision + 1, accepted.actor_id, accepted.source_instance_id],
+        rusqlite::params![
+            accepted.grant_revision + 1,
+            accepted.actor_id,
+            accepted.source_instance_id
+        ],
     )
     .unwrap();
     assert_eq!(
@@ -1760,11 +1939,18 @@ fn initial_completed_pending_result_rejects_each_lineage_human_authority_change(
         Err(foundry_ledger::ProductResultError::StaleBinding),
         "initial completed-pending finalizer independently rejects ResolveReviewHold grant revision"
     );
-    assert_eq!(result_store.lookup_product_review_result(&fixture.service, &fixture.expected), Ok(None));
+    assert_eq!(
+        result_store.lookup_product_review_result(&fixture.service, &fixture.expected),
+        Ok(None)
+    );
     db.execute(
         "UPDATE product_scope_grants_v1 SET grant_revision=?1
          WHERE subject_id=?2 AND source_instance_id=?3 AND capability='resolve_review_hold'",
-        rusqlite::params![accepted.grant_revision, accepted.actor_id, accepted.source_instance_id],
+        rusqlite::params![
+            accepted.grant_revision,
+            accepted.actor_id,
+            accepted.source_instance_id
+        ],
     )
     .unwrap();
 
@@ -1907,13 +2093,16 @@ fn completed_initial_result_finalizes_after_worker_lease_expiry_without_renewal(
         .query_row(
             "SELECT payload_json,receipt_json FROM product_result_bindings_v1 WHERE order_id=?1",
             [&fixture.identity.order_id],
-            |r| Ok((r.get(0)?,r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
     let replay = expired
         .finalize_product_review_result(&fixture.service, &fixture.expected)
         .unwrap();
-    assert_eq!(replay, result, "same expired-worker condition replays the stored receipt");
+    assert_eq!(
+        replay, result,
+        "same expired-worker condition replays the stored receipt"
+    );
     let claim_after_replay: (String, i64, i64, String, String, String) =
         Connection::open(&fixture.db_path)
             .unwrap()
@@ -1925,13 +2114,18 @@ fn completed_initial_result_finalizes_after_worker_lease_expiry_without_renewal(
                 |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
             )
             .unwrap();
-    assert_eq!(claim_after_replay, claim_before, "replay leaves expired claim and lease untouched");
+    assert_eq!(
+        claim_after_replay, claim_before,
+        "replay leaves expired claim and lease untouched"
+    );
     let receipt_after_replay: (String, String) = Connection::open(&fixture.db_path)
         .unwrap()
         .query_row(
             "SELECT payload_json,receipt_json FROM product_result_bindings_v1 WHERE order_id=?1",
-            [&fixture.identity.order_id], |r| Ok((r.get(0)?,r.get(1)?)),
-        ).unwrap();
+            [&fixture.identity.order_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
     assert_eq!(receipt_after_replay, receipt_before_replay);
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 4);
     assert_eq!(fixture.restores.load(Ordering::SeqCst), 0);
@@ -2298,7 +2492,10 @@ fn pending_result_rejects_source_rebind_without_writing_history() {
         "a service context bound to a retired source cannot disclose or finalize its pending result"
     );
     assert_eq!(
-        fixture.result_store.as_mut().unwrap()
+        fixture
+            .result_store
+            .as_mut()
+            .unwrap()
             .lookup_product_review_result(&fixture.service, &fixture.expected),
         Err(foundry_ledger::ProductResultError::Unauthorized),
         "pending-result lookup denies the retired source context"
@@ -2695,7 +2892,9 @@ fn redrive_charge_rejects_wrong_order_and_stale_run_without_durable_changes() {
     stale_run.run = foundry_exec::RunId(fixture.intent.run.0 + 1);
     assert_eq!(
         ReviewHostStore::charge_budget(&mut store, &fixture.identity.order_id, &stale_run),
-        Err(foundry_exec::HostError::Worker("inactive product review run".into())),
+        Err(foundry_exec::HostError::Worker(
+            "inactive product review run".into()
+        )),
         "stale-run charge returns its exact inactive-run error while a different run is actively executing"
     );
     let after: (i64, i64, i64, i64) = Connection::open(&fixture.db_path)
@@ -2718,21 +2917,36 @@ fn redrive_charge_rejects_wrong_order_and_stale_run_without_durable_changes() {
     drop(store);
     fixture.stage_pause.release();
     let (host, outcome) = worker.join().unwrap();
-    assert!(outcome.is_ok(), "active-running control completes after the stale-run probe");
+    assert!(
+        outcome.is_ok(),
+        "active-running control completes after the stale-run probe"
+    );
     drop(host);
     drop(fixture.result_store.take());
     drop(fixture.host.take());
     std::fs::remove_dir_all(fixture.root).unwrap();
 }
 
-fn accepted_resume(order: &str) -> (product_result_fixture::GenuineResultFixture, foundry_ledger::ProductHoldAcceptance) {
-    accepted_hold(order, ReviewScript::ResumePass, ProductHoldDecision::Resume("replan_full".into()))
+fn accepted_resume(
+    order: &str,
+) -> (
+    product_result_fixture::GenuineResultFixture,
+    foundry_ledger::ProductHoldAcceptance,
+) {
+    accepted_hold(
+        order,
+        ReviewScript::ResumePass,
+        ProductHoldDecision::Resume("replan_full".into()),
+    )
 }
 
 fn completed_pending_resume_fixture(
     script: ReviewScript,
     order: &str,
-) -> (product_result_fixture::GenuineResultFixture, ProductResultExpectation) {
+) -> (
+    product_result_fixture::GenuineResultFixture,
+    ProductResultExpectation,
+) {
     let (mut fixture, first) = accepted_hold(
         order,
         script,
@@ -2822,7 +3036,10 @@ fn accepted_hold(
     order: &str,
     script: ReviewScript,
     decision: ProductHoldDecision,
-) -> (product_result_fixture::GenuineResultFixture, foundry_ledger::ProductHoldAcceptance) {
+) -> (
+    product_result_fixture::GenuineResultFixture,
+    foundry_ledger::ProductHoldAcceptance,
+) {
     let identity = FixtureIdentity::new(
         ProductConfig {
             installation_id: format!("{order}-pause-install"),
@@ -2839,7 +3056,10 @@ fn accepted_hold_with_identity(
     identity: FixtureIdentity,
     order: &str,
     decision: ProductHoldDecision,
-) -> (product_result_fixture::GenuineResultFixture, foundry_ledger::ProductHoldAcceptance) {
+) -> (
+    product_result_fixture::GenuineResultFixture,
+    foundry_ledger::ProductHoldAcceptance,
+) {
     let fixture = genuine_host_done(identity);
     grant_review_hold_scope(&fixture);
     let mut store = ProductStore::open(&fixture.db_path, fixture.config.clone()).unwrap();
@@ -3196,8 +3416,7 @@ fn charge_budget_samples_clock_after_waiting_for_begin_immediate() {
         assert!(fixture.now < credential_expiry);
         assert!(fixture.now + Duration::minutes(3) >= credential_expiry);
         assert!(
-            fixture.now + Duration::minutes(3)
-                < fixture.claim.lease_until(),
+            fixture.now + Duration::minutes(3) < fixture.claim.lease_until(),
             "clock advance expires the service credential while the worker claim remains live"
         );
         let clock = AdjustableFixtureClock::new(fixture.now);
@@ -3347,7 +3566,10 @@ fn continuation_run8_resuming_charge_rejects_expired_service_credential() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
         )
         .unwrap();
-    assert_eq!(state, (2, "resuming".into(), 1, 0, 5, 5, "recovery_required".into()));
+    assert_eq!(
+        state,
+        (2, "resuming".into(), 1, 0, 5, 5, "recovery_required".into())
+    );
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 5);
     assert_eq!(fixture.restores.load(Ordering::SeqCst), 1);
     assert_eq!(host.dispatch_count(), 1);
@@ -3388,7 +3610,8 @@ fn revocation_between_hold_acceptance_and_continuation_blocks_pre_stage_work() {
     .with_script(ReviewScript::ResumePass);
     let mut fixture = genuine_host_done_with_stage_start_observer(identity, observer);
     grant_review_hold_scope(&fixture);
-    let mut acceptance_store = ProductStore::open(&fixture.db_path, fixture.config.clone()).unwrap();
+    let mut acceptance_store =
+        ProductStore::open(&fixture.db_path, fixture.config.clone()).unwrap();
     let hold = acceptance_store
         .list_product_review_holds(&fixture.human_session_digest, fixture.now)
         .unwrap()
@@ -3420,7 +3643,15 @@ fn revocation_between_hold_acceptance_and_continuation_blocks_pre_stage_work() {
                     (SELECT count(*) FROM artifact_tuples WHERE order_id=?1),
                     (SELECT count(*) FROM product_result_bindings_v1 WHERE order_id=?1)",
             [&order],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .unwrap();
     assert_eq!(original, (4, 3, 4, 0, 0));
@@ -3458,7 +3689,11 @@ fn revocation_between_hold_acceptance_and_continuation_blocks_pre_stage_work() {
                     (SELECT count(*) FROM product_review_stages_v1 WHERE order_id=?1 AND run_id=?2),
                     (SELECT count(*) FROM product_review_authority_v1 WHERE order_id=?1),
                     (SELECT phase FROM product_review_hold_progress_v1 WHERE operation_id=?3)",
-            rusqlite::params![fixture.identity.order_id, format!("{}:1:8:3", fixture.identity.order_id), accepted.operation_id],
+            rusqlite::params![
+                fixture.identity.order_id,
+                format!("{}:1:8:3", fixture.identity.order_id),
+                accepted.operation_id
+            ],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .unwrap();
@@ -3472,7 +3707,15 @@ fn revocation_between_hold_acceptance_and_continuation_blocks_pre_stage_work() {
                     (SELECT count(*) FROM artifact_tuples WHERE order_id=?1),
                     (SELECT count(*) FROM product_result_bindings_v1 WHERE order_id=?1)",
             [&order],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .unwrap();
     assert_eq!(after, original);
@@ -3837,18 +4080,23 @@ fn direct_commitpass_reassignment_is_rejected_before_continuation() {
     assert_eq!(reassigned.0, "replacement-worker");
     let replacement_before = work_claim_backlog_state(&conn, &fixture.identity.order_id);
     let mut host = fixture.host.take().unwrap();
-    assert!(host
-        .continue_accepted_product_hold(
+    assert!(
+        host.continue_accepted_product_hold(
             &fixture.human_session_digest,
             &accepted.operation_id,
             fixture.now,
         )
-        .is_err());
+        .is_err()
+    );
     let state: (i64, String) = conn
         .query_row(
             "SELECT (SELECT count(*) FROM product_review_runs_v1 WHERE order_id=?1 AND run_id=?2),
                     (SELECT phase FROM product_review_hold_progress_v1 WHERE operation_id=?3)",
-            rusqlite::params![fixture.identity.order_id, format!("{}:1:8:3", fixture.identity.order_id), accepted.operation_id],
+            rusqlite::params![
+                fixture.identity.order_id,
+                format!("{}:1:8:3", fixture.identity.order_id),
+                accepted.operation_id
+            ],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
@@ -3898,49 +4146,99 @@ fn commit_fail_and_abort_continuations_are_ineligible_finalizer_controls() {
             .with_script(ReviewScript::ResumePass),
         );
         grant_review_hold_scope(&fixture);
-        let before_s1: (i64, i64) = Connection::open(&fixture.db_path).unwrap().query_row(
-            "SELECT (SELECT count(*) FROM ledger WHERE order_id=?1),
+        let before_s1: (i64, i64) = Connection::open(&fixture.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT (SELECT count(*) FROM ledger WHERE order_id=?1),
                     (SELECT count(*) FROM product_transition_receipts_v1 WHERE order_id=?1)",
-            [&order], |r| Ok((r.get(0)?,r.get(1)?)),
-        ).unwrap();
+                [&order],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
         let mut owner = ProductStore::open(&fixture.db_path, fixture.config.clone()).unwrap();
-        let hold = owner.list_product_review_holds(&fixture.human_session_digest, fixture.now)
-            .unwrap().into_iter().find(|hold| hold.order_id == order).unwrap();
-        let accepted = owner.accept_product_review_hold(
-            &fixture.human_session_digest, &order, &hold.hold_instance_id,
-            &hold.expectation, &format!("{order}-decision"), decision, fixture.now,
-        ).unwrap();
+        let hold = owner
+            .list_product_review_holds(&fixture.human_session_digest, fixture.now)
+            .unwrap()
+            .into_iter()
+            .find(|hold| hold.order_id == order)
+            .unwrap();
+        let accepted = owner
+            .accept_product_review_hold(
+                &fixture.human_session_digest,
+                &order,
+                &hold.hold_instance_id,
+                &hold.expectation,
+                &format!("{order}-decision"),
+                decision,
+                fixture.now,
+            )
+            .unwrap();
         let mut host = fixture.host.take().unwrap();
         host.continue_accepted_product_hold(
-            &fixture.human_session_digest, &accepted.operation_id, fixture.now,
-        ).unwrap();
-        let terminal: foundry_exec::HostResult = Connection::open(&fixture.db_path).unwrap().query_row(
-            "SELECT result_json FROM product_review_host_results_v1
+            &fixture.human_session_digest,
+            &accepted.operation_id,
+            fixture.now,
+        )
+        .unwrap();
+        let terminal: foundry_exec::HostResult = Connection::open(&fixture.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT result_json FROM product_review_host_results_v1
              WHERE order_id=?1 AND attempt=?2 AND run_id=?3 AND activation=?4",
-            rusqlite::params![order, fixture.expected.host_key.attempt as i64,
-                7_i64,
-                fixture.expected.host_key.activation as i64],
-            |r| serde_json::from_str(&r.get::<_,String>(0)?).map_err(|e|
-                rusqlite::Error::FromSqlConversionFailure(0,rusqlite::types::Type::Text,Box::new(e))),
-        ).unwrap();
+                rusqlite::params![
+                    order,
+                    fixture.expected.host_key.attempt as i64,
+                    7_i64,
+                    fixture.expected.host_key.activation as i64
+                ],
+                |r| {
+                    serde_json::from_str(&r.get::<_, String>(0)?).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })
+                },
+            )
+            .unwrap();
         let terminal_expectation = ProductResultExpectation {
             host_key: fixture.expected.host_key.clone(),
             host_result_digest: foundry_ledger::product_host_result_digest(&terminal).unwrap(),
         };
-        let error = fixture.result_store.as_mut().unwrap()
+        let error = fixture
+            .result_store
+            .as_mut()
+            .unwrap()
             .finalize_product_review_result(&fixture.service, &terminal_expectation)
             .expect_err("CommitFail and Abort are not successful final results");
         assert_eq!(error, foundry_ledger::ProductResultError::Ineligible);
-        let after: (i64, i64, i64, i64) = Connection::open(&fixture.db_path).unwrap().query_row(
-            "SELECT (SELECT count(*) FROM ledger WHERE order_id=?1),
+        let after: (i64, i64, i64, i64) = Connection::open(&fixture.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT (SELECT count(*) FROM ledger WHERE order_id=?1),
                     (SELECT count(*) FROM product_transition_receipts_v1 WHERE order_id=?1),
                     (SELECT count(*) FROM artifact_tuples WHERE order_id=?1),
                     (SELECT count(*) FROM product_result_bindings_v1 WHERE order_id=?1)",
-            [&order], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
-        ).unwrap();
-        assert_eq!(after.0, before_s1.0 + 1, "{label} appends exactly one existing failure outcome event");
-        assert_eq!(after.1, before_s1.1 + 1, "{label} appends exactly one transition receipt");
-        assert_eq!((after.2,after.3), (0,0), "{label} finalizer refusal writes no tuple/result");
+                [&order],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            after.0,
+            before_s1.0 + 1,
+            "{label} appends exactly one existing failure outcome event"
+        );
+        assert_eq!(
+            after.1,
+            before_s1.1 + 1,
+            "{label} appends exactly one transition receipt"
+        );
+        assert_eq!(
+            (after.2, after.3),
+            (0, 0),
+            "{label} finalizer refusal writes no tuple/result"
+        );
         drop(owner);
         drop(host);
         drop(fixture.result_store.take());
@@ -3957,8 +4255,18 @@ fn legacy_census_corrupt_reachable_acceptance_is_corrupt_evidence() {
 fn completed_result_rejects_reclaimed_and_same_owner_aba() {
     assert_continuation_result_with_reclaim(ReviewScript::ResumePass, "p2:A", false, Some(false));
     assert_continuation_result_with_reclaim(ReviewScript::ResumePass, "p2:A", false, Some(true));
-    assert_continuation_result_with_reclaim(ReviewScript::ResumeCommitPass, "p2:B", false, Some(false));
-    assert_continuation_result_with_reclaim(ReviewScript::ResumeCommitPass, "p2:B", false, Some(true));
+    assert_continuation_result_with_reclaim(
+        ReviewScript::ResumeCommitPass,
+        "p2:B",
+        false,
+        Some(false),
+    );
+    assert_continuation_result_with_reclaim(
+        ReviewScript::ResumeCommitPass,
+        "p2:B",
+        false,
+        Some(true),
+    );
 }
 
 #[test]
@@ -3984,7 +4292,16 @@ fn completed_backlog_public_reclaim_requires_expired_lease() {
              FROM product_work_claims_v1 c JOIN product_work_backlog_v1 b USING(order_id,lifecycle)
              WHERE c.order_id=?1 AND c.lifecycle=1",
             [&order],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
         )
         .unwrap();
     assert_eq!(old_work.3, "completed");
@@ -4043,7 +4360,10 @@ fn completed_backlog_public_reclaim_requires_expired_lease() {
         )
         .unwrap();
     assert_eq!(result_counts, (0, 0), "T/R remains +0/+0");
-    assert_eq!(result_evidence_rows(&connection, &order), preserved_after_reclaim);
+    assert_eq!(
+        result_evidence_rows(&connection, &order),
+        preserved_after_reclaim
+    );
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 4);
     assert_eq!(fixture.restores.load(Ordering::SeqCst), 0);
     drop(connection);
@@ -4162,11 +4482,15 @@ fn assert_continuation_result_with_reclaim(
             now,
         )
         .unwrap();
-    let s1_before_decision: (i64, i64) = Connection::open(&db).unwrap().query_row(
-        "SELECT (SELECT count(*) FROM ledger WHERE order_id=?1),
+    let s1_before_decision: (i64, i64) = Connection::open(&db)
+        .unwrap()
+        .query_row(
+            "SELECT (SELECT count(*) FROM ledger WHERE order_id=?1),
                 (SELECT count(*) FROM product_transition_receipts_v1 WHERE order_id=?1)",
-        [order], |r| Ok((r.get(0)?,r.get(1)?)),
-    ).unwrap();
+            [order],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
     assert_eq!(first_receipt.reserved_run_id, 8);
     let reserved_only: (i64, i64) = Connection::open(&db)
         .unwrap()
@@ -4183,15 +4507,23 @@ fn assert_continuation_result_with_reclaim(
         "acceptance reserves but does not materialize Resume work"
     );
     let resume_copy_c0 = result_evidence_rows(&Connection::open(&db).unwrap(), order);
-    let resume_copy_intent: String = Connection::open(&db).unwrap().query_row(
-        "SELECT b.intent_json FROM product_review_bindings_v1 b
+    let resume_copy_intent: String = Connection::open(&db)
+        .unwrap()
+        .query_row(
+            "SELECT b.intent_json FROM product_review_bindings_v1 b
          JOIN product_review_active_v1 a ON a.key_json=b.key_json WHERE a.order_id=?1",
-        [order], |r| r.get(0),
-    ).unwrap();
-    let resume_copy_active: (String, String, i64) = Connection::open(&db).unwrap().query_row(
-        "SELECT key_json,journal_run,epoch FROM product_review_active_v1 WHERE order_id=?1",
-        [order], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
-    ).unwrap();
+            [order],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let resume_copy_active: (String, String, i64) = Connection::open(&db)
+        .unwrap()
+        .query_row(
+            "SELECT key_json,journal_run,epoch FROM product_review_active_v1 WHERE order_id=?1",
+            [order],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
     let resume_copy_progress: (String, i64, String, i64, i64, i64, Option<String>) =
         Connection::open(&db).unwrap().query_row(
             "SELECT phase,progress_revision,owner_id,epoch,fence,reserved_run_id,recovery_reason
@@ -4228,15 +4560,21 @@ fn assert_continuation_result_with_reclaim(
             "failed Resume copy must roll back materialization and leave the accepted reservation retryable"
         );
         assert_eq!(result_evidence_rows(&copy_fault, order), resume_copy_c0);
-        let intent_after: String = copy_fault.query_row(
-            "SELECT b.intent_json FROM product_review_bindings_v1 b
+        let intent_after: String = copy_fault
+            .query_row(
+                "SELECT b.intent_json FROM product_review_bindings_v1 b
              JOIN product_review_active_v1 a ON a.key_json=b.key_json WHERE a.order_id=?1",
-            [order], |r| r.get(0),
-        ).unwrap();
-        let active_after: (String, String, i64) = copy_fault.query_row(
-            "SELECT key_json,journal_run,epoch FROM product_review_active_v1 WHERE order_id=?1",
-            [order], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
-        ).unwrap();
+                [order],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let active_after: (String, String, i64) = copy_fault
+            .query_row(
+                "SELECT key_json,journal_run,epoch FROM product_review_active_v1 WHERE order_id=?1",
+                [order],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
         let progress_after: (String, i64, String, i64, i64, i64, Option<String>) = copy_fault.query_row(
             "SELECT phase,progress_revision,owner_id,epoch,fence,reserved_run_id,recovery_reason
              FROM product_review_hold_progress_v1 WHERE operation_id=?1",
@@ -4272,15 +4610,21 @@ fn assert_continuation_result_with_reclaim(
             .unwrap();
         assert_eq!(zero_copy_rollback, (1, "accepted".into(), 0, 0));
         assert_eq!(result_evidence_rows(&zero_copy, order), resume_copy_c0);
-        let zero_intent: String = zero_copy.query_row(
-            "SELECT b.intent_json FROM product_review_bindings_v1 b
+        let zero_intent: String = zero_copy
+            .query_row(
+                "SELECT b.intent_json FROM product_review_bindings_v1 b
              JOIN product_review_active_v1 a ON a.key_json=b.key_json WHERE a.order_id=?1",
-            [order], |r| r.get(0),
-        ).unwrap();
-        let zero_active: (String, String, i64) = zero_copy.query_row(
-            "SELECT key_json,journal_run,epoch FROM product_review_active_v1 WHERE order_id=?1",
-            [order], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
-        ).unwrap();
+                [order],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let zero_active: (String, String, i64) = zero_copy
+            .query_row(
+                "SELECT key_json,journal_run,epoch FROM product_review_active_v1 WHERE order_id=?1",
+                [order],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
         let zero_progress: (String, i64, String, i64, i64, i64, Option<String>) = zero_copy.query_row(
             "SELECT phase,progress_revision,owner_id,epoch,fence,reserved_run_id,recovery_reason
              FROM product_review_hold_progress_v1 WHERE operation_id=?1",
@@ -4295,7 +4639,10 @@ fn assert_continuation_result_with_reclaim(
             .unwrap();
     }
     let direct_commitpass_before = if script == ReviewScript::DirectCommitPass {
-        Some(result_runtime_counts(&Connection::open(&db).unwrap(), order))
+        Some(result_runtime_counts(
+            &Connection::open(&db).unwrap(),
+            order,
+        ))
     } else {
         None
     };
@@ -4348,7 +4695,8 @@ fn assert_continuation_result_with_reclaim(
             )
             .unwrap();
         assert_eq!(receipt.reserved_run_id, 9);
-        let commitpass_runtime_before = result_runtime_counts(&Connection::open(&db).unwrap(), order);
+        let commitpass_runtime_before =
+            result_runtime_counts(&Connection::open(&db).unwrap(), order);
         host.continue_accepted_product_hold(&session, &receipt.operation_id, now)
             .unwrap();
         assert_eq!(
@@ -4363,15 +4711,29 @@ fn assert_continuation_result_with_reclaim(
         );
         second_receipt = Some(receipt);
     }
-    let s1_after_decisions: (i64, i64) = Connection::open(&db).unwrap().query_row(
-        "SELECT (SELECT count(*) FROM ledger WHERE order_id=?1),
+    let s1_after_decisions: (i64, i64) = Connection::open(&db)
+        .unwrap()
+        .query_row(
+            "SELECT (SELECT count(*) FROM ledger WHERE order_id=?1),
                 (SELECT count(*) FROM product_transition_receipts_v1 WHERE order_id=?1)",
-        [order], |r| Ok((r.get(0)?,r.get(1)?)),
-    ).unwrap();
-    let terminal_s1_delta = if matches!(script, ReviewScript::DirectCommitPass | ReviewScript::ResumeCommitPass) { 1 } else { 0 };
+            [order],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    let terminal_s1_delta = if matches!(
+        script,
+        ReviewScript::DirectCommitPass | ReviewScript::ResumeCommitPass
+    ) {
+        1
+    } else {
+        0
+    };
     assert_eq!(
         s1_after_decisions,
-        (s1_before_decision.0 + terminal_s1_delta, s1_before_decision.1 + terminal_s1_delta),
+        (
+            s1_before_decision.0 + terminal_s1_delta,
+            s1_before_decision.1 + terminal_s1_delta
+        ),
         "terminal CommitPass appends one S1 outcome/receipt; Resume alone appends neither"
     );
 
@@ -4423,7 +4785,9 @@ fn assert_continuation_result_with_reclaim(
         let fix = observations
             .iter()
             .find(|task| task.stage_id == "fixdie-g2")
-            .expect("the single-finding fix generation executed through the shared fixture executor");
+            .expect(
+                "the single-finding fix generation executed through the shared fixture executor",
+            );
         assert_eq!(
             replan.session_id,
             format!("{order}:replan_full:fresh:{order}:1:8:3:resume-1"),
@@ -4451,7 +4815,8 @@ fn assert_continuation_result_with_reclaim(
         assert_eq!(replan.artifact_commit, "b".repeat(40));
         assert_eq!(fix.artifact_commit, "c".repeat(40));
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(replan.inputs.get("plan_full").unwrap()).unwrap(),
+            serde_json::from_str::<serde_json::Value>(replan.inputs.get("plan_full").unwrap())
+                .unwrap(),
             serde_json::json!([]),
             "the resumed generation records its exact plan_full script input"
         );
@@ -4486,7 +4851,10 @@ fn assert_continuation_result_with_reclaim(
         .unwrap()
         .query_row("SELECT count(*) FROM ledger", [], |row| row.get(0))
         .unwrap();
-    if matches!(script, ReviewScript::ResumePass | ReviewScript::ResumeCommitPass) {
+    if matches!(
+        script,
+        ReviewScript::ResumePass | ReviewScript::ResumeCommitPass
+    ) {
         // Corrupt the ancestor before first finalization so this exercises
         // the new-result ancestry validator, not stored-result replay.
         let mutation = Connection::open(&db).unwrap();
@@ -4598,7 +4966,8 @@ fn assert_continuation_result_with_reclaim(
             )
             .unwrap();
         let clean_inspected_commit = result_evidence_rows(&mutation, order);
-        let mut wrong_inspected: serde_json::Value = serde_json::from_str(&original_output).unwrap();
+        let mut wrong_inspected: serde_json::Value =
+            serde_json::from_str(&original_output).unwrap();
         let original_inspected = wrong_inspected["inspected_commit"].clone();
         wrong_inspected["inspected_commit"] = serde_json::Value::String("f".repeat(40));
         mutation
@@ -4616,7 +4985,8 @@ fn assert_continuation_result_with_reclaim(
         assert_eq!(
             result_evidence_rows(&mutation, order)
                 .into_iter()
-                .filter(|row| row.starts_with("artifact_tuples:") || row.starts_with("product_result_bindings_v1:"))
+                .filter(|row| row.starts_with("artifact_tuples:")
+                    || row.starts_with("product_result_bindings_v1:"))
                 .count(),
             0,
             "the inspected-commit negative has no tuple/result side effects"
@@ -4629,7 +4999,10 @@ fn assert_continuation_result_with_reclaim(
                 rusqlite::params![wrong_inspected.to_string(), order, format!("{order}:1:8:3")],
             )
             .unwrap();
-        assert_eq!(result_evidence_rows(&mutation, order), clean_inspected_commit);
+        assert_eq!(
+            result_evidence_rows(&mutation, order),
+            clean_inspected_commit
+        );
 
         let foreign_artifact: (String, String, String) = mutation
             .query_row(
@@ -4661,7 +5034,8 @@ fn assert_continuation_result_with_reclaim(
         assert_eq!(
             result_evidence_rows(&mutation, order)
                 .into_iter()
-                .filter(|row| row.starts_with("artifact_tuples:") || row.starts_with("product_result_bindings_v1:"))
+                .filter(|row| row.starts_with("artifact_tuples:")
+                    || row.starts_with("product_result_bindings_v1:"))
                 .count(),
             0,
             "the foreign-origin artifact negative has no tuple/result side effects"
@@ -4678,8 +5052,14 @@ fn assert_continuation_result_with_reclaim(
                    BEGIN SELECT RAISE(ABORT,'product artifact binding is immutable'); END;",
             )
             .unwrap();
-        assert_eq!(result_evidence_rows(&mutation, order), clean_foreign_artifact);
-        assert!(!foreign_artifact.2.is_empty(), "the original registered repository key is present");
+        assert_eq!(
+            result_evidence_rows(&mutation, order),
+            clean_foreign_artifact
+        );
+        assert!(
+            !foreign_artifact.2.is_empty(),
+            "the original registered repository key is present"
+        );
         let restored_artifact_id: String = mutation
             .query_row(
                 "SELECT artifact_id FROM product_artifacts_v1 WHERE artifact_id=?1",
@@ -4710,11 +5090,23 @@ fn assert_continuation_result_with_reclaim(
                 changed_acceptances.push((stringify!($field), changed));
             }};
         }
-        changed_acceptance!(operation_id, format!("{}-changed", original_acceptance.operation_id));
-        changed_acceptance!(actor_id, format!("{}-changed", original_acceptance.actor_id));
-        changed_acceptance!(order_id, format!("{}-changed", original_acceptance.order_id));
+        changed_acceptance!(
+            operation_id,
+            format!("{}-changed", original_acceptance.operation_id)
+        );
+        changed_acceptance!(
+            actor_id,
+            format!("{}-changed", original_acceptance.actor_id)
+        );
+        changed_acceptance!(
+            order_id,
+            format!("{}-changed", original_acceptance.order_id)
+        );
         changed_acceptance!(lifecycle, original_acceptance.lifecycle + 1);
-        changed_acceptance!(hold_instance_id, format!("{}-changed", original_acceptance.hold_instance_id));
+        changed_acceptance!(
+            hold_instance_id,
+            format!("{}-changed", original_acceptance.hold_instance_id)
+        );
         changed_acceptance!(hold_revision, original_acceptance.hold_revision + 1);
         changed_acceptance!(attempt, original_acceptance.attempt + 1);
         changed_acceptance!(originating_run, original_acceptance.originating_run + 1);
@@ -4722,19 +5114,31 @@ fn assert_continuation_result_with_reclaim(
         changed_acceptance!(host_epoch, original_acceptance.host_epoch + 1);
         changed_acceptance!(decision, foundry_ledger::ProductHoldDecision::CommitPass);
         changed_acceptance!(source_revision, original_acceptance.source_revision + 1);
-        changed_acceptance!(authority_revision, original_acceptance.authority_revision + 1);
-        changed_acceptance!(source_instance_id, format!("{}-changed", original_acceptance.source_instance_id));
+        changed_acceptance!(
+            authority_revision,
+            original_acceptance.authority_revision + 1
+        );
+        changed_acceptance!(
+            source_instance_id,
+            format!("{}-changed", original_acceptance.source_instance_id)
+        );
         changed_acceptance!(scope_revision, original_acceptance.scope_revision + 1);
         changed_acceptance!(grant_revision, original_acceptance.grant_revision + 1);
         changed_acceptance!(predecessor_seq, original_acceptance.predecessor_seq + 1);
         changed_acceptance!(reserved_run_id, original_acceptance.reserved_run_id + 1);
-        changed_acceptance!(accepted_at, format!("{}-changed", original_acceptance.accepted_at));
+        changed_acceptance!(
+            accepted_at,
+            format!("{}-changed", original_acceptance.accepted_at)
+        );
         mutation
             .execute_batch("DROP TRIGGER product_review_acceptance_no_update;")
             .unwrap();
         for (member, changed) in changed_acceptances {
             let changed_json = serde_json::to_string(&changed).unwrap();
-            assert_ne!(changed_json, original_receipt, "G08 acceptance member changes: {member}");
+            assert_ne!(
+                changed_json, original_receipt,
+                "G08 acceptance member changes: {member}"
+            );
             mutation
                 .execute(
                     "UPDATE product_review_hold_acceptances_v1 SET receipt_json=?1 WHERE operation_id=?2",
@@ -4748,7 +5152,8 @@ fn assert_continuation_result_with_reclaim(
                 "independent accepted-hold wire member corruption is rejected: {member}"
             );
             assert_eq!(
-                result_evidence_rows(&mutation, order), c0_before,
+                result_evidence_rows(&mutation, order),
+                c0_before,
                 "each rejected accepted-hold member preserves the complete C0 durable state: {member}"
             );
             mutation
@@ -4826,23 +5231,34 @@ fn assert_continuation_result_with_reclaim(
         // and is followed by a finalization attempt before the next case.
         let c0_progress_matrix = result_evidence_rows(&mutation, order);
         for (column, sql_value) in [
-            ("phase", "'accepted'") ,
+            ("phase", "'accepted'"),
             ("owner_id", "'foreign-progress-owner'"),
         ] {
             let update = format!(
                 "UPDATE product_review_hold_progress_v1 SET {column}={sql_value} WHERE operation_id=?1"
             );
-            assert_eq!(mutation.execute(&update, [&first_receipt.operation_id]).unwrap(), 1);
+            assert_eq!(
+                mutation
+                    .execute(&update, [&first_receipt.operation_id])
+                    .unwrap(),
+                1
+            );
             assert_eq!(
                 result_store.finalize_product_review_result(&service, &expected),
                 Err(foundry_ledger::ProductResultError::CorruptEvidence),
                 "independent progress {column} mutation is rejected on clean A"
             );
-            mutation.execute(
-                "UPDATE product_review_hold_progress_v1
+            mutation
+                .execute(
+                    "UPDATE product_review_hold_progress_v1
                  SET phase=?1,owner_id=?2 WHERE operation_id=?3",
-                rusqlite::params![original_progress.0, original_progress.2, first_receipt.operation_id],
-            ).unwrap();
+                    rusqlite::params![
+                        original_progress.0,
+                        original_progress.2,
+                        first_receipt.operation_id
+                    ],
+                )
+                .unwrap();
             assert_eq!(result_evidence_rows(&mutation, order), c0_progress_matrix);
         }
         // progress_revision first-finalization vector removed per parent adjudication 2026-10-21
@@ -4858,31 +5274,48 @@ fn assert_continuation_result_with_reclaim(
             let update = format!(
                 "UPDATE product_review_hold_progress_v1 SET {column}=?1 WHERE operation_id=?2"
             );
-            assert_eq!(mutation.execute(&update, rusqlite::params![value, first_receipt.operation_id]).unwrap(), 1);
+            assert_eq!(
+                mutation
+                    .execute(
+                        &update,
+                        rusqlite::params![value, first_receipt.operation_id]
+                    )
+                    .unwrap(),
+                1
+            );
             assert_eq!(
                 result_store.finalize_product_review_result(&service, &expected),
                 Err(foundry_ledger::ProductResultError::CorruptEvidence),
                 "independent progress {column} mutation is rejected on clean A"
             );
-            mutation.execute(
-                "UPDATE product_review_hold_progress_v1
+            mutation
+                .execute(
+                    "UPDATE product_review_hold_progress_v1
                  SET progress_revision=?1,epoch=?2,reserved_run_id=?3 WHERE operation_id=?4",
-                rusqlite::params![original_progress.1, original_progress.3, original_progress.5, first_receipt.operation_id],
-            ).unwrap();
+                    rusqlite::params![
+                        original_progress.1,
+                        original_progress.3,
+                        original_progress.5,
+                        first_receipt.operation_id
+                    ],
+                )
+                .unwrap();
             assert_eq!(result_evidence_rows(&mutation, order), c0_progress_matrix);
         }
 
-        let active_before: (String, String, i64) = mutation.query_row(
-            "SELECT key_json,journal_run,epoch FROM product_review_active_v1 WHERE order_id=?1",
-            [order], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
-        ).unwrap();
+        let active_before: (String, String, i64) = mutation
+            .query_row(
+                "SELECT key_json,journal_run,epoch FROM product_review_active_v1 WHERE order_id=?1",
+                [order],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
         for (column, value) in [
             ("key_json", "'{}'".to_owned()),
             ("journal_run", "'foreign-journal-run'".to_owned()),
         ] {
-            let update = format!(
-                "UPDATE product_review_active_v1 SET {column}={value} WHERE order_id=?1"
-            );
+            let update =
+                format!("UPDATE product_review_active_v1 SET {column}={value} WHERE order_id=?1");
             assert_eq!(mutation.execute(&update, [order]).unwrap(), 1);
             assert_eq!(
                 result_store.finalize_product_review_result(&service, &expected),
@@ -4895,9 +5328,15 @@ fn assert_continuation_result_with_reclaim(
             ).unwrap();
             assert_eq!(result_evidence_rows(&mutation, order), c0_progress_matrix);
         }
-        assert_eq!(mutation.execute(
-            "UPDATE product_review_active_v1 SET epoch=epoch+1 WHERE order_id=?1", [order],
-        ).unwrap(), 1);
+        assert_eq!(
+            mutation
+                .execute(
+                    "UPDATE product_review_active_v1 SET epoch=epoch+1 WHERE order_id=?1",
+                    [order],
+                )
+                .unwrap(),
+            1
+        );
         assert_eq!(
             result_store.finalize_product_review_result(&service, &expected),
             Err(foundry_ledger::ProductResultError::CorruptEvidence),
@@ -4963,12 +5402,24 @@ fn assert_continuation_result_with_reclaim(
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        store.set_account_authority(
-            &fixture.owner_session_digest, &first_receipt.actor_id, "operator", true, now,
-        ).unwrap();
-        store.set_account_authority(
-            &fixture.owner_session_digest, &first_receipt.actor_id, "approver", true, now,
-        ).unwrap();
+        store
+            .set_account_authority(
+                &fixture.owner_session_digest,
+                &first_receipt.actor_id,
+                "operator",
+                true,
+                now,
+            )
+            .unwrap();
+        store
+            .set_account_authority(
+                &fixture.owner_session_digest,
+                &first_receipt.actor_id,
+                "approver",
+                true,
+                now,
+            )
+            .unwrap();
         assert_eq!(
             result_store.finalize_product_review_result(&service, &expected),
             Err(foundry_ledger::ProductResultError::StaleBinding),
@@ -5035,7 +5486,11 @@ fn assert_continuation_result_with_reclaim(
                 .execute(
                     "UPDATE product_scope_subject_revisions_v1 SET revision=?1
                      WHERE subject_id=?2 AND source_instance_id=?3",
-                    rusqlite::params![accepted.scope_revision + 1, accepted.actor_id, accepted.source_instance_id],
+                    rusqlite::params![
+                        accepted.scope_revision + 1,
+                        accepted.actor_id,
+                        accepted.source_instance_id
+                    ],
                 )
                 .unwrap(),
             1
@@ -5045,7 +5500,10 @@ fn assert_continuation_result_with_reclaim(
             Err(foundry_ledger::ProductResultError::StaleBinding),
             "completed-pending lineage independently rejects a changed human scope revision"
         );
-        assert_eq!(result_store.lookup_product_review_result(&service, &expected), Ok(None));
+        assert_eq!(
+            result_store.lookup_product_review_result(&service, &expected),
+            Ok(None)
+        );
         assert_eq!(
             mutation
                 .query_row::<i64, _, _>(
@@ -5082,7 +5540,10 @@ fn assert_continuation_result_with_reclaim(
             Err(foundry_ledger::ProductResultError::StaleBinding),
             "completed-pending lineage independently rejects a changed ResolveReviewHold grant revision"
         );
-        assert_eq!(result_store.lookup_product_review_result(&service, &expected), Ok(None));
+        assert_eq!(
+            result_store.lookup_product_review_result(&service, &expected),
+            Ok(None)
+        );
         mutation
             .execute(
                 "UPDATE product_scope_grants_v1 SET grant_revision=?1
@@ -5095,15 +5556,15 @@ fn assert_continuation_result_with_reclaim(
             )
             .unwrap();
         if script == ReviewScript::ResumePass {
-        let reservation_before: i64 = mutation
+            let reservation_before: i64 = mutation
             .query_row(
                 "SELECT followup_run_id FROM product_review_run_reservations_v1 WHERE operation_id=?1",
                 [&first_receipt.operation_id],
                 |row| row.get(0),
             )
             .unwrap();
-        let clean_origin_reservation = result_evidence_rows(&mutation, order);
-        assert_eq!(
+            let clean_origin_reservation = result_evidence_rows(&mutation, order);
+            assert_eq!(
             mutation
                 .execute(
                     "UPDATE product_review_run_reservations_v1 SET followup_run_id=?1 WHERE operation_id=?2",
@@ -5112,26 +5573,30 @@ fn assert_continuation_result_with_reclaim(
                 .unwrap(),
             1
         );
-        assert_eq!(
-            result_store.finalize_product_review_result(&service, &expected),
-            Err(foundry_ledger::ProductResultError::Ineligible),
-            "a reservation whose followup origin disagrees with the accepted receipt is rejected as ineligible ancestry"
-        );
-        assert_eq!(
-            result_evidence_rows(&mutation, order)
-                .into_iter()
-                .filter(|row| row.starts_with("artifact_tuples:") || row.starts_with("product_result_bindings_v1:"))
-                .count(),
-            0,
-            "origin/reservation mismatch rejects before result materialization"
-        );
-        mutation
+            assert_eq!(
+                result_store.finalize_product_review_result(&service, &expected),
+                Err(foundry_ledger::ProductResultError::Ineligible),
+                "a reservation whose followup origin disagrees with the accepted receipt is rejected as ineligible ancestry"
+            );
+            assert_eq!(
+                result_evidence_rows(&mutation, order)
+                    .into_iter()
+                    .filter(|row| row.starts_with("artifact_tuples:")
+                        || row.starts_with("product_result_bindings_v1:"))
+                    .count(),
+                0,
+                "origin/reservation mismatch rejects before result materialization"
+            );
+            mutation
             .execute(
                 "UPDATE product_review_run_reservations_v1 SET followup_run_id=?1 WHERE operation_id=?2",
                 rusqlite::params![reservation_before, first_receipt.operation_id],
             )
             .unwrap();
-        assert_eq!(result_evidence_rows(&mutation, order), clean_origin_reservation);
+            assert_eq!(
+                result_evidence_rows(&mutation, order),
+                clean_origin_reservation
+            );
         }
         drop(mutation);
     }
@@ -5163,7 +5628,10 @@ fn assert_continuation_result_with_reclaim(
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(corrupted.ends_with(' '), "corruption injection must take effect");
+        assert!(
+            corrupted.ends_with(' '),
+            "corruption injection must take effect"
+        );
         drop(corrupt);
         assert_eq!(
             result_store.finalize_product_review_result(&service, &expected),
@@ -5228,11 +5696,21 @@ fn assert_continuation_result_with_reclaim(
             other => panic!("completed result lease should be publicly reclaimable: {other:?}"),
         };
         let replacement_binding = replacement.review_binding();
-        assert_eq!(replacement_binding.epoch, 2, "reclaim advances the claim epoch");
-        assert!(replacement_binding.fence > old_work.2, "reclaim advances the global fence");
+        assert_eq!(
+            replacement_binding.epoch, 2,
+            "reclaim advances the claim epoch"
+        );
+        assert!(
+            replacement_binding.fence > old_work.2,
+            "reclaim advances the global fence"
+        );
         assert_eq!(
             replacement_binding.fence,
-            if script == ReviewScript::ResumeCommitPass { 6 } else { 4 },
+            if script == ReviewScript::ResumeCommitPass {
+                6
+            } else {
+                4
+            },
             "the A/B reclaim fence follows the frozen deterministic fixture coordinates"
         );
         assert_eq!(replacement_binding.worker_id, worker_id);
@@ -5244,7 +5722,11 @@ fn assert_continuation_result_with_reclaim(
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(new_attempts, old_work.5 + 1, "reclaim increments attempts once");
+        assert_eq!(
+            new_attempts,
+            old_work.5 + 1,
+            "reclaim increments attempts once"
+        );
         // Snapshot taken AFTER the reclaim: the reclaim legitimately advances the
         // claim/backlog rows (asserted above), so the preservation baseline for the
         // refused finalization must reflect the post-reclaim durable state.
@@ -5273,8 +5755,22 @@ fn assert_continuation_result_with_reclaim(
             )
             .unwrap();
         assert_eq!(after_rejection, (0, 0), "stale finalization has T/R +0/+0");
-        assert_eq!(fixture.calls.load(Ordering::SeqCst), if script == ReviewScript::Passing { 4 } else { 14 });
-        assert_eq!(fixture.restores.load(Ordering::SeqCst), if script == ReviewScript::Passing { 0 } else { 3 });
+        assert_eq!(
+            fixture.calls.load(Ordering::SeqCst),
+            if script == ReviewScript::Passing {
+                4
+            } else {
+                14
+            }
+        );
+        assert_eq!(
+            fixture.restores.load(Ordering::SeqCst),
+            if script == ReviewScript::Passing {
+                0
+            } else {
+                3
+            }
+        );
         drop(connection);
         drop(replacement_store);
         drop(result_store);
@@ -5357,15 +5853,23 @@ fn assert_continuation_result_with_reclaim(
         rusqlite::params![order, unused_successor, format!("{order}:1:{unused_successor}:3")],
         |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?)),
     ).unwrap();
-    let reserved_unused_successor = if terminal_run == 7 || second_receipt.is_some() { 1 } else { 0 };
+    let reserved_unused_successor = if terminal_run == 7 || second_receipt.is_some() {
+        1
+    } else {
+        0
+    };
     assert_eq!(
         successor_census,
-        (0,0,0,0,0,0,0,0,reserved_unused_successor),
+        (0, 0, 0, 0, 0, 0, 0, 0, reserved_unused_successor),
         "the terminal CommitPass successor is reserved at most once and has no materialized host/runtime rows"
     );
-    let reservation_allocator_before_replay: i64 = conn.query_row(
-        "SELECT count(*) FROM product_review_run_reservations_v1 WHERE order_id=?1", [order], |r| r.get(0),
-    ).unwrap();
+    let reservation_allocator_before_replay: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM product_review_run_reservations_v1 WHERE order_id=?1",
+            [order],
+            |r| r.get(0),
+        )
+        .unwrap();
     assert_eq!(host.dispatch_count(), 1);
     let payload_json: String = conn
         .query_row(
@@ -5429,10 +5933,21 @@ fn assert_continuation_result_with_reclaim(
         assert_eq!(hold["receipt_json"], acceptance);
         assert_eq!(hold["snapshot_digest"], frozen_digest);
         assert_eq!(progress.0, "completed");
-        assert_eq!(progress.1, 3, "frozen progress revision is acceptance + claim + completion");
+        assert_eq!(
+            progress.1, 3,
+            "frozen progress revision is acceptance + claim + completion"
+        );
         assert_eq!(progress.3, 0, "frozen initial owner epoch");
-        assert_eq!(progress.4, index as i64 * 2 + 3, "frozen initial owner fence");
-        assert_eq!(progress.5, index as i64 + 8, "frozen reserved successor run");
+        assert_eq!(
+            progress.4,
+            index as i64 * 2 + 3,
+            "frozen initial owner fence"
+        );
+        assert_eq!(
+            progress.5,
+            index as i64 + 8,
+            "frozen reserved successor run"
+        );
         assert_eq!(hold["progress_revision"], progress.1);
         assert_eq!(hold["owner_id"], progress.2);
         assert_eq!(hold["epoch"], progress.3);
@@ -5467,7 +5982,16 @@ fn assert_continuation_result_with_reclaim(
     let continuation_present = if terminal_run == 8 { 1 } else { 0 };
     assert_eq!(
         producer_census,
-        vec![(1,1,1,1),(continuation_present,continuation_present,continuation_present,continuation_present),(0,0,0,0)],
+        vec![
+            (1, 1, 1, 1),
+            (
+                continuation_present,
+                continuation_present,
+                continuation_present,
+                continuation_present
+            ),
+            (0, 0, 0, 0)
+        ],
         "both genuine host producers and the unmaterialized successor are censused independently"
     );
     assert_eq!(
@@ -5477,9 +6001,12 @@ fn assert_continuation_result_with_reclaim(
         result
     );
     assert_eq!(
-        conn.query_row::<i64,_,_>(
-            "SELECT count(*) FROM product_review_run_reservations_v1 WHERE order_id=?1", [order], |r| r.get(0),
-        ).unwrap(),
+        conn.query_row::<i64, _, _>(
+            "SELECT count(*) FROM product_review_run_reservations_v1 WHERE order_id=?1",
+            [order],
+            |r| r.get(0),
+        )
+        .unwrap(),
         reservation_allocator_before_replay,
         "result replay does not advance the reserved-run allocator"
     );
@@ -5538,7 +6065,10 @@ fn assert_continuation_result_with_reclaim(
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .unwrap();
-        assert_eq!(no_copy_effects, (1, 1, original_payload.clone(), original_receipt.clone()));
+        assert_eq!(
+            no_copy_effects,
+            (1, 1, original_payload.clone(), original_receipt.clone())
+        );
         conn.execute(
             "INSERT INTO product_review_authority_v1 SELECT * FROM saved_followup_authority",
             [],
@@ -5563,8 +6093,8 @@ fn assert_continuation_result_with_reclaim(
             .as_str()
             .unwrap();
         let encoded_hold_receipt = serde_json::to_string(accepted_hold_receipt).unwrap();
-        let changed_hold_receipt = serde_json::to_string(&format!("{accepted_hold_receipt} "))
-            .unwrap();
+        let changed_hold_receipt =
+            serde_json::to_string(&format!("{accepted_hold_receipt} ")).unwrap();
         assert!(original_payload.contains(&encoded_hold_receipt));
         let changed_payload =
             original_payload.replacen(&encoded_hold_receipt, &changed_hold_receipt, 1);
@@ -5586,7 +6116,10 @@ fn assert_continuation_result_with_reclaim(
                 |r| r.get(0),
             )
             .unwrap();
-        assert_ne!(mutated_payload, original_payload, "accepted-hold wire mutation is persisted");
+        assert_ne!(
+            mutated_payload, original_payload,
+            "accepted-hold wire mutation is persisted"
+        );
         assert_eq!(
             result_store.lookup_product_review_result(&service, &expected),
             Err(foundry_ledger::ProductResultError::CorruptEvidence),
@@ -5606,7 +6139,16 @@ fn assert_continuation_result_with_reclaim(
                         (SELECT payload_json FROM product_result_bindings_v1 WHERE result_id=?2),
                         (SELECT receipt_json FROM product_result_bindings_v1 WHERE result_id=?2)",
                 rusqlite::params![order, result_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
             )
             .unwrap();
         assert_eq!(
@@ -5706,7 +6248,11 @@ fn assert_pending_result_authority_matrix(
                     .execute(
                         "UPDATE product_scope_subject_revisions_v1 SET revision=?1
                          WHERE subject_id=?2 AND source_instance_id=?3",
-                        rusqlite::params![accepted.scope_revision + 1, accepted.actor_id, accepted.source_instance_id],
+                        rusqlite::params![
+                            accepted.scope_revision + 1,
+                            accepted.actor_id,
+                            accepted.source_instance_id
+                        ],
                     )
                     .unwrap(),
                 1
@@ -5733,7 +6279,10 @@ fn assert_pending_result_authority_matrix(
                     [&fixture.identity.connector_id],
                 )
                 .unwrap();
-            assert_eq!(changed, 1, "the connector source revision changes on an isolated baseline");
+            assert_eq!(
+                changed, 1,
+                "the connector source revision changes on an isolated baseline"
+            );
             owner
                 .authenticate_product_service_for_action(
                     &fixture.service_token,
@@ -5899,14 +6448,19 @@ fn result_evidence_rows(connection: &Connection, order: &str) -> Vec<String> {
         "ledger",
     ] {
         let mut statement = connection
-            .prepare(&format!("SELECT * FROM {table} WHERE order_id=?1 ORDER BY rowid"))
+            .prepare(&format!(
+                "SELECT * FROM {table} WHERE order_id=?1 ORDER BY rowid"
+            ))
             .unwrap();
         let columns = statement.column_count();
         let rows = statement
             .query_map([order], |row| {
                 let mut values = Vec::with_capacity(columns);
                 for column in 0..columns {
-                    values.push(format!("{:?}", row.get::<_, rusqlite::types::Value>(column)?));
+                    values.push(format!(
+                        "{:?}",
+                        row.get::<_, rusqlite::types::Value>(column)?
+                    ));
                 }
                 Ok(values.join("\u{1f}"))
             })
@@ -5953,7 +6507,10 @@ fn without_work_rows(rows: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn work_claim_backlog_state(connection: &Connection, order: &str) -> (String, i64, i64, String, String, i64, i64, String) {
+fn work_claim_backlog_state(
+    connection: &Connection,
+    order: &str,
+) -> (String, i64, i64, String, String, i64, i64, String) {
     connection.query_row(
         "SELECT c.owner_id,c.epoch,c.fence,c.state,c.lease_until,b.attempts,c.source_revision,b.state
          FROM product_work_claims_v1 c JOIN product_work_backlog_v1 b USING(order_id,lifecycle)

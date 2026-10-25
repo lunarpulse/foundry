@@ -22,6 +22,11 @@
 //! - **재입장 = 전량 재평가**: sizing/바인딩/선언/승인 상태를 현재
 //!   로그·원장 기준으로 전부 재검사 — A 수리가 B 를 우회하지 않는다.
 
+#![allow(clippy::collapsible_if)] // W6a clippy debt: preserve explicit branch and short-circuit ordering
+#![allow(clippy::drop_non_drop)] // W6a clippy debt: preserve the explicit borrow-scope ordering in the journal path
+#![allow(clippy::needless_borrows_for_generic_args)] // W6a clippy debt: preserve explicit generic-call borrow boundaries
+#![allow(unused_imports)] // W6a clippy debt: retain the existing feature and test configuration import set
+
 use crate::refusal::{RefusalCode, RemediationKind};
 use crate::{OrchRow, OrchestrationKind, OrchestrationLog};
 use foundry_approval::{ApprovalLedger, GrantState};

@@ -2,6 +2,8 @@
 //! per contract (astra B1: "a registered HTTP handler, not a library
 //! function"). Uses axum's oneshot test adapter: real router, real
 //! request, no network.
+#![allow(clippy::let_and_return)] // W6a clippy debt: preserve this existing test/example logic, assertions, and cell sequence
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use foundry_serve::ServeState;

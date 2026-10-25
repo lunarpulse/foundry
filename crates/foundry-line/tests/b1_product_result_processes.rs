@@ -1,4 +1,5 @@
 use foundry_ledger::{ProductConfig, ProductHoldDecision, ProductStore};
+use foundry_line::{PackReviewHost, StageExecutor, StageOutput, StageTask};
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
@@ -6,7 +7,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
-use foundry_line::{PackReviewHost, StageExecutor, StageOutput, StageTask};
 
 #[path = "support/product_result_fixture.rs"]
 mod product_result_fixture;
@@ -80,11 +80,7 @@ impl StageExecutor for ProcessContinuationExecutor {
         })
     }
 
-    fn restore_session(
-        &mut self,
-        _session_id: &str,
-        _workdir: &Path,
-    ) -> Result<(), String> {
+    fn restore_session(&mut self, _session_id: &str, _workdir: &Path) -> Result<(), String> {
         Ok(())
     }
 }
@@ -141,7 +137,10 @@ fn product_result_continuation_child() {
         .to_string(),
     )
     .unwrap();
-    assert!(result.is_err(), "revocation blocks the next continuation edge");
+    assert!(
+        result.is_err(),
+        "revocation blocks the next continuation edge"
+    );
 }
 
 #[derive(Serialize)]
@@ -1174,9 +1173,7 @@ fn approval_commit_write_failure_rolls_back_and_reopen_commits_once() {
                 "the commit must fail with a filesystem I/O error at the commit write, got {error:?}"
             );
         }
-        other => panic!(
-            "commit-time I/O failure must propagate a Database error, got {other:?}"
-        ),
+        other => panic!("commit-time I/O failure must propagate a Database error, got {other:?}"),
     }
     watcher.join().unwrap();
     {
@@ -1248,11 +1245,7 @@ fn recovery_lookup_io_failure_propagates_error_not_absence() {
     // error; there is no acceptable early return.
     let page_size = {
         let raw = u16::from_be_bytes([bytes[16], bytes[17]]) as usize;
-        if raw == 1 {
-            65536
-        } else {
-            raw
-        }
+        if raw == 1 { 65536 } else { raw }
     };
     assert!(
         page_size >= 512 && bytes.len() > page_size,
@@ -1368,7 +1361,10 @@ fn v2_migration_cutoff_bounds_legacy_replay_and_postcutoff_rejection() {
         .unwrap();
     Connection::open(&path)
         .unwrap()
-        .execute("UPDATE product_grants_v1 SET state='revoked' WHERE grant_id=?1", [&grant])
+        .execute(
+            "UPDATE product_grants_v1 SET state='revoked' WHERE grant_id=?1",
+            [&grant],
+        )
         .unwrap();
     let tampered_proof = reopened
         .prepare_approval(&fixture.human_session_digest, &intent)
@@ -1376,11 +1372,16 @@ fn v2_migration_cutoff_bounds_legacy_replay_and_postcutoff_rejection() {
     match reopened.approve_product(&fixture.human_session_digest, &intent, &tampered_proof) {
         Err(foundry_ledger::ProductError::Invariant(message))
             if message.contains("legacy approval evidence is incomplete") => {}
-        other => panic!("tampered legacy evidence must reject with the incomplete-evidence invariant, got {other:?}"),
+        other => panic!(
+            "tampered legacy evidence must reject with the incomplete-evidence invariant, got {other:?}"
+        ),
     }
     Connection::open(&path)
         .unwrap()
-        .execute("UPDATE product_grants_v1 SET state='consumed' WHERE grant_id=?1", [&grant])
+        .execute(
+            "UPDATE product_grants_v1 SET state='consumed' WHERE grant_id=?1",
+            [&grant],
+        )
         .unwrap();
     let restored_proof = reopened
         .prepare_approval(&fixture.human_session_digest, &intent)
@@ -1410,7 +1411,9 @@ fn v2_migration_cutoff_bounds_legacy_replay_and_postcutoff_rejection() {
     match reopened.approve_product(&fixture.human_session_digest, &intent, &excluded_proof) {
         Err(foundry_ledger::ProductError::Invariant(message))
             if message.contains("post-cutoff approval lacks result side binding") => {}
-        other => panic!("post-cutoff replay without binding must reject with the post-cutoff invariant, got {other:?}"),
+        other => panic!(
+            "post-cutoff replay without binding must reject with the post-cutoff invariant, got {other:?}"
+        ),
     }
     drop(reopened);
     drop(fixture);
@@ -1560,7 +1563,8 @@ fn sigkill_before_commit_rolls_back_and_after_commit_preserves_exact_set() {
 }
 
 #[test]
-fn two_process_stage_start_then_service_revocation_preserves_completed_result_and_blocks_finalizer() {
+fn two_process_stage_start_then_service_revocation_preserves_completed_result_and_blocks_finalizer()
+{
     let order = "result-process-revoke-after-stage-start";
     let identity = FixtureIdentity::new(
         ProductConfig {
@@ -1616,10 +1620,17 @@ fn two_process_stage_start_then_service_revocation_preserves_completed_result_an
     };
     let manifest_path = fixture.root.join("continuation-process-manifest.json");
     let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-    write_private(&manifest_path, std::str::from_utf8(&manifest_bytes).unwrap());
+    write_private(
+        &manifest_path,
+        std::str::from_utf8(&manifest_bytes).unwrap(),
+    );
     let executable = std::env::current_exe().unwrap();
     let child = Command::new(executable)
-        .args(["--exact", "product_result_continuation_child", "--nocapture"])
+        .args([
+            "--exact",
+            "product_result_continuation_child",
+            "--nocapture",
+        ])
         .env("B1_RESULT_CONTINUATION_MANIFEST", &manifest_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1643,11 +1654,17 @@ fn two_process_stage_start_then_service_revocation_preserves_completed_result_an
         .unwrap();
     assert_eq!(
         started,
-        ("resuming".into(), "accepted".into(), format!("{order}:1:8:3"), 5),
+        (
+            "resuming".into(),
+            "accepted".into(),
+            format!("{order}:1:8:3"),
+            5
+        ),
         "the child reaches real stage execution only after the stage-start transaction commits"
     );
     assert_eq!(
-        std::fs::read_to_string(&execute_count_path).unwrap(), "1",
+        std::fs::read_to_string(&execute_count_path).unwrap(),
+        "1",
         "exactly one executor call is in flight at the committed stage-start barrier"
     );
     let service_revision: i64 = Connection::open(&fixture.db_path)
@@ -1685,9 +1702,15 @@ fn two_process_stage_start_then_service_revocation_preserves_completed_result_an
     );
     let child_result: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&result_path).unwrap()).unwrap();
-    assert!(child_result["result"].as_str().unwrap().contains("review service authority"));
+    assert!(
+        child_result["result"]
+            .as_str()
+            .unwrap()
+            .contains("review service authority")
+    );
     assert_eq!(
-        std::fs::read_to_string(&execute_count_path).unwrap(), "1",
+        std::fs::read_to_string(&execute_count_path).unwrap(),
+        "1",
         "the in-flight stage is the only execute call; after revocation next execute=0"
     );
 
@@ -1705,7 +1728,10 @@ fn two_process_stage_start_then_service_revocation_preserves_completed_result_an
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
         )
         .unwrap();
-    assert_eq!(preserved, (1, 5, 4, 0, 0, "resuming".into(), "recovery_required".into()));
+    assert_eq!(
+        preserved,
+        (1, 5, 4, 0, 0, "resuming".into(), "recovery_required".into())
+    );
     let followup = foundry_ledger::ProductResultExpectation {
         host_key: foundry_exec::HostKey {
             run: 8,

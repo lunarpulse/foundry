@@ -12,6 +12,10 @@
 //! about which files each role READS, verified by checker + tests,
 //! not kernel-level sandboxing (that is M5 containerization).
 
+#![allow(clippy::collapsible_if)] // W6a clippy debt: preserve explicit branch and short-circuit ordering
+#![allow(dead_code)] // W6a clippy debt: retain conditional helpers used by other feature and test configurations
+#![allow(clippy::useless_format)] // W6a clippy debt: preserve the current formatting call site and output construction
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 

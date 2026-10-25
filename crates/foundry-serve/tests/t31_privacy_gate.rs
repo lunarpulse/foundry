@@ -1,6 +1,10 @@
 //! T31 gate: no API response ever carries a secret. We plant canaries
 //! in every leak channel (journal payloads, error paths, detail view)
 //! and assert they never serialize out.
+#![allow(dead_code)] // W6a clippy debt: preserve this existing test/example logic, assertions, and cell sequence
+#![allow(unused_imports)] // W6a clippy debt: preserve this existing test/example logic, assertions, and cell sequence
+#![allow(clippy::useless_format)] // W6a clippy debt: preserve this existing test/example logic, assertions, and cell sequence
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::routing::Router;

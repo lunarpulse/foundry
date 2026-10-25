@@ -13,6 +13,8 @@
 //! The handler owns the pipeline+layer+coordinator trio through
 //! ServeState.policy (T60b wiring): there is NO other production
 //! path that constructs these — inventory.rs is the record.
+#![allow(clippy::unnecessary_mut_passed)] // W6a clippy debt: preserve the existing receiver call shape
+
 use crate::ServeState;
 use crate::serve_wiring::apply_policy_via_serve;
 use axum::Json;

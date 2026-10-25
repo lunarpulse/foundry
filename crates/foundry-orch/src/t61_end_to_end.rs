@@ -11,6 +11,9 @@
 //!    후 **전체 재구축** — 로그·원장·저널에서 상태 재생, 체인 검증.
 //! 5. **전체 재구축 동등**: 재구축 오케스트레이션 로그가 원본과 동일.
 
+#![allow(clippy::needless_borrow)] // W6a clippy debt: preserve this existing test/example logic, assertions, and cell sequence
+#![allow(clippy::needless_borrows_for_generic_args)] // W6a clippy debt: preserve this existing test/example logic, assertions, and cell sequence
+
 use crate::chainer::{Chainer, ChainerError, SizingVerdict};
 use crate::refusal::{RefusalCode, RemediationKind};
 use crate::stream::{Stream, StreamRuntime};

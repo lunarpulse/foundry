@@ -13,6 +13,9 @@
 //!      and observe the same durability contract as T58w: the file
 //!      opens, the stream is valid, committed facts survive, the
 //!      journal continues at the right seq.
+#![allow(clippy::needless_borrows_for_generic_args)] // W6a clippy debt: preserve this existing test/example logic, assertions, and cell sequence
+#![allow(unused_imports)] // W6a clippy debt: preserve this existing test/example logic, assertions, and cell sequence
+
 use foundry_watch::bundles::{
     BundleProfile, BundleStore, CandidateBundle, DependencyPins, LessonSnapshot,
 };

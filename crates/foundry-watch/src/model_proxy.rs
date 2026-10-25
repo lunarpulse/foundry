@@ -11,6 +11,8 @@
 //! credential files. T44b completes the other half: cast cannot
 //! DECIDE where its network requests go. The proxy is the only door,
 //! and the door has a fixed shape.
+#![allow(clippy::type_complexity)] // W6a clippy debt: preserve the existing internal tuple and storage representation
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;

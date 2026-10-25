@@ -1,5 +1,7 @@
 //! G13 — 활성화 토큰 결속 4케이스: 무토큰·타 root·타 의도·주문 토큰 재사용.
 
+#![allow(dead_code)] // W6a clippy debt: retain conditional helpers used by other feature and test configurations
+
 use foundry_approval::ApprovalLedger;
 
 fn scope(order: &str, intent: &str, digest: &str, root: &str) -> serde_json::Value {

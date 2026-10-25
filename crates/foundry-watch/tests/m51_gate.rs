@@ -12,6 +12,9 @@
 //!   W7 audit precision             — truncation/tamper/mutation named
 //!   W8 real crash injection        — SIGKILL, committed facts survive
 //!   W9 back-compat                 — legacy digest path still applies (M5 contract intact)
+#![allow(clippy::needless_borrows_for_generic_args)] // W6a clippy debt: preserve this existing test/example logic, assertions, and cell sequence
+#![allow(unused_mut)] // W6a clippy debt: preserve this existing test/example logic, assertions, and cell sequence
+
 use foundry_watch::audit_precision::{AuditError, HeadPin, audit};
 use foundry_watch::bundles::{
     BundleProfile, BundleStore, CandidateBundle, DependencyPins, LessonSnapshot,

@@ -1,4 +1,6 @@
 //! Product adapter from durable review dispatches to a frozen pack graph.
+#![allow(clippy::needless_borrows_for_generic_args)] // W6a clippy debt: preserve explicit generic-call borrow boundaries
+
 use foundry_exec::{
     ArtifactTuple, ArtifactTupleKey, Attempt, DispatchHost, DurableReviewRun, EmitLog, EmitReceipt,
     EmitSink, Epoch, ExecutionIntent, HostError, HostKey, HostResult, IntentLog, OrderId,

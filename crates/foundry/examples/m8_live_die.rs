@@ -10,6 +10,8 @@
 //!
 //! 전제: ~/.foundry/bin/foundry-die, rustain, die.env (M0 게이트 구성).
 
+#![allow(unused_imports)] // W6a clippy debt: preserve this existing test/example logic, assertions, and cell sequence
+
 use std::path::PathBuf;
 
 use foundry_domain::order::{ExternalRef, Order};

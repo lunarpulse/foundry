@@ -10,6 +10,9 @@
 //! drain은 명시적 방출, Drop은 백업 — 취소 경로 전부에서 reqwest
 //! teardown이 async 컨텍스트에서 실행되지 않는다(의도적 유계 누수).
 
+#![allow(unused_imports)] // W6a clippy debt: retain the existing feature and test configuration import set
+#![allow(clippy::useless_format)] // W6a clippy debt: preserve the current formatting call site and output construction
+
 use std::path::PathBuf;
 use std::time::Duration;
 

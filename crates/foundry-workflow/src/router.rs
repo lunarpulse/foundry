@@ -30,6 +30,9 @@
 //! 선언이 소유한다(사이즈 라우팅: 인테이크 부트스트랩 → 인간 사이징
 //! 게이트 → preset_bound → 발행).
 
+#![allow(clippy::needless_borrows_for_generic_args)] // W6a clippy debt: preserve explicit generic-call borrow boundaries
+#![allow(unused_imports)] // W6a clippy debt: retain the existing feature and test configuration import set
+
 use crate::dsl::{RouteRule, RoutingRules};
 use serde::{Deserialize, Serialize};
 

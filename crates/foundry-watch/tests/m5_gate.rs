@@ -2,6 +2,10 @@
 //! 19 items + sub-gates). Each item is a PROOF, not a checkbox: the
 //! scenario actually runs and the adversarial property is observed.
 //! Pattern inherited from m4_gate.rs (M4, 16/16).
+#![allow(clippy::needless_borrows_for_generic_args)] // W6a clippy debt: preserve this existing test/example logic, assertions, and cell sequence
+#![allow(clippy::redundant_pattern_matching)] // W6a clippy debt: preserve this existing test/example logic, assertions, and cell sequence
+#![allow(unused_imports)] // W6a clippy debt: preserve this existing test/example logic, assertions, and cell sequence
+
 use sha2::Digest;
 use std::collections::BTreeMap;
 

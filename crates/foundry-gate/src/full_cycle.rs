@@ -4,6 +4,9 @@
 //! (dispatch_live+grant) → 출하 → 재시작 3단(원장 reopen·저널 verify·신규
 //! 엔진 rebuild) → 발급 커서 재생 상태 동등.
 
+#![allow(dead_code)] // W6a clippy debt: retain conditional helpers used by other feature and test configurations
+#![allow(unused_imports)] // W6a clippy debt: retain the existing feature and test configuration import set
+
 use crate::common::{actor, terminal_commitment_from};
 use foundry_domain::order::ExternalRef;
 use foundry_domain::ports::Ledger as _;

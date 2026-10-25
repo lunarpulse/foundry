@@ -17,6 +17,11 @@
 //!   MULTI-LIFECYCLE — one order_id can span several lifecycles
 //!   (re-orders restart from Received); a fresh Order starts at every
 //!   `from_state == received` boundary (defect #7, live-ledger measured).
+#![allow(clippy::collapsible_if)] // W6a clippy debt: preserve explicit branch and short-circuit ordering
+#![allow(clippy::doc_lazy_continuation)] // W6a clippy debt: preserve the existing API documentation text and layout
+#![allow(clippy::manual_pattern_char_comparison)] // W6a clippy debt: preserve the existing parser predicate and character handling
+#![allow(clippy::match_result_ok)] // W6a clippy debt: preserve the existing parse failure branch structure
+
 use crate::LedgerRow;
 use foundry_domain::{Order, OrderEvent, OrderState};
 

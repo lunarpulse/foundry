@@ -1,6 +1,8 @@
 //! M4 gate — 16 items (plan v2). Proofs run against the REAL
 //! subsystems: identity, scope, privacy, Jira intake, audit reports,
 //! deployment profile, M3 compatibility. Exit 0 = all pass.
+#![allow(clippy::redundant_pattern_matching)] // W6a clippy debt: preserve this existing test/example logic, assertions, and cell sequence
+
 use foundry_domain::casting::{CastingRun, CastingState, Verdict};
 use foundry_domain::ports::{ActorId, ActorKind, ApprovalToken};
 use foundry_ledger::LedgerRow;

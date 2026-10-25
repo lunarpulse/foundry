@@ -1,3 +1,6 @@
+#![allow(dead_code)] // W6a clippy debt: preserve this existing test/example logic, assertions, and cell sequence
+#![allow(clippy::too_many_arguments)] // W6a clippy debt: preserve this existing test/example logic, assertions, and cell sequence
+
 #[cfg(feature = "p2-test-support")]
 use foundry_exec::DispatchHost;
 use foundry_ledger::{ProductConfig, ProductStore, RepositoryIdentity, ScopeSourceManifest};

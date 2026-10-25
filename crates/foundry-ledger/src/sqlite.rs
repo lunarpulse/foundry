@@ -1,5 +1,10 @@
 //! SqliteLedger — Ledger trait over append-only journal with chain hashing (plan §11).
 //! Vendored maos-audit machinery lives in `vendor` (see VENDORED.md).
+#![allow(clippy::collapsible_if)] // W6a clippy debt: preserve explicit branch and short-circuit ordering
+#![allow(clippy::io_other_error)] // W6a clippy debt: preserve the existing I/O error construction path
+#![allow(clippy::to_string_in_format_args)] // W6a clippy debt: preserve the existing implementation and observable behavior
+#![allow(clippy::too_many_arguments)] // W6a clippy debt: preserve the established operation binding and call shape
+
 use chrono::{DateTime, Utc};
 use foundry_domain::ports::{Ledger, PortError, PortResult};
 use foundry_domain::{ActorId, OrderEvent, OrderState};

@@ -1,13 +1,15 @@
+#![allow(unused_imports)] // W6a clippy debt: preserve this existing test/example logic, assertions, and cell sequence
+
 use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
-use rusqlite::OptionalExtension;
 use foundry_ledger::{
-    ProductCapability, ProductConfig, ProductResultExpectation, ProductStore,
-    RepositoryIdentity, ScopeGrantManifest, ScopeMutation, ScopeSourceManifest,
+    ProductCapability, ProductConfig, ProductResultExpectation, ProductStore, RepositoryIdentity,
+    ScopeGrantManifest, ScopeMutation, ScopeSourceManifest,
 };
 use foundry_serve::{auth_http::ProductHttpState, http::product_router};
+use rusqlite::OptionalExtension;
 use tower::ServiceExt;
 
 #[cfg(feature = "p2-test-support")]
@@ -127,8 +129,10 @@ async fn w5_y5_production_http_hold_route_requires_auth_and_continues() {
     )
     .unwrap();
     assert_eq!(acceptance["progress"]["phase"], "completed");
-    assert!(fixture.calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
-        "the genuine host used its labeled test executor mock");
+    assert!(
+        fixture.calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "the genuine host used its labeled test executor mock"
+    );
 }
 
 #[cfg(feature = "p2-test-support")]
@@ -425,8 +429,7 @@ async fn scoped_audit_connects_product_sources_and_preserves_event_time_scope() 
         .event_scope
         .iter()
         .find(|event| {
-            event.event_source == "product_scope_source_events_v1"
-                && event.operation == "rebound"
+            event.event_source == "product_scope_source_events_v1" && event.operation == "rebound"
         })
         .unwrap();
     let source_a_alias = transition.previous_source_alias.as_deref().unwrap();
@@ -439,13 +442,20 @@ async fn scoped_audit_connects_product_sources_and_preserves_event_time_scope() 
         .iter()
         .filter(|event| event.event_source == "product_scope_events_v1")
         .collect();
-    assert!(source_events.len() >= 2, "scope grants for both sources are present");
-    assert!(source_events
-        .iter()
-        .any(|event| event.source_alias.as_deref() == Some(source_a_alias)));
-    assert!(source_events
-        .iter()
-        .any(|event| event.source_alias.as_deref() == Some(source_b_alias)));
+    assert!(
+        source_events.len() >= 2,
+        "scope grants for both sources are present"
+    );
+    assert!(
+        source_events
+            .iter()
+            .any(|event| event.source_alias.as_deref() == Some(source_a_alias))
+    );
+    assert!(
+        source_events
+            .iter()
+            .any(|event| event.source_alias.as_deref() == Some(source_b_alias))
+    );
 
     // Repeated references to a stored source use the transition's same
     // request-local alias, and no event attributed to the old source is
@@ -456,9 +466,11 @@ async fn scoped_audit_connects_product_sources_and_preserves_event_time_scope() 
         .unwrap();
     let pre_transition_events = &source_events[..first_post_transition];
     assert!(!pre_transition_events.is_empty());
-    assert!(pre_transition_events
-        .iter()
-        .all(|event| event.source_alias.as_deref() == Some(source_a_alias)));
+    assert!(
+        pre_transition_events
+            .iter()
+            .all(|event| event.source_alias.as_deref() == Some(source_a_alias))
+    );
     assert_eq!(
         transition.previous_source_alias.as_deref(),
         pre_transition_events[0].source_alias.as_deref(),
@@ -555,8 +567,14 @@ async fn scoped_audit_connects_product_sources_and_preserves_event_time_scope() 
             fixture.now,
         )
         .unwrap();
-    assert!(long_history.has_more, "another authorized order follows the selected order");
-    assert!(long_history.coverage_complete, "selection paging does not truncate selected-order history");
+    assert!(
+        long_history.has_more,
+        "another authorized order follows the selected order"
+    );
+    assert!(
+        long_history.coverage_complete,
+        "selection paging does not truncate selected-order history"
+    );
     let long_history_rows = long_history
         .rows
         .iter()
@@ -582,19 +600,23 @@ async fn scoped_audit_connects_product_sources_and_preserves_event_time_scope() 
         "W5 Y2 selected_order_history_rows={long_history_rows} total_order_rows={total_order_history} selection_has_more={}",
         long_history.has_more
     );
-    assert!(long_history.rows.iter().all(|row| row.order_id == fixture.identity.order_id));
-    let long_export = foundry_serve::privacy::scoped_product_export(
-        &long_history,
-        "audit-y2-long-history",
-        &key,
-    )
-    .unwrap();
+    assert!(
+        long_history
+            .rows
+            .iter()
+            .all(|row| row.order_id == fixture.identity.order_id)
+    );
+    let long_export =
+        foundry_serve::privacy::scoped_product_export(&long_history, "audit-y2-long-history", &key)
+            .unwrap();
     assert!(long_export.has_more, "selection has more authorized orders");
     assert!(long_export.selection_truncated);
-    assert!(long_export
-        .selection_truncation_label
-        .as_deref()
-        .is_some_and(|label| label.contains("not the full set")));
+    assert!(
+        long_export
+            .selection_truncation_label
+            .as_deref()
+            .is_some_and(|label| label.contains("not the full set"))
+    );
     assert!(long_export.selected_order_history_complete);
     assert_eq!(long_export.selected_order_history_byte_limit, None);
     assert_eq!(long_export.rows.len() as i64, total_order_history);
@@ -754,7 +776,10 @@ async fn registered_product_export_requires_current_approver_and_redacts_identif
         assert!(!text.contains(canary));
     }
     let export: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    eprintln!("W5 Y3 export verification_duration_micros={}", export["verification_duration_micros"]);
+    eprintln!(
+        "W5 Y3 export verification_duration_micros={}",
+        export["verification_duration_micros"]
+    );
     assert_eq!(export["schema"], "foundry-scoped-evidence-projection-v1");
     assert_eq!(export["coverage"], "complete");
     assert_eq!(export["selection_truncated"], false);
@@ -762,7 +787,12 @@ async fn registered_product_export_requires_current_approver_and_redacts_identif
     assert_eq!(export["selected_order_history_complete"], true);
     assert!(export["selected_order_history_byte_limit"].is_null());
     assert!(export["verification_duration_micros"].as_u64().is_some());
-    assert!(export["verification_boundary"].as_str().unwrap().contains("does not substitute"));
+    assert!(
+        export["verification_boundary"]
+            .as_str()
+            .unwrap()
+            .contains("does not substitute")
+    );
     assert!(
         export["projected_digest"]
             .as_str()
@@ -817,9 +847,21 @@ async fn registered_product_export_requires_current_approver_and_redacts_identif
         assert!(!audit_text.contains(canary));
     }
     let audit: serde_json::Value = serde_json::from_slice(&audit_bytes).unwrap();
-    eprintln!("W5 Y3 audit verification_duration_micros={}", audit["projection"]["verification_duration_micros"]);
-    assert!(audit["projection"]["verification_duration_micros"].as_u64().is_some());
-    assert!(audit["projection"]["verification_boundary"].as_str().unwrap().contains("does not substitute"));
+    eprintln!(
+        "W5 Y3 audit verification_duration_micros={}",
+        audit["projection"]["verification_duration_micros"]
+    );
+    assert!(
+        audit["projection"]["verification_duration_micros"]
+            .as_u64()
+            .is_some()
+    );
+    assert!(
+        audit["projection"]["verification_boundary"]
+            .as_str()
+            .unwrap()
+            .contains("does not substitute")
+    );
     assert_eq!(audit["schema_version"], 3);
     assert_eq!(audit["sources"][0]["source"], "S1");
     assert_eq!(audit["sources"][0]["availability"], "available");
@@ -1134,11 +1176,25 @@ fn scoped_export_and_audit_require_their_own_capability_and_hide_foreign_rows() 
         assert_eq!(projection["coverage"], "page");
         assert!(projection["has_more"].as_bool().unwrap());
         assert_eq!(projection["selection_truncated"], true);
-        assert!(projection["selection_truncation_label"].as_str().unwrap().contains("not the full set"));
+        assert!(
+            projection["selection_truncation_label"]
+                .as_str()
+                .unwrap()
+                .contains("not the full set")
+        );
         assert_eq!(projection["selected_order_history_complete"], true);
         assert!(projection["selected_order_history_byte_limit"].is_null());
-        assert!(projection["verification_duration_micros"].as_u64().is_some());
-        assert!(projection["verification_boundary"].as_str().unwrap().contains("other users' response failures"));
+        assert!(
+            projection["verification_duration_micros"]
+                .as_u64()
+                .is_some()
+        );
+        assert!(
+            projection["verification_boundary"]
+                .as_str()
+                .unwrap()
+                .contains("other users' response failures")
+        );
         assert_eq!(projection["rows"].as_array().unwrap().len(), 1);
         assert_eq!(projection["rows"][0]["ordinal"], 1);
         assert!(!String::from_utf8_lossy(&bytes).contains("foreign-order-canary"));

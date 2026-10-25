@@ -1,5 +1,12 @@
 //! ProductAtomicV1 storage owner. This module deliberately exposes typed
 //! operations only; it never returns its SQLite connection or transaction.
+#![allow(clippy::collapsible_if)] // W6a clippy debt: preserve explicit branch and short-circuit ordering
+#![allow(dead_code)] // W6a clippy debt: retain conditional helpers used by other feature and test configurations
+#![allow(clippy::large_enum_variant)] // W6a clippy debt: preserve the existing public enum representation and matching behavior
+#![allow(clippy::manual_contains)] // W6a clippy debt: preserve the existing predicate expression and evaluation order
+#![allow(clippy::too_many_arguments)] // W6a clippy debt: preserve the established operation binding and call shape
+#![allow(clippy::type_complexity)] // W6a clippy debt: preserve the existing internal tuple and storage representation
+
 use crate::product_scope::{
     ProductCapability, RepositoryIdentity, ScopeGrantManifest, ScopeGrantReceipt, ScopeGrantView,
     ScopeMigrationManifest, ScopeMigrationReceipt, ScopeMutation, ScopeMutationReceiptKind,
@@ -1320,9 +1327,8 @@ impl ProductStore {
             let start = match state.as_str() {
                 "pending" => ProductPublishStart::Reconcile,
                 "confirmed" => ProductPublishStart::Confirmed {
-                    pr_url: pr_url.ok_or(ProductError::Invariant(
-                        "confirmed publish URL is missing",
-                    ))?,
+                    pr_url: pr_url
+                        .ok_or(ProductError::Invariant("confirmed publish URL is missing"))?,
                 },
                 _ => return Err(ProductError::Invariant("publish state is invalid")),
             };
@@ -1383,9 +1389,8 @@ impl ProductStore {
         let start = match state.as_str() {
             "pending" => ProductPublishStart::Started,
             "confirmed" => ProductPublishStart::Confirmed {
-                pr_url: pr_url.ok_or(ProductError::Invariant(
-                    "confirmed publish URL is missing",
-                ))?,
+                pr_url: pr_url
+                    .ok_or(ProductError::Invariant("confirmed publish URL is missing"))?,
             },
             _ => return Err(ProductError::Invariant("publish state is invalid")),
         };
@@ -1421,9 +1426,9 @@ impl ProductStore {
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?;
-            if existing.is_some_and(|(state, url)| {
-                state == "confirmed" && url.as_deref() == Some(pr_url)
-            }) {
+            if existing
+                .is_some_and(|(state, url)| state == "confirmed" && url.as_deref() == Some(pr_url))
+            {
                 // Concurrent settlement of the same confirmed effect: success.
                 tx.commit()?;
                 return Ok(());
@@ -5374,9 +5379,7 @@ fn scope_enforced_in(tx: &rusqlite::Transaction<'_>) -> Result<bool, ProductErro
     Ok(mode == "enforced")
 }
 
-fn create_product_publish_schema(
-    tx: &rusqlite::Transaction<'_>,
-) -> Result<(), ProductError> {
+fn create_product_publish_schema(tx: &rusqlite::Transaction<'_>) -> Result<(), ProductError> {
     tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS product_publish_outcomes_v1(
             operation_id TEXT PRIMARY KEY REFERENCES product_outcomes_v1(operation_id),

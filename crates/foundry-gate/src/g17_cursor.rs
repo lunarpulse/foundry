@@ -3,6 +3,9 @@
 //! ①무커서=입구 부재(원천 봉쇄) ②이벤트 치환 ③유효핀+위조접미 ④핀 범위 외
 //! seq ⑤재정렬 ⑥커밋먼트 범위 밖 발급 거부.
 
+#![allow(dead_code)] // W6a clippy debt: retain conditional helpers used by other feature and test configurations
+#![allow(unused_imports)] // W6a clippy debt: retain the existing feature and test configuration import set
+
 use crate::common::{actor, file_journal, terminal_commitment, terminal_commitment_from};
 use foundry_domain::OrderEvent;
 use foundry_domain::order::{ExternalRef, Order};

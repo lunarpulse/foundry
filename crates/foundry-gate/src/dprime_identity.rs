@@ -1,5 +1,8 @@
 //! D′ — 토큰 스코프·정체성 단정: 정규 비교(키 순서·NFKC 충돌)·재발급 불가(token_id PK)·전 스코프 불일치 음성.
 
+#![allow(dead_code)] // W6a clippy debt: retain conditional helpers used by other feature and test configurations
+#![allow(unused_imports)] // W6a clippy debt: retain the existing feature and test configuration import set
+
 use foundry_approval::{ApprovalLedger, LedgerError};
 
 fn scope_full(order: &str, intent: &str, digest: &str, root: &str) -> serde_json::Value {

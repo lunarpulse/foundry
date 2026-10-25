@@ -4,6 +4,12 @@
 //! receipts. This module only records evidence already accepted by the
 //! ProductStore-backed review host; it never dispatches work or changes S1.
 
+#![allow(clippy::clone_on_copy)] // W6a clippy debt: preserve the explicit copy boundary in the stored result
+#![allow(clippy::collapsible_if)] // W6a clippy debt: preserve explicit branch and short-circuit ordering
+#![allow(clippy::too_many_arguments)] // W6a clippy debt: preserve the established operation binding and call shape
+#![allow(clippy::type_complexity)] // W6a clippy debt: preserve the existing internal tuple and storage representation
+#![allow(clippy::useless_borrows_in_formatting)] // W6a clippy debt: preserve formatting inputs without changing the formatting expression
+
 use super::*;
 use foundry_exec::{
     ArtifactLocation, ArtifactTuple, Attempt, Generation, HostKey, HostResult, ImmutableCommit,
@@ -761,18 +767,20 @@ impl ProductStore {
             params![order_id],
             |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
         ).optional().map_err(|_| ProductResultError::Storage)?;
-        let Some((own_intent_json,own_journal,own_active_epoch,own_epoch_row)) = active_own else {
+        let Some((own_intent_json, own_journal, own_active_epoch, own_epoch_row)) = active_own
+        else {
             return Err(ProductResultError::CorruptEvidence);
         };
-        let own_intent: foundry_exec::ExecutionIntent =
-            serde_json::from_str(&own_intent_json).map_err(|_| ProductResultError::CorruptEvidence)?;
+        let own_intent: foundry_exec::ExecutionIntent = serde_json::from_str(&own_intent_json)
+            .map_err(|_| ProductResultError::CorruptEvidence)?;
         let own_expected_journal = format!(
             "{}:{}:{}:{}",
             own_intent.order.0, own_intent.attempt.0, own_intent.run.0, own_intent.activation
         );
         if own_expected_journal != own_journal
             || own_active_epoch
-                != i64::try_from(own_intent.epoch.0).map_err(|_| ProductResultError::InvalidInput)?
+                != i64::try_from(own_intent.epoch.0)
+                    .map_err(|_| ProductResultError::InvalidInput)?
             || own_epoch_row != own_active_epoch
         {
             return Err(ProductResultError::CorruptEvidence);
@@ -2341,7 +2349,15 @@ fn validate_stored_hold_progress_in(
                 "SELECT progress_revision,epoch,fence,reserved_run_id,owner_id
                  FROM product_review_hold_progress_v1 WHERE operation_id=?1",
                 [&hold.operation_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .optional()
             .map_err(|_| ProductResultError::Storage)?;
@@ -2438,13 +2454,8 @@ fn has_failed_accepted_hold_decision_in(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| ProductResultError::Storage)?;
     for (operation, receipt_json) in rows {
-        let receipt = parse_hold_acceptance_receipt(
-            &receipt_json,
-            &operation,
-            order,
-            lifecycle,
-            attempt,
-        )?;
+        let receipt =
+            parse_hold_acceptance_receipt(&receipt_json, &operation, order, lifecycle, attempt)?;
         if matches!(
             receipt.decision,
             super::ProductHoldDecision::CommitFail | super::ProductHoldDecision::Abort
@@ -2930,8 +2941,8 @@ fn completed_result_ancestry_in(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| ProductResultError::Storage)?;
     for payload_json in prior_payloads {
-        let prior: ResultPayloadV1 = serde_json::from_str(&payload_json)
-            .map_err(|_| ProductResultError::CorruptEvidence)?;
+        let prior: ResultPayloadV1 =
+            serde_json::from_str(&payload_json).map_err(|_| ProductResultError::CorruptEvidence)?;
         if prior.order_id != order || prior.lifecycle != lifecycle {
             return Err(ProductResultError::CorruptEvidence);
         }
@@ -3434,11 +3445,7 @@ mod result_wire_tests {
                 "\"authority\":{\"service_id\":\"svc\",\"service_id\":\"svc\"",
                 1,
             ),
-            encoded.replacen(
-                ",\"connector_revision\":6}",
-                "}",
-                1,
-            ),
+            encoded.replacen(",\"connector_revision\":6}", "}", 1),
             encoded.replacen(
                 "\"accepted_holds\":[{\"operation_id\":\"op\"",
                 "\"accepted_holds\":[{\"operation_id\":\"op\",\"extra\":0",

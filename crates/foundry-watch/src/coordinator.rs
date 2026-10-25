@@ -19,6 +19,8 @@
 //! (`apply()` then `journal.push()` as separate calls): here, an
 //! append that fails leaves NO state change, and state changes ride
 //! the same transaction.
+#![allow(unused_mut)] // W6a clippy debt: retain the existing mutation-ready fixture and branch structure
+
 use crate::governance_events::{
     GOVERNANCE_SCHEMA_VERSION, GovernanceEvent, OpKind, Phase, recover, verify_stream,
 };

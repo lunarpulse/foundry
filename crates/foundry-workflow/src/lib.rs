@@ -24,6 +24,14 @@
 //! 동일한 승인·동일한 거부를 산출하고, 관측 벡터는 결정적이다 —
 //! 같은 이벤트 스트림 → 같은 관측 바이트열.
 
+#![allow(clippy::collapsible_if)] // W6a clippy debt: preserve explicit branch and short-circuit ordering
+#![allow(dropping_references)] // W6a clippy debt: preserve the existing reference-lifetime comments and statements
+#![allow(clippy::empty_line_after_doc_comments)] // W6a clippy debt: preserve the established documentation grouping
+#![allow(clippy::needless_return)] // W6a clippy debt: preserve the existing return boundary in this branch
+#![allow(clippy::op_ref)] // W6a clippy debt: preserve the existing comparison ownership behavior
+#![allow(unused_imports)] // W6a clippy debt: retain the existing feature and test configuration import set
+#![allow(clippy::useless_borrows_in_formatting)] // W6a clippy debt: preserve formatting inputs without changing the formatting expression
+
 /// **T56**: 승인 원장의 프로덕션 어댑터 — ApprovalLedgerHook 구현.
 /// (게이트·서비스가 사용하는 정상 경로; 단위 테스트용 로컬 정의는 유지.)
 pub struct ApprovalLedgerAdapter(pub foundry_approval::ApprovalLedger);

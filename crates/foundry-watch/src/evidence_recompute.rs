@@ -23,6 +23,9 @@
 //! wiring and the M5.1 gate construct the pipeline with a real
 //! reader, and the recomputation proof below shows the forged
 //! envelope failing ONLY under a real reader.
+#![allow(dead_code)] // W6a clippy debt: retain conditional helpers used by other feature and test configurations
+#![allow(unused_imports)] // W6a clippy debt: retain the existing feature and test configuration import set
+
 use crate::retro::{EvidenceEnvelope, InsightError, InsightPipeline};
 use std::collections::BTreeMap;
 

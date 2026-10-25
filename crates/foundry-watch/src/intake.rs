@@ -1,6 +1,11 @@
 //! GitHub label Intake — polls issues labeled `foundry:make` (plan §3).
 //! At-least-once + dedup_key (issue number + updated_at) = effectively-once.
 //! M0 uses the public REST API (no auth needed for public repos, 60 req/h).
+#![allow(clippy::collapsible_if)] // W6a clippy debt: preserve explicit branch and short-circuit ordering
+#![allow(clippy::manual_clamp)] // W6a clippy debt: preserve the existing bound handling and edge semantics
+#![allow(clippy::redundant_closure)] // W6a clippy debt: preserve the callback boundary and captured behavior
+#![allow(clippy::too_many_arguments)] // W6a clippy debt: preserve the established operation binding and call shape
+
 use foundry_domain::ports::{Intake, OrderDraft, PortError, PortResult};
 use std::collections::HashSet;
 

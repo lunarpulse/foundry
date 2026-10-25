@@ -18,6 +18,10 @@
 //! takes a session TOKEN; the role is looked up. The CLI path can
 //! still construct an ApplyCommand directly, but ONLY after
 //! `authenticate_cli` resolves a real session (no ambient owner).
+#![allow(clippy::bool_assert_comparison)] // W6a clippy debt: preserve the test assertion form and expected value
+#![allow(clippy::too_many_arguments)] // W6a clippy debt: preserve the established operation binding and call shape
+#![allow(unused_imports)] // W6a clippy debt: retain the existing feature and test configuration import set
+
 use crate::identity::{Identity, IdentityError};
 use foundry_watch::command_binding::{HardenedApply, HardenedError};
 use foundry_watch::coordinator::GovernanceCoordinator;

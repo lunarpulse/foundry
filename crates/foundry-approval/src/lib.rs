@@ -24,6 +24,9 @@
 //! 같은 root·다른 의도 / 다른 root·같은 의도 / 주문 스토브 토큰 재사용
 //! 전부 거부 (G13 4케이스).
 
+#![allow(clippy::doc_lazy_continuation)] // W6a clippy debt: preserve the existing API documentation text and layout
+#![allow(clippy::let_and_return)] // W6a clippy debt: preserve the existing expression boundary and return path
+
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};

@@ -25,6 +25,10 @@
 //! The PinnedVerifier composes all three with the existing
 //! structural verification (verify_stream) — precise errors, never
 //! "invalid" as one blob.
+#![allow(dead_code)] // W6a clippy debt: retain conditional helpers used by other feature and test configurations
+#![allow(clippy::needless_borrows_for_generic_args)] // W6a clippy debt: preserve explicit generic-call borrow boundaries
+#![allow(unused_variables)] // W6a clippy debt: retain names used by conditional or diagnostic configurations
+
 use crate::coordinator::GovernanceCoordinator;
 use crate::governance_events::{GovernanceEvent, VerifyError, verify_stream};
 

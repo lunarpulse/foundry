@@ -12,9 +12,9 @@ use foundry_ledger::{
     ProductServiceGrant, ProductStore, RepositoryIdentity, ScopeMutation, ScopeSourceManifest,
 };
 use foundry_line::{PackReviewHost, StageExecutor, StageOutput, StageTask};
+use std::sync::atomic::AtomicI64;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::sync::atomic::AtomicI64;
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -44,9 +44,11 @@ impl StagePause {
 
     fn stop_if_armed(&self, stage_id: &str) {
         let mut state = self.state.lock().unwrap();
-        if !state.stage.as_deref().is_some_and(|requested| {
-            requested == "*" || stage_id.starts_with(requested)
-        }) {
+        if !state
+            .stage
+            .as_deref()
+            .is_some_and(|requested| requested == "*" || stage_id.starts_with(requested))
+        {
             return;
         }
         state.reached = true;
@@ -233,7 +235,6 @@ impl FixtureIdentity {
         self.g05_retry_ledger = true;
         self
     }
-
 }
 
 pub struct PassingExecutor {
@@ -269,8 +270,7 @@ impl StageExecutor for PassingExecutor {
                 .get("plan_full")
                 .expect("resume generation receives the plan_full input");
             assert_eq!(
-                plan,
-                "[]",
+                plan, "[]",
                 "the resume generation receives the frozen serialized plan_full input"
             );
         }
@@ -282,7 +282,10 @@ impl StageExecutor for PassingExecutor {
             let findings: Vec<foundry_exec::ReviewRedriveArtifact> =
                 serde_json::from_str(findings).unwrap();
             assert_eq!(
-                findings.iter().map(|artifact| artifact.stage_id.as_str()).collect::<Vec<_>>(),
+                findings
+                    .iter()
+                    .map(|artifact| artifact.stage_id.as_str())
+                    .collect::<Vec<_>>(),
                 ["triage"],
                 "the fix input contains the single triage finding carried by this run"
             );
@@ -445,7 +448,13 @@ pub fn append_g05_retry_chain(
     let mut conn = rusqlite::Connection::open(db_path).unwrap();
     // (from, to, event repr, intent, canonical event JSON)
     let chain: [(&str, &str, &str, &str, &str); 5] = [
-        ("queued", "working", "DieStarted", "p2-test-support", r#"{"type":"die_started"}"#),
+        (
+            "queued",
+            "working",
+            "DieStarted",
+            "p2-test-support",
+            r#"{"type":"die_started"}"#,
+        ),
         (
             "working",
             "queued",
@@ -454,7 +463,13 @@ pub fn append_g05_retry_chain(
             "g05-retry",
             r#"{"type":"die_failed","attempt":1,"reason":"g05-retry"}"#,
         ),
-        ("queued", "working", "DieStarted", "p2-test-support", r#"{"type":"die_started"}"#),
+        (
+            "queued",
+            "working",
+            "DieStarted",
+            "p2-test-support",
+            r#"{"type":"die_started"}"#,
+        ),
         (
             "working",
             "review",
@@ -496,8 +511,8 @@ pub fn append_g05_retry_chain(
             hash: String::new(),
             event_json: Some(json.to_owned()),
         };
-        let hash = foundry_ledger::sqlite::SqliteLedger::row_hash_at(&[row.clone()])
-            .expect("v2 row hash");
+        let hash =
+            foundry_ledger::sqlite::SqliteLedger::row_hash_at(&[row.clone()]).expect("v2 row hash");
         conn.execute(
             "INSERT INTO product_transition_intents_v1(order_id,lifecycle,expected_predecessor,operation)\
              VALUES(?1,?2,?3,'p2-test-preparation')",
@@ -543,10 +558,8 @@ pub fn genuine_host_done_with_stage_start_observer(
         "result-owner-password",
         |_, db_path, config, source, _now, owner_id, owner_password| {
             let mut store = ProductStore::open(db_path, product_configured(config)).unwrap();
-            let owner_phc = foundry_ledger::product_identity::ProductPasswordKdf::hash(
-                owner_password,
-            )
-            .unwrap();
+            let owner_phc =
+                foundry_ledger::product_identity::ProductPasswordKdf::hash(owner_password).unwrap();
             store
                 .bootstrap_owner_scoped(owner_id, &owner_phc, std::slice::from_ref(source), &[])
                 .unwrap();
@@ -839,7 +852,10 @@ where
     let preclaim_db_path = root.join("product-preclaim.sqlite");
     rusqlite::Connection::open(&db_path)
         .unwrap()
-        .execute("VACUUM INTO ?1", [preclaim_db_path.to_string_lossy().as_ref()])
+        .execute(
+            "VACUUM INTO ?1",
+            [preclaim_db_path.to_string_lossy().as_ref()],
+        )
         .unwrap();
     if identity.stale_admission_preparation_probe {
         let before: (i64, i64, i64, i64, i64, i64) = rusqlite::Connection::open(&db_path)
@@ -855,12 +871,23 @@ where
                 |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
             )
             .unwrap();
-        assert_eq!(before, (0, 0, 0, 0, 0, 1), "stale-admission vector starts with genuinely fresh waiting work");
+        assert_eq!(
+            before,
+            (0, 0, 0, 0, 0, 1),
+            "stale-admission vector starts with genuinely fresh waiting work"
+        );
         let mut stale = admission.clone();
         stale.sequence += 1;
         assert!(matches!(
-            store.prepare_p2_review_fixture(&service, &stale, &delivery.delivery_id, identity.preparation),
-            Err(foundry_ledger::ProductError::Invariant("P2 preparation requires exact acknowledged admission and fresh work"))
+            store.prepare_p2_review_fixture(
+                &service,
+                &stale,
+                &delivery.delivery_id,
+                identity.preparation
+            ),
+            Err(foundry_ledger::ProductError::Invariant(
+                "P2 preparation requires exact acknowledged admission and fresh work"
+            ))
         ));
         let after: (i64, i64, i64, i64, i64, i64) = rusqlite::Connection::open(&db_path)
             .unwrap()
@@ -875,7 +902,10 @@ where
                 |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
             )
             .unwrap();
-        assert_eq!(after, before, "stale admission fails before changing fresh-work evidence");
+        assert_eq!(
+            after, before,
+            "stale admission fails before changing fresh-work evidence"
+        );
     }
     let preparation_fault = rusqlite::Connection::open(&db_path).unwrap();
     let (create_preparation_fault, drop_preparation_fault) = match identity.preparation {
@@ -934,13 +964,18 @@ where
         )
         .unwrap();
     let zero_row_result = store.prepare_p2_review_fixture(
-            &service,
-            &admission,
-            &delivery.delivery_id,
-            identity.preparation,
-        );
+        &service,
+        &admission,
+        &delivery.delivery_id,
+        identity.preparation,
+    );
     assert!(
-        matches!(zero_row_result, Err(foundry_ledger::ProductError::Invariant("P2 backlog CAS failed"))),
+        matches!(
+            zero_row_result,
+            Err(foundry_ledger::ProductError::Invariant(
+                "P2 backlog CAS failed"
+            ))
+        ),
         "a conditional zero-row backlog update is an exact rollback failure"
     );
     let after_zero_row: (i64, i64, i64, String) = preparation_fault
@@ -1024,13 +1059,18 @@ where
     };
     assert_eq!(prepared, expected_preparation);
     let duplicate_result = store.prepare_p2_review_fixture(
-            &service,
-            &admission,
-            &delivery.delivery_id,
-            identity.preparation,
-        );
+        &service,
+        &admission,
+        &delivery.delivery_id,
+        identity.preparation,
+    );
     assert!(
-        matches!(duplicate_result, Err(foundry_ledger::ProductError::Invariant("P2 preparation requires exact acknowledged admission and fresh work"))),
+        matches!(
+            duplicate_result,
+            Err(foundry_ledger::ProductError::Invariant(
+                "P2 preparation requires exact acknowledged admission and fresh work"
+            ))
+        ),
         "duplicate preparation before any worker claim is rejected exactly"
     );
     let after_duplicate: (i64, i64, i64, i64, i64, i64, i64, String) = preparation
@@ -1045,7 +1085,18 @@ where
                (SELECT count(*) FROM product_review_stages_v1 WHERE order_id=?1),
                (SELECT state FROM product_work_backlog_v1 WHERE order_id=?1 AND lifecycle=?2)",
             rusqlite::params![identity.order_id, admission.lifecycle],
-            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
         )
         .unwrap();
     assert_eq!(after_duplicate, expected_preparation);

@@ -17,6 +17,9 @@
 //! reflections of what we emitted) are dropped by authenticated
 //! account id + emitted-event memory — text markers are NEVER the
 //! mechanism (spoofable). Human events always pass.
+#![allow(clippy::collapsible_if)] // W6a clippy debt: preserve explicit branch and short-circuit ordering
+#![allow(unused_variables)] // W6a clippy debt: retain names used by conditional or diagnostic configurations
+
 use foundry_domain::ports::{Intake, OrderDraft, PortError, PortResult};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;

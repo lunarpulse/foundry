@@ -4,6 +4,10 @@
 //! DieStarted 클레임) · 소진 → MaxAttempts 경로 · 매핑 불능 → 엔진 래치·
 //! 주문 상태 불변.
 
+#![allow(dead_code)] // W6a clippy debt: retain conditional helpers used by other feature and test configurations
+#![allow(unused_imports)] // W6a clippy debt: retain the existing feature and test configuration import set
+#![allow(unused_mut)] // W6a clippy debt: retain the existing mutation-ready fixture and branch structure
+
 use crate::common::{engine, file_journal, replay_event};
 use foundry_domain::OrderState;
 use foundry_domain::order::{ExternalRef, Order};

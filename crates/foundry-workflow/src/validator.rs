@@ -16,6 +16,9 @@
 //! * **StepId 계약**: v3 문서의 steps는 StepId(비어있지 않음·문서 내
 //!   유일) 필수.
 
+#![allow(clippy::doc_lazy_continuation)] // W6a clippy debt: preserve the existing API documentation text and layout
+#![allow(clippy::needless_borrows_for_generic_args)] // W6a clippy debt: preserve explicit generic-call borrow boundaries
+
 use crate::dsl::{InterpretError, PolicyLevel, WorkflowDoc, engine_registry, merkle_root};
 use foundry_domain::OrderState;
 use foundry_domain::workflow_encoding::{

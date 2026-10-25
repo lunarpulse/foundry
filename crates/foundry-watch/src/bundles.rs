@@ -16,6 +16,8 @@
 //! recomputed at every load; any byte drift = different candidate =
 //! re-examination required. Promotion tokens bind to the digest, so
 //! a token can never promote "the same name, different contents".
+#![allow(clippy::needless_borrows_for_generic_args)] // W6a clippy debt: preserve explicit generic-call borrow boundaries
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;

@@ -14,6 +14,10 @@
 //!   "fh1:" 가시 태그, 99,999,999 바이트 상한 — 구분자/길이스트림
 //!   모호성 원천 불가 (astra r4-r6 폐쇄).
 
+#![allow(clippy::collapsible_if)] // W6a clippy debt: preserve explicit branch and short-circuit ordering
+#![allow(clippy::type_complexity)] // W6a clippy debt: preserve the existing internal tuple and storage representation
+#![allow(unused_imports)] // W6a clippy debt: retain the existing feature and test configuration import set
+
 pub mod chainer;
 pub mod refusal;
 pub mod stream;

@@ -6,6 +6,11 @@
 //! is MODELLED — seven states below — and the journal commit stays
 //! independent of mirror success (append-only inviolable; the mirror is a
 //! catch-up projection, always rebuildable from the ledger).
+#![allow(clippy::explicit_counter_loop)] // W6a clippy debt: preserve the explicit mirrored-row sequence accounting
+#![allow(clippy::io_other_error)] // W6a clippy debt: preserve the existing I/O error construction path
+#![allow(clippy::manual_unwrap_or_default)] // W6a clippy debt: preserve the explicit fallback branch
+#![allow(clippy::useless_format)] // W6a clippy debt: preserve the current formatting call site and output construction
+
 use crate::sqlite::LedgerRow;
 use std::io::Write;
 use std::path::{Path, PathBuf};

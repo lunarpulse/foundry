@@ -24,6 +24,8 @@
 //!      verdict Inconclusive — not promotable,
 //!   5. routes the verdict: promotable requires guardrails clean AND
 //!      positive standard ON THE HOLDOUT and no overfit signal.
+#![allow(unused_variables)] // W6a clippy debt: retain names used by conditional or diagnostic configurations
+
 use crate::bundles::BundleStore;
 use crate::evaluation_protocol::{EvaluationProtocol, Partition};
 use crate::governance_events::{GovernanceEvent, OpKind, Phase};

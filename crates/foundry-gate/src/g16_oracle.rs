@@ -4,6 +4,9 @@
 //! — 게이트 안 순수 Rust 재현. 비교 필드: 주문 상태·시도·fence 단조성·소비.
 //! 성공/거부/회복 3경로.
 
+#![allow(dead_code)] // W6a clippy debt: retain conditional helpers used by other feature and test configurations
+#![allow(unused_imports)] // W6a clippy debt: retain the existing feature and test configuration import set
+
 use crate::common::{approval_event, engine, furnace_order};
 use foundry_domain::OrderState;
 use foundry_workflow::{ApprovalLedgerAdapter as LedgerHook, GrantRef};

@@ -1,6 +1,8 @@
 //! T32 integration: a Jira-sourced order walks the SAME state machine
 //! and journal schema as a GitHub-sourced one — the intake window is
 //! different, the factory behind it is identical.
+#![allow(unused_variables)] // W6a clippy debt: preserve this existing test/example logic, assertions, and cell sequence
+
 use foundry_domain::ports::OrderDraft;
 use foundry_domain::{Order, OrderEvent, OrderState, Source};
 use foundry_watch::jira_intake::JiraIntake;

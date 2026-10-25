@@ -15,6 +15,8 @@
 //! 매핑 테이블은 **선언적이고 결정론적**: 같은 (오류 종류, 주문 상태,
 //! 시도 상황)은 항상 같은 매핑. 매핑 자체가 저널 기록 가능한 값이다.
 
+#![allow(clippy::useless_conversion)] // W6a clippy debt: preserve explicit conversion boundaries in the failure path
+
 use crate::{EngineError, Outcome, WorkflowEngine};
 use foundry_domain::{OrderEvent, OrderState};
 

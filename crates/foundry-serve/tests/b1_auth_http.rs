@@ -459,7 +459,10 @@ async fn registered_product_approval_route_consumes_genuine_result_and_replays_e
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri(format!("/api/product/orders/{}/approve", fixture.identity.order_id))
+                .uri(format!(
+                    "/api/product/orders/{}/approve",
+                    fixture.identity.order_id
+                ))
                 .header("authorization", format!("Bearer {token}"))
                 .header("idempotency-key", "genuine-http-approval")
                 .header("content-type", "application/json")
@@ -529,8 +532,16 @@ async fn registered_product_approval_route_consumes_genuine_result_and_replays_e
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(retry_after, (1, 1, 1), "approval retry retains exactly one consumption and outcome");
-    assert_eq!(retry_after.2 - retry_before.2, 0, "approval retry adds zero publishing rows");
+    assert_eq!(
+        retry_after,
+        (1, 1, 1),
+        "approval retry retains exactly one consumption and outcome"
+    );
+    assert_eq!(
+        retry_after.2 - retry_before.2,
+        0,
+        "approval retry adds zero publishing rows"
+    );
 
     let conn = rusqlite::Connection::open(&fixture.db_path).unwrap();
     let participants: (i64, i64, i64, i64, i64) = conn.query_row(
@@ -623,8 +634,16 @@ async fn registered_product_approval_route_consumes_genuine_result_and_replays_e
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(reopen_after, (1, 1, 1), "reopened replay retains exactly one consumption and outcome");
-    assert_eq!(reopen_after.2 - reopen_before.2, 0, "reopened replay adds zero publishing rows");
+    assert_eq!(
+        reopen_after,
+        (1, 1, 1),
+        "reopened replay retains exactly one consumption and outcome"
+    );
+    assert_eq!(
+        reopen_after.2 - reopen_before.2,
+        0,
+        "reopened replay adds zero publishing rows"
+    );
     let conn = rusqlite::Connection::open(&fixture.db_path).unwrap();
     let replay_counts: (i64, i64, i64, i64, i64) = conn.query_row(
         "SELECT (SELECT count(*) FROM product_token_consumptions_v1),(SELECT count(*) FROM product_outcomes_v1),(SELECT count(*) FROM ledger WHERE to_state='publishing'),(SELECT count(*) FROM product_approval_result_bindings_v1),(SELECT count(*) FROM product_transition_receipts_v1 WHERE operation='human-approval')",

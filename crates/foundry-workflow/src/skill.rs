@@ -17,6 +17,9 @@
 //!   계층에서 journal 도구가 봉투에 있어도 advisory에는 부여되지
 //!   않는다 (구조 차단의 동적 반쪽; 정적 반쪽은 T51c DSL이 검사).
 
+#![allow(clippy::cloned_ref_to_slice_refs)] // W6a clippy debt: preserve the existing fixture expression and ownership sequence
+#![allow(clippy::needless_borrows_for_generic_args)] // W6a clippy debt: preserve explicit generic-call borrow boundaries
+
 use crate::dsl::{SkillKind, WorkflowDoc};
 
 /// 지원하는 스킬 인터페이스 버전 (계약).

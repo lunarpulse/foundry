@@ -18,6 +18,9 @@
 //!    an unclassified field fails closed, and a CandidateAffecting
 //!    FIELD makes the whole proposal CandidateAffecting (M3 route),
 //!    regardless of its outer target.
+#![allow(clippy::needless_borrows_for_generic_args)] // W6a clippy debt: preserve explicit generic-call borrow boundaries
+#![allow(unused_imports)] // W6a clippy debt: retain the existing feature and test configuration import set
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;

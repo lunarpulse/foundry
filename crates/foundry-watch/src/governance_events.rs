@@ -19,6 +19,9 @@
 //! verification reports them explicitly (M4 reports keep validating
 //! under their original schema: M4 events are all version 0/governance
 //! -free, so M4 envelope verification is unchanged by construction).
+#![allow(clippy::collapsible_if)] // W6a clippy debt: preserve explicit branch and short-circuit ordering
+#![allow(clippy::doc_lazy_continuation)] // W6a clippy debt: preserve the existing API documentation text and layout
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 

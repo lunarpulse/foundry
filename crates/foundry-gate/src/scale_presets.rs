@@ -7,6 +7,9 @@
 //!  절대 발화되지 않는다 (방화벽 스케일 무관성).
 //! 그리고 라우터가 소스 패턴으로 프리셋을 선택한다 (멀티프리셋 라우팅).
 
+#![allow(dead_code)] // W6a clippy debt: retain conditional helpers used by other feature and test configurations
+#![allow(unused_imports)] // W6a clippy debt: retain the existing feature and test configuration import set
+
 use crate::common::{actor, replay_ctx_for, terminal_commitment_from};
 use foundry_domain::order::{ExternalRef, Order};
 use foundry_domain::ports::Ledger as _;

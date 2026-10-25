@@ -476,7 +476,10 @@ fn w4_cli_reports_rejected_without_side_effects() {
     assert!(String::from_utf8_lossy(&rejected.stderr).contains(&format!(
         "external PR closed without merge: {url}; stored pending; a new approval is required to retry"
     )));
-    assert_eq!(publish_snapshot(&approved.db, &approved.operation_id), before);
+    assert_eq!(
+        publish_snapshot(&approved.db, &approved.operation_id),
+        before
+    );
     assert_eq!(publish_rows(&approved.db).0, 1);
     assert_eq!(publisher_call_count(&registry), 0);
     assert_eq!(registry_pr_count(&registry), 1);

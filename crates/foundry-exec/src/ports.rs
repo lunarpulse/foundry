@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)] // W6a clippy debt: preserve the established operation binding and call shape
+
 use crate::{
     hold::{HoldApplied, HoldCasOutcome, HoldCommand, HoldInstanceId, HoldState},
     types::{

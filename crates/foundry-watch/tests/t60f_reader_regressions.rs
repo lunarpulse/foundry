@@ -1,6 +1,8 @@
 //! T60f 회귀 (astra 5th): LedgerEvidenceReader의 실측 회귀 4종 —
 //! ①비영 재시도율 ②event_json 폴백(canonical snake_case) ③빈 접두사
 //! 거부 ④진짜 0 완료. 실 SQLite 파일 위에서.
+#![allow(clippy::needless_borrows_for_generic_args)] // W6a clippy debt: preserve this existing test/example logic, assertions, and cell sequence
+
 use foundry_watch::evidence_recompute::{EvidenceReader, LedgerEvidenceReader};
 use std::collections::BTreeMap;
 

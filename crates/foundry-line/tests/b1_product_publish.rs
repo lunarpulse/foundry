@@ -5,11 +5,9 @@ use foundry_ledger::{
     ProductApprovalReceipt, ProductCapability, ProductConfig, ProductPublishStart, ProductStore,
     ScopeMutation,
 };
-use foundry_line::{
-    product::{
-        ProductProjection, ProductPublishReconcileOutcome, ProductPublishReconciler,
-        ProductPublishResult,
-    },
+use foundry_line::product::{
+    ProductProjection, ProductPublishReconcileOutcome, ProductPublishReconciler,
+    ProductPublishResult,
 };
 use rusqlite::Connection;
 use std::path::Path;
@@ -84,7 +82,10 @@ impl Publisher for LocalPublisher {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(pending, 1, "publish-start must be committed before callback");
+        assert_eq!(
+            pending, 1,
+            "publish-start must be committed before callback"
+        );
         let race = self.interleave_settle.lock().unwrap().take();
         let outcome = if let Some((db, install, database, url)) = race {
             // Concurrent caller B settles the same external effect from a
@@ -115,10 +116,12 @@ impl Publisher for LocalPublisher {
             {
                 let mut opened = self.opened_prs.lock().unwrap();
                 let seq = opened.len() + 1;
-                opened.entry(operation_id.to_string()).or_insert_with(|| LocalPr {
-                    url: format!("https://example.invalid/pr/open-{seq}"),
-                    state: LocalPrState::Open,
-                });
+                opened
+                    .entry(operation_id.to_string())
+                    .or_insert_with(|| LocalPr {
+                        url: format!("https://example.invalid/pr/open-{seq}"),
+                        state: LocalPrState::Open,
+                    });
             }
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.outcome.lock().unwrap().take().unwrap()
@@ -319,8 +322,8 @@ fn append_publish_confirmed(
         hash: String::new(),
         event_json,
     };
-    let hash = foundry_ledger::sqlite::SqliteLedger::row_hash_at(&[row.clone()])
-        .expect("v2 row hash");
+    let hash =
+        foundry_ledger::sqlite::SqliteLedger::row_hash_at(&[row.clone()]).expect("v2 row hash");
     // Journal appends under ProductAtomicV1 require a pending transition
     // intent for the order (consumed by the AFTER INSERT trigger) — the same
     // requirement the accepted append_g05_retry_chain helper satisfies.
@@ -377,26 +380,30 @@ fn revalidation_and_capability_gate_before_any_start() {
     let mut forged = approved_fixture("u1-forged", true);
     let mut changed = forged.receipt.clone();
     changed.artifact_digest.push('x');
-    assert!(forged
-        .store
-        .begin_product_publish(
-            &forged.fixture.human_session_digest,
-            &changed,
-            forged.fixture.now,
-        )
-        .is_err());
+    assert!(
+        forged
+            .store
+            .begin_product_publish(
+                &forged.fixture.human_session_digest,
+                &changed,
+                forged.fixture.now,
+            )
+            .is_err()
+    );
     assert_eq!(publish_counts(&forged.fixture.db_path), (0, 0, 0));
     close(forged);
 
     let mut missing = approved_fixture("u1-missing-scope", false);
-    assert!(missing
-        .store
-        .begin_product_publish(
-            &missing.fixture.human_session_digest,
-            &missing.receipt,
-            missing.fixture.now,
-        )
-        .is_err());
+    assert!(
+        missing
+            .store
+            .begin_product_publish(
+                &missing.fixture.human_session_digest,
+                &missing.receipt,
+                missing.fixture.now,
+            )
+            .is_err()
+    );
     assert_eq!(publish_counts(&missing.fixture.db_path), (0, 0, 0));
     close(missing);
 
@@ -407,14 +414,16 @@ fn revalidation_and_capability_gate_before_any_start() {
     // invented identifier.
     let mut other = approved_fixture("u1-foreign-other", true);
     let mut foreign = approved_fixture("u1-foreign-order", true);
-    assert!(foreign
-        .store
-        .begin_product_publish(
-            &foreign.fixture.human_session_digest,
-            &other.receipt,
-            foreign.fixture.now,
-        )
-        .is_err());
+    assert!(
+        foreign
+            .store
+            .begin_product_publish(
+                &foreign.fixture.human_session_digest,
+                &other.receipt,
+                foreign.fixture.now,
+            )
+            .is_err()
+    );
     assert_eq!(publish_counts(&foreign.fixture.db_path), (0, 0, 0));
     close(other);
     close(foreign);
@@ -441,14 +450,16 @@ fn revalidation_and_capability_gate_before_any_start() {
             revoked.fixture.now,
         )
         .unwrap();
-    assert!(revoked
-        .store
-        .begin_product_publish(
-            &revoked.fixture.human_session_digest,
-            &revoked.receipt,
-            revoked.fixture.now,
-        )
-        .is_err());
+    assert!(
+        revoked
+            .store
+            .begin_product_publish(
+                &revoked.fixture.human_session_digest,
+                &revoked.receipt,
+                revoked.fixture.now,
+            )
+            .is_err()
+    );
     assert_eq!(publish_counts(&revoked.fixture.db_path), (0, 0, 0));
     close(revoked);
 
@@ -496,15 +507,20 @@ fn revalidation_and_capability_gate_before_any_start() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_ne!(bumped, stale.receipt.source_revision, "reconfigure must advance the source revision");
-    assert!(stale
-        .store
-        .begin_product_publish(
-            &stale.fixture.human_session_digest,
-            &stale.receipt,
-            stale.fixture.now,
-        )
-        .is_err());
+    assert_ne!(
+        bumped, stale.receipt.source_revision,
+        "reconfigure must advance the source revision"
+    );
+    assert!(
+        stale
+            .store
+            .begin_product_publish(
+                &stale.fixture.human_session_digest,
+                &stale.receipt,
+                stale.fixture.now,
+            )
+            .is_err()
+    );
     assert_eq!(publish_counts(&stale.fixture.db_path), (0, 0, 0));
     close(stale);
 
@@ -540,14 +556,16 @@ fn revalidation_and_capability_gate_before_any_start() {
             disabled.fixture.now,
         )
         .unwrap();
-    assert!(disabled
-        .store
-        .begin_product_publish(
-            &disabled.fixture.human_session_digest,
-            &disabled.receipt,
-            disabled.fixture.now,
-        )
-        .is_err());
+    assert!(
+        disabled
+            .store
+            .begin_product_publish(
+                &disabled.fixture.human_session_digest,
+                &disabled.receipt,
+                disabled.fixture.now,
+            )
+            .is_err()
+    );
     assert_eq!(publish_counts(&disabled.fixture.db_path), (0, 0, 0));
     close(disabled);
 
@@ -596,17 +614,21 @@ fn revalidation_and_capability_gate_before_any_start() {
         registry: None,
         interleave_settle: Arc::new(Mutex::new(None)),
     };
-    let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
-    assert!(runtime
-        .block_on(ProductProjection::publish_product_approved(
-            &mut queued_store,
-            &queued.human_session_digest,
-            &queued_receipt,
-            &publisher,
-            &reconciler,
-            Utc::now(),
-        ))
-        .is_err());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    assert!(
+        runtime
+            .block_on(ProductProjection::publish_product_approved(
+                &mut queued_store,
+                &queued.human_session_digest,
+                &queued_receipt,
+                &publisher,
+                &reconciler,
+                Utc::now(),
+            ))
+            .is_err()
+    );
     assert_eq!(publish_counts(&queued.db_path), (0, 0, 0));
     assert_eq!(publisher.calls.load(Ordering::SeqCst), 0);
     drop(queued_store);
@@ -622,7 +644,10 @@ fn revalidation_and_capability_gate_before_any_start() {
     // provenance or session resolution.
     let mut foreign_scope = approved_fixture("u1-foreign-scope", false);
     let second_connector = format!("{}-second", foreign_scope.fixture.identity.connector_id);
-    let second_repository = format!("{}-second-repo", foreign_scope.fixture.identity.repository_id);
+    let second_repository = format!(
+        "{}-second-repo",
+        foreign_scope.fixture.identity.repository_id
+    );
     let second_identity = foundry_ledger::RepositoryIdentity::canonicalized(
         "acme",
         "github",
@@ -682,14 +707,16 @@ fn revalidation_and_capability_gate_before_any_start() {
         .unwrap();
     // The order's own source carries NO grant for this principal: the only
     // grant genuinely issued sits on the second source.
-    assert!(foreign_scope
-        .store
-        .begin_product_publish(
-            &foreign_scope.fixture.human_session_digest,
-            &foreign_scope.receipt,
-            foreign_scope.fixture.now,
-        )
-        .is_err());
+    assert!(
+        foreign_scope
+            .store
+            .begin_product_publish(
+                &foreign_scope.fixture.human_session_digest,
+                &foreign_scope.receipt,
+                foreign_scope.fixture.now,
+            )
+            .is_err()
+    );
     assert_eq!(publish_counts(&foreign_scope.fixture.db_path), (0, 0, 0));
     close(foreign_scope);
 
@@ -728,14 +755,16 @@ fn revalidation_and_capability_gate_before_any_start() {
     assert_eq!(to_state, "shipped");
     assert!(head_after > head_before);
     assert!(head_after > advanced.receipt.sequence);
-    assert!(advanced
-        .store
-        .begin_product_publish(
-            &advanced.fixture.human_session_digest,
-            &advanced.receipt,
-            advanced.fixture.now,
-        )
-        .is_err());
+    assert!(
+        advanced
+            .store
+            .begin_product_publish(
+                &advanced.fixture.human_session_digest,
+                &advanced.receipt,
+                advanced.fixture.now,
+            )
+            .is_err()
+    );
     assert_eq!(publish_counts(&advanced.fixture.db_path), (0, 0, 0));
     close(advanced);
 }
@@ -776,7 +805,8 @@ fn start_commits_before_external_call_and_survives_crash() {
     // close (no destructor, no WAL checkpoint) — the durable pending start
     // must survive on its own.
     std::mem::forget(approved.store);
-    let mut reopened = ProductStore::open(&approved.fixture.db_path, approved.fixture.config.clone()).unwrap();
+    let mut reopened =
+        ProductStore::open(&approved.fixture.db_path, approved.fixture.config.clone()).unwrap();
     // First external attempt is lost after reaching the publisher.
     let publisher = LocalPublisher {
         db: approved.fixture.db_path.clone(),
@@ -793,7 +823,9 @@ fn start_commits_before_external_call_and_survives_crash() {
         registry: None,
         interleave_settle: Arc::new(Mutex::new(None)),
     };
-    let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
     assert_eq!(
         runtime
             .block_on(ProductProjection::publish_product_approved(
@@ -840,7 +872,11 @@ fn start_commits_before_external_call_and_survives_crash() {
     );
     assert_eq!(reconciler.calls.load(Ordering::SeqCst), 2);
     assert_eq!(publisher.calls.load(Ordering::SeqCst), 2);
-    assert_eq!(publisher.distinct_prs(), 1, "retry of the same operation must reuse its PR");
+    assert_eq!(
+        publisher.distinct_prs(),
+        1,
+        "retry of the same operation must reuse its PR"
+    );
     assert_eq!(publish_counts(&approved.fixture.db_path), (1, 0, 1));
     let url: String = Connection::open(&approved.fixture.db_path)
         .unwrap()
@@ -894,7 +930,9 @@ fn response_loss_unknown_keeps_pending_and_reconciles() {
         registry: None,
         interleave_settle: Arc::new(Mutex::new(None)),
     };
-    let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
     assert_eq!(
         runtime
             .block_on(ProductProjection::publish_product_approved(
@@ -931,7 +969,11 @@ fn response_loss_unknown_keeps_pending_and_reconciles() {
             operation_id: approved.receipt.operation_id.clone()
         }
     );
-    assert_eq!(publisher.calls.load(Ordering::SeqCst), 1, "Unknown reconciliation must not re-execute");
+    assert_eq!(
+        publisher.calls.load(Ordering::SeqCst),
+        1,
+        "Unknown reconciliation must not re-execute"
+    );
     assert_eq!(publish_counts(&approved.fixture.db_path), (1, 1, 0));
     // Reconciliation later observing the confirmed effect settles and returns
     // it without any further publisher invocation.
@@ -977,28 +1019,42 @@ fn confirmed_is_never_reexecuted() {
         registry: None,
         interleave_settle: Arc::new(Mutex::new(None)),
     };
-    let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
-    assert!(runtime
-        .block_on(ProductProjection::publish_product_approved(
-            &mut approved.store,
-            &approved.fixture.human_session_digest,
-            &approved.receipt,
-            &publisher,
-            &reconciler,
-            approved.fixture.now,
-        ))
-        .is_ok());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    assert!(
+        runtime
+            .block_on(ProductProjection::publish_product_approved(
+                &mut approved.store,
+                &approved.fixture.human_session_digest,
+                &approved.receipt,
+                &publisher,
+                &reconciler,
+                approved.fixture.now,
+            ))
+            .is_ok()
+    );
     assert_eq!(publisher.calls.load(Ordering::SeqCst), 1);
     // Concurrent same-URL settlement is idempotent success; a DIFFERENT URL
     // for the confirmed operation is rejected.
-    assert!(approved
-        .store
-        .settle_product_publish(&approved.receipt.operation_id, "https://example.invalid/pr/4")
-        .is_ok());
-    assert!(approved
-        .store
-        .settle_product_publish(&approved.receipt.operation_id, "https://example.invalid/pr/other")
-        .is_err());
+    assert!(
+        approved
+            .store
+            .settle_product_publish(
+                &approved.receipt.operation_id,
+                "https://example.invalid/pr/4"
+            )
+            .is_ok()
+    );
+    assert!(
+        approved
+            .store
+            .settle_product_publish(
+                &approved.receipt.operation_id,
+                "https://example.invalid/pr/other"
+            )
+            .is_err()
+    );
     assert!(Connection::open(&approved.fixture.db_path)
         .unwrap()
         .execute(
@@ -1006,13 +1062,15 @@ fn confirmed_is_never_reexecuted() {
             [&approved.receipt.operation_id],
         )
         .is_err());
-    assert!(Connection::open(&approved.fixture.db_path)
-        .unwrap()
-        .execute(
-            "DELETE FROM product_publish_outcomes_v1 WHERE operation_id=?1",
-            [&approved.receipt.operation_id],
-        )
-        .is_err());
+    assert!(
+        Connection::open(&approved.fixture.db_path)
+            .unwrap()
+            .execute(
+                "DELETE FROM product_publish_outcomes_v1 WHERE operation_id=?1",
+                [&approved.receipt.operation_id],
+            )
+            .is_err()
+    );
     assert_eq!(
         runtime
             .block_on(ProductProjection::publish_product_approved(
@@ -1169,13 +1227,19 @@ fn existing_pr_reconciles_confirmed() {
     let mut approved = approved_fixture("w1-existing-pr", true);
     start_pending_publish(&mut approved);
     let publisher = local_publisher(&approved);
-    let url = format!("https://example.invalid/pr/{}", approved.receipt.operation_id);
+    let url = format!(
+        "https://example.invalid/pr/{}",
+        approved.receipt.operation_id
+    );
     publisher.register_pr(&approved.receipt.operation_id, &url, LocalPrState::Open);
     let registry = publisher.opened_prs.clone();
     let registry_before = registry.lock().unwrap().clone();
-    let receipt_json = stored_publish_row(&approved.fixture.db_path, &approved.receipt.operation_id).1;
+    let receipt_json =
+        stored_publish_row(&approved.fixture.db_path, &approved.receipt.operation_id).1;
     let reconciler = reconcile_with_registry(registry.clone());
-    let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
 
     assert_eq!(
         runtime
@@ -1191,7 +1255,10 @@ fn existing_pr_reconciles_confirmed() {
         PublishOutcome::Confirmed { pr_url: url }
     );
     assert_eq!(publish_counts(&approved.fixture.db_path), (1, 0, 1));
-    assert_eq!(stored_publish_row(&approved.fixture.db_path, &approved.receipt.operation_id).1, receipt_json);
+    assert_eq!(
+        stored_publish_row(&approved.fixture.db_path, &approved.receipt.operation_id).1,
+        receipt_json
+    );
     assert_eq!(*registry.lock().unwrap(), registry_before);
     assert_eq!(publisher.calls.load(Ordering::SeqCst), 0);
     assert_eq!(publisher.distinct_prs(), 1);
@@ -1205,7 +1272,10 @@ fn closed_merged_reconciles_confirmed() {
     let mut approved = approved_fixture("w2-closed-merged", true);
     start_pending_publish(&mut approved);
     let publisher = local_publisher(&approved);
-    let url = format!("https://example.invalid/pr/{}", approved.receipt.operation_id);
+    let url = format!(
+        "https://example.invalid/pr/{}",
+        approved.receipt.operation_id
+    );
     publisher.register_pr(
         &approved.receipt.operation_id,
         &url,
@@ -1213,9 +1283,12 @@ fn closed_merged_reconciles_confirmed() {
     );
     let registry = publisher.opened_prs.clone();
     let registry_before = registry.lock().unwrap().clone();
-    let receipt_json = stored_publish_row(&approved.fixture.db_path, &approved.receipt.operation_id).1;
+    let receipt_json =
+        stored_publish_row(&approved.fixture.db_path, &approved.receipt.operation_id).1;
     let reconciler = reconcile_with_registry(registry.clone());
-    let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
 
     assert_eq!(
         runtime
@@ -1231,7 +1304,10 @@ fn closed_merged_reconciles_confirmed() {
         PublishOutcome::Confirmed { pr_url: url }
     );
     assert_eq!(publish_counts(&approved.fixture.db_path), (1, 0, 1));
-    assert_eq!(stored_publish_row(&approved.fixture.db_path, &approved.receipt.operation_id).1, receipt_json);
+    assert_eq!(
+        stored_publish_row(&approved.fixture.db_path, &approved.receipt.operation_id).1,
+        receipt_json
+    );
     assert_eq!(*registry.lock().unwrap(), registry_before);
     assert_eq!(publisher.calls.load(Ordering::SeqCst), 0);
     assert_eq!(publisher.distinct_prs(), 1);
@@ -1246,7 +1322,10 @@ fn closed_unmerged_rejected_keeps_pending() {
     let mut approved = approved_fixture("w3-closed-unmerged", true);
     start_pending_publish(&mut approved);
     let publisher = local_publisher(&approved);
-    let url = format!("https://example.invalid/pr/{}", approved.receipt.operation_id);
+    let url = format!(
+        "https://example.invalid/pr/{}",
+        approved.receipt.operation_id
+    );
     publisher.register_pr(
         &approved.receipt.operation_id,
         &url,
@@ -1256,7 +1335,9 @@ fn closed_unmerged_rejected_keeps_pending() {
     let registry_before = registry.lock().unwrap().clone();
     let row_before = stored_publish_row(&approved.fixture.db_path, &approved.receipt.operation_id);
     let reconciler = reconcile_with_registry(registry.clone());
-    let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
     let expected = ProductPublishResult::Rejected { pr_url: url };
 
     for _ in 0..2 {
@@ -1273,7 +1354,10 @@ fn closed_unmerged_rejected_keeps_pending() {
                 .unwrap(),
             expected
         );
-        assert_eq!(stored_publish_row(&approved.fixture.db_path, &approved.receipt.operation_id), row_before);
+        assert_eq!(
+            stored_publish_row(&approved.fixture.db_path, &approved.receipt.operation_id),
+            row_before
+        );
         assert_eq!(publish_counts(&approved.fixture.db_path), (1, 1, 0));
         assert_eq!(*registry.lock().unwrap(), registry_before);
         assert_eq!(publisher.calls.load(Ordering::SeqCst), 0);
@@ -1282,7 +1366,6 @@ fn closed_unmerged_rejected_keeps_pending() {
     assert_eq!(reconciler.calls.load(Ordering::SeqCst), 2);
     close(approved);
 }
-
 
 /// Child role for the SIGKILL crash cell. Runs ONLY when the orchestrator
 /// spawns this test binary with the B1_PUBLISH_CRASH_* environment armed;
@@ -1329,12 +1412,21 @@ fn crash_between_start_and_external_call_survives_sigkill() {
     let config = approved.fixture.config.clone();
     drop(approved.store);
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "u2_crash_child", "--nocapture", "--test-threads", "1"])
+        .args([
+            "--exact",
+            "u2_crash_child",
+            "--nocapture",
+            "--test-threads",
+            "1",
+        ])
         .env("B1_PUBLISH_CRASH_DB", &db_path)
         .env("B1_PUBLISH_CRASH_INSTALL", &config.installation_id)
         .env("B1_PUBLISH_CRASH_DATABASE", &config.database_id)
         .env("B1_PUBLISH_CRASH_RECEIPT", &receipt_json)
-        .env("B1_PUBLISH_CRASH_SESSION", &approved.fixture.human_session_digest)
+        .env(
+            "B1_PUBLISH_CRASH_SESSION",
+            &approved.fixture.human_session_digest,
+        )
         .env("B1_PUBLISH_CRASH_AT", approved.fixture.now.to_rfc3339())
         .stdout(std::process::Stdio::null())
         .spawn()
@@ -1372,7 +1464,9 @@ fn crash_between_start_and_external_call_survives_sigkill() {
         registry: None,
         interleave_settle: Arc::new(Mutex::new(None)),
     };
-    let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
     assert_eq!(
         runtime
             .block_on(ProductProjection::publish_product_approved(
@@ -1436,7 +1530,9 @@ fn fence_observes_concurrent_settle_during_reconcile() {
             pr_url: "https://example.invalid/pr/must-not-open".into(),
         })),
     };
-    let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
     assert_eq!(
         runtime
             .block_on(ProductProjection::publish_product_approved(
@@ -1451,7 +1547,11 @@ fn fence_observes_concurrent_settle_during_reconcile() {
         PublishOutcome::Confirmed { pr_url: race_url }
     );
     assert_eq!(reconciler.calls.load(Ordering::SeqCst), 1);
-    assert_eq!(publisher.calls.load(Ordering::SeqCst), 0, "fence must short-circuit");
+    assert_eq!(
+        publisher.calls.load(Ordering::SeqCst),
+        0,
+        "fence must short-circuit"
+    );
     assert_eq!(publisher.distinct_prs(), 0);
     assert_eq!(publish_counts(&approved.fixture.db_path), (1, 0, 1));
     close(approved);
@@ -1483,7 +1583,9 @@ fn concurrent_settle_during_publisher_call_is_idempotent() {
         registry: None,
         interleave_settle: Arc::new(Mutex::new(None)),
     };
-    let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
     assert_eq!(
         runtime
             .block_on(ProductProjection::publish_product_approved(

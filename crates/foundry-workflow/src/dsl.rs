@@ -17,6 +17,9 @@
 //! v1+v2 해석기를 모두 품고 있으므로 v1 문서는 v1 해석기로 **동일하게**
 //! 재생된다 — 결과(엣지 집합·digest)가 v1 엔진 시절과 바이트 동일.
 
+#![allow(clippy::needless_borrow)] // W6a clippy debt: preserve explicit borrow boundaries at established APIs
+#![allow(clippy::needless_borrows_for_generic_args)] // W6a clippy debt: preserve explicit generic-call borrow boundaries
+
 use foundry_domain::workflow_encoding::EmbeddedWorkflow;
 use serde::{Deserialize, Serialize};
 

@@ -25,6 +25,8 @@
 //! Sealing emits T49a governance events (LessonSeal / LessonRevoke
 //! intent+effect), so the whole lesson lifecycle rides the crash-safe
 //! commit protocol.
+#![allow(clippy::collapsible_if)] // W6a clippy debt: preserve explicit branch and short-circuit ordering
+
 use crate::governance_events::{GovernanceEvent, OpKind, Phase};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};

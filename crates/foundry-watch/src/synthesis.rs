@@ -25,6 +25,9 @@
 //!   governance (T49a): CandidateSynthesize rides the intent/effect
 //!                    commit protocol — crash mid-synthesis leaves a
 //!                    detectable pending intent.
+#![allow(clippy::needless_borrows_for_generic_args)] // W6a clippy debt: preserve explicit generic-call borrow boundaries
+#![allow(unused_imports)] // W6a clippy debt: retain the existing feature and test configuration import set
+
 use crate::budget_accounting::{Amount, BudgetError, BudgetEvent, BudgetLedger};
 use crate::bundles::{BundleProfile, BundleStore, CandidateBundle, DependencyPins, LessonSnapshot};
 use crate::evaluation_protocol::{EvaluationProtocol, Partition};

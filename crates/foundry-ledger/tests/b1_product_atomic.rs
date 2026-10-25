@@ -1,3 +1,5 @@
+#![allow(clippy::cloned_ref_to_slice_refs)] // W6a clippy debt: preserve this existing test/example logic, assertions, and cell sequence
+
 use foundry_domain::ports::Ledger;
 use foundry_domain::{ActorId, ActorKind, OrderEvent, OrderState};
 use foundry_exec::{

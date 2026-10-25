@@ -5,6 +5,8 @@
 //! ServeState, 실 라우터, 실 요청으로 재현한다. foundry-watch의
 //! 게이트 관례(m51_gate.rs)와 동일한 정신, serve 크레이트에 거주
 //! (HTTP 라우터 검증 때문 — 순환 의존 회피, T53w 선례).
+#![allow(clippy::await_holding_lock)] // W6a clippy debt: preserve this existing test/example logic, assertions, and cell sequence
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use foundry_serve::ServeState;

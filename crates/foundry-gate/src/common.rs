@@ -1,5 +1,9 @@
 //! 게이트 공용 픽스처 — 엔진·원장·저널·주문·컨텍스트 팩토리.
 
+#![allow(deprecated)] // W6a clippy debt: preserve the pinned tempfile behavior in the existing fixture
+#![allow(clippy::filter_next)] // W6a clippy debt: preserve the existing reverse-search iterator behavior
+#![allow(unused_variables)] // W6a clippy debt: retain names used by conditional or diagnostic configurations
+
 use foundry_domain::OrderState;
 use foundry_domain::order::{ExternalRef, Order, OrderEvent};
 use foundry_domain::ports::{ActorId, ActorKind};

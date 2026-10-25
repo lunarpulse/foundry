@@ -19,6 +19,11 @@
 //!
 //! Fail-closed admission: a scope with no explicit limit covering it
 //! is not admissible at all.
+#![allow(clippy::collapsible_if)] // W6a clippy debt: preserve explicit branch and short-circuit ordering
+#![allow(clippy::for_kv_map)] // W6a clippy debt: preserve the current map iteration binding shape
+#![allow(clippy::should_implement_trait)] // W6a clippy debt: preserve the domain-specific checked arithmetic contract
+#![allow(clippy::unwrap_or_default)] // W6a clippy debt: preserve the existing default insertion behavior
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 

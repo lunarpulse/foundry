@@ -2,6 +2,8 @@
 //! blocking worker: both the connector acknowledgement and ProductStore use
 //! blocking I/O, and the owned client must also be dropped there.
 
+#![allow(clippy::question_mark)] // W6a clippy debt: preserve the explicit early-return path
+
 use chrono::{DateTime, Utc};
 use foundry_ledger::{AdmissionReceipt, ProductDelivery, ProductError, ProductStore};
 use thiserror::Error;

@@ -1,3 +1,5 @@
+#![allow(clippy::large_enum_variant)] // W6a clippy debt: preserve the existing public enum representation and matching behavior
+
 use crate::{
     emit::{EmitLog, EmitOutcome, EmitSink, complete_after_w4, emit_once},
     host::{GenerationCommit, HoldState, HostError, HostResult},

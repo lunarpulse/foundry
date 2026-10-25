@@ -1,6 +1,8 @@
 //! 프리셋 배포 핀 — bmad-intake-pool.v3.json 의 sha256 상수 동결.
 //! 배포 자산 바이트 변조 감지 (T55 MINOR 이관, T56 게이트).
 
+#![allow(dead_code)] // W6a clippy debt: retain conditional helpers used by other feature and test configurations
+
 use sha2::Digest;
 
 /// 배포 시점 실측 지문 — 프리셋 파일이 이 값을 벗어나면 게이트 실패.

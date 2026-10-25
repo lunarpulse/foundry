@@ -895,7 +895,9 @@ async fn g_final_result_metadata_and_artifact_routes_check_source_and_stored_evi
         std::sync::Arc::new(FixtureClock(fixture.now)),
     )
     .unwrap();
-    http_store.configure_product_artifact_root(&fixture.artifact_root).unwrap();
+    http_store
+        .configure_product_artifact_root(&fixture.artifact_root)
+        .unwrap();
     let state = foundry_serve::auth_http::ProductHttpState::new(http_store);
     let app = foundry_serve::http::product_router(state.clone());
     let bearer = std::fs::read_to_string(&fixture.human_session_bearer_path).unwrap();
@@ -911,7 +913,10 @@ async fn g_final_result_metadata_and_artifact_routes_check_source_and_stored_evi
         .await
         .unwrap();
     assert_eq!(metadata.status(), StatusCode::OK);
-    assert_eq!(metadata.headers()[axum::http::header::CACHE_CONTROL], "no-store");
+    assert_eq!(
+        metadata.headers()[axum::http::header::CACHE_CONTROL],
+        "no-store"
+    );
     let metadata_bytes = to_bytes(metadata.into_body(), 1024 * 1024).await.unwrap();
     let metadata_json: serde_json::Value = serde_json::from_slice(&metadata_bytes).unwrap();
     assert_eq!(metadata_json["result_id"], result_id);
@@ -924,10 +929,16 @@ async fn g_final_result_metadata_and_artifact_routes_check_source_and_stored_evi
         .await
         .unwrap();
     assert_eq!(artifact.status(), StatusCode::OK);
-    assert_eq!(artifact.headers()[axum::http::header::CACHE_CONTROL], "no-store");
+    assert_eq!(
+        artifact.headers()[axum::http::header::CACHE_CONTROL],
+        "no-store"
+    );
     assert_eq!(artifact.headers()["x-foundry-result-id"], result_id);
     assert_eq!(artifact.headers()["x-foundry-artifact-id"], artifact_id);
-    assert_eq!(artifact.headers()["x-foundry-tuple-digest"], info.tuple_digest);
+    assert_eq!(
+        artifact.headers()["x-foundry-tuple-digest"],
+        info.tuple_digest
+    );
     let original_bytes = to_bytes(artifact.into_body(), 1024 * 1024)
         .await
         .unwrap()
@@ -946,7 +957,11 @@ async fn g_final_result_metadata_and_artifact_routes_check_source_and_stored_evi
             StatusCode::NOT_FOUND,
         ),
         (
-            format!("/api/product/orders/{}/results/{}", fixture.identity.order_id, "f".repeat(64)),
+            format!(
+                "/api/product/orders/{}/results/{}",
+                fixture.identity.order_id,
+                "f".repeat(64)
+            ),
             StatusCode::NOT_FOUND,
         ),
         (
@@ -1012,10 +1027,8 @@ async fn g_final_result_metadata_and_artifact_routes_check_source_and_stored_evi
             &fixture.owner_session_digest,
             "new-source-only-reader",
             "approver",
-            &foundry_ledger::product_identity::ProductPasswordKdf::hash(
-                "new-source-only-password",
-            )
-            .unwrap(),
+            &foundry_ledger::product_identity::ProductPasswordKdf::hash("new-source-only-password")
+                .unwrap(),
             fixture.now,
         )
         .unwrap();
@@ -1032,7 +1045,11 @@ async fn g_final_result_metadata_and_artifact_routes_check_source_and_stored_evi
         )
         .unwrap();
     let new_reader = authority
-        .login("new-source-only-reader", "new-source-only-password", fixture.now)
+        .login(
+            "new-source-only-reader",
+            "new-source-only-password",
+            fixture.now,
+        )
         .unwrap()
         .bearer()
         .to_owned();
@@ -1074,7 +1091,9 @@ async fn g_final_result_metadata_and_artifact_routes_check_source_and_stored_evi
         .unwrap();
     assert_eq!(new_source_metadata.status(), StatusCode::NOT_FOUND);
     assert_eq!(
-        to_bytes(new_source_metadata.into_body(), 1024).await.unwrap(),
+        to_bytes(new_source_metadata.into_body(), 1024)
+            .await
+            .unwrap(),
         foreign_metadata_body,
         "new-source-only metadata reader gets the same 404 body as a foreign order"
     );
@@ -1090,23 +1109,25 @@ async fn g_final_result_metadata_and_artifact_routes_check_source_and_stored_evi
 
     // A real missing artifact-root capability is service unavailable, not an
     // empty successful response or a path-bearing diagnostic.
-    let unavailable_app = foundry_serve::http::product_router(
-        foundry_serve::auth_http::ProductHttpState::new(
+    let unavailable_app =
+        foundry_serve::http::product_router(foundry_serve::auth_http::ProductHttpState::new(
             ProductStore::open_with_clock(
                 &fixture.db_path,
                 fixture.config.clone(),
                 std::sync::Arc::new(FixtureClock(fixture.now)),
             )
             .unwrap(),
-        ),
-    );
+        ));
     let unavailable = unavailable_app
         .oneshot(app_request("GET", &artifact_path, Some(&bearer)))
         .await
         .unwrap();
     assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
     let unavailable_body = to_bytes(unavailable.into_body(), 1024).await.unwrap();
-    assert!(!String::from_utf8_lossy(&unavailable_body).contains(fixture.root.to_string_lossy().as_ref()));
+    assert!(
+        !String::from_utf8_lossy(&unavailable_body)
+            .contains(fixture.root.to_string_lossy().as_ref())
+    );
 
     #[cfg(unix)]
     {
@@ -1122,8 +1143,13 @@ async fn g_final_result_metadata_and_artifact_routes_check_source_and_stored_evi
             )
             .unwrap();
         let outside = fixture.root.join("replacement-artifact-root");
-        std::fs::create_dir_all(outside.join(std::path::Path::new(&relative).parent().unwrap())).unwrap();
-        std::fs::write(outside.join(&relative), b"outside-root-secret-must-not-leak").unwrap();
+        std::fs::create_dir_all(outside.join(std::path::Path::new(&relative).parent().unwrap()))
+            .unwrap();
+        std::fs::write(
+            outside.join(&relative),
+            b"outside-root-secret-must-not-leak",
+        )
+        .unwrap();
         std::fs::rename(&artifact_root, &displaced_root).unwrap();
         symlink(&outside, &artifact_root).unwrap();
         let replacement = app
@@ -1132,8 +1158,14 @@ async fn g_final_result_metadata_and_artifact_routes_check_source_and_stored_evi
             .await
             .unwrap();
         if replacement.status() == StatusCode::OK {
-            let bytes = to_bytes(replacement.into_body(), 1024 * 1024).await.unwrap();
-            assert_eq!(bytes.as_ref(), original_bytes.as_slice(), "root replacement must keep the pinned root");
+            let bytes = to_bytes(replacement.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            assert_eq!(
+                bytes.as_ref(),
+                original_bytes.as_slice(),
+                "root replacement must keep the pinned root"
+            );
         } else {
             assert_eq!(replacement.status(), StatusCode::NOT_FOUND);
             let body = to_bytes(replacement.into_body(), 1024).await.unwrap();
@@ -1148,7 +1180,10 @@ async fn g_final_result_metadata_and_artifact_routes_check_source_and_stored_evi
             .unwrap();
         assert_eq!(restored.status(), StatusCode::OK);
         assert_eq!(
-            to_bytes(restored.into_body(), 1024 * 1024).await.unwrap().as_ref(),
+            to_bytes(restored.into_body(), 1024 * 1024)
+                .await
+                .unwrap()
+                .as_ref(),
             original_bytes.as_slice()
         );
     }
@@ -1156,7 +1191,8 @@ async fn g_final_result_metadata_and_artifact_routes_check_source_and_stored_evi
     // Each DB corruption starts from a successful metadata and byte baseline,
     // is rejected by both result routes, and is restored before the next cell.
     let conn = rusqlite::Connection::open(&fixture.db_path).unwrap();
-    conn.execute("DROP TRIGGER product_tuples_no_update", []).unwrap();
+    conn.execute("DROP TRIGGER product_tuples_no_update", [])
+        .unwrap();
     let binding: (String, String, String, i64, i64, i64) = conn
         .query_row(
             "SELECT binding_digest,tuple_digest,host_result_digest,attempt,run_id,generation FROM product_result_bindings_v1 WHERE result_id=?1",
@@ -1180,23 +1216,75 @@ async fn g_final_result_metadata_and_artifact_routes_check_source_and_stored_evi
         .unwrap();
     drop(conn);
     let assert_clean = async || {
-        let metadata = app.clone().oneshot(app_request("GET", &metadata_path, Some(&bearer))).await.unwrap();
-        assert_eq!(metadata.status(), StatusCode::OK, "restored metadata baseline");
-        let artifact = app.clone().oneshot(app_request("GET", &artifact_path, Some(&bearer))).await.unwrap();
-        assert_eq!(artifact.status(), StatusCode::OK, "restored artifact baseline");
-        assert_eq!(to_bytes(artifact.into_body(), 1024 * 1024).await.unwrap().as_ref(), original_bytes.as_slice());
+        let metadata = app
+            .clone()
+            .oneshot(app_request("GET", &metadata_path, Some(&bearer)))
+            .await
+            .unwrap();
+        assert_eq!(
+            metadata.status(),
+            StatusCode::OK,
+            "restored metadata baseline"
+        );
+        let artifact = app
+            .clone()
+            .oneshot(app_request("GET", &artifact_path, Some(&bearer)))
+            .await
+            .unwrap();
+        assert_eq!(
+            artifact.status(),
+            StatusCode::OK,
+            "restored artifact baseline"
+        );
+        assert_eq!(
+            to_bytes(artifact.into_body(), 1024 * 1024)
+                .await
+                .unwrap()
+                .as_ref(),
+            original_bytes.as_slice()
+        );
     };
     let assert_corrupt = async |label: &str| {
-        let metadata = app.clone().oneshot(app_request("GET", &metadata_path, Some(&bearer))).await.unwrap();
-        assert_eq!(metadata.status(), StatusCode::NOT_FOUND, "{label} metadata corruption");
+        let metadata = app
+            .clone()
+            .oneshot(app_request("GET", &metadata_path, Some(&bearer)))
+            .await
+            .unwrap();
+        assert_eq!(
+            metadata.status(),
+            StatusCode::NOT_FOUND,
+            "{label} metadata corruption"
+        );
         let metadata_body = to_bytes(metadata.into_body(), 1024).await.unwrap();
-        let artifact = app.clone().oneshot(app_request("GET", &artifact_path, Some(&bearer))).await.unwrap();
-        assert_eq!(artifact.status(), StatusCode::NOT_FOUND, "{label} artifact corruption");
+        let artifact = app
+            .clone()
+            .oneshot(app_request("GET", &artifact_path, Some(&bearer)))
+            .await
+            .unwrap();
+        assert_eq!(
+            artifact.status(),
+            StatusCode::NOT_FOUND,
+            "{label} artifact corruption"
+        );
         let body = to_bytes(artifact.into_body(), 1024).await.unwrap();
-        assert!(!original_bytes.starts_with(body.as_ref()), "no artifact prefix is returned on {label}");
-        let foreign = app.clone().oneshot(app_request("GET", &metadata_path, Some(&new_reader))).await.unwrap();
-        assert_eq!(foreign.status(), StatusCode::NOT_FOUND, "unauthorized plus {label} remains uniform");
-        assert_eq!(to_bytes(foreign.into_body(), 1024).await.unwrap(), metadata_body);
+        assert!(
+            !original_bytes.starts_with(body.as_ref()),
+            "no artifact prefix is returned on {label}"
+        );
+        let foreign = app
+            .clone()
+            .oneshot(app_request("GET", &metadata_path, Some(&new_reader)))
+            .await
+            .unwrap();
+        assert_eq!(
+            foreign.status(),
+            StatusCode::NOT_FOUND,
+            "unauthorized plus {label} remains uniform"
+        );
+        assert_eq!(
+            to_bytes(foreign.into_body(), 1024).await.unwrap(),
+            metadata_body
+        );
     };
 
     // The genuine fixture has no accepted hold. Keep this census explicit so
@@ -1226,17 +1314,45 @@ async fn g_final_result_metadata_and_artifact_routes_check_source_and_stored_evi
         assert_clean().await;
         let conn = rusqlite::Connection::open(&fixture.db_path).unwrap();
         if label == "tuple" {
-            assert_eq!(conn.execute(sql, rusqlite::params![fixture.identity.order_id,binding.3,binding.4,binding.5]).unwrap(), 1);
+            assert_eq!(
+                conn.execute(
+                    sql,
+                    rusqlite::params![fixture.identity.order_id, binding.3, binding.4, binding.5]
+                )
+                .unwrap(),
+                1
+            );
         } else {
-            assert_eq!(conn.execute(sql, rusqlite::params![fixture.identity.order_id,binding.3,binding.4]).unwrap(), 1);
+            assert_eq!(
+                conn.execute(
+                    sql,
+                    rusqlite::params![fixture.identity.order_id, binding.3, binding.4]
+                )
+                .unwrap(),
+                1
+            );
         }
         drop(conn);
         assert_corrupt(label).await;
         let conn = rusqlite::Connection::open(&fixture.db_path).unwrap();
         if label == "tuple" {
-            conn.execute(restore_sql, rusqlite::params![tuple.0,fixture.identity.order_id,binding.3,binding.4,binding.5]).unwrap();
+            conn.execute(
+                restore_sql,
+                rusqlite::params![
+                    tuple.0,
+                    fixture.identity.order_id,
+                    binding.3,
+                    binding.4,
+                    binding.5
+                ],
+            )
+            .unwrap();
         } else {
-            conn.execute(restore_sql, rusqlite::params![host_json,fixture.identity.order_id,binding.3,binding.4]).unwrap();
+            conn.execute(
+                restore_sql,
+                rusqlite::params![host_json, fixture.identity.order_id, binding.3, binding.4],
+            )
+            .unwrap();
         }
         drop(conn);
     }
@@ -1245,12 +1361,24 @@ async fn g_final_result_metadata_and_artifact_routes_check_source_and_stored_evi
     // Binding corruption uses the real immutable-result row after disabling
     // only its test DB trigger, then restores the exact original digest.
     let conn = rusqlite::Connection::open(&fixture.db_path).unwrap();
-    conn.execute("DROP TRIGGER product_result_bindings_no_update", []).unwrap();
-    assert_eq!(conn.execute("UPDATE product_result_bindings_v1 SET binding_digest=?1 WHERE result_id=?2", rusqlite::params!["0".repeat(64), result_id]).unwrap(), 1);
+    conn.execute("DROP TRIGGER product_result_bindings_no_update", [])
+        .unwrap();
+    assert_eq!(
+        conn.execute(
+            "UPDATE product_result_bindings_v1 SET binding_digest=?1 WHERE result_id=?2",
+            rusqlite::params!["0".repeat(64), result_id]
+        )
+        .unwrap(),
+        1
+    );
     drop(conn);
     assert_corrupt("binding").await;
     let conn = rusqlite::Connection::open(&fixture.db_path).unwrap();
-    conn.execute("UPDATE product_result_bindings_v1 SET binding_digest=?1 WHERE result_id=?2", rusqlite::params![binding.0, result_id]).unwrap();
+    conn.execute(
+        "UPDATE product_result_bindings_v1 SET binding_digest=?1 WHERE result_id=?2",
+        rusqlite::params![binding.0, result_id],
+    )
+    .unwrap();
     drop(conn);
     assert_clean().await;
 
@@ -1270,38 +1398,75 @@ async fn g_final_result_metadata_and_artifact_routes_check_source_and_stored_evi
         .oneshot(app_request("GET", &artifact_path, Some(&bearer)))
         .await
         .unwrap();
-    assert_eq!(bad_bytes.status(), StatusCode::NOT_FOUND, "file-byte mutation");
+    assert_eq!(
+        bad_bytes.status(),
+        StatusCode::NOT_FOUND,
+        "file-byte mutation"
+    );
     let bad_bytes_body = to_bytes(bad_bytes.into_body(), 1024).await.unwrap();
-    assert!(!original_bytes.starts_with(bad_bytes_body.as_ref()), "file-byte rejection contains no artifact prefix");
+    assert!(
+        !original_bytes.starts_with(bad_bytes_body.as_ref()),
+        "file-byte rejection contains no artifact prefix"
+    );
     let bad_metadata = app
         .clone()
         .oneshot(app_request("GET", &metadata_path, Some(&bearer)))
         .await
         .unwrap();
-    assert_eq!(bad_metadata.status(), StatusCode::NOT_FOUND, "file-byte mutation metadata");
+    assert_eq!(
+        bad_metadata.status(),
+        StatusCode::NOT_FOUND,
+        "file-byte mutation metadata"
+    );
     let bad_metadata_body = to_bytes(bad_metadata.into_body(), 1024).await.unwrap();
-    assert!(!original_bytes.starts_with(bad_metadata_body.as_ref()), "file-byte metadata rejection contains no artifact prefix");
+    assert!(
+        !original_bytes.starts_with(bad_metadata_body.as_ref()),
+        "file-byte metadata rejection contains no artifact prefix"
+    );
     let foreign_bad_artifact = app
         .clone()
         .oneshot(app_request("GET", &artifact_path, Some(&new_reader)))
         .await
         .unwrap();
-    assert_eq!(foreign_bad_artifact.status(), StatusCode::NOT_FOUND, "foreign reader file-byte response");
-    let foreign_bad_artifact_body = to_bytes(foreign_bad_artifact.into_body(), 1024).await.unwrap();
-    assert!(!original_bytes.starts_with(foreign_bad_artifact_body.as_ref()), "foreign response contains no artifact prefix");
-    assert_eq!(bad_bytes_body, foreign_bad_artifact_body, "file-byte corruption and foreign reader artifact responses are uniform");
+    assert_eq!(
+        foreign_bad_artifact.status(),
+        StatusCode::NOT_FOUND,
+        "foreign reader file-byte response"
+    );
+    let foreign_bad_artifact_body = to_bytes(foreign_bad_artifact.into_body(), 1024)
+        .await
+        .unwrap();
+    assert!(
+        !original_bytes.starts_with(foreign_bad_artifact_body.as_ref()),
+        "foreign response contains no artifact prefix"
+    );
+    assert_eq!(
+        bad_bytes_body, foreign_bad_artifact_body,
+        "file-byte corruption and foreign reader artifact responses are uniform"
+    );
     let foreign_bad_metadata = app
         .clone()
         .oneshot(app_request("GET", &metadata_path, Some(&new_reader)))
         .await
         .unwrap();
-    assert_eq!(foreign_bad_metadata.status(), StatusCode::NOT_FOUND, "foreign reader file-byte metadata response");
-    assert_eq!(bad_metadata_body, to_bytes(foreign_bad_metadata.into_body(), 1024).await.unwrap(), "file-byte corruption and foreign reader metadata responses are uniform");
+    assert_eq!(
+        foreign_bad_metadata.status(),
+        StatusCode::NOT_FOUND,
+        "foreign reader file-byte metadata response"
+    );
+    assert_eq!(
+        bad_metadata_body,
+        to_bytes(foreign_bad_metadata.into_body(), 1024)
+            .await
+            .unwrap(),
+        "file-byte corruption and foreign reader metadata responses are uniform"
+    );
     std::fs::write(&artifact_file, &original_bytes).unwrap();
     assert_clean().await;
 
     let conn = rusqlite::Connection::open(&fixture.db_path).unwrap();
-    conn.execute("DROP TRIGGER product_artifact_no_update", []).unwrap();
+    conn.execute("DROP TRIGGER product_artifact_no_update", [])
+        .unwrap();
     drop(conn);
     for (label, sql, restore_sql, changed) in [
         (
@@ -1325,7 +1490,11 @@ async fn g_final_result_metadata_and_artifact_routes_check_source_and_stored_evi
     ] {
         assert_clean().await;
         let conn = rusqlite::Connection::open(&fixture.db_path).unwrap();
-        assert_eq!(conn.execute(sql, rusqlite::params![changed, artifact_id]).unwrap(), 1);
+        assert_eq!(
+            conn.execute(sql, rusqlite::params![changed, artifact_id])
+                .unwrap(),
+            1
+        );
         drop(conn);
         assert_corrupt(label).await;
         let conn = rusqlite::Connection::open(&fixture.db_path).unwrap();
@@ -1334,7 +1503,8 @@ async fn g_final_result_metadata_and_artifact_routes_check_source_and_stored_evi
             "artifact provenance" => &artifact_row.2,
             _ => &artifact_row.0,
         };
-        conn.execute(restore_sql, rusqlite::params![baseline, artifact_id]).unwrap();
+        conn.execute(restore_sql, rusqlite::params![baseline, artifact_id])
+            .unwrap();
         drop(conn);
         assert_clean().await;
     }
@@ -1358,26 +1528,45 @@ async fn g_final_result_metadata_and_artifact_routes_check_source_and_stored_evi
                     .oneshot(app_request("GET", &artifact_path, Some(&bearer)))
                     .await
                     .unwrap();
-                assert_eq!(response.status(), StatusCode::NOT_FOUND, "FIFO artifact leaf fails closed");
+                assert_eq!(
+                    response.status(),
+                    StatusCode::NOT_FOUND,
+                    "FIFO artifact leaf fails closed"
+                );
                 let body = to_bytes(response.into_body(), 1024).await.unwrap();
-                assert!(!original_bytes.starts_with(body.as_ref()), "FIFO response contains no artifact prefix");
+                assert!(
+                    !original_bytes.starts_with(body.as_ref()),
+                    "FIFO response contains no artifact prefix"
+                );
                 std::fs::remove_file(&leaf).unwrap();
                 std::fs::write(&leaf, &original_bytes).unwrap();
                 assert_clean().await;
             }
             Ok(status) => {
-                assert!(!leaf.exists(), "denied FIFO creation leaves no test artifact ({status})");
+                assert!(
+                    !leaf.exists(),
+                    "denied FIFO creation leaves no test artifact ({status})"
+                );
                 let response = app
                     .clone()
                     .oneshot(app_request("GET", &artifact_path, Some(&bearer)))
                     .await
                     .unwrap();
-                assert_eq!(response.status(), StatusCode::NOT_FOUND, "denied FIFO artifact leaf fails closed");
+                assert_eq!(
+                    response.status(),
+                    StatusCode::NOT_FOUND,
+                    "denied FIFO artifact leaf fails closed"
+                );
                 let body = to_bytes(response.into_body(), 1024).await.unwrap();
-                assert!(!original_bytes.starts_with(body.as_ref()), "denied FIFO response contains no artifact prefix");
+                assert!(
+                    !original_bytes.starts_with(body.as_ref()),
+                    "denied FIFO response contains no artifact prefix"
+                );
                 std::fs::write(&leaf, &original_bytes).unwrap();
                 assert_clean().await;
-                eprintln!("sandbox/platform denied FIFO creation ({status}); PT-10 FIFO vector requires parent rerun");
+                eprintln!(
+                    "sandbox/platform denied FIFO creation ({status}); PT-10 FIFO vector requires parent rerun"
+                );
             }
             Err(error) => {
                 assert!(!leaf.exists(), "unavailable mkfifo leaves no test artifact");
@@ -1386,9 +1575,16 @@ async fn g_final_result_metadata_and_artifact_routes_check_source_and_stored_evi
                     .oneshot(app_request("GET", &artifact_path, Some(&bearer)))
                     .await
                     .unwrap();
-                assert_eq!(response.status(), StatusCode::NOT_FOUND, "unavailable FIFO artifact leaf fails closed");
+                assert_eq!(
+                    response.status(),
+                    StatusCode::NOT_FOUND,
+                    "unavailable FIFO artifact leaf fails closed"
+                );
                 let body = to_bytes(response.into_body(), 1024).await.unwrap();
-                assert!(!original_bytes.starts_with(body.as_ref()), "unavailable FIFO response contains no artifact prefix");
+                assert!(
+                    !original_bytes.starts_with(body.as_ref()),
+                    "unavailable FIFO response contains no artifact prefix"
+                );
                 std::fs::write(&leaf, &original_bytes).unwrap();
                 assert_clean().await;
                 eprintln!("mkfifo unavailable ({error}); PT-10 FIFO vector requires parent rerun");
@@ -1397,7 +1593,12 @@ async fn g_final_result_metadata_and_artifact_routes_check_source_and_stored_evi
 
         std::fs::remove_file(&leaf).unwrap();
         let device = std::process::Command::new("mknod")
-            .args([leaf.as_os_str(), std::ffi::OsStr::new("c"), std::ffi::OsStr::new("1"), std::ffi::OsStr::new("3")])
+            .args([
+                leaf.as_os_str(),
+                std::ffi::OsStr::new("c"),
+                std::ffi::OsStr::new("1"),
+                std::ffi::OsStr::new("3"),
+            ])
             .status();
         match device {
             Ok(status) if status.success() => {
@@ -1406,26 +1607,45 @@ async fn g_final_result_metadata_and_artifact_routes_check_source_and_stored_evi
                     .oneshot(app_request("GET", &artifact_path, Some(&bearer)))
                     .await
                     .unwrap();
-                assert_eq!(response.status(), StatusCode::NOT_FOUND, "device artifact leaf fails closed");
+                assert_eq!(
+                    response.status(),
+                    StatusCode::NOT_FOUND,
+                    "device artifact leaf fails closed"
+                );
                 let body = to_bytes(response.into_body(), 1024).await.unwrap();
-                assert!(!original_bytes.starts_with(body.as_ref()), "device response contains no artifact prefix");
+                assert!(
+                    !original_bytes.starts_with(body.as_ref()),
+                    "device response contains no artifact prefix"
+                );
                 std::fs::remove_file(&leaf).unwrap();
                 std::fs::write(&leaf, &original_bytes).unwrap();
                 assert_clean().await;
             }
             Ok(status) => {
-                assert!(!leaf.exists(), "failed device creation leaves no test artifact");
+                assert!(
+                    !leaf.exists(),
+                    "failed device creation leaves no test artifact"
+                );
                 let response = app
                     .clone()
                     .oneshot(app_request("GET", &artifact_path, Some(&bearer)))
                     .await
                     .unwrap();
-                assert_eq!(response.status(), StatusCode::NOT_FOUND, "denied device artifact leaf fails closed");
+                assert_eq!(
+                    response.status(),
+                    StatusCode::NOT_FOUND,
+                    "denied device artifact leaf fails closed"
+                );
                 let body = to_bytes(response.into_body(), 1024).await.unwrap();
-                assert!(!original_bytes.starts_with(body.as_ref()), "denied device response contains no artifact prefix");
+                assert!(
+                    !original_bytes.starts_with(body.as_ref()),
+                    "denied device response contains no artifact prefix"
+                );
                 std::fs::write(&leaf, &original_bytes).unwrap();
                 assert_clean().await;
-                eprintln!("sandbox/platform denied character-device creation ({status}); PT-10 device vector requires parent rerun");
+                eprintln!(
+                    "sandbox/platform denied character-device creation ({status}); PT-10 device vector requires parent rerun"
+                );
             }
             Err(error) => {
                 assert!(!leaf.exists(), "unavailable mknod leaves no test artifact");
@@ -1434,9 +1654,16 @@ async fn g_final_result_metadata_and_artifact_routes_check_source_and_stored_evi
                     .oneshot(app_request("GET", &artifact_path, Some(&bearer)))
                     .await
                     .unwrap();
-                assert_eq!(response.status(), StatusCode::NOT_FOUND, "unavailable device artifact leaf fails closed");
+                assert_eq!(
+                    response.status(),
+                    StatusCode::NOT_FOUND,
+                    "unavailable device artifact leaf fails closed"
+                );
                 let body = to_bytes(response.into_body(), 1024).await.unwrap();
-                assert!(!original_bytes.starts_with(body.as_ref()), "unavailable device response contains no artifact prefix");
+                assert!(
+                    !original_bytes.starts_with(body.as_ref()),
+                    "unavailable device response contains no artifact prefix"
+                );
                 std::fs::write(&leaf, &original_bytes).unwrap();
                 assert_clean().await;
                 eprintln!("mknod unavailable ({error}); PT-10 device vector requires parent rerun");
@@ -1449,7 +1676,11 @@ async fn g_final_result_metadata_and_artifact_routes_check_source_and_stored_evi
     // transition. Host invocation counters remain at the producer baseline.
     let publish_rows: i64 = rusqlite::Connection::open(&fixture.db_path)
         .unwrap()
-        .query_row("SELECT count(*) FROM ledger WHERE to_state='publishing'", [], |row| row.get(0))
+        .query_row(
+            "SELECT count(*) FROM ledger WHERE to_state='publishing'",
+            [],
+            |row| row.get(0),
+        )
         .unwrap();
     assert_eq!(publish_rows, 0);
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 4);
@@ -1475,7 +1706,10 @@ async fn g_final_result_metadata_and_artifact_routes_check_source_and_stored_evi
             .unwrap();
         if replaced_ancestor.status() == StatusCode::OK {
             assert_eq!(
-                to_bytes(replaced_ancestor.into_body(), 1024 * 1024).await.unwrap().as_ref(),
+                to_bytes(replaced_ancestor.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap()
+                    .as_ref(),
                 original_bytes.as_slice(),
                 "ancestor replacement remains bound to original directory handles"
             );
@@ -1491,9 +1725,16 @@ async fn g_final_result_metadata_and_artifact_routes_check_source_and_stored_evi
             .oneshot(app_request("GET", &artifact_path, Some(&bearer)))
             .await
             .unwrap();
-        assert_eq!(restored_ancestor.status(), StatusCode::OK, "restored original root serves artifact");
         assert_eq!(
-            to_bytes(restored_ancestor.into_body(), 1024 * 1024).await.unwrap().as_ref(),
+            restored_ancestor.status(),
+            StatusCode::OK,
+            "restored original root serves artifact"
+        );
+        assert_eq!(
+            to_bytes(restored_ancestor.into_body(), 1024 * 1024)
+                .await
+                .unwrap()
+                .as_ref(),
             original_bytes.as_slice()
         );
         assert_clean().await;
@@ -1503,12 +1744,17 @@ async fn g_final_result_metadata_and_artifact_routes_check_source_and_stored_evi
 #[cfg(feature = "p2-test-support")]
 #[tokio::test]
 async fn product_result_read_and_approval_routes_use_a_real_loopback_socket_when_available() {
-    use product_result_fixture::{FixtureClock, FixtureIdentity, genuine_host_done, genuine_result_finalized};
+    use product_result_fixture::{
+        FixtureClock, FixtureIdentity, genuine_host_done, genuine_result_finalized,
+    };
     use std::net::SocketAddr;
     use tokio::net::TcpListener;
 
     let identity = FixtureIdentity::new(
-        ProductConfig { installation_id: "socket-install".into(), database_id: "socket-db".into() },
+        ProductConfig {
+            installation_id: "socket-install".into(),
+            database_id: "socket-db".into(),
+        },
         "socket-source",
         "socket-order",
     );
@@ -1519,21 +1765,45 @@ async fn product_result_read_and_approval_routes_use_a_real_loopback_socket_when
         &fixture.db_path,
         fixture.config.clone(),
         std::sync::Arc::new(FixtureClock(fixture.now)),
-    ).unwrap();
-    store.configure_product_artifact_root(&fixture.artifact_root).unwrap();
-    let result_id: String = rusqlite::Connection::open(&fixture.db_path).unwrap().query_row(
-        "SELECT result_id FROM product_result_bindings_v1 WHERE order_id=?1", [&fixture.identity.order_id], |row| row.get(0)
-    ).unwrap();
-    let payload_json: String = rusqlite::Connection::open(&fixture.db_path).unwrap().query_row(
-        "SELECT payload_json FROM product_result_bindings_v1 WHERE result_id=?1", [&result_id], |row| row.get(0)
-    ).unwrap();
-    let artifact_id = serde_json::from_str::<serde_json::Value>(&payload_json).unwrap()["final_artifact_id"]
-        .as_str().unwrap().to_owned();
-    let app = foundry_serve::http::product_router(foundry_serve::auth_http::ProductHttpState::new(store));
+    )
+    .unwrap();
+    store
+        .configure_product_artifact_root(&fixture.artifact_root)
+        .unwrap();
+    let result_id: String = rusqlite::Connection::open(&fixture.db_path)
+        .unwrap()
+        .query_row(
+            "SELECT result_id FROM product_result_bindings_v1 WHERE order_id=?1",
+            [&fixture.identity.order_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let payload_json: String = rusqlite::Connection::open(&fixture.db_path)
+        .unwrap()
+        .query_row(
+            "SELECT payload_json FROM product_result_bindings_v1 WHERE result_id=?1",
+            [&result_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let artifact_id =
+        serde_json::from_str::<serde_json::Value>(&payload_json).unwrap()["final_artifact_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+    let app =
+        foundry_serve::http::product_router(foundry_serve::auth_http::ProductHttpState::new(store));
     let listener = match TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await {
         Ok(listener) => listener,
-        Err(error) if matches!(error.kind(), std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::AddrNotAvailable) => {
-            eprintln!("sandbox blocked real loopback bind; C lane is unreachable here and must be rerun by the parent: {error}");
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::AddrNotAvailable
+            ) =>
+        {
+            eprintln!(
+                "sandbox blocked real loopback bind; C lane is unreachable here and must be rerun by the parent: {error}"
+            );
             return;
         }
         Err(error) => panic!("unexpected loopback bind failure: {error}"),
@@ -1553,13 +1823,18 @@ async fn product_result_read_and_approval_routes_use_a_real_loopback_socket_when
     assert_eq!(login_status, 200);
     let login_json: serde_json::Value = serde_json::from_slice(&login_bytes).unwrap();
     let bearer = login_json["access_token"].as_str().unwrap();
-    let metadata_path = format!("/api/product/orders/{}/results/{result_id}", fixture.identity.order_id);
-    let (metadata_status, metadata_bytes) = loopback_request(address, "GET", &metadata_path, Some(bearer), &[]).await;
+    let metadata_path = format!(
+        "/api/product/orders/{}/results/{result_id}",
+        fixture.identity.order_id
+    );
+    let (metadata_status, metadata_bytes) =
+        loopback_request(address, "GET", &metadata_path, Some(bearer), &[]).await;
     assert_eq!(metadata_status, 200);
     let metadata_json: serde_json::Value = serde_json::from_slice(&metadata_bytes).unwrap();
     assert_eq!(metadata_json["result_id"], result_id);
     let artifact_path = format!("{metadata_path}/artifacts/{artifact_id}");
-    let (artifact_status, bytes) = loopback_request(address, "GET", &artifact_path, Some(bearer), &[]).await;
+    let (artifact_status, bytes) =
+        loopback_request(address, "GET", &artifact_path, Some(bearer), &[]).await;
     assert_eq!(artifact_status, 200);
     assert!(!bytes.is_empty());
     let (no_auth_status, _) = loopback_request(address, "GET", &metadata_path, None, &[]).await;
@@ -1569,8 +1844,11 @@ async fn product_result_read_and_approval_routes_use_a_real_loopback_socket_when
         "POST",
         "/api/product/approval-grants",
         Some(bearer),
-        serde_json::json!({"order_id":fixture.identity.order_id}).to_string().as_bytes(),
-    ).await;
+        serde_json::json!({"order_id":fixture.identity.order_id})
+            .to_string()
+            .as_bytes(),
+    )
+    .await;
     assert_eq!(grant_status, 201);
     let grant_json: serde_json::Value = serde_json::from_slice(&grant_bytes).unwrap();
     let approval = serde_json::json!({
@@ -1582,13 +1860,37 @@ async fn product_result_read_and_approval_routes_use_a_real_loopback_socket_when
     });
     let approve_path = format!("/api/product/orders/{}/approve", fixture.identity.order_id);
     let approval_body = approval.to_string();
-    let (approved_status, approved_bytes) = loopback_request(address, "POST", &approve_path, Some(bearer), approval_body.as_bytes()).await;
+    let (approved_status, approved_bytes) = loopback_request(
+        address,
+        "POST",
+        &approve_path,
+        Some(bearer),
+        approval_body.as_bytes(),
+    )
+    .await;
     assert_eq!(approved_status, 200);
-    let (retry_status, retry_bytes) = loopback_request(address, "POST", &approve_path, Some(bearer), approval_body.as_bytes()).await;
+    let (retry_status, retry_bytes) = loopback_request(
+        address,
+        "POST",
+        &approve_path,
+        Some(bearer),
+        approval_body.as_bytes(),
+    )
+    .await;
     assert_eq!(retry_status, 200);
-    assert_eq!(retry_bytes, approved_bytes, "socket retry replays the exact response");
+    assert_eq!(
+        retry_bytes, approved_bytes,
+        "socket retry replays the exact response"
+    );
     let failed_body = serde_json::json!({"grant_id":"missing","grant_token":"missing","expected_source_revision":99,"expected_attempt":1,"run_id":1,"generation":0,"artifact_digest":"0".repeat(40),"tuple_digest":"0".repeat(64),"intent":"must refuse"}).to_string();
-    let (failed_status, _) = loopback_request(address, "POST", &approve_path, Some(bearer), failed_body.as_bytes()).await;
+    let (failed_status, _) = loopback_request(
+        address,
+        "POST",
+        &approve_path,
+        Some(bearer),
+        failed_body.as_bytes(),
+    )
+    .await;
     assert!(matches!(failed_status, 400 | 403 | 404 | 409));
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 4);
     assert_eq!(fixture.restores.load(Ordering::SeqCst), 0);
@@ -1601,7 +1903,9 @@ async fn product_result_read_and_approval_routes_use_a_real_loopback_socket_when
         std::sync::Arc::new(FixtureClock(fixture.now)),
     )
     .unwrap();
-    reopened.configure_product_artifact_root(&fixture.artifact_root).unwrap();
+    reopened
+        .configure_product_artifact_root(&fixture.artifact_root)
+        .unwrap();
     let reopened_app = foundry_serve::http::product_router(
         foundry_serve::auth_http::ProductHttpState::new(reopened),
     );
@@ -1609,7 +1913,8 @@ async fn product_result_read_and_approval_routes_use_a_real_loopback_socket_when
         .await
         .expect("loopback bind was available earlier in this C lane");
     let reopened_address = reopened_listener.local_addr().unwrap();
-    let reopened_server = tokio::spawn(async move { axum::serve(reopened_listener, reopened_app).await });
+    let reopened_server =
+        tokio::spawn(async move { axum::serve(reopened_listener, reopened_app).await });
     let (reopen_status, reopen_bytes) = loopback_request(
         reopened_address,
         "POST",
@@ -1619,7 +1924,10 @@ async fn product_result_read_and_approval_routes_use_a_real_loopback_socket_when
     )
     .await;
     assert_eq!(reopen_status, 200);
-    assert_eq!(reopen_bytes, approved_bytes, "reopened socket retries the exact response");
+    assert_eq!(
+        reopen_bytes, approved_bytes,
+        "reopened socket retries the exact response"
+    );
     reopened_server.abort();
     let _ = reopened_server.await;
 }

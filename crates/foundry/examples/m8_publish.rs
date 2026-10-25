@@ -14,6 +14,8 @@
 //! 재실행은 런 접미사(o-141-r2)로 새 주문, 불확실 후 재시도는 원격
 //! 재판정 선행(SHA·base·이력), 머지는 인간 소유.
 
+#![allow(unused_mut)] // W6a clippy debt: preserve this existing test/example logic, assertions, and cell sequence
+
 use std::path::{Path, PathBuf};
 
 use foundry_domain::order::{ExternalRef, Order, Source};

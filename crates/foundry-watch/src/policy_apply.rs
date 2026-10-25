@@ -18,6 +18,10 @@
 //! and scored on schedule; proposer track records update via the
 //! FROZEN weight rule (T48a derive_weights) — repeated misses
 //! degrade a proposer's standing, repeated hits raise it.
+#![allow(clippy::needless_borrows_for_generic_args)] // W6a clippy debt: preserve explicit generic-call borrow boundaries
+#![allow(clippy::unnecessary_get_then_check)] // W6a clippy debt: preserve the existing map lookup expression
+#![allow(unused_imports)] // W6a clippy debt: retain the existing feature and test configuration import set
+
 use crate::evaluation_protocol::{PolicyClass, PolicyGraph, derive_weights};
 use crate::governance_events::{GovernanceEvent, OpKind, Phase, verify_stream};
 use crate::retro::{InsightPipeline, Prediction, ProposalStrength};

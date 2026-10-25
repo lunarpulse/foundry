@@ -12,6 +12,8 @@
 //! Skipped (with an explicit printed reason) only when the Docker
 //! daemon is absent — a skip never counts as pass; the M5 gate reads
 //! this test's JSON verdict, not its exit code alone.
+#![allow(clippy::redundant_pattern_matching)] // W6a clippy debt: preserve this existing test/example logic, assertions, and cell sequence
+
 use std::process::Command;
 
 fn docker(args: &[&str]) -> Result<String, String> {

@@ -17,6 +17,8 @@
 //! The line is rehydrated from the journal on ServeState::new (same
 //! defect-#7 recovery the CLI uses), so a restarted serve can still
 //! approve orders recorded by watch.
+#![allow(clippy::collapsible_if)] // W6a clippy debt: preserve explicit branch and short-circuit ordering
+
 use crate::ServeState;
 use axum::Json;
 use axum::extract::{Path, State};
