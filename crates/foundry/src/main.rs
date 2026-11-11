@@ -17,6 +17,10 @@
 use clap::{Parser, Subcommand};
 
 mod deploy_profile;
+#[cfg(feature = "a01-harness-support")]
+pub(crate) mod a01_harness_live;
+#[cfg(feature = "a01-harness-support")]
+pub(crate) mod a01_real_git_producer;
 use foundry_domain::ports::{
     ApprovalToken, Decision, DieOutput, Gate, Harness, Policy, PortResult, PublishOutcome,
     Publisher,
@@ -42,6 +46,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Isolated A01 real GitHub/Die path with a fresh private store.
+    #[cfg(feature = "a01-harness-support")]
+    A01HarnessLive(a01_harness_live::LiveArgs),
     /// M4 T34: deployment profile — check boundary, emit systemd units/readme
     DeployProfile {
         /// run the on-host boundary + permission check
@@ -2022,6 +2029,11 @@ fn notify_event_order_id(e: &foundry_domain::ports::NotifyEvent) -> &str {
 async fn main() {
     let cli = Cli::parse();
     let code = match cli.cmd {
+        #[cfg(feature = "a01-harness-support")]
+        Cmd::A01HarnessLive(args) => match tokio::task::spawn_blocking(move || a01_harness_live::run(args)).await {
+            Ok(Ok(())) => { println!("A01 live passed and finalized; evidence retained"); 0 },
+            _ => { eprintln!("A01 live stopped; inspect retained evidence locally"); 2 },
+        },
         Cmd::DeployProfile {
             check,
             units,

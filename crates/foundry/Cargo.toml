@@ -22,6 +22,11 @@ required-features = ["p2-test-support"]
 name = "b1_publish_cli_default"
 path = "tests/b1_publish_cli_default.rs"
 
+[[test]]
+name = "b2_a01_harness_live"
+path = "tests/b2_a01_harness_live.rs"
+required-features = ["a01-harness-support"]
+
 [dependencies]
 futures = "0.3"
 sha2 = "0.10"

@@ -11181,6 +11181,57 @@ pub fn create_a01_task_claim_test_store(
         pub fn authorize_a01_task(&mut self, session_digest: &str, context: &ProductServiceContext, request: &A01AuthorizeTaskRequest) -> Result<A01TaskReceipt,ProductError> {
             authorize(self,session_digest,context,request,&mut TaskHooks::default())
         }
+        /// Read-only construction from a unique, acked, durable intake receipt.
+        /// Bridge permission must already have been issued independently.
+        pub fn prepare_a01_authorization_request(
+            &mut self, session_digest: &str, context: &ProductServiceContext,
+            receipts: &[AdmissionReceipt], stable_issue_id: &str,
+            bridge_permission: &A01BridgePermissionRef, request_key: &str,
+            expires_at_ns: i64,
+        ) -> Result<A01AuthorizeTaskRequest,ProductError> {
+            if !self.open_mode.is_a01_task() { return Err(ProductError::ContractMismatch); }
+            validate_key(request_key,0)?;
+            if !text(stable_issue_id,256) { return Err(ProductError::InvalidConfig); }
+            let tx = self.conn.unchecked_transaction()?;
+            let now = clock_ns(self.clock.now())?;
+            let principal = session(&tx,session_digest,now)?;
+            let service = authority(&tx,context,now)?;
+            permission(&tx,bridge_permission,&principal.actor_id,&context.source_instance_id)?;
+            let mut selected: Option<AdmissionReceipt> = None;
+            for receipt in receipts {
+                let row: Option<(String,String,String,String)> = tx.query_row(
+                    "SELECT i.issue_id,i.repository_id,p.source_instance_id,i.connector_id FROM product_orders_v1 o JOIN product_work_backlog_v1 b ON b.order_id=o.order_id AND b.lifecycle=o.lifecycle JOIN product_intake_inbox_v1 i USING(delivery_id) JOIN product_scope_order_provenance_v1 p ON p.order_id=o.order_id AND p.lifecycle=o.lifecycle WHERE o.order_id=?1 AND o.lifecycle=?2 AND o.admission_seq=?3 AND o.admission_hash=?4 AND i.state='acked' AND p.verified=1 AND p.admission_seq=o.admission_seq AND p.admission_hash=o.admission_hash",
+                    params![receipt.order_id,receipt.lifecycle,receipt.sequence,receipt.event_hash],
+                    |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional().map_err(stored_error)?;
+                let (issue,repo,source,connector) = row.ok_or_else(||evidence("A01 selection foreign receipt"))?;
+                if issue==stable_issue_id && repo==context.repository_id && source==context.source_instance_id && connector==context.connector_id {
+                    if selected.as_ref().is_some_and(|prior|prior!=receipt) { return Err(evidence("A01 selection ambiguous")); }
+                    selected=Some(receipt.clone());
+                }
+            }
+            let receipt=selected.ok_or_else(||evidence("A01 selection missing"))?;
+            let view=require_order_capability_in(&tx,&principal,&receipt.order_id,ProductCapability::ReadOrder,true).map_err(scope_error)?;
+            let (delivery_id,raw_kind,raw_payload_digest):(String,String,String)=tx.query_row(
+                "SELECT b.delivery_id,o.task_kind,d.payload_digest FROM product_orders_v1 o JOIN product_work_backlog_v1 b ON b.order_id=o.order_id AND b.lifecycle=o.lifecycle JOIN product_order_payload_digests_v1 d USING(order_id) WHERE o.order_id=?1 AND o.lifecycle=?2",
+                params![receipt.order_id,receipt.lifecycle],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(stored_error)?;
+            let provider:String=tx.query_row("SELECT provider FROM product_scope_repositories_v1 WHERE repository_key=?1",[&view.repository_key],|r|r.get(0)).map_err(stored_error)?;
+            let admission=A01TaskAdmissionExpectation {
+                store:A01TaskStoreRef{installation_id:self.installation_id.clone(),database_id:self.database_id.clone()},
+                order_id:receipt.order_id,lifecycle:receipt.lifecycle,delivery_id,admission_seq:receipt.sequence,admission_hash:receipt.event_hash,
+                raw_kind,raw_payload_digest,source_instance_id:context.source_instance_id.clone(),source_generation:context.source_generation,
+                source_instance_revision:context.source_instance_revision,connector_id:context.connector_id.clone(),connector_revision:context.connector_revision,
+                repository_key:view.repository_key,repository_provider:provider,api_origin:context.api_origin.clone(),stable_repository_id:context.repository_id.clone(),
+                api_owner:context.api_owner.clone(),api_repo:context.api_repo.clone(),
+            };
+            validate_admission(&admission)?;
+            admission_check_for_request(&tx,&admission)?;
+            let request=A01AuthorizeTaskRequest{bridge_permission:bridge_permission.clone(),request_key:request_key.into(),expected_revision:0,
+                admission,owner:A01TaskOwnerExpectation{account_revision:principal.authority_revision,scope_revision:view.scope_revision,read_order_grant_revision:view.grant_revision},
+                service,expires_at_ns};
+            if expires_at_ns<=now { return Err(ProductError::InvalidConfig); }
+            tx.commit()?;
+            Ok(request)
+        }
         pub fn revoke_a01_task(&mut self, session_digest: &str, request: &A01RevokeTaskRequest) -> Result<A01TaskReceipt,ProductError> {
             revoke(self,session_digest,request,&mut TaskHooks::default())
         }
@@ -11209,6 +11260,12 @@ pub fn create_a01_task_claim_test_store(
             })();
             finish(tx,result,&mut TaskHooks::default())
         }
+    }
+    fn admission_check_for_request(tx: &rusqlite::Transaction<'_>, a: &A01TaskAdmissionExpectation) -> Result<(),ProductError> {
+        let (_,state,attempts)=admission(tx,a)?;
+        if state!="waiting_unsupported" || attempts!=0 { return Err(ineligible()); }
+        queued(tx,&a.order_id)?;
+        no_execution(tx,a)
     }
     pub(super) fn authorize(store: &mut ProductStore, key: &str, context: &ProductServiceContext, request: &A01AuthorizeTaskRequest, hooks: &mut TaskHooks<'_>) -> Result<A01TaskReceipt,ProductError> {
         if !store.open_mode.is_a01_task() { return Err(ProductError::ContractMismatch); }
@@ -11414,6 +11471,116 @@ pub fn create_a01_task_claim_test_store(
         pub sequence: i64,
         pub event_hash: String,
     }
+
+    const REAL_PREFIX: &str = "foundry-a01-real-output/v1\n";
+    #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct A01RealManifest {
+        pub order_id: String,
+        pub attempt: u32,
+        pub task: String,
+        pub profile: String,
+        pub base: String,
+        pub fix_context: bool,
+        pub context: Vec<String>,
+    }
+    #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct A01RealEvidence {
+        pub manifest_sha256: String,
+        pub die_output_sha256: String,
+        pub process_log_sha256: String,
+        pub session_record_sha256: String,
+        pub exit_code: i32,
+    }
+    #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct A01RealOutput {
+        pub version: u32,
+        pub kind: String,
+        pub task_digest: String,
+        pub task_receipt_sha256: String,
+        pub reservation_sha256: String,
+        pub base_commit: String,
+        pub result_commit: String,
+        pub manifest: A01RealManifest,
+        pub evidence: A01RealEvidence,
+    }
+    pub fn a01_real_reservation_sha256(r: &A01ProducerReservation) -> Result<String, ProductError> {
+        bound_digest("foundry-a01-real-reservation-v1", r)
+    }
+    pub fn a01_real_task_receipt_sha256(r: &A01TaskReceipt) -> Result<String, ProductError> {
+        bound_digest("foundry-a01-real-task-receipt-v1", r)
+    }
+    fn bound_digest<T: Serialize>(domain: &str, value: &T) -> Result<String, ProductError> {
+        let bytes = canonical(value)?;
+        let json = std::str::from_utf8(&bytes).map_err(|_| evidence("A01 real JSON invalid"))?;
+        Ok(crate::product_scope::framed_hash(domain, &[json]))
+    }
+    pub fn a01_real_inputs(r: &A01ProducerReservation) -> Result<std::collections::BTreeMap<String,String>, ProductError> {
+        if r.task.task_kind != TASK_KIND || r.task.task_bytes != TASK_BYTES || r.task.task_digest != task_digest() {
+            return Err(evidence("A01 real fixed task mismatch"));
+        }
+        Ok([
+            ("action", "create-a01-proof-v1".to_owned()),
+            ("proof_path", ".foundry/a01-proof.txt".to_owned()),
+            ("task_kind", r.task.task_kind.clone()),
+            ("task_utf8", String::from_utf8(r.task.task_bytes.clone()).map_err(|_| evidence("A01 real task UTF-8 invalid"))?),
+            ("task_digest", r.task.task_digest.clone()),
+            ("reservation_sha256", a01_real_reservation_sha256(r)?),
+        ].into_iter().map(|(k,v)|(k.to_owned(),v)).collect())
+    }
+    pub fn a01_real_manifest(r: &A01ProducerReservation, base: &str) -> Result<A01RealManifest, ProductError> {
+        if !git_oid(base) { return Err(evidence("A01 real base invalid")); }
+        Ok(A01RealManifest {
+            order_id: format!("a01p-{}", a01_real_reservation_sha256(r)?), attempt: 0,
+            task: "producer:a01-fixed-v1".into(), profile: "coding".into(), base: base.into(), fix_context: false,
+            context: a01_real_inputs(r)?.iter().map(|(k,v)|format!("{k}={v}")).collect(),
+        })
+    }
+    fn git_oid(value: &str) -> bool {
+        matches!(value.len(),40|64) && value.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }
+    fn validate_real(r: &A01ProducerReservation, o: &A01RealOutput) -> Result<(),ProductError> {
+        if o.version != 1 || o.kind != "real-git" || o.task_digest != r.task.task_digest
+            || o.task_receipt_sha256 != a01_real_task_receipt_sha256(&r.task)?
+            || o.reservation_sha256 != a01_real_reservation_sha256(r)?
+            || !git_oid(&o.base_commit) || !git_oid(&o.result_commit)
+            || o.base_commit.len() != o.result_commit.len() || o.base_commit == o.result_commit
+            || o.manifest != a01_real_manifest(r, &o.base_commit)? || o.evidence.exit_code != 0
+            || [&o.evidence.manifest_sha256, &o.evidence.die_output_sha256, &o.evidence.process_log_sha256,
+                &o.evidence.session_record_sha256].iter().any(|s| !digest(s)) {
+            return Err(evidence("A01 real output binding invalid"));
+        }
+        Ok(())
+    }
+    pub fn encode_a01_real_output(r: &A01ProducerReservation, o: &A01RealOutput) -> Result<String,ProductError> {
+        validate_real(r,o)?;
+        let bytes = canonical(o)?;
+        let json = std::str::from_utf8(&bytes).map_err(|_| evidence("A01 real output UTF-8 invalid"))?;
+        let output = format!("{REAL_PREFIX}{json}");
+        output_bounds(&output)?;
+        Ok(output)
+    }
+    fn output_bounds(output: &str) -> Result<(),ProductError> {
+        if output.is_empty() || output.len()>4096 || output.as_bytes().contains(&0) { return Err(ProductError::InvalidConfig); }
+        Ok(())
+    }
+    /// Validates canonical bytes and reservation bindings, not physical execution.
+    pub fn decode_a01_real_output(r: &A01ProducerReservation, output: &str) -> Result<A01RealOutput,ProductError> {
+        output_bounds(output)?;
+        let json = output.strip_prefix(REAL_PREFIX).ok_or_else(||evidence("A01 real output framing invalid"))?;
+        let value: A01RealOutput = decode(json.as_bytes())?;
+        validate_real(r,&value)?;
+        Ok(value)
+    }
+    fn output_commits(r: &A01ProducerReservation, output: &str) -> Result<(String,String),ProductError> {
+        output_bounds(output)?;
+        if output.starts_with("foundry-a01-real-output/") {
+            let value = decode_a01_real_output(r,output)?;
+            Ok((value.base_commit,value.result_commit))
+        } else { Ok(commits(r,output)) }
+    }
     #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     pub struct A01AcceptedProducerOutput {
@@ -11496,7 +11663,7 @@ pub fn create_a01_task_claim_test_store(
             live(&tx,&reservation.task,&reservation.claim,service,claim,now)?;
             let current=replayed(&tx,&claim.order_id)?;
             if current.last_seq!=reservation.sequence || current.order.state().to_string()!="working" {return Err(ineligible().into());}
-            let (base_commit,result_commit)=commits(reservation,output);
+            let (base_commit,result_commit)=output_commits(reservation,output)?;
             let intent=foundry_exec::ExecutionIntent{order:foundry_exec::OrderId(claim.order_id.clone()),attempt:foundry_exec::Attempt(reservation.attempt),run:foundry_exec::RunId(reservation.run),activation:reservation.activation,generation:foundry_exec::Generation(0),epoch:foundry_exec::Epoch(reservation.claim.epoch as u64),external_ref:format!("review:{}:{}:{}..{}",claim.order_id,reservation.attempt,base_commit,result_commit),recorded_at:datetime(now)?};
             let original=ProducerOutput{kind:"a01-producer-output-v1".into(),task:reservation.task.clone(),claim:reservation.claim.clone(),reservation:reservation.clone(),output:output.into(),base_commit:base_commit.clone(),result_commit:result_commit.clone(),intent:intent.clone()};
             let (sequence,event_hash,_)=append(&tx,&claim.order_id,claim.lifecycle,OrderEvent::DieSucceeded{attempt:reservation.attempt.try_into().map_err(|_|evidence("A01 producer output attempt out of range"))?},"a01-producer-output-v1",&canonical(&original)?,datetime(now)?)?;
@@ -11624,7 +11791,7 @@ pub fn create_a01_task_claim_test_store(
         if a.output.as_bytes().contains(&0) { return Err(evidence("A01 producer output mirror identity or bytes invalid: a.output.as_bytes")); }
         let (intent,hash,at,event,from,to):(String,String,String,String,String,String)=tx.query_row("SELECT intent,hash,at,event,from_state,to_state FROM ledger WHERE seq=?1 AND order_id=?2",params![a.sequence,order],|v|Ok((v.get(0)?,v.get(1)?,v.get(2)?,v.get(3)?,v.get(4)?,v.get(5)?))).map_err(stored_error)?;
         let original:ProducerOutput=decode(intent.as_bytes())?;
-        let (base,result)=commits(r,&a.output);
+        let (base,result)=output_commits(r,&a.output)?;
         if original.kind!="a01-producer-output-v1" { return Err(evidence("A01 producer output immutable provenance mismatch: original.kind")); }
         if original.task!=r.task { return Err(evidence("A01 producer output immutable provenance mismatch: original.task")); }
         if original.claim!=r.claim { return Err(evidence("A01 producer output immutable provenance mismatch: original.claim")); }
@@ -11761,7 +11928,7 @@ pub fn create_a01_task_claim_test_store(
 }
 
 #[cfg(feature = "a01-harness-support")]
-pub use a01_task::{A01BridgePermissionRef,A01ProducerReservation,A01AcceptedProducerOutput,A01ProducerError,A01TaskStoreRef,A01TaskAdmissionExpectation,A01TaskOwnerExpectation,A01TaskServiceExpectation,A01AuthorizeTaskRequest,A01RevokeTaskRequest,A01TaskReceipt,A01TaskClaimView,A01TaskOperation,A01TaskStoreIdentity};
+pub use a01_task::{A01RealManifest,A01RealEvidence,A01RealOutput,a01_real_inputs,a01_real_manifest,a01_real_reservation_sha256,a01_real_task_receipt_sha256,encode_a01_real_output,decode_a01_real_output,A01BridgePermissionRef,A01ProducerReservation,A01AcceptedProducerOutput,A01ProducerError,A01TaskStoreRef,A01TaskAdmissionExpectation,A01TaskOwnerExpectation,A01TaskServiceExpectation,A01AuthorizeTaskRequest,A01RevokeTaskRequest,A01TaskReceipt,A01TaskClaimView,A01TaskOperation,A01TaskStoreIdentity};
 
 
 #[cfg(all(test, feature = "a01-harness-support", unix))]
