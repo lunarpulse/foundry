@@ -731,7 +731,7 @@ fn product_store_host_writes_real_frozen_hold_then_accepts_exact_snapshot() {
     }
     assert!(
         stale_probe
-            .claim_accepted_hold(&session, &receipt.operation_id, now)
+            .claim_accepted_hold(&session, &receipt.operation_id, now, &mut |_, _| panic!("preflight must not run"))
             .is_err(),
         "corrupt immutable snapshot digest must reject continuation"
     );
@@ -762,7 +762,7 @@ fn product_store_host_writes_real_frozen_hold_then_accepts_exact_snapshot() {
         .unwrap();
     assert!(
         stale_probe
-            .claim_accepted_hold("foreign-session-digest", &receipt.operation_id, now)
+            .claim_accepted_hold("foreign-session-digest", &receipt.operation_id, now, &mut |_, _| panic!("preflight must not run"))
             .is_err(),
         "a foreign session cannot resume another actor's accepted decision"
     );
@@ -1721,4 +1721,802 @@ fn standalone_review_host_refuses_product_contract_before_creating_host_schema()
     assert!(!host_schema);
     drop(conn);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn product_accepted_hold_missing_pack_snapshot_characterization() {
+    use foundry_exec::{Epoch, ExecutionIntent, Generation, OrderId, ReviewHostStore, RunId};
+    use foundry_ledger::{ProductHoldDecision, ProductHoldExpectation};
+    use std::sync::Arc;
+
+    struct ObservedExecutor {
+        tasks: Arc<Mutex<Vec<String>>>,
+        restores: Arc<AtomicUsize>,
+    }
+    impl StageExecutor for ObservedExecutor {
+        fn execute(&mut self, task: &StageTask) -> Result<StageOutput, String> {
+            self.tasks.lock().unwrap().push(task.role.clone());
+            Err("characterization executor failure".into())
+        }
+        fn restore_session(&mut self, _id: &str, _workdir: &std::path::Path) -> Result<(), String> {
+            self.restores.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    fn state(db: &std::path::Path, operation: &str) -> (String, String, String, String, String) {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        let receipt = conn.query_row("SELECT receipt_json FROM product_review_hold_acceptances_v1 WHERE operation_id=?1", [operation], |r| r.get(0)).unwrap();
+        let progress = conn.query_row("SELECT json_object('phase',phase,'revision',progress_revision,'owner',owner_id,'epoch',epoch,'fence',fence,'reserved_run',reserved_run_id,'recovery_reason',recovery_reason) FROM product_review_hold_progress_v1 WHERE operation_id=?1", [operation], |r| r.get(0)).unwrap();
+        let runs = conn.query_row("SELECT json_group_array(json_object('run',run_id,'status',status,'hold_id',hold_instance_id,'result',result_json)) FROM (SELECT * FROM product_review_runs_v1 WHERE order_id='snapshot-order' ORDER BY run_id)", [], |r| r.get(0)).unwrap();
+        let results = conn.query_row("SELECT json_group_array(json_object('run',run_id,'activation',activation,'result',result_json)) FROM (SELECT * FROM product_review_host_results_v1 WHERE order_id='snapshot-order' ORDER BY run_id,activation)", [], |r| r.get(0)).unwrap();
+        let stages = conn.query_row("SELECT json_group_array(json_object('run',run_id,'sequence',sequence,'stage',stage_id,'status',status,'output',output_json)) FROM (SELECT * FROM product_review_stages_v1 WHERE order_id='snapshot-order' ORDER BY run_id,sequence)", [], |r| r.get(0)).unwrap();
+        (receipt, progress, runs, results, stages)
+    }
+
+    // Read every column independently of the display-oriented state() query.
+    fn rows(db: &std::path::Path, table: &str) -> Vec<serde_json::Value> {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        let mut columns = conn.prepare(&format!("PRAGMA table_info({table})")).unwrap();
+        let names: Vec<String> = columns.query_map([], |row| row.get(1)).unwrap()
+            .collect::<Result<_, _>>().unwrap();
+        assert!(!names.is_empty());
+        let fields = names.iter().map(|name| format!("'{name}',\"{name}\""))
+            .collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT json_object({fields}) FROM {table} WHERE order_id='snapshot-order' ORDER BY rowid");
+        let mut statement = conn.prepare(&sql).unwrap();
+        statement.query_map([], |row| row.get::<_, String>(0)).unwrap()
+            .map(|row| serde_json::from_str(&row.unwrap()).unwrap()).collect()
+    }
+
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let root = std::env::temp_dir().join(format!("foundry-p05-missing-snapshot-{}-{n}-{nonce}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let db = root.join("product.db");
+    let config = ProductConfig { installation_id: "snapshot-install".into(), database_id: "snapshot-db".into() };
+    let now = chrono::Utc::now();
+    let (store, session, claim) = service_backed_work(&db, config.clone(), "snapshot-order", "issue:25", now);
+    append_waiting_lifecycle(&rusqlite::Connection::open(&db).unwrap(), "snapshot-order");
+    let pack = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills/bmad-review-full/v1");
+    let initial_calls = Arc::new(AtomicUsize::new(0));
+    let mut host = PackReviewHost::with_product_store(&pack, CountingHoldExecutor(initial_calls.clone()), store, root.join("artifacts"), root.join("sessions"), root.join("claims")).unwrap().with_source_commit("67aa6c2bbea68ddec015cd8a3ec6fc7d26f837b0").unwrap();
+    let intent = ExecutionIntent { order: OrderId("snapshot-order".into()), attempt: foundry_exec::Attempt(1), run: RunId(7), activation: 1, generation: Generation(0), epoch: Epoch(1), external_ref: "review:snapshot-order:1:base..result".into(), recorded_at: now };
+    let hold = host.try_dispatch_product_work(&intent, &claim).unwrap().held.expect("real dispatch must reach a hold");
+    assert!(initial_calls.load(Ordering::SeqCst) > 0);
+    drop(host);
+    assert_activation_authority_is_the_live_service_snapshot(&db, "snapshot-order", 1, 7, 1);
+    let mut store = ProductStore::open(&db, config.clone()).unwrap();
+    let latest = store.latest_hold("snapshot-order").unwrap().unwrap();
+    assert_eq!(latest.hold_id, hold.hold_instance_id);
+    assert_eq!(latest.snapshot.intent, intent);
+    let expected = rusqlite::Connection::open(&db).unwrap().query_row(
+        "SELECT lifecycle,attempt,originating_run,activation,host_epoch,hold_revision,source_revision,expected_predecessor,snapshot_digest FROM product_review_holds_v1 WHERE order_id='snapshot-order' AND hold_instance_id=?1",
+        [&hold.hold_instance_id], |r| Ok(ProductHoldExpectation { lifecycle:r.get(0)?, attempt:r.get(1)?, originating_run:r.get(2)?, activation:r.get(3)?, host_epoch:r.get(4)?, hold_revision:r.get(5)?, source_revision:r.get(6)?, predecessor_seq:r.get(7)?, snapshot_digest:r.get(8)? })).unwrap();
+    let receipt = store.accept_product_review_hold(&session, "snapshot-order", &hold.hold_instance_id, &expected, "snapshot-accept", ProductHoldDecision::Resume(hold.resume_targets.first().unwrap().clone()), now).unwrap();
+    assert_eq!(receipt.hold_instance_id, hold.hold_instance_id);
+    drop(store);
+    let tasks = Arc::new(Mutex::new(Vec::new()));
+    let restores = Arc::new(AtomicUsize::new(0));
+    let mut continuation = PackReviewHost::with_product_store(&pack, ObservedExecutor { tasks: tasks.clone(), restores: restores.clone() }, ProductStore::open(&db, config).unwrap(), root.join("artifacts"), root.join("sessions"), root.join("claims")).unwrap().with_source_commit("67aa6c2bbea68ddec015cd8a3ec6fc7d26f837b0").unwrap();
+    // Resolve the exact persisted snapshot through the configured ProductStore API.
+    let mut probe = ProductStore::open(&db, ProductConfig { installation_id: "snapshot-install".into(), database_id: "snapshot-db".into() }).unwrap();
+    probe.configure_review_backend(ProductReviewConfig { artifact_root: root.join("artifacts"), session_root: root.join("sessions"), claim_root: root.join("claims"), pack_digest: foundry_pack::load_pack(&pack).unwrap().digest().to_owned() }).unwrap();
+    let snapshot = probe.run_root(&latest.snapshot.snapshot_run_id).unwrap().join("pack-snapshot");
+    assert_eq!(foundry_pack::load_pack(&snapshot).unwrap().digest(), foundry_pack::load_pack(&pack).unwrap().digest());
+    let before = state(&db, &receipt.operation_id);
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&before.0).unwrap()["operation_id"], receipt.operation_id);
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&before.1).unwrap()["phase"], "accepted");
+    let receipt_before: foundry_ledger::ProductHoldAcceptance = serde_json::from_str(&before.0).unwrap();
+    assert_eq!(receipt_before, receipt);
+    let runs_before = rows(&db, "product_review_runs_v1");
+    let results_before = rows(&db, "product_review_host_results_v1");
+    let stages_before = rows(&db, "product_review_stages_v1");
+    assert_eq!(runs_before.len(), 1);
+    assert_eq!(runs_before[0]["run_id"], "snapshot-order:1:7:1");
+    assert_eq!(runs_before[0]["attempt"], 1);
+    assert_eq!(runs_before[0]["hold_instance_id"], hold.hold_instance_id);
+    assert_eq!(results_before.len(), 1);
+    assert_eq!(results_before[0]["run_id"], 7);
+    assert_eq!(results_before[0]["attempt"], 1);
+    assert_eq!(results_before[0]["activation"], 1);
+    assert_eq!(stages_before.len(), 4);
+    assert_eq!(stages_before.iter().map(|row| (row["run_id"].as_str().unwrap(), row["sequence"].as_i64().unwrap(), row["stage_id"].as_str().unwrap(), row["status"].as_str().unwrap())).collect::<Vec<_>>(), vec![
+        ("snapshot-order:1:7:1", 1, "edge", "error"),
+        ("snapshot-order:1:7:1", 2, "verif", "error"),
+        ("snapshot-order:1:7:1", 3, "claims", "blocked"),
+        ("snapshot-order:1:7:1", 4, "triage", "blocked"),
+    ]);
+    let progress = |db: &std::path::Path| -> (String, i64) {
+        rusqlite::Connection::open(db).unwrap().query_row(
+            "SELECT phase,reserved_run_id FROM product_review_hold_progress_v1 WHERE operation_id=?1",
+            [&receipt.operation_id], |row| Ok((row.get(0)?, row.get(1)?))
+        ).unwrap()
+    };
+    assert_eq!(progress(&db), ("accepted".into(), receipt.reserved_run_id));
+    let calls_before = (tasks.lock().unwrap().clone(), restores.load(Ordering::SeqCst));
+    std::fs::remove_dir_all(&snapshot).unwrap();
+    assert!(!snapshot.exists());
+    let missing_error = foundry_pack::load_pack(&snapshot).unwrap_err().to_string();
+    assert!(missing_error.starts_with("E_PACK_IO:"));
+    let outcome = continuation.continue_accepted_product_hold(&session, &receipt.operation_id, now);
+    let after = state(&db, &receipt.operation_id);
+    let calls_after = (tasks.lock().unwrap().clone(), restores.load(Ordering::SeqCst));
+    assert_eq!(outcome, Err(foundry_exec::HostError::Persistence(missing_error)));
+    let receipt_after: foundry_ledger::ProductHoldAcceptance = serde_json::from_str(&after.0).unwrap();
+    assert_eq!(receipt_after, receipt);
+    assert_eq!(after.0, before.0);
+    assert_eq!(progress(&db).1, receipt.reserved_run_id);
+    let runs_after = rows(&db, "product_review_runs_v1");
+    let results_after = rows(&db, "product_review_host_results_v1");
+    let stages_after = rows(&db, "product_review_stages_v1");
+    for (before_rows, after_rows) in [(&runs_before, &runs_after), (&results_before, &results_after), (&stages_before, &stages_after)] {
+        for row in before_rows {
+            assert_eq!(after_rows.iter().filter(|candidate| *candidate == row).count(), 1, "original row must remain unchanged: {row}");
+        }
+    }
+    assert_eq!(stages_after, stages_before);
+    assert_eq!(calls_before, (Vec::<String>::new(), 0));
+    assert_eq!(calls_after, calls_before);
+    eprintln!("P05 outcome: {outcome:?}\nP05 before receipt/progress/runs/results/stages: {before:#?}\nP05 after receipt/progress/runs/results/stages: {after:#?}\nP05 initial executor calls: {}\nP05 continuation tasks/restore calls before: {calls_before:?}; after: {calls_after:?}", initial_calls.load(Ordering::SeqCst));
+    drop(continuation);
+    drop(probe);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn product_accepted_hold_missing_pack_snapshot_preflight_is_read_only() {
+    use foundry_exec::{Epoch, ExecutionIntent, Generation, OrderId, ReviewHostStore, RunId};
+    use foundry_ledger::{ProductHoldDecision, ProductHoldExpectation};
+    use std::sync::Arc;
+
+    struct ObservedExecutor {
+        tasks: Arc<Mutex<Vec<String>>>,
+        restores: Arc<AtomicUsize>,
+    }
+    impl StageExecutor for ObservedExecutor {
+        fn execute(&mut self, task: &StageTask) -> Result<StageOutput, String> {
+            self.tasks.lock().unwrap().push(task.role.clone());
+            Err("characterization executor failure".into())
+        }
+        fn restore_session(&mut self, _id: &str, _workdir: &std::path::Path) -> Result<(), String> {
+            self.restores.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    fn state(db: &std::path::Path, operation: &str) -> (String, String, String, String, String) {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        let receipt = conn.query_row("SELECT receipt_json FROM product_review_hold_acceptances_v1 WHERE operation_id=?1", [operation], |r| r.get(0)).unwrap();
+        let progress = conn.query_row("SELECT json_object('phase',phase,'revision',progress_revision,'owner',owner_id,'epoch',epoch,'fence',fence,'reserved_run',reserved_run_id,'recovery_reason',recovery_reason) FROM product_review_hold_progress_v1 WHERE operation_id=?1", [operation], |r| r.get(0)).unwrap();
+        let runs = conn.query_row("SELECT json_group_array(json_object('run',run_id,'status',status,'hold_id',hold_instance_id,'result',result_json)) FROM (SELECT * FROM product_review_runs_v1 WHERE order_id='snapshot-order' ORDER BY run_id)", [], |r| r.get(0)).unwrap();
+        let results = conn.query_row("SELECT json_group_array(json_object('run',run_id,'activation',activation,'result',result_json)) FROM (SELECT * FROM product_review_host_results_v1 WHERE order_id='snapshot-order' ORDER BY run_id,activation)", [], |r| r.get(0)).unwrap();
+        let stages = conn.query_row("SELECT json_group_array(json_object('run',run_id,'sequence',sequence,'stage',stage_id,'status',status,'output',output_json)) FROM (SELECT * FROM product_review_stages_v1 WHERE order_id='snapshot-order' ORDER BY run_id,sequence)", [], |r| r.get(0)).unwrap();
+        (receipt, progress, runs, results, stages)
+    }
+
+    // Read every column independently of the display-oriented state() query.
+    fn rows(db: &std::path::Path, table: &str) -> Vec<serde_json::Value> {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        let mut columns = conn.prepare(&format!("PRAGMA table_info({table})")).unwrap();
+        let names: Vec<String> = columns.query_map([], |row| row.get(1)).unwrap()
+            .collect::<Result<_, _>>().unwrap();
+        assert!(!names.is_empty());
+        let fields = names.iter().map(|name| format!("'{name}',\"{name}\""))
+            .collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT json_object({fields}) FROM {table} ORDER BY rowid");
+        let mut statement = conn.prepare(&sql).unwrap();
+        statement.query_map([], |row| row.get::<_, String>(0)).unwrap()
+            .map(|row| serde_json::from_str(&row.unwrap()).unwrap()).collect()
+    }
+
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let root = std::env::temp_dir().join(format!("foundry-p05-preflight-read-only-{}-{n}-{nonce}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let db = root.join("product.db");
+    let config = ProductConfig { installation_id: "snapshot-install".into(), database_id: "snapshot-db".into() };
+    let now = chrono::Utc::now();
+    let (store, session, claim) = service_backed_work(&db, config.clone(), "snapshot-order", "issue:25", now);
+    append_waiting_lifecycle(&rusqlite::Connection::open(&db).unwrap(), "snapshot-order");
+    let pack = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills/bmad-review-full/v1");
+    let initial_calls = Arc::new(AtomicUsize::new(0));
+    let mut host = PackReviewHost::with_product_store(&pack, CountingHoldExecutor(initial_calls.clone()), store, root.join("artifacts"), root.join("sessions"), root.join("claims")).unwrap().with_source_commit("67aa6c2bbea68ddec015cd8a3ec6fc7d26f837b0").unwrap();
+    let intent = ExecutionIntent { order: OrderId("snapshot-order".into()), attempt: foundry_exec::Attempt(1), run: RunId(7), activation: 1, generation: Generation(0), epoch: Epoch(1), external_ref: "review:snapshot-order:1:base..result".into(), recorded_at: now };
+    let hold = host.try_dispatch_product_work(&intent, &claim).unwrap().held.expect("real dispatch must reach a hold");
+    assert!(initial_calls.load(Ordering::SeqCst) > 0);
+    drop(host);
+    assert_activation_authority_is_the_live_service_snapshot(&db, "snapshot-order", 1, 7, 1);
+    let mut store = ProductStore::open(&db, config.clone()).unwrap();
+    let latest = store.latest_hold("snapshot-order").unwrap().unwrap();
+    assert_eq!(latest.hold_id, hold.hold_instance_id);
+    assert_eq!(latest.snapshot.intent, intent);
+    let expected = rusqlite::Connection::open(&db).unwrap().query_row(
+        "SELECT lifecycle,attempt,originating_run,activation,host_epoch,hold_revision,source_revision,expected_predecessor,snapshot_digest FROM product_review_holds_v1 WHERE order_id='snapshot-order' AND hold_instance_id=?1",
+        [&hold.hold_instance_id], |r| Ok(ProductHoldExpectation { lifecycle:r.get(0)?, attempt:r.get(1)?, originating_run:r.get(2)?, activation:r.get(3)?, host_epoch:r.get(4)?, hold_revision:r.get(5)?, source_revision:r.get(6)?, predecessor_seq:r.get(7)?, snapshot_digest:r.get(8)? })).unwrap();
+    let receipt = store.accept_product_review_hold(&session, "snapshot-order", &hold.hold_instance_id, &expected, "snapshot-accept", ProductHoldDecision::Resume(hold.resume_targets.first().unwrap().clone()), now).unwrap();
+    assert_eq!(receipt.hold_instance_id, hold.hold_instance_id);
+    drop(store);
+    let tasks = Arc::new(Mutex::new(Vec::new()));
+    let restores = Arc::new(AtomicUsize::new(0));
+    let mut continuation = PackReviewHost::with_product_store(&pack, ObservedExecutor { tasks: tasks.clone(), restores: restores.clone() }, ProductStore::open(&db, config).unwrap(), root.join("artifacts"), root.join("sessions"), root.join("claims")).unwrap().with_source_commit("67aa6c2bbea68ddec015cd8a3ec6fc7d26f837b0").unwrap();
+    // Resolve the exact persisted snapshot through the configured ProductStore API.
+    let mut probe = ProductStore::open(&db, ProductConfig { installation_id: "snapshot-install".into(), database_id: "snapshot-db".into() }).unwrap();
+    probe.configure_review_backend(ProductReviewConfig { artifact_root: root.join("artifacts"), session_root: root.join("sessions"), claim_root: root.join("claims"), pack_digest: foundry_pack::load_pack(&pack).unwrap().digest().to_owned() }).unwrap();
+    let snapshot = probe.run_root(&latest.snapshot.snapshot_run_id).unwrap().join("pack-snapshot");
+    assert_eq!(foundry_pack::load_pack(&snapshot).unwrap().digest(), foundry_pack::load_pack(&pack).unwrap().digest());
+    let before = state(&db, &receipt.operation_id);
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&before.0).unwrap()["operation_id"], receipt.operation_id);
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&before.1).unwrap()["phase"], "accepted");
+    let receipt_before: foundry_ledger::ProductHoldAcceptance = serde_json::from_str(&before.0).unwrap();
+    assert_eq!(receipt_before, receipt);
+    let runs_before = rows(&db, "product_review_runs_v1");
+    let results_before = rows(&db, "product_review_host_results_v1");
+    let stages_before = rows(&db, "product_review_stages_v1");
+    assert_eq!(runs_before.len(), 1);
+    assert_eq!(runs_before[0]["run_id"], "snapshot-order:1:7:1");
+    assert_eq!(runs_before[0]["attempt"], 1);
+    assert_eq!(runs_before[0]["hold_instance_id"], hold.hold_instance_id);
+    assert_eq!(results_before.len(), 1);
+    assert_eq!(results_before[0]["run_id"], 7);
+    assert_eq!(results_before[0]["attempt"], 1);
+    assert_eq!(results_before[0]["activation"], 1);
+    assert_eq!(stages_before.len(), 4);
+    assert_eq!(stages_before.iter().map(|row| (row["run_id"].as_str().unwrap(), row["sequence"].as_i64().unwrap(), row["stage_id"].as_str().unwrap(), row["status"].as_str().unwrap())).collect::<Vec<_>>(), vec![
+        ("snapshot-order:1:7:1", 1, "edge", "error"),
+        ("snapshot-order:1:7:1", 2, "verif", "error"),
+        ("snapshot-order:1:7:1", 3, "claims", "blocked"),
+        ("snapshot-order:1:7:1", 4, "triage", "blocked"),
+    ]);
+    let progress = |db: &std::path::Path| -> (String, i64) {
+        rusqlite::Connection::open(db).unwrap().query_row(
+            "SELECT phase,reserved_run_id FROM product_review_hold_progress_v1 WHERE operation_id=?1",
+            [&receipt.operation_id], |row| Ok((row.get(0)?, row.get(1)?))
+        ).unwrap()
+    };
+    assert_eq!(progress(&db), ("accepted".into(), receipt.reserved_run_id));
+    // The lifecycle and readiness for this isolated fixture are seeded by SQL;
+    // acceptance and continuation use the real ProductStore and host APIs.
+    std::fs::remove_dir_all(&snapshot).unwrap();
+    assert!(!snapshot.exists());
+    let missing_error = foundry_pack::load_pack(&snapshot).unwrap_err().to_string();
+    assert!(missing_error.starts_with("E_PACK_IO:"));
+    let tables = [
+        "product_review_hold_acceptances_v1",
+        "product_review_hold_progress_v1",
+        "product_review_run_reservations_v1",
+        "product_review_holds_v1",
+        "product_review_runs_v1",
+        "product_review_host_results_v1",
+        "product_review_stages_v1",
+        "product_review_active_v1",
+        "product_review_bindings_v1",
+        "product_review_work_bindings_v1",
+        "product_review_host_accept_v1",
+        "product_review_sessions_v1",
+    ];
+    let observe = || -> std::collections::BTreeMap<&str, Vec<serde_json::Value>> {
+        tables.iter().map(|&table| (table, rows(&db, table))).collect()
+    };
+    let before_rows = observe();
+    assert_eq!(before_rows["product_review_hold_acceptances_v1"].len(), 1);
+    assert_eq!(before_rows["product_review_hold_progress_v1"].len(), 1);
+    let calls_before = (tasks.lock().unwrap().clone(), restores.load(Ordering::SeqCst));
+    assert_eq!(calls_before, (Vec::<String>::new(), 0));
+    let outcome = continuation.continue_accepted_product_hold(&session, &receipt.operation_id, now);
+    let after_rows = observe();
+    let calls_after = (tasks.lock().unwrap().clone(), restores.load(Ordering::SeqCst));
+    drop(continuation);
+    drop(probe);
+    std::fs::remove_dir_all(root).unwrap();
+    assert_eq!(outcome, Err(foundry_exec::HostError::Persistence(missing_error)));
+    assert_eq!(calls_after, calls_before, "continuation must not execute or restore");
+    assert_eq!(after_rows, before_rows, "continuation must leave durable state unchanged");
+}
+
+
+// Fresh real ProductStore holds shared only by the snapshot contract tests below.
+struct AcceptedPackSnapshotFixture {
+    root: std::path::PathBuf,
+    db: std::path::PathBuf,
+    pack: std::path::PathBuf,
+    config: ProductConfig,
+    session: String,
+    operation_id: String,
+    now: chrono::DateTime<chrono::Utc>,
+    snapshot: std::path::PathBuf,
+}
+
+impl AcceptedPackSnapshotFixture {
+    fn new() -> Self {
+        use foundry_exec::{Epoch, ExecutionIntent, Generation, OrderId, ReviewHostStore, RunId};
+        use foundry_ledger::{ProductHoldDecision, ProductHoldExpectation};
+        use std::sync::Arc;
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "foundry-p05-snapshot-contract-{}-{n}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("product.db");
+        let config = ProductConfig {
+            installation_id: "snapshot-install".into(),
+            database_id: "snapshot-db".into(),
+        };
+        let now = chrono::Utc::now();
+        let (store, session, claim) =
+            service_backed_work(&db, config.clone(), "snapshot-order", "issue:25", now);
+        append_waiting_lifecycle(&rusqlite::Connection::open(&db).unwrap(), "snapshot-order");
+        let pack = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../skills/bmad-review-full/v1");
+        let initial_calls = Arc::new(AtomicUsize::new(0));
+        let mut host = PackReviewHost::with_product_store(
+            &pack,
+            CountingHoldExecutor(initial_calls.clone()),
+            store,
+            root.join("artifacts"),
+            root.join("sessions"),
+            root.join("claims"),
+        )
+        .unwrap()
+        .with_source_commit("67aa6c2bbea68ddec015cd8a3ec6fc7d26f837b0")
+        .unwrap();
+        let intent = ExecutionIntent {
+            order: OrderId("snapshot-order".into()),
+            attempt: foundry_exec::Attempt(1),
+            run: RunId(7),
+            activation: 1,
+            generation: Generation(0),
+            epoch: Epoch(1),
+            external_ref: "review:snapshot-order:1:base..result".into(),
+            recorded_at: now,
+        };
+        let hold = host
+            .try_dispatch_product_work(&intent, &claim)
+            .unwrap()
+            .held
+            .expect("real dispatch must reach a hold");
+        assert!(initial_calls.load(Ordering::SeqCst) > 0);
+        drop(host);
+        assert_activation_authority_is_the_live_service_snapshot(&db, "snapshot-order", 1, 7, 1);
+        let mut store = ProductStore::open(&db, config.clone()).unwrap();
+        store
+            .configure_review_backend(foundry_ledger::ProductReviewConfig {
+                artifact_root: root.join("artifacts"),
+                session_root: root.join("sessions"),
+                claim_root: root.join("claims"),
+                pack_digest: foundry_pack::load_pack(&pack).unwrap().digest().to_owned(),
+            })
+            .unwrap();
+        let latest = store.latest_hold("snapshot-order").unwrap().unwrap();
+        assert_eq!(latest.hold_id, hold.hold_instance_id);
+        assert_eq!(latest.snapshot.intent, intent);
+        let expected = rusqlite::Connection::open(&db).unwrap().query_row(
+            "SELECT lifecycle,attempt,originating_run,activation,host_epoch,hold_revision,source_revision,expected_predecessor,snapshot_digest FROM product_review_holds_v1 WHERE order_id='snapshot-order' AND hold_instance_id=?1",
+            [&hold.hold_instance_id], |r| Ok(ProductHoldExpectation { lifecycle:r.get(0)?, attempt:r.get(1)?, originating_run:r.get(2)?, activation:r.get(3)?, host_epoch:r.get(4)?, hold_revision:r.get(5)?, source_revision:r.get(6)?, predecessor_seq:r.get(7)?, snapshot_digest:r.get(8)? })).unwrap();
+        let receipt = store
+            .accept_product_review_hold(
+                &session,
+                "snapshot-order",
+                &hold.hold_instance_id,
+                &expected,
+                "snapshot-accept",
+                ProductHoldDecision::Resume(hold.resume_targets.first().unwrap().clone()),
+                now,
+            )
+            .unwrap();
+        assert_eq!(receipt.hold_instance_id, hold.hold_instance_id);
+        let snapshot = store
+            .run_root(&latest.snapshot.snapshot_run_id)
+            .unwrap()
+            .join("pack-snapshot");
+        drop(store);
+
+        Self {
+            root,
+            db,
+            pack,
+            config,
+            session,
+            operation_id: receipt.operation_id,
+            now,
+            snapshot,
+        }
+    }
+
+    fn host(&self, executor: impl StageExecutor + 'static) -> PackReviewHost {
+        PackReviewHost::with_product_store(
+            &self.pack,
+            executor,
+            ProductStore::open(&self.db, self.config.clone()).unwrap(),
+            self.root.join("artifacts"),
+            self.root.join("sessions"),
+            self.root.join("claims"),
+        )
+        .unwrap()
+        .with_source_commit("67aa6c2bbea68ddec015cd8a3ec6fc7d26f837b0")
+        .unwrap()
+    }
+
+    fn rows(&self, table: &str) -> Vec<serde_json::Value> {
+        let conn = rusqlite::Connection::open(&self.db).unwrap();
+        let mut columns = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        let names: Vec<String> = columns
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(!names.is_empty());
+        let fields = names
+            .iter()
+            .map(|name| format!("'{name}',\"{name}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("SELECT json_object({fields}) FROM {table} ORDER BY rowid");
+        let mut statement = conn.prepare(&sql).unwrap();
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|row| serde_json::from_str(&row.unwrap()).unwrap())
+            .collect()
+    }
+
+    fn observe(
+        &self,
+        tables: &[&'static str],
+    ) -> std::collections::BTreeMap<&'static str, Vec<serde_json::Value>> {
+        tables
+            .iter()
+            .map(|&table| (table, self.rows(table)))
+            .collect()
+    }
+
+    fn history(&self) -> std::collections::BTreeMap<&'static str, Vec<serde_json::Value>> {
+        self.observe(&[
+            "product_review_hold_acceptances_v1",
+            "product_review_holds_v1",
+            "product_review_runs_v1",
+            "product_review_host_results_v1",
+            "product_review_stages_v1",
+            "product_review_sessions_v1",
+            "ledger",
+        ])
+    }
+}
+
+// Keep the replacement valid while changing its digest, without editing pack assets.
+fn rehash_test_snapshot(snapshot: &std::path::Path) {
+    use sha2::Digest;
+
+    let manifest_path = snapshot.join("manifest.toml");
+    let manifest_text = std::fs::read_to_string(&manifest_path).unwrap();
+    let manifest: toml::Value = toml::from_str(&manifest_text).unwrap();
+    let is_digest = |line: &str| {
+        line.split_once('=')
+            .is_some_and(|(key, _)| key.trim() == "digest")
+    };
+    assert_eq!(
+        manifest_text.lines().filter(|line| is_digest(line)).count(),
+        1
+    );
+    let mut entries = std::collections::BTreeMap::new();
+    for name in manifest["files"].as_array().unwrap() {
+        let name = name.as_str().unwrap();
+        entries.insert(name.to_owned(), std::fs::read(snapshot.join(name)).unwrap());
+    }
+    entries.insert(
+        "manifest.toml".into(),
+        manifest_text
+            .split_inclusive('\n')
+            .filter(|line| !is_digest(line))
+            .collect::<String>()
+            .into_bytes(),
+    );
+    let mut canonical = Vec::new();
+    for (name, content) in entries {
+        for bytes in [name.as_bytes(), content.as_slice()] {
+            canonical.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            canonical.extend_from_slice(bytes);
+        }
+    }
+    let digest = format!("{:x}", sha2::Sha256::digest(&canonical));
+    let rewritten = manifest_text
+        .split_inclusive('\n')
+        .map(|line| {
+            if is_digest(line) {
+                format!("digest = \"{digest}\"\n")
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<String>();
+    std::fs::write(manifest_path, rewritten).unwrap();
+}
+
+#[test]
+fn product_accepted_hold_tampered_pack_snapshot_preflight_is_read_only() {
+    use std::sync::Arc;
+
+    struct ObservedExecutor {
+        calls: Arc<AtomicUsize>,
+        restores: Arc<AtomicUsize>,
+    }
+    impl StageExecutor for ObservedExecutor {
+        fn execute(&mut self, task: &StageTask) -> Result<StageOutput, String> {
+            ProductContinuationExecutor {
+                calls: self.calls.clone(),
+            }
+            .execute(task)
+        }
+        fn restore_session(&mut self, _id: &str, _workdir: &std::path::Path) -> Result<(), String> {
+            self.restores.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    for mode in ["byte-tamper", "rehashed-replacement", "untouched"] {
+        let fixture = AcceptedPackSnapshotFixture::new();
+        let original = foundry_pack::load_pack(&fixture.snapshot).unwrap();
+        let history = fixture.history();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let restores = Arc::new(AtomicUsize::new(0));
+        let mut host = fixture.host(ObservedExecutor {
+            calls: calls.clone(),
+            restores: restores.clone(),
+        });
+        let expected_error = if mode == "untouched" {
+            None
+        } else {
+            let lens = fixture.snapshot.join("lens-edge.md");
+            let mut replacement = std::fs::read(&lens).unwrap();
+            replacement.extend_from_slice(b"\nPRODUCT SNAPSHOT REPLACEMENT\n");
+            assert_ne!(replacement, original.files()["lens-edge.md"]);
+            std::fs::write(lens, replacement).unwrap();
+            if mode == "byte-tamper" {
+                let error = foundry_pack::load_pack(&fixture.snapshot).unwrap_err();
+                assert_eq!(error.code, "E_DIGEST_MISMATCH");
+                Some(error.to_string())
+            } else {
+                rehash_test_snapshot(&fixture.snapshot);
+                let replacement = foundry_pack::load_pack(&fixture.snapshot).unwrap();
+                assert_ne!(replacement.digest(), original.digest());
+                Some("held pack snapshot digest changed".to_owned())
+            }
+        };
+        let tables = [
+            "product_review_hold_acceptances_v1",
+            "product_review_hold_progress_v1",
+            "product_review_run_reservations_v1",
+            "product_review_holds_v1",
+            "product_review_runs_v1",
+            "product_review_host_results_v1",
+            "product_review_stages_v1",
+            "product_review_active_v1",
+            "product_review_bindings_v1",
+            "product_review_work_bindings_v1",
+            "product_review_host_accept_v1",
+            "product_review_sessions_v1",
+            "product_review_authority_v1",
+            "product_fence_counter_v1",
+            "ledger",
+        ];
+        let before = fixture.observe(&tables);
+        assert_eq!(before["product_review_hold_acceptances_v1"].len(), 1);
+        assert_eq!(before["product_review_hold_progress_v1"].len(), 1);
+        assert_eq!(before["product_review_authority_v1"].len(), 1);
+        assert_eq!(before["product_fence_counter_v1"].len(), 1);
+        let outcome = host.continue_accepted_product_hold(
+            &fixture.session,
+            &fixture.operation_id,
+            fixture.now,
+        );
+        if let Some(expected) = expected_error {
+            assert_eq!(outcome, Err(foundry_exec::HostError::Persistence(expected)));
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "rejection must not execute"
+            );
+            assert_eq!(
+                restores.load(Ordering::SeqCst),
+                0,
+                "rejection must not restore"
+            );
+            assert_eq!(
+                fixture.observe(&tables),
+                before,
+                "preflight rejection must leave every observed row unchanged"
+            );
+        } else {
+            outcome.unwrap();
+            assert!(
+                calls.load(Ordering::SeqCst) > 0,
+                "untouched sibling must continue"
+            );
+            let after = fixture.history();
+            for (table, rows) in history {
+                assert!(
+                    after[table].starts_with(&rows),
+                    "original history changed in {table}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn product_accepted_hold_uses_verified_bytes_after_snapshot_path_swap() {
+    use std::sync::Arc;
+
+    struct SnapshotSwapExecutor {
+        inner: ProductContinuationExecutor,
+        tasks: Arc<Mutex<Vec<StageTask>>>,
+        barrier_calls: Arc<AtomicUsize>,
+        snapshot: std::path::PathBuf,
+        replacement: Option<std::path::PathBuf>,
+        retained: std::path::PathBuf,
+        db: std::path::PathBuf,
+        operation_id: String,
+    }
+    impl StageExecutor for SnapshotSwapExecutor {
+        fn ensure_available(&self) -> Result<(), String> {
+            assert_eq!(self.barrier_calls.fetch_add(1, Ordering::SeqCst), 0);
+            assert!(
+                self.tasks.lock().unwrap().is_empty(),
+                "barrier must precede stage execution"
+            );
+            let phase: String = rusqlite::Connection::open(&self.db)
+                .unwrap()
+                .query_row(
+                    "SELECT phase FROM product_review_hold_progress_v1 WHERE operation_id=?1",
+                    [&self.operation_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                phase, "continuing",
+                "barrier must follow real ProductStore preflight and materialization"
+            );
+            if let Some(replacement) = &self.replacement {
+                std::fs::rename(&self.snapshot, &self.retained).map_err(|e| e.to_string())?;
+                std::fs::rename(replacement, &self.snapshot).map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        }
+        fn execute(&mut self, task: &StageTask) -> Result<StageOutput, String> {
+            self.tasks.lock().unwrap().push(task.clone());
+            self.inner.execute(task)
+        }
+        fn restore_session(&mut self, id: &str, workdir: &std::path::Path) -> Result<(), String> {
+            self.inner.restore_session(id, workdir)
+        }
+    }
+
+    for swap_enabled in [false, true] {
+        let fixture = AcceptedPackSnapshotFixture::new();
+        let original = foundry_pack::load_pack(&fixture.snapshot).unwrap();
+        let original_manifest = std::fs::read(fixture.snapshot.join("manifest.toml")).unwrap();
+        let x = original.files()["lens-edge.md"].clone();
+        let mut y = x.clone();
+        y.extend_from_slice(b"\nPRODUCT SNAPSHOT PATH SWAP\n");
+        assert_ne!(x, y);
+        let replacement_path = fixture.root.join("replacement-pack");
+        std::fs::create_dir(&replacement_path).unwrap();
+        std::fs::write(replacement_path.join("manifest.toml"), &original_manifest).unwrap();
+        for (name, bytes) in original.files() {
+            let path = replacement_path.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        std::fs::write(replacement_path.join("lens-edge.md"), &y).unwrap();
+        rehash_test_snapshot(&replacement_path);
+        let replacement = foundry_pack::load_pack(&replacement_path).unwrap();
+        let replacement_manifest = std::fs::read(replacement_path.join("manifest.toml")).unwrap();
+        assert_ne!(replacement.digest(), original.digest());
+        let history = fixture.history();
+        for table in [
+            "product_review_hold_acceptances_v1",
+            "product_review_holds_v1",
+            "product_review_runs_v1",
+            "product_review_host_results_v1",
+            "product_review_stages_v1",
+            "ledger",
+        ] {
+            assert!(
+                !history[table].is_empty(),
+                "original {table} must be observed"
+            );
+        }
+        let tasks = Arc::new(Mutex::new(Vec::new()));
+        let barrier_calls = Arc::new(AtomicUsize::new(0));
+        let retained = fixture.root.join("verified-pack-original");
+        let mut host = fixture.host(SnapshotSwapExecutor {
+            inner: ProductContinuationExecutor {
+                calls: Arc::new(AtomicUsize::new(0)),
+            },
+            tasks: tasks.clone(),
+            barrier_calls: barrier_calls.clone(),
+            snapshot: fixture.snapshot.clone(),
+            replacement: swap_enabled.then_some(replacement_path),
+            retained: retained.clone(),
+            db: fixture.db.clone(),
+            operation_id: fixture.operation_id.clone(),
+        });
+        host.continue_accepted_product_hold(&fixture.session, &fixture.operation_id, fixture.now)
+            .unwrap();
+        assert_eq!(
+            barrier_calls.load(Ordering::SeqCst),
+            1,
+            "continuation barrier must fire"
+        );
+        let disk_pack = if swap_enabled {
+            assert!(
+                retained.is_dir(),
+                "original snapshot directory must have been renamed"
+            );
+            assert_eq!(std::fs::read(retained.join("lens-edge.md")).unwrap(), x);
+            assert_eq!(
+                std::fs::read(fixture.snapshot.join("lens-edge.md")).unwrap(),
+                y
+            );
+            &replacement
+        } else {
+            assert!(!retained.exists());
+            assert_eq!(
+                std::fs::read(fixture.snapshot.join("lens-edge.md")).unwrap(),
+                x
+            );
+            &original
+        };
+        for (name, bytes) in disk_pack.files() {
+            assert_eq!(
+                &std::fs::read(fixture.snapshot.join(name)).unwrap(),
+                bytes,
+                "unexpected disk bytes for {name}"
+            );
+        }
+        let expected_manifest = if swap_enabled {
+            &replacement_manifest
+        } else {
+            &original_manifest
+        };
+        assert_eq!(
+            &std::fs::read(fixture.snapshot.join("manifest.toml")).unwrap(),
+            expected_manifest
+        );
+        let tasks = tasks.lock().unwrap();
+        let edges: Vec<_> = tasks
+            .iter()
+            .filter(|task| task.stage_id == "edge" && task.role == "lens")
+            .collect();
+        assert!(
+            !edges.is_empty(),
+            "continuation must reach the edge lens-bearing task"
+        );
+        let mut expected_x = x;
+        expected_x.push(b'\n');
+        let mut replaced_y = y;
+        replaced_y.push(b'\n');
+        for edge in edges {
+            assert_eq!(
+                edge.lens_bytes, expected_x,
+                "continuation must execute the verified X bytes"
+            );
+            assert_ne!(
+                edge.lens_bytes, replaced_y,
+                "replacement bytes must never execute"
+            );
+        }
+        let after = fixture.history();
+        for (table, rows) in history {
+            assert!(
+                after[table].starts_with(&rows),
+                "original hold, receipt, or history changed in {table}"
+            );
+        }
+    }
 }

@@ -2925,3 +2925,170 @@ async fn resumed_commit_fail_at_max_attempts_is_terminal() {
             .is_none()
     );
 }
+
+fn b2_w1_snapshot_resume_characterization(missing: bool) {
+    let db = Db::new();
+    let trace = Arc::new(Mutex::new(Trace::default()));
+    for i in 0..3 {
+        trace.lock().unwrap().outputs.push_back(output(None, false, i));
+    }
+    trace.lock().unwrap().outputs.push_back(output(Some("intent_gap"), true, 3));
+    let order = if missing { "b2-w1-missing" } else { "b2-w1-tampered" };
+    let mut initial = host(&db, trace.clone(), Arc::new(AtomicBool::new(false)));
+    let hold = initial.try_dispatch(&intent(order, 1)).unwrap().held.unwrap();
+    let run = initial.latest_run(order, 1).unwrap().unwrap();
+    assert_eq!(run.status, "held");
+    assert_eq!(run.hold_instance_id.as_deref(), Some(hold.hold_instance_id.as_str()));
+    assert!(initial.latest_hold(order).unwrap().is_some());
+    let root = trace.lock().unwrap().tasks[0].workdir.ancestors().nth(3).unwrap().to_owned();
+    assert!(root.starts_with(db.0.with_extension("review-runs")));
+    let snapshot = root.join("pack-snapshot");
+    let digest = foundry_pack::load_pack(&snapshot).unwrap().digest().to_owned();
+    let read_state = || -> (String, i64) {
+        connection(&db).query_row(
+            "SELECT json_array(order_id,attempt,run_id,base_commit,result_commit,pack_digest,status,counters_json,hold_json,hold_instance_id,resume_targets,deadline,result_json,provenance_json,created_at), (SELECT count(*) FROM review_stage_attempts WHERE order_id=?1) FROM review_runs WHERE order_id=?1",
+            [order], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap()
+    };
+    let before = read_state();
+    let row: serde_json::Value = serde_json::from_str(&before.0).unwrap();
+    assert_eq!(row[5].as_str(), Some(digest.as_str()));
+    assert_eq!(row[6].as_str(), Some("held"));
+    assert_eq!(row[9].as_str(), Some(hold.hold_instance_id.as_str()));
+    assert!(!row[8].is_null());
+    let calls = trace.lock().unwrap().tasks.len();
+    assert!(calls > 0);
+    drop(initial);
+    if missing {
+        std::fs::rename(&snapshot, root.join("pack-snapshot-moved-aside")).unwrap();
+        assert!(!snapshot.exists());
+    } else {
+        use std::io::Write;
+        std::fs::OpenOptions::new().append(true).open(snapshot.join("policy.toml"))
+            .unwrap().write_all(b"\n# changed snapshot\n").unwrap();
+        assert_eq!(foundry_pack::load_pack(&snapshot).unwrap_err().code, "E_DIGEST_MISMATCH");
+    }
+    let mut reopened = host(&db, trace.clone(), Arc::new(AtomicBool::new(false)));
+    assert!(reopened.resume(order, &hold.hold_instance_id, "replan_full", "human").is_err());
+    assert_eq!(trace.lock().unwrap().tasks.len(), calls);
+    assert_eq!(read_state(), before);
+    let after = reopened.latest_run(order, 1).unwrap().unwrap();
+    assert_eq!(after.status, "held");
+    assert_eq!(after.hold_instance_id.as_deref(), Some(hold.hold_instance_id.as_str()));
+    assert!(reopened.latest_hold(order).unwrap().is_some());
+}
+
+#[test]
+fn b2_w1_snapshot_missing_resume_characterization() {
+    b2_w1_snapshot_resume_characterization(true);
+}
+
+#[test]
+fn b2_w1_snapshot_tampered_resume_characterization() {
+    b2_w1_snapshot_resume_characterization(false);
+}
+
+#[test]
+fn snapshot_rejection_leaves_unlocked_resume_claim_file() {
+    use sha2::{Digest, Sha256};
+
+    struct Fixture(PathBuf);
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    let unique = Db::new();
+    let fixture = Fixture(unique.0.with_extension("claim-characterization"));
+    std::fs::create_dir(&fixture.0).unwrap();
+    let db = Db(fixture.0.join("state.db"));
+    let trace = Arc::new(Mutex::new(Trace::default()));
+    for i in 0..3 {
+        trace.lock().unwrap().outputs.push_back(output(None, false, i));
+    }
+    trace.lock().unwrap().outputs.push_back(output(Some("intent_gap"), true, 3));
+    let order = "claim-snapshot-characterization";
+    let mut h = host(&db, trace.clone(), Arc::new(AtomicBool::new(false)));
+    let hold = h.try_dispatch(&intent(order, 1)).unwrap().held.unwrap();
+    let run = h.latest_run(order, 1).unwrap().unwrap();
+    assert_eq!(run.status, "held");
+    assert_eq!(run.hold_instance_id.as_deref(), Some(hold.hold_instance_id.as_str()));
+    let snapshot = trace.lock().unwrap().tasks[0].workdir.ancestors().nth(3).unwrap().join("pack-snapshot");
+    assert!(foundry_pack::load_pack(&snapshot).is_ok());
+    let read_state = || -> (String, i64) {
+        connection(&db).query_row(
+            "SELECT json_array(order_id,attempt,run_id,base_commit,result_commit,pack_digest,status,counters_json,hold_json,hold_instance_id,resume_targets,deadline,result_json,provenance_json,created_at), (SELECT count(*) FROM review_stage_attempts WHERE order_id=?1) FROM review_runs WHERE order_id=?1",
+            [order], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap()
+    };
+    let before = read_state();
+    let run_id: String = connection(&db).query_row("SELECT run_id FROM review_runs WHERE order_id=?1", [order], |r| r.get(0)).unwrap();
+    let claim_root = db.0.with_extension("review-claims");
+    let claim_path = claim_root.join(format!("{:x}.lock", Sha256::digest(run_id.as_bytes())));
+    assert!(!claim_root.exists());
+    assert!(!claim_path.exists());
+    let calls = { let t = trace.lock().unwrap(); (t.tasks.len(), t.restores.len()) };
+    assert!(calls.0 > 0);
+    assert_eq!(h.resume(order, &hold.hold_instance_id, "invalid-target", "human").unwrap_err(), foundry_exec::HostError::Worker("resume target is not allowed".into()));
+    assert!(!claim_root.exists());
+    assert_eq!(read_state(), before);
+    assert_eq!({ let t = trace.lock().unwrap(); (t.tasks.len(), t.restores.len()) }, calls);
+
+    std::fs::rename(&snapshot, snapshot.with_file_name("pack-snapshot-moved")).unwrap();
+    assert!(!snapshot.exists());
+    assert!(matches!(h.resume(order, &hold.hold_instance_id, "replan_full", "human"), Err(foundry_exec::HostError::Persistence(_))));
+    assert!(claim_root.is_dir());
+    let entries: Vec<_> = std::fs::read_dir(&claim_root).unwrap().map(|entry| entry.unwrap().path()).collect();
+    assert_eq!(entries, vec![claim_path.clone()]);
+    assert!(claim_path.is_file());
+    assert_eq!(std::fs::metadata(&claim_path).unwrap().len(), 0);
+    let claim = std::fs::OpenOptions::new().write(true).open(&claim_path).unwrap();
+    claim.try_lock().unwrap();
+    claim.unlock().unwrap();
+    drop(claim);
+    assert_eq!(read_state(), before);
+    assert_eq!({ let t = trace.lock().unwrap(); (t.tasks.len(), t.restores.len()) }, calls);
+    drop(h);
+    drop(db);
+    drop(fixture);
+}
+
+#[test]
+fn held_resume_rejects_durable_pack_digest_mismatch_without_mutation() {
+    let db = Db::new();
+    let trace = Arc::new(Mutex::new(Trace::default()));
+    for i in 0..3 {
+        trace.lock().unwrap().outputs.push_back(output(None, false, i));
+    }
+    trace.lock().unwrap().outputs.push_back(output(Some("intent_gap"), true, 3));
+    let order = "durable-pack-digest-mismatch";
+    let mut h = host(&db, trace.clone(), Arc::new(AtomicBool::new(false)));
+    let hold = h.try_dispatch(&intent(order, 1)).unwrap().held.unwrap();
+    let run = h.latest_run(order, 1).unwrap().unwrap();
+    assert_eq!(run.status, "held");
+    let root = trace.lock().unwrap().tasks[0].workdir.ancestors().nth(3).unwrap().to_owned();
+    assert!(root.starts_with(db.0.with_extension("review-runs")));
+    let digest = foundry_pack::load_pack(root.join("pack-snapshot")).unwrap().digest().to_owned();
+    let forged_digest = if digest == "00".repeat(32) { "11".repeat(32) } else { "00".repeat(32) };
+    assert_eq!(connection(&db).execute(
+        "UPDATE review_runs SET pack_digest=?1 WHERE order_id=?2",
+        rusqlite::params![forged_digest, order],
+    ).unwrap(), 1);
+    let read_state = || -> (String, i64) {
+        connection(&db).query_row(
+            "SELECT json_array(order_id,attempt,run_id,base_commit,result_commit,pack_digest,status,counters_json,hold_json,hold_instance_id,resume_targets,deadline,result_json,provenance_json,created_at), (SELECT count(*) FROM review_stage_attempts WHERE order_id=?1) FROM review_runs WHERE order_id=?1",
+            [order], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap()
+    };
+    let before = read_state();
+    let row: serde_json::Value = serde_json::from_str(&before.0).unwrap();
+    assert_eq!(row[5].as_str(), Some(forged_digest.as_str()));
+    assert_eq!(row[6].as_str(), Some("held"));
+    let calls = trace.lock().unwrap().tasks.len();
+    assert!(calls > 0);
+    let error = h.resume(order, &hold.hold_instance_id, "replan_full", "human").unwrap_err();
+    assert_eq!(error, foundry_exec::HostError::Persistence("held pack snapshot digest changed".into()));
+    assert_eq!(trace.lock().unwrap().tasks.len(), calls);
+    assert_eq!(read_state(), before);
+}

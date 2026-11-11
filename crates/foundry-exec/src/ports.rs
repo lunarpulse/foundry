@@ -250,11 +250,15 @@ pub trait ReviewHostStore: ReviewAdmissionStore + ReviewDispatchStore + Send {
     ) -> Result<Option<crate::types::ExecutionIntent>, crate::host::HostError>;
     /// Atomically validates current product authority, loads the immutable
     /// accepted decision, and claims its durable continuation progress.
+    /// For Resume, call preflight exactly once with the validated snapshot root
+    /// and configured digest before writing continuation state, while holding
+    /// the same authority transaction and claim lock. Propagate its error.
     fn claim_accepted_hold(
         &mut self,
         session_digest: &str,
         operation_id: &str,
         now: chrono::DateTime<chrono::Utc>,
+        preflight: &mut dyn FnMut(&std::path::Path, &str) -> Result<(), crate::host::HostError>,
     ) -> Result<crate::review_run::ReviewAcceptedHold, crate::host::HostError>;
     fn finalize_accepted_hold(
         &mut self,
