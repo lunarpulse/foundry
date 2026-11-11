@@ -48,11 +48,22 @@ pub trait StageExecutor: Send {
     fn ensure_available(&self) -> Result<(), String> {
         Ok(())
     }
+    /// Observation boundary after durable stage acceptance and before the
+    /// terminal transaction. Implementations may stop before completion.
+    #[cfg(feature = "a01-harness-support")]
+    fn before_terminal_commit(&mut self, _completion: &foundry_exec::ReviewDispatchCompletion) -> Result<(),String> {
+        Ok(())
+    }
     fn restore_session(&mut self, _session_id: &str, _workdir: &Path) -> Result<(), String> {
         Err("session restoration is not implemented".into())
     }
 }
 impl<T: StageExecutor + ?Sized> StageExecutor for Box<T> {
+    #[cfg(feature = "a01-harness-support")]
+    fn before_terminal_commit(&mut self, completion: &foundry_exec::ReviewDispatchCompletion) -> Result<(),String> {
+        (**self).before_terminal_commit(completion)
+    }
+
     fn execute(&mut self, task: &StageTask) -> Result<StageOutput, String> {
         (**self).execute(task)
     }
@@ -236,6 +247,16 @@ impl ReviewHostStore for StandaloneReviewStore {
         if current.2 != request.expected.deadline || (current.2 > 0 && current.2 <= request.now) {
             return Err(HostError::Worker(
                 "review hold deadline expired or changed".into(),
+            ));
+        }
+        let durable_digest: String = tx.query_row(
+            "SELECT pack_digest FROM review_runs WHERE order_id=?1 AND attempt=?2 AND run_id=?3 AND status='held'",
+            params![request.expected.binding.order_id, request.expected.binding.attempt as i64, request.expected.binding.journal_run],
+            |row| row.get(0),
+        ).map_err(sqlerr)?;
+        if durable_digest != self.pack_digest {
+            return Err(HostError::Persistence(
+                "held pack snapshot digest changed".into(),
             ));
         }
         let updated = encode_continuation_snapshot(&request.snapshot)?;
@@ -587,6 +608,7 @@ impl ReviewHostStore for StandaloneReviewStore {
         _session_digest: &str,
         _operation_id: &str,
         _now: chrono::DateTime<chrono::Utc>,
+        _preflight: &mut dyn FnMut(&std::path::Path, &str) -> Result<(), HostError>,
     ) -> Result<foundry_exec::ReviewAcceptedHold, HostError> {
         Err(HostError::Worker(
             "product acceptance continuation is unavailable in standalone mode".into(),
@@ -809,11 +831,30 @@ impl PackReviewHost {
         operation_id: &str,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), HostError> {
+        let mut verified_pack = None;
+        let mut preflight_calls = 0usize;
+        let mut preflight = |root: &std::path::Path, expected_digest: &str| {
+            preflight_calls += 1;
+            if preflight_calls != 1 {
+                return Err(HostError::Persistence("snapshot preflight invoked more than once".into()));
+            }
+            let pack = load_pack(root.join("pack-snapshot"))
+                .map_err(|e| HostError::Persistence(e.to_string()))?;
+            if pack.digest() != expected_digest {
+                return Err(HostError::Persistence("held pack snapshot digest changed".into()));
+            }
+            verified_pack = Some(pack);
+            Ok(())
+        };
         let accepted = self
             .store
-            .claim_accepted_hold(session_digest, operation_id, now)?;
+            .claim_accepted_hold(session_digest, operation_id, now, &mut preflight)?;
         match accepted.decision.clone() {
             foundry_exec::ReviewHoldAction::Resume { target } => {
+                if preflight_calls != 1 {
+                    return Err(HostError::Persistence("snapshot preflight must run exactly once".into()));
+                }
+                let pack = verified_pack.ok_or_else(|| HostError::Persistence("snapshot preflight did not succeed".into()))?;
                 if let Err(error) = self.executor.ensure_available() {
                     let _ = self
                         .store
@@ -825,6 +866,7 @@ impl PackReviewHost {
                     &accepted.binding,
                     &target,
                     accepted.snapshot.clone(),
+                    Some(pack),
                 ) {
                     let _ = self
                         .store
@@ -833,7 +875,12 @@ impl PackReviewHost {
                 }
                 Ok(())
             }
-            _ => self.store.finalize_accepted_hold(accepted, now),
+            _ => {
+                if preflight_calls != 0 {
+                    return Err(HostError::Persistence("snapshot preflight invoked for non-Resume decision".into()));
+                }
+                self.store.finalize_accepted_hold(accepted, now)
+            }
         }
     }
     pub fn sqlite_ports(
@@ -1449,8 +1496,7 @@ impl PackReviewHost {
                     .saturating_add(hold.deadline_secs as i64)
             }
         });
-        self.store
-            .complete_review_dispatch(foundry_exec::ReviewDispatchCompletion {
+        let completion = foundry_exec::ReviewDispatchCompletion {
                 intent: intent.clone(),
                 journal_run: run_id.clone(),
                 status: if passed {
@@ -1470,7 +1516,10 @@ impl PackReviewHost {
                     pack_digest: binary.pack_digest,
                 },
                 deadline,
-            })?;
+            };
+        #[cfg(feature = "a01-harness-support")]
+        self.executor.before_terminal_commit(&completion).map_err(HostError::Worker)?;
+        self.store.complete_review_dispatch(completion)?;
         Ok(host)
     }
 }
@@ -1562,6 +1611,14 @@ impl DispatchHost for PackReviewHost {
                 .store
                 .claim_resume(&record.binding.journal_run)?
                 .ok_or_else(|| HostError::Worker("review continuation is still running".into()))?;
+            let snapshot_root = self.store.run_root(&snapshot.snapshot_run_id)?;
+            let pack = load_pack(snapshot_root.join("pack-snapshot"))
+                .map_err(|e| HostError::Persistence(e.to_string()))?;
+            if pack.digest() != self.store.pack_digest() {
+                return Err(HostError::Persistence(
+                    "held pack snapshot digest changed".into(),
+                ));
+            }
             snapshot.resume_sequence = snapshot
                 .resume_sequence
                 .checked_add(1)
@@ -1579,7 +1636,7 @@ impl DispatchHost for PackReviewHost {
                     now,
                     snapshot: snapshot.clone(),
                 })?;
-            if let Err(error) = self.continue_held_engine(order, &record.binding, target, snapshot)
+            if let Err(error) = self.continue_held_engine(order, &record.binding, target, snapshot, Some(pack))
             {
                 let _ = self
                     .store
@@ -1631,15 +1688,21 @@ impl PackReviewHost {
         binding: &foundry_exec::ReviewRunBinding,
         target: &str,
         mut continuation: foundry_exec::ReviewContinuationSnapshot,
+        verified_pack: Option<foundry_pack::PackSnapshot>,
     ) -> Result<(), HostError> {
         let intent = continuation.intent.clone();
         let run_id = &binding.journal_run;
         let attempt = binding.attempt as i64;
         let mut state = foundry_pack::EngineState::import(&continuation.held.engine_state)?;
         let run_root = self.store.run_root(run_id)?;
-        let snapshot_root = self.store.run_root(&continuation.snapshot_run_id)?;
-        let snap = load_pack(snapshot_root.join("pack-snapshot"))
-            .map_err(|e| HostError::Persistence(e.to_string()))?;
+        let snap = match verified_pack {
+            Some(pack) => pack,
+            None => {
+                let snapshot_root = self.store.run_root(&continuation.snapshot_run_id)?;
+                load_pack(snapshot_root.join("pack-snapshot"))
+                    .map_err(|e| HostError::Persistence(e.to_string()))?
+            }
+        };
         let continuation_binding = self.store.continuation_binding(order, attempt, run_id)?;
         let expected_digest = continuation_binding.pack_digest;
         let mut sequence = continuation_binding.next_sequence;
@@ -3651,6 +3714,8 @@ mod tests {
         inner: StandaloneReviewStore,
         calls: Arc<Mutex<Vec<&'static str>>>,
         reject_admission: bool,
+        resume_swap: Option<Arc<Mutex<Option<(PathBuf, Vec<u8>, bool)>>>>,
+        accepted_fixture: Option<(foundry_exec::ReviewAcceptedHold, PathBuf, bool)>,
     }
     impl ReviewHostStore for RecordingReviewStore {
         fn pack_digest(&self) -> &str {
@@ -3710,6 +3775,12 @@ mod tests {
             &mut self,
             request: foundry_exec::ReviewHoldUpdate,
         ) -> Result<(), HostError> {
+            if let Some(swap) = &self.resume_swap {
+                if let Some((path, bytes, fired)) = swap.lock().unwrap().as_mut() {
+                    fs::write(path, bytes).unwrap();
+                    *fired = true;
+                }
+            }
             self.inner.begin_hold_resume(request)
         }
         fn restore_hold_after_resume_error(
@@ -3813,15 +3884,25 @@ mod tests {
             session_digest: &str,
             operation_id: &str,
             now: chrono::DateTime<chrono::Utc>,
+            preflight: &mut dyn FnMut(&std::path::Path, &str) -> Result<(), HostError>,
         ) -> Result<foundry_exec::ReviewAcceptedHold, HostError> {
+            if let Some((claim, root, invoke_preflight)) = &self.accepted_fixture {
+                self.calls.lock().unwrap().push("claim");
+                if *invoke_preflight {
+                    preflight(root, self.inner.pack_digest())?;
+                    self.calls.lock().unwrap().push("preflight_succeeded");
+                }
+                return Ok(claim.clone());
+            }
             self.inner
-                .claim_accepted_hold(session_digest, operation_id, now)
+                .claim_accepted_hold(session_digest, operation_id, now, preflight)
         }
         fn finalize_accepted_hold(
             &mut self,
             claim: foundry_exec::ReviewAcceptedHold,
             now: chrono::DateTime<chrono::Utc>,
         ) -> Result<(), HostError> {
+            self.calls.lock().unwrap().push("finalize");
             self.inner.finalize_accepted_hold(claim, now)
         }
     }
@@ -3901,6 +3982,173 @@ mod tests {
         }
     }
 
+    fn assert_alternate_claim_preflight_rejected(decision: foundry_exec::ReviewHoldAction, invoke_preflight: bool) {
+        struct NoDispatchExecutor;
+        impl StageExecutor for NoDispatchExecutor {
+            fn ensure_available(&self) -> Result<(), String> {
+                panic!("executor availability must not be checked")
+            }
+            fn execute(&mut self, _: &StageTask) -> Result<StageOutput, String> {
+                panic!("executor must not run")
+            }
+        }
+        struct TempDir(PathBuf);
+        impl Drop for TempDir {
+            fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+        }
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let temp = TempDir(std::env::temp_dir().join(format!(
+            "alternate-claim-preflight-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)
+        )));
+        fs::create_dir(&temp.0).unwrap();
+        let pack_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills/bmad-review-full/v1");
+        let pack = load_pack(&pack_path).unwrap();
+        persist_snapshot(&temp.0, &pack).unwrap();
+        let binding = foundry_exec::ReviewRunBinding {
+            order_id: "order".into(), attempt: 1, journal_run: "run".into(),
+        };
+        let snapshot = foundry_exec::ReviewContinuationSnapshot {
+            binding: binding.clone(),
+            snapshot_run_id: "run".into(),
+            held: foundry_exec::ReviewHeldSnapshot {
+                hold: foundry_exec::host::HoldState {
+                    hold_instance_id: "hold".into(), reason: "test".into(),
+                    resume_targets: vec![], deadline_secs: 0,
+                },
+                node_id: "node".into(), entry_counters: BTreeMap::new(), requested_revert: None,
+                engine_state: String::new(), session_ids: vec![], accepted_logs: vec![],
+                generations: vec![], latest_commit: "result".into(), sequence: 0,
+            },
+            intent: ExecutionIntent {
+                order: foundry_exec::OrderId("order".into()), attempt: Attempt(1), run: RunId(1),
+                activation: 1, generation: foundry_exec::Generation(0), epoch: Epoch(1),
+                external_ref: "review:order:1:base..result".into(), recorded_at: chrono::Utc::now(),
+            },
+            resume_sequence: 0, human_events: vec![],
+        };
+        let claim = foundry_exec::ReviewAcceptedHold {
+            operation_id: "operation".into(), actor_id: "actor".into(), decision,
+            binding, snapshot, reserved_run_id: 1,
+        };
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let store = RecordingReviewStore {
+            inner: StandaloneReviewStore::open(&temp.0.join("review.db"), REVIEW_PACK_DIGEST).unwrap(),
+            calls: calls.clone(), reject_admission: false, resume_swap: None,
+            accepted_fixture: Some((claim, temp.0.clone(), invoke_preflight)),
+        };
+        let mut host = PackReviewHost::with_store(pack_path, NoDispatchExecutor, Box::new(store), None, false).unwrap();
+        let error = host.continue_accepted_product_hold("session", "operation", chrono::Utc::now()).unwrap_err();
+        let expected = if invoke_preflight {
+            "snapshot preflight invoked for non-Resume decision"
+        } else {
+            "snapshot preflight must run exactly once"
+        };
+        assert!(matches!(error, HostError::Persistence(ref message) if message == expected), "unexpected error: {error:?}");
+        let calls = calls.lock().unwrap();
+        if invoke_preflight {
+            assert_eq!(&*calls, &["claim", "preflight_succeeded"]);
+        } else {
+            assert_eq!(&*calls, &["claim"]);
+        }
+        assert_eq!(host.dispatches, 0);
+    }
+
+    #[test]
+    fn alternate_resume_claim_without_preflight_is_rejected() {
+        assert_alternate_claim_preflight_rejected(
+            foundry_exec::ReviewHoldAction::Resume { target: "verify".into() }, false,
+        );
+    }
+
+    #[test]
+    fn alternate_non_resume_claim_after_successful_preflight_is_rejected() {
+        assert_alternate_claim_preflight_rejected(foundry_exec::ReviewHoldAction::CommitPass, true);
+    }
+
+    #[test]
+    fn standalone_resume_executes_verified_snapshot_after_persisted_lens_swap() {
+        struct ResumeExecutor(Arc<Mutex<Vec<StageTask>>>);
+        impl StageExecutor for ResumeExecutor {
+            fn execute(&mut self, task: &StageTask) -> Result<StageOutput, String> {
+                let mut tasks = self.0.lock().unwrap();
+                tasks.push(task.clone());
+                let log = task.workdir.join("output.log");
+                fs::write(&log, b"stage output").unwrap();
+                Ok(StageOutput {
+                    log_path: log.to_string_lossy().into_owned(),
+                    inspected_commit: Some(task.artifact_commit.clone()),
+                    verdict_category: (tasks.len() == 4).then(|| "intent_gap".into()),
+                    findings: tasks.len() == 4,
+                    produced_commit: (task.role == "replan").then(|| "commit-B".into()),
+                    ..StageOutput::default()
+                })
+            }
+        }
+
+        struct TempDir(PathBuf);
+        impl Drop for TempDir {
+            fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+        }
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        for swap_enabled in [false, true] {
+            let temp = TempDir(std::env::temp_dir().join(format!(
+                "verified-snapshot-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)
+            )));
+            fs::create_dir(&temp.0).unwrap();
+            let db = temp.0.join("review.db");
+            let pack = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills/bmad-review-full/v1");
+            let store = StandaloneReviewStore::open(&db, REVIEW_PACK_DIGEST).unwrap();
+            let tasks = Arc::new(Mutex::new(Vec::new()));
+            let swap = Arc::new(Mutex::new(None));
+            let mut host = PackReviewHost::with_store(
+                pack, ResumeExecutor(tasks.clone()),
+                Box::new(RecordingReviewStore {
+                    inner: store,
+                    calls: Arc::new(Mutex::new(Vec::new())),
+                    reject_admission: false,
+                    resume_swap: Some(swap.clone()),
+                    accepted_fixture: None,
+                }), None, false,
+            ).unwrap().with_source_commit("a".repeat(40)).unwrap();
+            let order = "verified-snapshot-resume";
+            let intent = ExecutionIntent {
+                order: foundry_exec::OrderId(order.into()), attempt: Attempt(1),
+                run: RunId(7), activation: 1, generation: foundry_exec::Generation(0),
+                epoch: Epoch(1), external_ref: format!("review:{order}:1:base..result"),
+                recorded_at: chrono::Utc::now(),
+            };
+            let hold = host.try_dispatch(&intent).unwrap().held.unwrap();
+            let record = host.latest_hold(order).unwrap().unwrap();
+            let lens_path = host.store.run_root(&record.snapshot.snapshot_run_id).unwrap()
+                .join("pack-snapshot/lens-edge.md");
+            let x = fs::read(&lens_path).unwrap();
+            let mut y = x.clone();
+            y.extend_from_slice(b"\nSWAPPED SNAPSHOT MARKER\n");
+            assert_ne!(x, y);
+            if swap_enabled {
+                *swap.lock().unwrap() = Some((lens_path.clone(), y.clone(), false));
+            }
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute("INSERT INTO review_stage_attempts(order_id,run_id,sequence,stage_id,status,output_json) SELECT order_id,run_id,0,'plan_full','complete',?1 FROM review_runs WHERE order_id=?2", rusqlite::params![serde_json::json!({"log_path":"plan-full.log","verdicts":[]}).to_string(), order]).unwrap();
+            let before = tasks.lock().unwrap().len();
+            host.resume(order, &hold.hold_instance_id, "replan_full", "human").unwrap();
+            if swap_enabled {
+                assert!(swap.lock().unwrap().as_ref().unwrap().2, "resume swap barrier did not fire");
+                assert_eq!(fs::read(&lens_path).unwrap(), y);
+            } else {
+                assert_eq!(fs::read(&lens_path).unwrap(), x);
+            }
+            let tasks = tasks.lock().unwrap();
+            let edge = tasks[before..].iter().find(|task| task.stage_id == "edge").expect("resume did not execute edge lens");
+            let mut expected = x.clone();
+            expected.push(b'\n');
+            let mut swapped = y.clone();
+            swapped.push(b'\n');
+            assert_eq!(edge.lens_bytes, expected);
+            assert_ne!(edge.lens_bytes, swapped);
+        }
+    }
+
     #[test]
     fn supplied_backend_receives_real_host_dispatch_stage_and_terminal_writes() {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -3919,6 +4167,8 @@ mod tests {
                 inner: store,
                 calls: calls.clone(),
                 reject_admission: false,
+                resume_swap: None,
+                accepted_fixture: None,
             }),
             None,
             false,
@@ -3979,6 +4229,8 @@ mod tests {
                 inner: store,
                 calls: calls.clone(),
                 reject_admission: true,
+                resume_swap: None,
+                accepted_fixture: None,
             }),
             None,
             false,

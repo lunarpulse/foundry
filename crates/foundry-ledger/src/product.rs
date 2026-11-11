@@ -24,6 +24,174 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+// The capture readers are private to the isolated v3 claim path.
+#[cfg(feature = "w1-isolated-test-support")]
+#[derive(Debug, PartialEq, Eq)]
+struct W1ServiceAuthority {
+    service_lease_until: String,
+    credential_expires_at: String,
+    grant_revision: i64,
+    grant_action: String,
+}
+
+#[cfg(feature = "w1-isolated-test-support")]
+fn w1_canonical_time(value: &str) -> Result<DateTime<Utc>, ProductError> {
+    let time = DateTime::parse_from_rfc3339(value)
+        .map_err(|_| ProductError::ContractMismatch)?
+        .with_timezone(&Utc);
+    if time.to_rfc3339() != value { return Err(ProductError::ContractMismatch); }
+    Ok(time)
+}
+
+#[cfg(feature = "w1-isolated-test-support")]
+fn w1_service_authority_in(tx: &rusqlite::Transaction<'_>, context: &ProductServiceContext, now: DateTime<Utc>) -> Result<W1ServiceAuthority, ProductError> {
+    let mut statement = tx.prepare("SELECT s.lease_until,c.expires_at,g.grant_revision,g.action FROM product_services_v1 s JOIN product_service_credentials_v1 c USING(service_id) JOIN product_service_grants_v1 g ON g.service_id=s.service_id JOIN product_scope_source_instances_v1 i ON i.source_instance_id=g.source_instance_id JOIN product_scope_current_sources_v1 cs ON cs.connector_id=i.connector_id AND cs.source_instance_id=i.source_instance_id JOIN product_scope_repositories_v1 r ON r.repository_key=i.repository_key JOIN product_scope_api_locators_v1 l USING(source_instance_id) JOIN product_sources_v1 ps ON ps.connector_id=i.connector_id WHERE s.service_id=?1 AND s.revision=?2 AND s.enabled=1 AND c.credential_revision=?3 AND g.source_instance_id=?4 AND g.action='drive_review' AND g.enabled=1 AND i.enabled=1 AND i.generation=?5 AND i.revision=?6 AND ps.revision=?7 AND ps.enabled=1 AND i.connector_id=?8 AND r.api_origin=?9 AND r.stable_repository_id=?10 AND ps.origin=?9 AND l.api_owner=?11 COLLATE NOCASE AND l.api_repo=?12 COLLATE NOCASE")?;
+    let mut rows = statement.query(params![context.service_id,context.service_revision,context.credential_revision,context.source_instance_id,context.source_generation,context.source_instance_revision,context.connector_revision,context.connector_id,context.api_origin,context.repository_id,context.api_owner,context.api_repo])?;
+    let denied = || ProductError::Invariant("service authority is absent, expired, or revoked");
+    let row = rows.next()?.ok_or_else(denied)?;
+    let authority = W1ServiceAuthority { service_lease_until: row.get(0).map_err(isolated_schema_error)?, credential_expires_at: row.get(1).map_err(isolated_schema_error)?, grant_revision: row.get(2).map_err(isolated_schema_error)?, grant_action: row.get(3).map_err(isolated_schema_error)? };
+    if authority.grant_action != "drive_review" { return Err(ProductError::ContractMismatch); }
+    if rows.next()?.is_some() { return Err(ProductError::ContractMismatch); }
+    let service_expiry = w1_canonical_time(&authority.service_lease_until)?;
+    let credential_expiry = w1_canonical_time(&authority.credential_expires_at)?;
+    if service_expiry <= now || credential_expiry <= now { return Err(denied()); }
+    Ok(authority)
+}
+
+#[cfg(feature = "w1-isolated-test-support")]
+#[derive(Debug, PartialEq, Eq)]
+struct W1ClaimCandidate {
+    order_id: String, lifecycle: i64, delivery_id: String, task_kind: String,
+    payload: String, source_revision: i64, admission_seq: i64, admission_hash: String,
+    old_epoch: Option<i64>, attempts: i64, provenance_seq: i64, provenance_hash: String, available_at: DateTime<Utc>, old_lease: Option<DateTime<Utc>>,
+    current_revision: i64, enabled: i64, state: String,
+}
+
+#[cfg(feature = "w1-isolated-test-support")]
+fn w1_claim_candidate_in(tx: &rusqlite::Transaction<'_>, context: &ProductServiceContext, now: DateTime<Utc>) -> Result<Option<W1ClaimCandidate>, ProductError> {
+    let mut statement = tx.prepare("SELECT o.order_id,o.lifecycle,b.delivery_id,o.task_kind,o.payload_snapshot,o.source_revision,o.admission_seq,o.admission_hash,s.revision,s.enabled,c.epoch,c.lease_until,b.available_at,b.state,c.order_id,b.attempts,p.admission_seq,p.admission_hash FROM product_work_backlog_v1 b JOIN product_orders_v1 o ON o.order_id=b.order_id AND o.lifecycle=b.lifecycle JOIN product_sources_v1 s ON s.connector_id=o.connector_id JOIN product_scope_order_provenance_v1 p ON p.order_id=o.order_id AND p.lifecycle=o.lifecycle AND p.verified=1 AND p.source_instance_id=?1 LEFT JOIN product_work_claims_v1 c ON c.order_id=b.order_id AND c.lifecycle=b.lifecycle WHERE o.connector_id=?2 AND o.repository_id=?3 AND b.state IN ('ready','retryable','claimed','completed')")?;
+    let mut rows = statement.query(params![context.source_instance_id,context.connector_id,context.repository_id])?;
+    let mut candidates = Vec::new();
+    while let Some(row) = rows.next()? {
+        let read = || -> Result<W1ClaimCandidate, rusqlite::Error> {
+            let old_lease: Option<String> = row.get(11)?;
+            let available: String = row.get(12)?;
+            let claim_id: Option<String> = row.get(14)?;
+            let epoch: Option<i64> = row.get(10)?;
+            if claim_id.is_some() != epoch.is_some() { return Err(rusqlite::Error::InvalidColumnType(10, "epoch".into(), rusqlite::types::Type::Null)); }
+            Ok(W1ClaimCandidate { order_id: row.get(0)?, lifecycle: row.get(1)?, delivery_id: row.get(2)?, task_kind: row.get(3)?, payload: row.get(4)?, source_revision: row.get(5)?, admission_seq: row.get(6)?, admission_hash: row.get(7)?, current_revision: row.get(8)?, enabled: row.get(9)?, old_epoch: epoch, attempts: row.get(15)?, provenance_seq: row.get(16)?, provenance_hash: row.get(17)?, old_lease: old_lease.as_deref().map(w1_canonical_time).transpose().map_err(|e| rusqlite::Error::FromSqlConversionFailure(11, rusqlite::types::Type::Text, Box::new(e)))?, available_at: w1_canonical_time(&available).map_err(|e| rusqlite::Error::FromSqlConversionFailure(12, rusqlite::types::Type::Text, Box::new(e)))?, state: row.get(13)? })
+        };
+        let candidate = read().map_err(isolated_schema_error)?;
+        if candidate.attempts < 0 || candidate.old_epoch.is_some_and(|epoch| epoch <= 0) { return Err(ProductError::ContractMismatch); }
+        if candidate.available_at <= now && (matches!(candidate.state.as_str(), "ready" | "retryable") || candidate.old_lease.is_none_or(|lease| lease <= now)) { candidates.push(candidate); }
+    }
+    candidates.sort_by(|a,b| a.available_at.cmp(&b.available_at).then_with(|| a.order_id.cmp(&b.order_id)).then_with(|| a.lifecycle.cmp(&b.lifecycle)));
+    let Some(candidate) = candidates.into_iter().next() else { return Ok(None); };
+    if candidate.enabled != 1 || candidate.current_revision != candidate.source_revision || candidate.source_revision != context.source_revision { return Err(ProductError::Invariant("work source was disabled or rebound")); }
+    if candidate.provenance_seq != candidate.admission_seq || candidate.provenance_hash != candidate.admission_hash { return Err(ProductError::Invariant("order provenance binding changed")); }
+    let anchor: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM product_transition_receipts_v1 WHERE seq=?1 AND event_hash=?2 AND order_id=?3 AND lifecycle=?4 AND operation='github-admission')", params![candidate.admission_seq,candidate.admission_hash,candidate.order_id,candidate.lifecycle], |r| r.get(0))?;
+    if !anchor { return Err(ProductError::Invariant("work admission anchor is not authoritative")); }
+    if candidate.old_lease.is_some_and(|lease| lease > now) { return Ok(None); }
+    Ok(Some(candidate))
+}
+
+// The callback is installed only for an explicitly armed v3 claim. SQLite invokes
+// it on the claiming thread, so it can report the first actual busy result.
+#[cfg(feature = "w1-isolated-test-support")]
+std::thread_local! {
+    static W1_BUSY_WAIT: std::cell::RefCell<Option<(std::sync::mpsc::SyncSender<()>, std::time::Instant)>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(feature = "w1-isolated-test-support")]
+fn w1_busy_handler(attempts: i32) -> bool {
+    W1_BUSY_WAIT.try_with(|slot| {
+        let Ok(mut slot) = slot.try_borrow_mut() else { return false; };
+        let Some((sender, started)) = slot.as_mut() else { return false; };
+        if attempts == 0 { let _ = sender.try_send(()); }
+        let remaining = std::time::Duration::from_secs(5).saturating_sub(started.elapsed());
+        if remaining.is_zero() { return false; }
+        std::thread::sleep(remaining.min(std::time::Duration::from_millis(10)));
+        true
+    }).unwrap_or(false)
+}
+
+#[cfg(feature = "w1-isolated-test-support")]
+struct W1BusyGuard<'a> { store: &'a mut ProductStore, restored: bool }
+
+#[cfg(feature = "w1-isolated-test-support")]
+impl W1BusyGuard<'_> {
+    fn restore(&mut self) -> rusqlite::Result<()> {
+        let _ = W1_BUSY_WAIT.try_with(|slot| { if let Ok(mut slot) = slot.try_borrow_mut() { *slot = None; } });
+        let result = self.store.conn.busy_timeout(std::time::Duration::from_secs(5));
+        self.restored = result.is_ok();
+        result
+    }
+}
+
+#[cfg(feature = "w1-isolated-test-support")]
+impl Drop for W1BusyGuard<'_> {
+    fn drop(&mut self) {
+        if !self.restored { let _ = self.restore(); }
+    }
+}
+
+// This private entry point owns the IMMEDIATE transaction and the single clock
+// sample.
+#[cfg(feature = "w1-isolated-test-support")]
+fn w1_capture_claim_private(store: &mut ProductStore, context: &ProductServiceContext, worker: &str, lease: chrono::Duration) -> Result<ProductWorkClaimResult, ProductError> {
+    if !store.open_mode.is_capture() { return Err(ProductError::ContractMismatch); }
+    if worker.trim().is_empty() || worker.len() > 128 || lease <= chrono::Duration::zero() || lease > chrono::Duration::hours(1) { return Err(ProductError::InvalidConfig); }
+    if let Some(sender) = store.w1_capture_busy_observer.take() {
+        W1_BUSY_WAIT.with(|slot| *slot.borrow_mut() = Some((sender, std::time::Instant::now())));
+        let mut guard = W1BusyGuard { store, restored: false };
+        guard.store.conn.busy_handler(Some(w1_busy_handler))?;
+        let result = w1_capture_claim_inner(guard.store, context, worker, lease);
+        guard.restore()?;
+        return result;
+    }
+    w1_capture_claim_inner(store, context, worker, lease)
+}
+
+#[cfg(feature = "w1-isolated-test-support")]
+fn w1_capture_claim_inner(store: &mut ProductStore, context: &ProductServiceContext, worker: &str, lease: chrono::Duration) -> Result<ProductWorkClaimResult, ProductError> {
+    let clock = store.clock.clone();
+    let tx = store.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let now = clock.now();
+    validate_isolated_pragmas(&tx)?;
+    validate_isolated_marker_version(&tx, store.open_mode)?;
+    validate_w1_operations(&tx)?;
+    validate_w1_capture_schema(&tx)?;
+    let authority = w1_service_authority_in(&tx, context, now)?;
+    let Some(c) = w1_claim_candidate_in(&tx, context, now)? else { return Ok(ProductWorkClaimResult::Empty); };
+    // Both supported transitions into claimed/completed retain a claim row.
+    if matches!(c.state.as_str(), "claimed" | "completed") && c.old_epoch.is_none() { return Err(ProductError::ContractMismatch); }
+    if c.lifecycle <= 0 { return Err(ProductError::ContractMismatch); }
+    let epoch = c.old_epoch.unwrap_or(0).checked_add(1).ok_or(ProductError::InvalidConfig)?;
+    let attempts = c.attempts.checked_add(1).ok_or(ProductError::InvalidConfig)?;
+    let lease_until = now.checked_add_signed(lease).ok_or(ProductError::InvalidConfig)?;
+    let old_fence: i64 = tx.query_row("SELECT next FROM product_fence_counter_v1 WHERE singleton=1", [], |r| r.get(0)).map_err(|error| match error {
+        rusqlite::Error::QueryReturnedNoRows => ProductError::ContractMismatch,
+        other => isolated_schema_error(other),
+    })?;
+    if old_fence < 0 { return Err(ProductError::ContractMismatch); }
+    let fence = old_fence.checked_add(1).ok_or(ProductError::InvalidConfig)?;
+    let digest = payload_digest(&c.task_kind, &c.payload);
+    let changed = tx.execute("UPDATE product_fence_counter_v1 SET next=?1 WHERE singleton=1 AND next=?2", params![fence, old_fence])?;
+    if changed != 1 { return Err(ProductError::ContractMismatch); }
+    let changed = tx.execute("INSERT INTO product_work_claims_v1(order_id,lifecycle,owner_id,epoch,fence,state,lease_until,source_revision,payload_digest) VALUES(?1,?2,?3,?4,?5,'claimed',?6,?7,?8) ON CONFLICT(order_id,lifecycle) DO UPDATE SET owner_id=excluded.owner_id,epoch=excluded.epoch,fence=excluded.fence,state='claimed',lease_until=excluded.lease_until,source_revision=excluded.source_revision,payload_digest=excluded.payload_digest WHERE product_work_claims_v1.epoch=?9", params![c.order_id,c.lifecycle,worker,epoch,fence,lease_until.to_rfc3339(),c.source_revision,digest,c.old_epoch])?;
+    if changed != 1 { return Err(ProductError::ContractMismatch); }
+    let changed = tx.execute("UPDATE product_work_backlog_v1 SET state='claimed',attempts=?1 WHERE order_id=?2 AND lifecycle=?3 AND delivery_id=?4 AND state=?5 AND attempts=?6", params![attempts,c.order_id,c.lifecycle,c.delivery_id,c.state,c.attempts])?;
+    if changed != 1 { return Err(ProductError::ContractMismatch); }
+    let changed = tx.execute("INSERT INTO product_service_work_bindings_v1(order_id,lifecycle,service_id,service_revision,credential_revision,source_instance_id) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(order_id,lifecycle) DO UPDATE SET service_id=excluded.service_id,service_revision=excluded.service_revision,credential_revision=excluded.credential_revision,source_instance_id=excluded.source_instance_id", params![c.order_id,c.lifecycle,context.service_id,context.service_revision,context.credential_revision,context.source_instance_id])?;
+    if changed != 1 { return Err(ProductError::ContractMismatch); }
+    if std::mem::take(&mut store.w1_capture_fail_after_legacy_writes) { return Err(ProductError::Invariant("w1 capture injected failure")); }
+    let changed = tx.execute("INSERT INTO product_w1_claim_authority_v1(order_id,lifecycle,epoch,fence,installation_id,database_id,delivery_id,worker_id,claimed_at,claim_lease_until,payload_digest,admission_seq,admission_hash,service_id,service_revision,service_lease_until,credential_revision,credential_expires_at,grant_action,grant_revision,source_instance_id,source_generation,source_instance_revision,connector_id,connector_revision,api_origin,repository_id,api_owner,api_repo) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29)", params![c.order_id,c.lifecycle,epoch,fence,store.installation_id,store.database_id,c.delivery_id,worker,now.to_rfc3339(),lease_until.to_rfc3339(),digest,c.admission_seq,c.admission_hash,context.service_id,context.service_revision,authority.service_lease_until,context.credential_revision,authority.credential_expires_at,authority.grant_action,authority.grant_revision,context.source_instance_id,context.source_generation,context.source_instance_revision,context.connector_id,context.connector_revision,context.api_origin,context.repository_id,context.api_owner,context.api_repo])?;
+    if changed != 1 { return Err(ProductError::ContractMismatch); }
+    let claim = ProductWorkClaim { order_id:c.order_id, lifecycle:c.lifecycle, delivery_id:c.delivery_id, worker_id:worker.to_owned(), epoch, fence, source_revision:c.source_revision, payload_digest:digest, service_binding:Some(foundry_exec::ReviewServiceBinding { service_id:context.service_id.clone(), service_revision:context.service_revision, credential_revision:context.credential_revision, source_instance_id:context.source_instance_id.clone() }), lease_until, task_kind:c.task_kind, payload_snapshot:c.payload };
+    tx.commit()?;
+    Ok(ProductWorkClaimResult::Claimed(claim))
+}
+
 #[path = "product/result.rs"]
 mod result;
 #[path = "product/review.rs"]
@@ -53,6 +221,70 @@ pub enum ProductError {
     Invariant(&'static str),
     #[error("product store database: {0}")]
     Database(#[from] rusqlite::Error),
+}
+
+#[cfg(feature = "w1-isolated-test-support")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum W1Operation { Approve, Revoke, Select }
+
+#[cfg(feature = "w1-isolated-test-support")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct W1OperationReceipt {
+    pub canonical: Vec<u8>,
+    pub operation: W1Operation,
+    pub installation_id: String,
+    pub database_id: String,
+    pub actor_id: String,
+    pub authority_revision: i64,
+    pub source_instance_id: String,
+    pub digest: String,
+    pub expected_revision: i64,
+    pub result_revision: i64,
+    pub request_key: String,
+    pub order_id: Option<String>,
+    pub lifecycle: Option<i64>,
+    pub approval_revision: Option<i64>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StoreOpenMode {
+    Normal,
+    #[cfg(feature = "a01-harness-support")]
+    A01Create,
+    #[cfg(feature = "a01-harness-support")]
+    A01Reopen,
+    #[cfg(feature = "a01-harness-support")]
+    A01TaskCreate,
+    #[cfg(feature = "a01-harness-support")]
+    A01TaskReopen,
+    #[cfg(feature = "w1-isolated-test-support")]
+    IsolatedCreate,
+    #[cfg(feature = "w1-isolated-test-support")]
+    IsolatedReopen,
+    #[cfg(feature = "w1-isolated-test-support")]
+    CaptureCreate,
+    #[cfg(feature = "w1-isolated-test-support")]
+    CaptureReopen,
+    #[cfg(feature = "w1-isolated-test-support")]
+    PinCreate,
+    #[cfg(feature = "w1-isolated-test-support")]
+    PinReopen,
+}
+
+#[cfg(feature = "a01-harness-support")]
+impl StoreOpenMode {
+    fn is_a01_task(self) -> bool { matches!(self, Self::A01TaskCreate | Self::A01TaskReopen) }
+    fn is_a01(self) -> bool {
+        matches!(self, Self::A01Create | Self::A01Reopen | Self::A01TaskCreate | Self::A01TaskReopen)
+    }
+}
+
+#[cfg(feature = "w1-isolated-test-support")]
+impl StoreOpenMode {
+    fn is_reopen(self) -> bool { matches!(self, Self::IsolatedReopen | Self::CaptureReopen | Self::PinReopen) }
+    fn is_create(self) -> bool { matches!(self, Self::IsolatedCreate | Self::CaptureCreate | Self::PinCreate) }
+    fn is_capture(self) -> bool { matches!(self, Self::CaptureCreate | Self::CaptureReopen) }
+    fn is_pin(self) -> bool { matches!(self, Self::PinCreate | Self::PinReopen) }
 }
 
 /// Human decision accepted for one exact, already persisted product hold.
@@ -375,10 +607,17 @@ impl ProductSession {
 
 pub struct ProductStore {
     conn: Connection,
+    open_mode: StoreOpenMode,
+    #[cfg(feature = "a01-harness-support")]
+    a01_identity: Option<A01FileIdentity>,
     path: PathBuf,
     installation_id: String,
     database_id: String,
     clock: std::sync::Arc<dyn ProductClock>,
+    #[cfg(feature = "w1-isolated-test-support")]
+    w1_capture_fail_after_legacy_writes: bool,
+    #[cfg(feature = "w1-isolated-test-support")]
+    w1_capture_busy_observer: Option<std::sync::mpsc::SyncSender<()>>,
     review_config: Option<ProductReviewConfig>,
     artifact_root: Option<PathBuf>,
     artifact_root_handle: Option<std::sync::Arc<std::fs::File>>,
@@ -422,6 +661,156 @@ pub struct ProductReviewConfig {
 }
 
 impl ProductStore {
+    /// Exclusively create a disposable A01 store in a caller-controlled private
+    /// directory. This mode denies all work claims and review admission.
+    /// The caller must exclude concurrent same-UID pathname/schema writers.
+    #[cfg(feature = "a01-harness-support")]
+    pub fn create_a01_isolated_test_store(
+        directory: &Path,
+        name: &str,
+        config: ProductConfig,
+        clock: std::sync::Arc<dyn ProductClock>,
+    ) -> Result<ProductStore, ProductError> {
+        Self::create_a01_isolated_test_store_with_checkpoint(
+            directory, name, config, clock,
+            #[cfg(all(test, feature = "a01-harness-support", unix))]
+            None,
+        )
+    }
+
+    #[cfg(feature = "a01-harness-support")]
+    
+fn create_a01_isolated_test_store_with_checkpoint(
+        directory: &Path,
+        name: &str,
+        config: ProductConfig,
+        clock: std::sync::Arc<dyn ProductClock>,
+            #[cfg(all(test, feature = "a01-harness-support", unix))] checkpoint: Option<usize>,
+    ) -> Result<ProductStore, ProductError> {
+        validate_a01_config(&config)?;
+        let path = a01_test_path(directory, name)?;
+        a01_require_absent(&path)?;
+        a01_check_sidecars(&path)?;
+        #[cfg(not(unix))]
+        { let _ = clock; Err(ProductError::InvalidConfig) }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let held = std::fs::OpenOptions::new().read(true).write(true)
+                .create_new(true).mode(0o600).open(&path)
+                .map_err(|_| ProductError::Invariant("A01 exclusive file creation failed"))?;
+            let identity = a01_checked_file(&path, &held)?;
+            // The fresh schema and discriminator share open_internal's one
+            // IMMEDIATE initialization transaction. No ordinary v3 is committed.
+            let mut store = Self::open_internal_with_checkpoint(
+            &path, config, clock, StoreOpenMode::A01Create,
+            #[cfg(all(test, feature = "a01-harness-support", unix))]
+            checkpoint,
+        )?;
+            if a01_checked_file(&path, &held)? != identity {
+                return Err(ProductError::Invariant("A01 physical identity changed"));
+            }
+            a01_check_sidecars(&path)?;
+            store.a01_identity = Some(identity);
+            Ok(store)
+        }
+    }
+
+    /// Validate and reopen an A01 store without creating or repairing schema.
+    /// Assembly must additionally compare its privately retained physical
+    /// identity; logical IDs alone cannot distinguish a copied database.
+    #[cfg(feature = "a01-harness-support")]
+    pub fn reopen_a01_isolated_test_store(
+        directory: &Path,
+        name: &str,
+        config: ProductConfig,
+        clock: std::sync::Arc<dyn ProductClock>,
+    ) -> Result<ProductStore, ProductError> {
+        validate_a01_config(&config)?;
+        let path = a01_test_path(directory, name)?;
+        a01_check_sidecars(&path)?;
+        a01_file_identity(&path)?;
+        let held = std::fs::File::open(&path)
+            .map_err(|_| ProductError::Invariant("A01 file inspection failed"))?;
+        let identity = a01_checked_file(&path, &held)?;
+        // Reject WAL format before SQLite inspection can create WAL/SHM files.
+        #[cfg(unix)]
+        {
+            let header = a01_read_header(&held)?;
+            if &header[..16] != b"SQLite format 3\0" || header[18..20] != [1, 1] {
+                return Err(ProductError::ContractMismatch);
+            }
+        }
+        {
+            let inspection = Connection::open_with_flags(
+                &path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+            inspection.busy_timeout(std::time::Duration::from_secs(5))?;
+            let tx = inspection.unchecked_transaction()?;
+            let journal: String = tx.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+            if journal != "delete" { return Err(ProductError::ContractMismatch); }
+            validate_a01_contract(&tx, &config)?;
+            tx.commit()?;
+        }
+        if a01_checked_file(&path, &held)? != identity {
+            return Err(ProductError::Invariant("A01 physical identity changed"));
+        }
+        a01_check_sidecars(&path)?;
+        let conn = Connection::open_with_flags(
+            &path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )?;
+        configure_a01_connection(&conn)?;
+        {
+            let tx = conn.unchecked_transaction()?;
+            validate_a01_connection(&tx, &config)?;
+            tx.commit()?;
+        }
+        if a01_checked_file(&path, &held)? != identity {
+            return Err(ProductError::Invariant("A01 physical identity changed"));
+        }
+        a01_check_sidecars(&path)?;
+        Ok(Self {
+            conn,
+            open_mode: StoreOpenMode::A01Reopen,
+            a01_identity: Some(identity),
+            path,
+            installation_id: config.installation_id,
+            database_id: config.database_id,
+            clock,
+            #[cfg(feature = "w1-isolated-test-support")]
+            w1_capture_fail_after_legacy_writes: false,
+            #[cfg(feature = "w1-isolated-test-support")]
+            w1_capture_busy_observer: None,
+            review_config: None,
+            artifact_root: None,
+            artifact_root_handle: None,
+            active_review_claim: None,
+            active_review_claim_lock: None,
+            #[cfg(any(test, feature = "p2-test-support"))]
+            charge_budget_observer: None,
+        })
+    }
+
+    /// Arm a single pre-commit capture failure on an isolated v3 store.
+    #[cfg(feature = "w1-isolated-test-support")]
+    pub fn w1_capture_fail_after_legacy_writes_once(&mut self) -> Result<(), ProductError> {
+        if !self.open_mode.is_capture() { return Err(ProductError::ContractMismatch); }
+        self.w1_capture_fail_after_legacy_writes = true;
+        Ok(())
+    }
+    /// Observe the first SQLite busy callback on the next v3 claim.
+    #[cfg(feature = "w1-isolated-test-support")]
+    pub fn w1_capture_observe_busy_once(&mut self, sender: std::sync::mpsc::SyncSender<()>) -> Result<(), ProductError> {
+        if !self.open_mode.is_capture() { return Err(ProductError::ContractMismatch); }
+        self.w1_capture_busy_observer = Some(sender);
+        Ok(())
+    }
+    /// Read the actual v3 connection timeout after a test claim.
+    #[cfg(feature = "w1-isolated-test-support")]
+    pub fn w1_capture_busy_timeout_ms(&self) -> Result<i64, ProductError> {
+        if !self.open_mode.is_capture() { return Err(ProductError::ContractMismatch); }
+        Ok(self.conn.query_row("PRAGMA busy_timeout", [], |row| row.get(0))?)
+    }
     /// Explicit maintenance-only upgrade from ProductAtomicV1 schema v1 to
     /// scoped v2. Normal `open` refuses v1, so callers must stop old
     /// processes and present a reviewed finite manifest before the version is
@@ -438,6 +827,7 @@ impl ProductStore {
         {
             return Err(ProductError::InvalidConfig);
         }
+        reject_isolated_before_path_creation(path)?;
         let path = normalized_path(path)?;
         let mut conn = Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -734,6 +1124,113 @@ impl ProductStore {
         })
     }
 
+    #[cfg(feature = "w1-isolated-test-support")]
+    pub fn w1_change_pack_approval(
+        &mut self, session_digest: &str, source_instance_id: &str, digest: &str,
+        expected_approval_revision: i64, approve: bool, request_key: &str, now: DateTime<Utc>,
+    ) -> Result<W1OperationReceipt, ProductError> {
+        use w1_owner_codec::{Request, Receipt, encode_request, encode_receipt};
+        if !w1_text(source_instance_id) || !w1_text(request_key)
+            || digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || expected_approval_revision < 0 || expected_approval_revision.checked_add(1).is_none() {
+            return Err(ProductError::InvalidConfig);
+        }
+        self.conn.pragma_update(None, "foreign_keys", "ON").map_err(isolated_schema_error)?;
+        self.conn.pragma_update(None, "recursive_triggers", "ON").map_err(isolated_schema_error)?;
+        validate_isolated_pragmas(&self.conn)?;
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if self.open_mode == StoreOpenMode::Normal { return Err(ProductError::ContractMismatch); }
+        validate_isolated_pragmas(&tx)?;
+        validate_isolated_marker_version(&tx, self.open_mode)?;
+        validate_w1_operations(&tx)?;
+        let principal = resolve_session_in(&tx, session_digest, now).map_err(|e| match e {
+            ProductError::Invariant("session invalid" | "session expiry invalid" | "session expired, revoked, or stale") => w1_authorization_error(), other => other,
+        })?;
+        if principal.role != "owner" { return Err(w1_authorization_error()); }
+        w1_authorize_source(&tx, &principal.actor_id, source_instance_id)?;
+        let operation = if approve { "approve" } else { "revoke" };
+        let request = Request {
+            installation: self.installation_id.clone(), database: self.database_id.clone(),
+            operation: operation.into(), actor: principal.actor_id.clone(), source: source_instance_id.into(),
+            digest: digest.into(), expected: expected_approval_revision, key: request_key.into(),
+            order: None, lifecycle: None,
+        };
+        let request_bytes = encode_request(&request).map_err(|_| ProductError::InvalidConfig)?;
+        if let Some(receipt) = w1_replay(&tx, &principal, &request, &request_bytes)? {
+            tx.commit()?;
+            return Ok(receipt);
+        }
+        let (latest, active, _) = w1_validate_histories(&tx, &self.installation_id, &self.database_id, source_instance_id, digest, None)?;
+        if latest != expected_approval_revision { return Err(ProductError::Invariant("w1 stale revision")); }
+        if active == approve { return Err(ProductError::Invariant("w1 approval state invalid")); }
+        let receipt = Receipt {
+            installation: request.installation.clone(), database: request.database.clone(), operation: operation.into(),
+            actor: request.actor.clone(), authority: principal.authority_revision, source: request.source.clone(),
+            digest: request.digest.clone(), expected: request.expected, result: request.expected + 1,
+            key: request.key.clone(), order: None, lifecycle: None, approval: None,
+        };
+        let receipt_bytes = encode_receipt(&receipt).map_err(|_| ProductError::ContractMismatch)?;
+        let public = w1_public_receipt(receipt_bytes.clone())?;
+        tx.execute("INSERT INTO product_w1_operations_v1(actor_id,request_key,operation,authority_revision,source_instance_id,digest,expected_revision,approval_result_revision,order_id,lifecycle,selection_result_revision,referenced_approval_revision,referenced_operation,request,receipt) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,NULL,NULL,NULL,NULL,NULL,?9,?10)",
+            params![principal.actor_id, request_key, operation, principal.authority_revision, source_instance_id, digest, expected_approval_revision, receipt.result, request_bytes, receipt_bytes])?;
+        tx.commit()?;
+        Ok(public)
+    }
+
+    #[cfg(feature = "w1-isolated-test-support")]
+    pub fn w1_select_pack(
+        &mut self, session_digest: &str, order_id: &str, lifecycle: i64,
+        source_instance_id: &str, digest: &str, expected_selection_revision: i64,
+        request_key: &str, now: DateTime<Utc>,
+    ) -> Result<W1OperationReceipt, ProductError> {
+        use w1_owner_codec::{Request, Receipt, encode_request, encode_receipt};
+        if !w1_text(order_id) || lifecycle <= 0 || !w1_text(source_instance_id) || !w1_text(request_key)
+            || digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || expected_selection_revision < 0 || expected_selection_revision.checked_add(1).is_none() {
+            return Err(ProductError::InvalidConfig);
+        }
+        self.conn.pragma_update(None, "foreign_keys", "ON").map_err(isolated_schema_error)?;
+        self.conn.pragma_update(None, "recursive_triggers", "ON").map_err(isolated_schema_error)?;
+        validate_isolated_pragmas(&self.conn)?;
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if self.open_mode == StoreOpenMode::Normal { return Err(ProductError::ContractMismatch); }
+        validate_isolated_pragmas(&tx)?;
+        validate_isolated_marker_version(&tx, self.open_mode)?;
+        validate_w1_operations(&tx)?;
+        let principal = resolve_session_in(&tx, session_digest, now).map_err(|e| match e {
+            ProductError::Invariant("session invalid" | "session expiry invalid" | "session expired, revoked, or stale") => w1_authorization_error(), other => other,
+        })?;
+        if principal.role != "owner" { return Err(w1_authorization_error()); }
+        w1_authorize_source(&tx, &principal.actor_id, source_instance_id)?;
+        w1_authorize_order(&tx, &principal, order_id, lifecycle, source_instance_id)?;
+        let request = Request { installation: self.installation_id.clone(), database: self.database_id.clone(),
+            operation: "select".into(), actor: principal.actor_id.clone(), source: source_instance_id.into(),
+            digest: digest.into(), expected: expected_selection_revision, key: request_key.into(),
+            order: Some(order_id.into()), lifecycle: Some(lifecycle) };
+        let request_bytes = encode_request(&request).map_err(|_| ProductError::InvalidConfig)?;
+        if let Some(receipt) = w1_replay(&tx, &principal, &request, &request_bytes)? {
+            tx.commit()?;
+            return Ok(receipt);
+        }
+        let (approval_revision, active, selection_revision) = w1_validate_histories(
+            &tx, &self.installation_id, &self.database_id, source_instance_id, digest, Some((order_id, lifecycle)))?;
+        let blocked: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM product_review_runs_v1 WHERE order_id=?1 AND product_lifecycle=?2) OR EXISTS(SELECT 1 FROM product_review_holds_v1 WHERE order_id=?1 AND lifecycle=?2) OR EXISTS(SELECT 1 FROM product_review_active_v1 WHERE order_id=?1)", params![order_id, lifecycle], |r| r.get(0))?;
+        if blocked { return Err(ProductError::Invariant("w1 selection blocked by review")); }
+        if selection_revision != expected_selection_revision { return Err(ProductError::Invariant("w1 stale revision")); }
+        if !active { return Err(ProductError::Invariant("w1 approval inactive")); }
+        let receipt = Receipt { installation: request.installation.clone(), database: request.database.clone(),
+            operation: request.operation.clone(), actor: request.actor.clone(), authority: principal.authority_revision,
+            source: request.source.clone(), digest: request.digest.clone(), expected: request.expected,
+            result: request.expected + 1, key: request.key.clone(), order: request.order.clone(),
+            lifecycle: request.lifecycle, approval: Some(approval_revision) };
+        let receipt_bytes = encode_receipt(&receipt).map_err(|_| ProductError::ContractMismatch)?;
+        let public = w1_public_receipt(receipt_bytes.clone())?;
+        tx.execute("INSERT INTO product_w1_operations_v1(actor_id,request_key,operation,authority_revision,source_instance_id,digest,expected_revision,approval_result_revision,order_id,lifecycle,selection_result_revision,referenced_approval_revision,referenced_operation,request,receipt) VALUES(?1,?2,'select',?3,?4,?5,?6,NULL,?7,?8,?9,?10,'approve',?11,?12)",
+            params![principal.actor_id, request_key, principal.authority_revision, source_instance_id, digest, expected_selection_revision, order_id, lifecycle, receipt.result, approval_revision, request_bytes, receipt_bytes])?;
+        tx.commit()?;
+        Ok(public)
+    }
+
     pub fn open(path: &Path, config: ProductConfig) -> Result<Self, ProductError> {
         Self::open_with_clock(path, config, std::sync::Arc::new(SystemProductClock))
     }
@@ -743,16 +1240,188 @@ impl ProductStore {
         config: ProductConfig,
         clock: std::sync::Arc<dyn ProductClock>,
     ) -> Result<Self, ProductError> {
+        Self::open_internal(path, config, clock, StoreOpenMode::Normal)
+    }
+
+    /// Create a fresh isolated test store in a private directory exclusively controlled
+    /// by the caller, including against same-UID interference, with no other writers.
+    /// `name` must be a single file name; an existing entry is never opened.
+    #[cfg(feature = "w1-isolated-test-support")]
+    pub fn create_isolated_test_store(directory: &Path, name: &str, config: ProductConfig) -> Result<Self, ProductError> {
+        Self::create_isolated_with_mode(directory, name, config, std::sync::Arc::new(SystemProductClock), StoreOpenMode::IsolatedCreate)
+    }
+
+    #[cfg(feature = "w1-isolated-test-support")]
+    pub fn create_w1_capture_test_store(directory: &Path, name: &str, config: ProductConfig, clock: std::sync::Arc<dyn ProductClock>) -> Result<Self, ProductError> {
+        Self::create_isolated_with_mode(directory, name, config, clock, StoreOpenMode::CaptureCreate)
+    }
+
+    /// Fresh, empty test-only storage; reference guards and pin writer are deferred.
+    #[cfg(feature = "w1-isolated-test-support")]
+    pub fn create_w1_pin_test_store(directory: &Path, name: &str, config: ProductConfig) -> Result<Self, ProductError> {
+        Self::create_isolated_with_mode(directory, name, config, std::sync::Arc::new(SystemProductClock), StoreOpenMode::PinCreate)
+    }
+
+    #[cfg(feature = "w1-isolated-test-support")]
+    fn create_isolated_with_mode(directory: &Path, name: &str, config: ProductConfig, clock: std::sync::Arc<dyn ProductClock>, mode: StoreOpenMode) -> Result<Self, ProductError> {
+        let path = isolated_test_path(directory, name)?;
+        for suffix in ["-journal", "-wal", "-shm"] {
+            let sidecar = path.with_file_name(format!("{}{}", name, suffix));
+            match std::fs::symlink_metadata(sidecar) {
+                Ok(_) => return Err(ProductError::InvalidConfig),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(ProductError::Invariant("isolated store sidecar inspection failed")),
+            }
+        }
+        let _exclusive_file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)
+            .map_err(|_| ProductError::Invariant("isolated store file creation failed"))?;
+        Self::open_internal(&path, config, clock, mode)
+    }
+
+    /// Reopen a marked isolated test store in a private directory exclusively controlled
+    /// by the caller, including against same-UID interference, with no other writers.
+    #[cfg(feature = "w1-isolated-test-support")]
+    pub fn reopen_isolated_test_store(directory: &Path, name: &str, config: ProductConfig) -> Result<Self, ProductError> {
+        Self::reopen_isolated_with_mode(directory, name, config, std::sync::Arc::new(SystemProductClock), StoreOpenMode::IsolatedReopen)
+    }
+
+    #[cfg(feature = "w1-isolated-test-support")]
+    pub fn reopen_w1_capture_test_store(directory: &Path, name: &str, config: ProductConfig, clock: std::sync::Arc<dyn ProductClock>) -> Result<Self, ProductError> {
+        Self::reopen_isolated_with_mode(directory, name, config, clock, StoreOpenMode::CaptureReopen)
+    }
+
+    #[cfg(feature = "w1-isolated-test-support")]
+    pub fn reopen_w1_pin_test_store(directory: &Path, name: &str, config: ProductConfig) -> Result<Self, ProductError> {
+        Self::reopen_isolated_with_mode(directory, name, config, std::sync::Arc::new(SystemProductClock), StoreOpenMode::PinReopen)
+    }
+
+    #[cfg(feature = "w1-isolated-test-support")]
+    fn reopen_isolated_with_mode(directory: &Path, name: &str, config: ProductConfig, clock: std::sync::Arc<dyn ProductClock>, mode: StoreOpenMode) -> Result<Self, ProductError> {
+        let path = isolated_test_path(directory, name)?;
+        for suffix in ["-journal", "-wal", "-shm"] {
+            let sidecar = path.with_file_name(format!("{}{}", name, suffix));
+            match std::fs::symlink_metadata(sidecar) {
+                Ok(_) => return Err(ProductError::InvalidConfig),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(ProductError::Invariant("isolated store sidecar inspection failed")),
+            }
+        }
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|_| ProductError::Invariant("isolated store file inspection failed"))?;
+        if !metadata.file_type().is_file() {
+            return Err(ProductError::InvalidConfig);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.nlink() != 1 { return Err(ProductError::InvalidConfig); }
+        }
+        Self::open_internal(&path, config, clock, mode)
+    }
+
+    fn open_internal(
+        path: &Path,
+        config: ProductConfig,
+        clock: std::sync::Arc<dyn ProductClock>,
+        mode: StoreOpenMode,
+    ) -> Result<Self, ProductError> {
+        Self::open_internal_with_checkpoint(
+            path, config, clock, mode,
+            #[cfg(all(test, feature = "a01-harness-support", unix))]
+            None,
+        )
+    }
+
+    
+fn open_internal_with_checkpoint(
+        path: &Path,
+        config: ProductConfig,
+        clock: std::sync::Arc<dyn ProductClock>,
+        mode: StoreOpenMode,
+            #[cfg(all(test, feature = "a01-harness-support", unix))] checkpoint: Option<usize>,
+    ) -> Result<Self, ProductError> {
         if path.as_os_str().is_empty()
             || config.installation_id.trim().is_empty()
             || config.database_id.trim().is_empty()
         {
             return Err(ProductError::InvalidConfig);
         }
+        if mode == StoreOpenMode::Normal {
+            reject_isolated_before_path_creation(path)?;
+        }
         let path = normalized_path(path)?;
-        let mut conn = Connection::open(&path)?;
+        // Inspect an existing database read-only before a writable SQLite open,
+        // which can otherwise perform recovery before the marker is checked.
+        if path.exists() {
+            let inspection = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            let marker: bool = inspection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='product_w1_isolated_marker_v1')",
+                [], |r| r.get(0),
+            )?;
+            if mode == StoreOpenMode::Normal && marker {
+                return Err(ProductError::ContractMismatch);
+            }
+            // A01 uses the product schema version as its discriminator. Check
+            // it on this read-only connection before SQLite can open writable.
+            if mode == StoreOpenMode::Normal {
+                let has_meta: bool = inspection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='product_meta_v1')",
+                    [], |r| r.get(0),
+                )?;
+                if has_meta {
+                    let version: Option<i64> = inspection.query_row(
+                        "SELECT schema_version FROM product_meta_v1 WHERE singleton=1",
+                        [], |r| r.get(0),
+                    ).optional()?;
+                    if version == Some(0x0A01) {
+                        return Err(ProductError::ContractMismatch);
+                    }
+                }
+            }
+            #[cfg(feature = "w1-isolated-test-support")]
+            if mode.is_reopen() {
+                validate_isolated_marker_version(&inspection, mode)?;
+            }
+        }
+        let mut conn = if mode == StoreOpenMode::Normal {
+            Connection::open(&path)?
+        } else {
+            Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?
+        };
+        let isolated_marker: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='product_w1_isolated_marker_v1')",
+            [], |r| r.get(0),
+        )?;
+        match mode {
+            StoreOpenMode::Normal if isolated_marker => return Err(ProductError::ContractMismatch),
+            #[cfg(feature = "w1-isolated-test-support")]
+            StoreOpenMode::IsolatedReopen | StoreOpenMode::CaptureReopen | StoreOpenMode::PinReopen if !isolated_marker => return Err(ProductError::ContractMismatch),
+            #[cfg(feature = "w1-isolated-test-support")]
+            StoreOpenMode::IsolatedCreate | StoreOpenMode::CaptureCreate | StoreOpenMode::PinCreate if isolated_marker => return Err(ProductError::ContractMismatch),
+            _ => {}
+        }
+        #[cfg(feature = "w1-isolated-test-support")]
+        if mode.is_reopen() {
+            validate_isolated_marker_version(&conn, mode)?;
+        }
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        #[cfg(feature = "w1-isolated-test-support")]
+        if mode != StoreOpenMode::Normal {
+            conn.pragma_update(None, "foreign_keys", "ON").map_err(isolated_schema_error)?;
+        } else {
+            conn.pragma_update(None, "foreign_keys", "ON")?;
+        }
+        #[cfg(not(feature = "w1-isolated-test-support"))]
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        #[cfg(feature = "w1-isolated-test-support")]
+        if mode != StoreOpenMode::Normal {
+            conn.pragma_update(None, "recursive_triggers", "ON").map_err(isolated_schema_error)?;
+            validate_isolated_pragmas(&conn)?;
+        }
+        #[cfg(feature = "a01-harness-support")]
+        if mode.is_a01() {
+            configure_a01_connection(&conn)?;
+        }
         let has_contract: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='foundry_contract')",
             [], |r| r.get(0),
@@ -767,6 +1436,10 @@ impl ProductStore {
         } else {
             None
         };
+        #[cfg(feature = "w1-isolated-test-support")]
+        if mode.is_reopen() && existing.as_deref() != Some("ProductAtomicV1") {
+            return Err(ProductError::ContractMismatch);
+        }
         if existing.as_deref().is_some_and(|v| v != "ProductAtomicV1") {
             return Err(ProductError::ContractMismatch);
         }
@@ -799,15 +1472,34 @@ impl ProductStore {
             // Product v3 keeps its result schema stable. The publication
             // ledger is an additive v3-compatible extension.
             result::validate_v3_connection(&conn, &config.installation_id, &config.database_id)?;
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            create_product_publish_schema(&tx)?;
-            tx.commit()?;
+            if mode == StoreOpenMode::Normal {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                create_product_publish_schema(&tx)?;
+                tx.commit()?;
+            }
+            #[cfg(feature = "w1-isolated-test-support")]
+            if mode.is_reopen() {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                validate_isolated_pragmas(&tx)?;
+                validate_isolated_marker_version(&tx, mode)?;
+                validate_w1_operations(&tx)?;
+                if mode.is_capture() || mode.is_pin() { validate_w1_capture_schema(&tx)?; }
+                if mode.is_pin() { validate_w1_pin_schema(&tx)?; }
+                tx.commit()?;
+            }
             return Ok(Self {
                 conn,
+                open_mode: mode,
+                #[cfg(feature = "a01-harness-support")]
+                a01_identity: None,
                 path,
                 installation_id: config.installation_id,
                 database_id: config.database_id,
                 clock,
+                #[cfg(feature = "w1-isolated-test-support")]
+                w1_capture_fail_after_legacy_writes: false,
+                #[cfg(feature = "w1-isolated-test-support")]
+                w1_capture_busy_observer: None,
                 review_config: None,
                 artifact_root: None,
                 artifact_root_handle: None,
@@ -831,267 +1523,44 @@ impl ProductStore {
             }
         }
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute_batch(
-            "CREATE TABLE IF NOT EXISTS foundry_contract(singleton INTEGER PRIMARY KEY CHECK(singleton=1), contract TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS product_meta_v1(singleton INTEGER PRIMARY KEY CHECK(singleton=1), installation_id TEXT NOT NULL, database_id TEXT NOT NULL, schema_version INTEGER NOT NULL, recovery_epoch INTEGER NOT NULL DEFAULT 0);
-             CREATE TABLE IF NOT EXISTS ledger(seq INTEGER PRIMARY KEY AUTOINCREMENT, order_id TEXT NOT NULL, from_state TEXT NOT NULL, to_state TEXT NOT NULL, event TEXT NOT NULL, actor TEXT NOT NULL, intent TEXT NOT NULL DEFAULT '', at TEXT NOT NULL, prev_hash TEXT NOT NULL, event_json TEXT, hash TEXT NOT NULL);
-             CREATE INDEX IF NOT EXISTS ledger_order_seq_v1 ON ledger(order_id,seq);
-             CREATE TRIGGER IF NOT EXISTS ledger_no_update BEFORE UPDATE ON ledger BEGIN SELECT RAISE(ABORT, 'ledger is append-only'); END;
-             CREATE TRIGGER IF NOT EXISTS ledger_no_delete BEFORE DELETE ON ledger BEGIN SELECT RAISE(ABORT, 'ledger is append-only'); END;
-             CREATE TABLE IF NOT EXISTS product_transition_receipts_v1(seq INTEGER PRIMARY KEY, event_hash TEXT NOT NULL UNIQUE, order_id TEXT NOT NULL, lifecycle INTEGER NOT NULL, expected_predecessor INTEGER NOT NULL, operation TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS product_transition_intents_v1(order_id TEXT PRIMARY KEY, lifecycle INTEGER NOT NULL, expected_predecessor INTEGER NOT NULL, operation TEXT NOT NULL);
-             CREATE TRIGGER IF NOT EXISTS product_ledger_requires_intent BEFORE INSERT ON ledger
-               WHEN (SELECT contract FROM foundry_contract WHERE singleton=1)='ProductAtomicV1'
-                 AND NOT EXISTS(SELECT 1 FROM product_transition_intents_v1 WHERE order_id=NEW.order_id)
-               BEGIN SELECT RAISE(ABORT, 'product transition receipt required'); END;
-             CREATE TRIGGER IF NOT EXISTS product_ledger_receipt AFTER INSERT ON ledger
-               WHEN (SELECT contract FROM foundry_contract WHERE singleton=1)='ProductAtomicV1'
-               BEGIN
-                 INSERT INTO product_transition_receipts_v1(seq,event_hash,order_id,lifecycle,expected_predecessor,operation)
-                   SELECT NEW.seq,NEW.hash,NEW.order_id,lifecycle,expected_predecessor,operation FROM product_transition_intents_v1 WHERE order_id=NEW.order_id;
-                 DELETE FROM product_transition_intents_v1 WHERE order_id=NEW.order_id;
-               END;
-             CREATE TABLE IF NOT EXISTS product_accounts_v1(actor_id TEXT PRIMARY KEY, role TEXT NOT NULL, enabled INTEGER NOT NULL, revision INTEGER NOT NULL);
-             CREATE TABLE IF NOT EXISTS product_credentials_v1(actor_id TEXT PRIMARY KEY, argon2id_phc TEXT NOT NULL, revision INTEGER NOT NULL);
-             CREATE TABLE IF NOT EXISTS product_sessions_v1(session_digest TEXT PRIMARY KEY, actor_id TEXT NOT NULL, authority_revision INTEGER NOT NULL, expires_at TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0);
-             CREATE TABLE IF NOT EXISTS product_login_throttle_v1(actor_id TEXT PRIMARY KEY, window_started_at TEXT NOT NULL, failures INTEGER NOT NULL, blocked_until TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS product_sources_v1(connector_id TEXT PRIMARY KEY, provider TEXT NOT NULL, origin TEXT NOT NULL, repository_id TEXT NOT NULL, scope TEXT NOT NULL, revision INTEGER NOT NULL, enabled INTEGER NOT NULL);
-             CREATE TABLE IF NOT EXISTS product_orders_v1(order_id TEXT PRIMARY KEY, lifecycle INTEGER NOT NULL, connector_id TEXT NOT NULL, repository_id TEXT NOT NULL, issue_id TEXT NOT NULL, task_kind TEXT NOT NULL, payload_snapshot TEXT NOT NULL, source_revision INTEGER NOT NULL, admission_seq INTEGER NOT NULL, admission_hash TEXT NOT NULL);
-             CREATE UNIQUE INDEX IF NOT EXISTS product_orders_v1_source_identity ON product_orders_v1(connector_id,repository_id,issue_id);
-             CREATE TABLE IF NOT EXISTS product_order_payload_digests_v1(order_id TEXT PRIMARY KEY, payload_digest TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS product_operations_v1(operation_id TEXT PRIMARY KEY, actor_id TEXT NOT NULL, request_key TEXT NOT NULL, request_digest TEXT NOT NULL, order_id TEXT NOT NULL, grant_id TEXT, phase TEXT NOT NULL, owner_id TEXT, epoch INTEGER, fence INTEGER, prepared_at TEXT NOT NULL, expires_at TEXT NOT NULL, scope_revision INTEGER NOT NULL DEFAULT -1, UNIQUE(actor_id, request_key));
-             CREATE TABLE IF NOT EXISTS product_grants_v1(grant_id TEXT PRIMARY KEY, token_digest TEXT NOT NULL UNIQUE, actor_id TEXT NOT NULL, order_id TEXT NOT NULL, state TEXT NOT NULL, fence INTEGER NOT NULL);
-             CREATE TABLE IF NOT EXISTS product_fence_counter_v1(singleton INTEGER PRIMARY KEY CHECK(singleton=1), next INTEGER NOT NULL);
-             INSERT OR IGNORE INTO product_fence_counter_v1(singleton,next) VALUES(1,0);
-             CREATE TABLE IF NOT EXISTS product_outcomes_v1(operation_id TEXT PRIMARY KEY, seq INTEGER NOT NULL UNIQUE, event_hash TEXT NOT NULL UNIQUE, receipt_json TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS product_token_consumptions_v1(token_digest TEXT PRIMARY KEY, operation_id TEXT NOT NULL UNIQUE, seq INTEGER NOT NULL UNIQUE);
-             CREATE TABLE IF NOT EXISTS product_intake_inbox_v1(delivery_id TEXT PRIMARY KEY, connector_id TEXT NOT NULL, repository_id TEXT NOT NULL, issue_id TEXT NOT NULL, version_digest TEXT NOT NULL, payload TEXT NOT NULL, state TEXT NOT NULL, retry_at TEXT);
-             CREATE TABLE IF NOT EXISTS product_intake_delivery_meta_v1(delivery_id TEXT PRIMARY KEY REFERENCES product_intake_inbox_v1(delivery_id), observed_updated_at TEXT NOT NULL, task_kind TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS product_intake_source_bindings_v1(delivery_id TEXT PRIMARY KEY,source_instance_id TEXT NOT NULL,source_revision INTEGER NOT NULL);
-             CREATE TABLE IF NOT EXISTS product_poll_source_bindings_v1(connector_id TEXT NOT NULL,query_fingerprint TEXT NOT NULL,source_instance_id TEXT NOT NULL,source_revision INTEGER NOT NULL,PRIMARY KEY(connector_id,query_fingerprint));
-             CREATE TABLE IF NOT EXISTS product_intake_rejections_v1(connector_id TEXT NOT NULL, query_fingerprint TEXT NOT NULL, sweep_id TEXT NOT NULL, item_digest TEXT NOT NULL, recorded_at TEXT NOT NULL, PRIMARY KEY(connector_id,query_fingerprint,sweep_id,item_digest));
-             CREATE TABLE IF NOT EXISTS product_poll_state_v1(connector_id TEXT NOT NULL, query_fingerprint TEXT NOT NULL, sweep_id TEXT NOT NULL, next_page INTEGER NOT NULL, page_ceiling INTEGER NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(connector_id, query_fingerprint));
-             CREATE TABLE IF NOT EXISTS product_poll_backoff_v1(connector_id TEXT NOT NULL, query_fingerprint TEXT NOT NULL, failures INTEGER NOT NULL, retry_at TEXT NOT NULL, PRIMARY KEY(connector_id,query_fingerprint));
-             CREATE TABLE IF NOT EXISTS product_services_v1(service_id TEXT PRIMARY KEY,revision INTEGER NOT NULL,enabled INTEGER NOT NULL,lease_until TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS product_service_credentials_v1(service_id TEXT PRIMARY KEY,verifier TEXT NOT NULL UNIQUE,credential_revision INTEGER NOT NULL,expires_at TEXT NOT NULL,issued_by TEXT NOT NULL,request_key TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS product_service_grants_v1(service_id TEXT NOT NULL,source_instance_id TEXT NOT NULL,action TEXT NOT NULL,grant_revision INTEGER NOT NULL,enabled INTEGER NOT NULL,PRIMARY KEY(service_id,source_instance_id,action));
-             CREATE TABLE IF NOT EXISTS product_service_events_v1(event_seq INTEGER PRIMARY KEY AUTOINCREMENT,service_id TEXT NOT NULL,actor_id TEXT NOT NULL,revision INTEGER NOT NULL,operation TEXT NOT NULL,request_key TEXT NOT NULL,request_digest TEXT NOT NULL,created_at TEXT NOT NULL);
-             CREATE UNIQUE INDEX IF NOT EXISTS product_service_credential_issue_once ON product_service_events_v1(service_id,operation,request_key) WHERE operation='credential_issue';
-             CREATE TABLE IF NOT EXISTS product_service_operations_v1(actor_id TEXT NOT NULL,request_key TEXT NOT NULL,request_digest TEXT NOT NULL,receipt_json TEXT NOT NULL,PRIMARY KEY(actor_id,request_key));
-             CREATE TABLE IF NOT EXISTS product_service_work_bindings_v1(order_id TEXT NOT NULL,lifecycle INTEGER NOT NULL,service_id TEXT NOT NULL,service_revision INTEGER NOT NULL,credential_revision INTEGER NOT NULL,source_instance_id TEXT NOT NULL,PRIMARY KEY(order_id,lifecycle));
-             CREATE TABLE IF NOT EXISTS product_work_backlog_v1(order_id TEXT NOT NULL, lifecycle INTEGER NOT NULL, delivery_id TEXT NOT NULL UNIQUE, state TEXT NOT NULL, available_at TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(order_id,lifecycle));
-             CREATE TABLE IF NOT EXISTS product_work_claims_v1(order_id TEXT NOT NULL, lifecycle INTEGER NOT NULL, owner_id TEXT, epoch INTEGER NOT NULL, fence INTEGER NOT NULL, state TEXT NOT NULL, lease_until TEXT, source_revision INTEGER, payload_digest TEXT, PRIMARY KEY(order_id,lifecycle));
-             CREATE TABLE IF NOT EXISTS product_review_meta_v1(singleton INTEGER PRIMARY KEY CHECK(singleton=1), installation_id TEXT NOT NULL, database_id TEXT NOT NULL, schema_version INTEGER NOT NULL);
-             CREATE TABLE IF NOT EXISTS product_review_holds_v1(order_id TEXT NOT NULL,lifecycle INTEGER NOT NULL,attempt INTEGER NOT NULL,originating_run INTEGER NOT NULL,activation INTEGER NOT NULL,host_epoch INTEGER NOT NULL,hold_instance_id TEXT NOT NULL,hold_revision INTEGER NOT NULL,expected_predecessor INTEGER NOT NULL,snapshot_digest TEXT NOT NULL,snapshot_json TEXT NOT NULL,allowed_targets_json TEXT NOT NULL,deadline TEXT NOT NULL,source_revision INTEGER NOT NULL,admission_seq INTEGER NOT NULL,admission_hash TEXT NOT NULL,state TEXT NOT NULL,PRIMARY KEY(order_id,lifecycle,attempt,originating_run,hold_instance_id));
-             CREATE TABLE IF NOT EXISTS product_review_hold_acceptances_v1(operation_id TEXT PRIMARY KEY,actor_id TEXT NOT NULL,request_key TEXT NOT NULL,request_digest TEXT NOT NULL,receipt_json TEXT NOT NULL,order_id TEXT NOT NULL,lifecycle INTEGER NOT NULL,attempt INTEGER NOT NULL,originating_run INTEGER NOT NULL,hold_instance_id TEXT NOT NULL,UNIQUE(actor_id,request_key),UNIQUE(order_id,lifecycle,attempt,originating_run,hold_instance_id));
-             CREATE TRIGGER IF NOT EXISTS product_review_acceptance_no_update BEFORE UPDATE ON product_review_hold_acceptances_v1 BEGIN SELECT RAISE(ABORT,'product review acceptance is immutable'); END;
-             CREATE TRIGGER IF NOT EXISTS product_review_acceptance_no_delete BEFORE DELETE ON product_review_hold_acceptances_v1 BEGIN SELECT RAISE(ABORT,'product review acceptance is immutable'); END;
-             CREATE TRIGGER IF NOT EXISTS product_review_hold_exact_cas BEFORE UPDATE ON product_review_holds_v1
-               WHEN OLD.state!='active' OR NEW.state!='accepted' OR NEW.order_id!=OLD.order_id OR NEW.lifecycle!=OLD.lifecycle OR NEW.attempt!=OLD.attempt OR NEW.originating_run!=OLD.originating_run OR NEW.activation!=OLD.activation OR NEW.host_epoch!=OLD.host_epoch OR NEW.hold_instance_id!=OLD.hold_instance_id OR NEW.hold_revision!=OLD.hold_revision OR NEW.expected_predecessor!=OLD.expected_predecessor OR NEW.snapshot_digest!=OLD.snapshot_digest OR NEW.snapshot_json!=OLD.snapshot_json OR NEW.allowed_targets_json!=OLD.allowed_targets_json OR NEW.deadline!=OLD.deadline OR NEW.source_revision!=OLD.source_revision OR NEW.admission_seq!=OLD.admission_seq OR NEW.admission_hash!=OLD.admission_hash
-               BEGIN SELECT RAISE(ABORT,'product review hold CAS binding changed'); END;
-             CREATE TRIGGER IF NOT EXISTS product_review_hold_no_delete BEFORE DELETE ON product_review_holds_v1 BEGIN SELECT RAISE(ABORT,'product review hold history is immutable'); END;
-             CREATE TABLE IF NOT EXISTS product_review_hold_progress_v1(operation_id TEXT PRIMARY KEY,phase TEXT NOT NULL,progress_revision INTEGER NOT NULL,owner_id TEXT NOT NULL,epoch INTEGER NOT NULL,fence INTEGER NOT NULL,reserved_run_id INTEGER NOT NULL,recovery_reason TEXT);
-             CREATE TABLE IF NOT EXISTS product_review_run_reservations_v1(reservation_id INTEGER PRIMARY KEY AUTOINCREMENT,operation_id TEXT NOT NULL UNIQUE,order_id TEXT NOT NULL,lifecycle INTEGER NOT NULL,attempt INTEGER NOT NULL,originating_run INTEGER NOT NULL,hold_instance_id TEXT NOT NULL,followup_run_id INTEGER);
-             CREATE TABLE IF NOT EXISTS product_review_runs_v1(order_id TEXT NOT NULL,attempt INTEGER NOT NULL,run_id TEXT NOT NULL,base_commit TEXT NOT NULL,result_commit TEXT NOT NULL,pack_digest TEXT NOT NULL,status TEXT NOT NULL,counters_json TEXT NOT NULL,hold_json TEXT,hold_instance_id TEXT,deadline INTEGER,result_json TEXT,provenance_json TEXT,product_lifecycle INTEGER NOT NULL DEFAULT 0,source_revision INTEGER NOT NULL DEFAULT 0,admission_seq INTEGER NOT NULL DEFAULT 0,admission_hash TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,PRIMARY KEY(order_id,attempt,run_id));
-             CREATE TABLE IF NOT EXISTS product_review_active_v1(order_id TEXT PRIMARY KEY,key_json TEXT NOT NULL,epoch INTEGER NOT NULL,journal_run TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS product_review_epochs_v1(order_id TEXT PRIMARY KEY,epoch INTEGER NOT NULL);
-             CREATE TABLE IF NOT EXISTS product_review_bindings_v1(key_json TEXT PRIMARY KEY,intent_json TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS product_review_host_accept_v1(order_id TEXT NOT NULL,attempt INTEGER NOT NULL,run_id INTEGER NOT NULL,activation INTEGER NOT NULL,PRIMARY KEY(order_id,attempt,run_id,activation));
-             CREATE TABLE IF NOT EXISTS product_review_host_results_v1(order_id TEXT NOT NULL,attempt INTEGER NOT NULL,run_id INTEGER NOT NULL,activation INTEGER NOT NULL,result_json TEXT NOT NULL,PRIMARY KEY(order_id,attempt,run_id,activation));
-             CREATE TABLE IF NOT EXISTS product_review_stages_v1(order_id TEXT NOT NULL,run_id TEXT NOT NULL,sequence INTEGER NOT NULL,stage_id TEXT NOT NULL,status TEXT NOT NULL,output_json TEXT,PRIMARY KEY(order_id,run_id,sequence));
-             CREATE TABLE IF NOT EXISTS product_review_sessions_v1(order_id TEXT NOT NULL,run_id TEXT NOT NULL,session_id TEXT NOT NULL,receipt_json TEXT NOT NULL,PRIMARY KEY(order_id,run_id,session_id));
-             CREATE TABLE IF NOT EXISTS product_review_budget_v1(order_id TEXT PRIMARY KEY,used INTEGER NOT NULL);
-             CREATE TABLE IF NOT EXISTS product_review_failures_v1(order_id TEXT NOT NULL,run_id TEXT NOT NULL,error TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS product_review_redrive_v1(order_id TEXT NOT NULL,run_id TEXT NOT NULL,payload TEXT NOT NULL,artifact_json TEXT NOT NULL,PRIMARY KEY(order_id,run_id,payload));",
-        )?;
-        // Run this additive migration only after the intake binding tables
-        // exist. Existing rows retain zero defaults and fail closed until an
-        // explicit source mapping/rebind supplies their provenance.
-        for table in [
-            "product_intake_source_bindings_v1",
-            "product_poll_source_bindings_v1",
-        ] {
-            let columns = {
-                let mut stmt = tx.prepare(&format!("PRAGMA table_info({table})"))?;
-                stmt.query_map([], |r| r.get::<_, String>(1))?
-                    .collect::<Result<Vec<_>, _>>()?
-            };
-            for (name, definition) in [
-                ("source_instance_revision", "INTEGER NOT NULL DEFAULT 0"),
-                ("source_generation", "INTEGER NOT NULL DEFAULT 0"),
-            ] {
-                if !columns.iter().any(|column| column == name) {
-                    tx.execute(
-                        &format!("ALTER TABLE {table} ADD COLUMN {name} {definition}"),
-                        [],
-                    )?;
-                }
-            }
-        }
-        crate::product_scope::create_schema(&tx)?;
-        create_product_publish_schema(&tx)?;
-        tx.execute_batch(
-            "CREATE TABLE IF NOT EXISTS product_review_work_bindings_v1(
-                order_id TEXT NOT NULL,
-                attempt INTEGER NOT NULL,
-                run_id TEXT NOT NULL,
-                lifecycle INTEGER NOT NULL,
-                delivery_id TEXT NOT NULL,
-                worker_id TEXT NOT NULL,
-                claim_epoch INTEGER NOT NULL,
-                claim_fence INTEGER NOT NULL,
-                source_revision INTEGER NOT NULL,
-                payload_digest TEXT NOT NULL,
-                task_kind TEXT NOT NULL,
-                payload_snapshot TEXT NOT NULL,
-                PRIMARY KEY(order_id,attempt,run_id)
-             );",
-        )?;
-        // Additive upgrade only: do not rewrite or remove any existing work
-        // history when opening a ProductAtomicV1 database.
-        let work_columns = {
-            let mut stmt = tx.prepare("PRAGMA table_info(product_work_claims_v1)")?;
-            stmt.query_map([], |r| r.get::<_, String>(1))?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        for (name, definition) in [
-            ("lease_until", "TEXT"),
-            ("source_revision", "INTEGER"),
-            ("payload_digest", "TEXT"),
-        ] {
-            if !work_columns.iter().any(|column| column == name) {
-                tx.execute(
-                    &format!("ALTER TABLE product_work_claims_v1 ADD COLUMN {name} {definition}"),
-                    [],
-                )?;
-            }
-        }
-        let reservation_columns = {
-            let mut stmt = tx.prepare("PRAGMA table_info(product_review_run_reservations_v1)")?;
-            stmt.query_map([], |r| r.get::<_, String>(1))?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        if !reservation_columns
-            .iter()
-            .any(|column| column == "followup_run_id")
-        {
-            tx.execute(
-                "ALTER TABLE product_review_run_reservations_v1 ADD COLUMN followup_run_id INTEGER",
-                [],
+        initialize_product_schema_with_a01_checkpoint_in(
+                &tx, &config, mode,
+                #[cfg(all(test, feature = "a01-harness-support", unix))]
+                checkpoint,
             )?;
-            // Preserve coordinates already returned by earlier product
-            // receipts. Those historical values are treated as occupied
-            // even though the old implementation sourced them from row IDs.
-            tx.execute("UPDATE product_review_run_reservations_v1 SET followup_run_id=(SELECT json_extract(a.receipt_json,'$.reserved_run_id') FROM product_review_hold_acceptances_v1 a WHERE a.operation_id=product_review_run_reservations_v1.operation_id) WHERE followup_run_id IS NULL AND EXISTS(SELECT 1 FROM product_review_hold_acceptances_v1 a WHERE a.operation_id=product_review_run_reservations_v1.operation_id)", [])?;
+        #[cfg(feature = "a01-harness-support")]
+        if mode.is_a01() {
+            if mode.is_a01_task() { a01_task::validate_a01_task_connection(&tx, &config)?; }
+            else { validate_a01_connection(&tx, &config)?; }
         }
-        let product_review_run_columns = {
-            let mut stmt = tx.prepare("PRAGMA table_info(product_review_runs_v1)")?;
-            stmt.query_map([], |r| r.get::<_, String>(1))?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        for (name, definition) in [
-            ("product_lifecycle", "INTEGER NOT NULL DEFAULT 0"),
-            ("source_revision", "INTEGER NOT NULL DEFAULT 0"),
-            ("admission_seq", "INTEGER NOT NULL DEFAULT 0"),
-            ("admission_hash", "TEXT NOT NULL DEFAULT ''"),
-        ] {
-            if !product_review_run_columns
-                .iter()
-                .any(|column| column == name)
-            {
-                tx.execute(
-                    &format!("ALTER TABLE product_review_runs_v1 ADD COLUMN {name} {definition}"),
-                    [],
-                )?;
+        #[cfg(feature = "w1-isolated-test-support")]
+        if mode.is_create() {
+            validate_isolated_pragmas(&tx)?;
+            validate_isolated_marker_version(&tx, mode)?;
+            validate_w1_operations(&tx)?;
+            if mode.is_capture() || mode.is_pin() { validate_w1_capture_schema(&tx)?; }
+            if mode.is_pin() { validate_w1_pin_schema(&tx)?; }
+            result::validate_v3_connection(&tx, &config.installation_id, &config.database_id)?;
+        }
+        #[cfg(all(test, feature = "a01-harness-support", unix))]
+            if mode.is_a01() {
+                a01_initialization_checkpoint(checkpoint, 6)?;
+                a01_initialization_checkpoint(checkpoint, 7)?;
             }
-        }
-        tx.execute("CREATE UNIQUE INDEX IF NOT EXISTS product_review_run_coordinates_v1 ON product_review_run_reservations_v1(order_id,followup_run_id) WHERE followup_run_id IS NOT NULL", [])?;
-        let has_grant_id = {
-            let mut stmt = tx.prepare("PRAGMA table_info(product_operations_v1)")?;
-            let columns = stmt.query_map([], |r| r.get::<_, String>(1))?;
-            columns
-                .collect::<Result<Vec<_>, _>>()?
-                .iter()
-                .any(|c| c == "grant_id")
-        };
-        if !has_grant_id {
-            tx.execute(
-                "ALTER TABLE product_operations_v1 ADD COLUMN grant_id TEXT",
-                [],
-            )?;
-        }
-        let has_scope_revision = {
-            let mut stmt = tx.prepare("PRAGMA table_info(product_operations_v1)")?;
-            let columns = stmt.query_map([], |r| r.get::<_, String>(1))?;
-            columns
-                .collect::<Result<Vec<_>, _>>()?
-                .iter()
-                .any(|column| column == "scope_revision")
-        };
-        if !has_scope_revision {
-            tx.execute(
-                "ALTER TABLE product_operations_v1 ADD COLUMN scope_revision INTEGER NOT NULL DEFAULT -1",
-                [],
-            )?;
-        }
-        let contract: Option<String> = tx
-            .query_row(
-                "SELECT contract FROM foundry_contract WHERE singleton=1",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        match contract.as_deref() {
-            Some("ProductAtomicV1") => {}
-            Some(_) => return Err(ProductError::ContractMismatch),
-            None => {
-                tx.execute(
-                    "INSERT INTO foundry_contract(singleton,contract) VALUES(1,'ProductAtomicV1')",
-                    [],
-                )?;
-            }
-        }
-        let meta: Option<(String, String)> = tx
-            .query_row(
-                "SELECT installation_id,database_id FROM product_meta_v1 WHERE singleton=1",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        match meta {
-            Some((installation, database))
-                if installation == config.installation_id && database == config.database_id => {}
-            Some(_) => return Err(ProductError::ContractMismatch),
-            None => {
-                tx.execute("INSERT INTO product_meta_v1(singleton,installation_id,database_id,schema_version) VALUES(1,?1,?2,3)", params![config.installation_id, config.database_id])?;
-            }
-        }
-        let review_meta: Option<(String, String, i64)> = tx
-            .query_row(
-                "SELECT installation_id,database_id,schema_version FROM product_review_meta_v1 WHERE singleton=1",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .optional()?;
-        match review_meta {
-            Some((installation, database, 1))
-                if installation == config.installation_id && database == config.database_id => {}
-            Some(_) => return Err(ProductError::ContractMismatch),
-            None => {
-                tx.execute(
-                    "INSERT INTO product_review_meta_v1(singleton,installation_id,database_id,schema_version) VALUES(1,?1,?2,1)",
-                    params![config.installation_id, config.database_id],
-                )?;
-            }
-        }
-        result::initialize_fresh_v3(&tx, &config.installation_id, &config.database_id)?;
-        tx.commit()?;
+            tx.commit()?;
         Ok(Self {
             conn,
+            open_mode: mode,
+            #[cfg(feature = "a01-harness-support")]
+            a01_identity: None,
             path,
             installation_id: config.installation_id,
             database_id: config.database_id,
             clock,
+            #[cfg(feature = "w1-isolated-test-support")]
+            w1_capture_fail_after_legacy_writes: false,
+            #[cfg(feature = "w1-isolated-test-support")]
+            w1_capture_busy_observer: None,
             review_config: None,
             artifact_root: None,
             artifact_root_handle: None,
@@ -1898,8 +2367,13 @@ impl ProductStore {
         {
             return Err(ProductError::Invariant("active scope grant unavailable"));
         }
-        let scope_revision = revision + 1;
-        let grant_revision = old.map(|(_, revision, _)| revision + 1).unwrap_or(1);
+        let (scope_revision, grant_revision) = if capability == ProductCapability::A01BridgePassed {
+            (revision.checked_add(1).ok_or(ProductError::Invariant("scope revision exhausted"))?,
+             old.as_ref().map_or(Some(1), |(_, revision, _)| revision.checked_add(1))
+                .ok_or(ProductError::Invariant("scope revision exhausted"))?)
+        } else {
+            (revision + 1, old.map(|(_, revision, _)| revision + 1).unwrap_or(1))
+        };
         let grant_id = crate::product_scope::framed_hash(
             "foundry-product-scope-grant-v1",
             &[
@@ -3063,7 +3537,7 @@ impl ProductStore {
         let (predecessor, current_lifecycle, current_state) =
             verified_order_state_in(&tx, order_id)?;
         if i64::from(current_lifecycle) + 1 != lifecycle
-            || current_state != "waiting"
+            || (current_state != "waiting" && !a01_hold_review_in(&tx,order_id,&current_state)?)
             || predecessor != expected_predecessor
         {
             return Err(ProductError::Invariant(
@@ -4582,6 +5056,12 @@ impl ProductStore {
         now: DateTime<Utc>,
         lease: chrono::Duration,
     ) -> Result<crate::product::ProductWorkClaimResult, ProductError> {
+        #[cfg(feature = "a01-harness-support")]
+        if self.open_mode.is_a01() {
+            return Err(ProductError::Invariant("A01 isolated store work is disabled"));
+        }
+        #[cfg(feature = "w1-isolated-test-support")]
+        if self.open_mode.is_pin() { return Err(ProductError::ContractMismatch); }
         if worker_id.trim().is_empty()
             || worker_id.len() > 128
             || lease <= chrono::Duration::zero()
@@ -4693,6 +5173,20 @@ impl ProductStore {
         now: DateTime<Utc>,
         lease: chrono::Duration,
     ) -> Result<ProductWorkClaimResult, ProductError> {
+        #[cfg(feature = "a01-harness-support")]
+        if self.open_mode.is_a01_task() {
+            return a01_task::claim(self, context, worker_id, lease, &mut a01_task::TaskHooks::default());
+        }
+        #[cfg(feature = "a01-harness-support")]
+        if self.open_mode.is_a01() {
+            return Err(ProductError::Invariant("A01 isolated store work is disabled"));
+        }
+        #[cfg(feature = "w1-isolated-test-support")]
+        if self.open_mode.is_pin() { return Err(ProductError::ContractMismatch); }
+        #[cfg(feature = "w1-isolated-test-support")]
+        if self.open_mode.is_capture() {
+            return w1_capture_claim_private(self, context, worker_id, lease);
+        }
         if worker_id.trim().is_empty()
             || worker_id.len() > 128
             || lease <= chrono::Duration::zero()
@@ -4794,6 +5288,12 @@ impl ProductStore {
         claim: &crate::product::ProductWorkClaim,
         now: DateTime<Utc>,
     ) -> Result<(), ProductError> {
+        #[cfg(feature = "a01-harness-support")]
+        if self.open_mode.is_a01() {
+            return Err(ProductError::Invariant("A01 isolated store work is disabled"));
+        }
+        #[cfg(feature = "w1-isolated-test-support")]
+        if self.open_mode.is_pin() { return Err(ProductError::ContractMismatch); }
         let exact: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM product_work_claims_v1 c JOIN product_work_backlog_v1 b ON b.order_id=c.order_id AND b.lifecycle=c.lifecycle JOIN product_orders_v1 o ON o.order_id=c.order_id AND o.lifecycle=c.lifecycle JOIN product_sources_v1 s ON s.connector_id=o.connector_id JOIN product_transition_receipts_v1 r ON r.seq=o.admission_seq AND r.event_hash=o.admission_hash WHERE c.order_id=?1 AND c.lifecycle=?2 AND c.owner_id=?3 AND c.epoch=?4 AND c.fence=?5 AND c.state='claimed' AND c.lease_until>?6 AND c.source_revision=?7 AND s.revision=?7 AND s.enabled=1 AND b.state='claimed' AND b.delivery_id=?8 AND c.payload_digest=?9 AND o.task_kind=?10 AND o.payload_snapshot=?11 AND r.operation='github-admission')",
             params![claim.order_id,claim.lifecycle,claim.worker_id,claim.epoch,claim.fence,now.to_rfc3339(),claim.source_revision,claim.delivery_id,claim.payload_digest,claim.task_kind,claim.payload_snapshot], |r| r.get(0),
@@ -5007,6 +5507,12 @@ fn verify_scoped_s1(
 /// Existing order tuples are not sufficient idempotency evidence. Before a
 /// service receives a historical receipt, prove the immutable admission is
 /// bound to this exact source instance and canonical repository identity.
+fn a01_hold_review_in(tx: &rusqlite::Transaction<'_>, order: &str, state: &str) -> Result<bool,ProductError> {
+    #[cfg(feature = "a01-harness-support")]
+    if state == "review" { return a01_task::canonical_review_in(tx,order); }
+    let _ = (tx,order,state); Ok(false)
+}
+
 fn verify_order_source_provenance_in(
     tx: &rusqlite::Transaction<'_>,
     order_id: &str,
@@ -5518,6 +6024,1233 @@ fn require_order_capability_in(
         }
     }
     Ok(view)
+}
+
+#[cfg(feature = "w1-isolated-test-support")]
+fn w1_text(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 256 && !s.as_bytes().contains(&0)
+}
+
+#[cfg(feature = "w1-isolated-test-support")]
+fn w1_authorization_error() -> ProductError {
+    ProductError::Invariant("w1 authorization or binding unavailable")
+}
+
+#[cfg(feature = "w1-isolated-test-support")]
+fn w1_authorize_source(tx: &rusqlite::Transaction<'_>, actor: &str, source: &str) -> Result<(), ProductError> {
+    let authorized: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM product_scope_source_instances_v1 i          JOIN product_scope_current_sources_v1 c ON c.source_instance_id=i.source_instance_id AND c.connector_id=i.connector_id          JOIN product_scope_grants_v1 g ON g.source_instance_id=i.source_instance_id AND g.subject_id=?1 AND g.capability=?3 AND g.enabled=1          JOIN product_scope_subject_revisions_v1 r ON r.source_instance_id=i.source_instance_id AND r.subject_id=g.subject_id          WHERE i.source_instance_id=?2 AND i.enabled=1)",
+        params![actor, source, ProductCapability::ReadOrder.as_str()], |row| row.get(0),
+    )?;
+    if authorized { Ok(()) } else { Err(w1_authorization_error()) }
+}
+
+#[cfg(feature = "w1-isolated-test-support")]
+fn w1_public_receipt(canonical: Vec<u8>) -> Result<W1OperationReceipt, ProductError> {
+    let r = w1_owner_codec::decode_receipt(&canonical).map_err(|_| ProductError::ContractMismatch)?;
+    let operation = match r.operation.as_str() {
+        "approve" => W1Operation::Approve, "revoke" => W1Operation::Revoke, "select" => W1Operation::Select,
+        _ => return Err(ProductError::ContractMismatch),
+    };
+    Ok(W1OperationReceipt { canonical, operation, installation_id: r.installation, database_id: r.database,
+        actor_id: r.actor, authority_revision: r.authority, source_instance_id: r.source, digest: r.digest,
+        expected_revision: r.expected, result_revision: r.result, request_key: r.key,
+        order_id: r.order, lifecycle: r.lifecycle, approval_revision: r.approval })
+}
+
+#[cfg(feature = "w1-isolated-test-support")]
+fn w1_authorize_order(tx: &rusqlite::Transaction<'_>, principal: &ProductPrincipal, order: &str, lifecycle: i64, source: &str) -> Result<(), ProductError> {
+    let view = require_order_capability_in(tx, principal, order, ProductCapability::ReadOrder, true)
+        .map_err(|e| match e {
+            ProductError::Invariant(_) => w1_authorization_error(),
+            ProductError::Database(rusqlite::Error::InvalidColumnType(..) | rusqlite::Error::IntegralValueOutOfRange(..) | rusqlite::Error::FromSqlConversionFailure(..)) => w1_authorization_error(),
+            other => other,
+        })?;
+    if view.lifecycle != lifecycle || view.source_instance_id != source { return Err(w1_authorization_error()); }
+    Ok(())
+}
+
+#[cfg(feature = "w1-isolated-test-support")]
+const W1_COLUMNS: &str = "actor_id,request_key,operation,authority_revision,source_instance_id,digest,expected_revision,approval_result_revision,order_id,lifecycle,selection_result_revision,referenced_approval_revision,referenced_operation,request,receipt";
+
+#[cfg(feature = "w1-isolated-test-support")]
+type W1Row = Vec<rusqlite::types::Value>;
+#[cfg(feature = "w1-isolated-test-support")]
+fn w1_read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<W1Row> {
+    (0..15).map(|i| row.get(i)).collect()
+}
+#[cfg(feature = "w1-isolated-test-support")]
+fn w1_str(row: &W1Row, n: usize) -> Option<&str> {
+    match &row[n] { rusqlite::types::Value::Text(s) => Some(s), _ => None }
+}
+#[cfg(feature = "w1-isolated-test-support")]
+fn w1_int(row: &W1Row, n: usize) -> Option<i64> {
+    match row[n] { rusqlite::types::Value::Integer(v) => Some(v), _ => None }
+}
+#[cfg(feature = "w1-isolated-test-support")]
+fn w1_null(row: &W1Row, n: usize) -> bool { matches!(row[n], rusqlite::types::Value::Null) }
+
+#[cfg(feature = "w1-isolated-test-support")]
+fn w1_validate_row(row: &W1Row, installation: &str, database: &str) -> Result<(w1_owner_codec::Request, w1_owner_codec::Receipt, Vec<u8>), ProductError> {
+    use rusqlite::types::Value;
+    let bad = || ProductError::ContractMismatch;
+    let (Value::Blob(q), Value::Blob(r)) = (&row[13], &row[14]) else { return Err(bad()); };
+    let request = w1_owner_codec::decode_request(q).map_err(|_| bad())?;
+    let receipt = w1_owner_codec::decode_receipt(r).map_err(|_| bad())?;
+    let result = request.expected.checked_add(1).ok_or_else(bad)?;
+    let selection = request.operation == "select";
+    if request.installation != installation || request.database != database
+        || w1_str(row,0) != Some(&request.actor) || w1_str(row,1) != Some(&request.key)
+        || w1_str(row,2) != Some(&request.operation) || w1_str(row,4) != Some(&request.source)
+        || w1_str(row,5) != Some(&request.digest) || w1_int(row,6) != Some(request.expected)
+        || w1_int(row,3) != Some(receipt.authority)
+        || receipt.installation != request.installation || receipt.database != request.database
+        || receipt.operation != request.operation || receipt.actor != request.actor || receipt.source != request.source
+        || receipt.digest != request.digest || receipt.expected != request.expected || receipt.result != result
+        || receipt.key != request.key || receipt.order != request.order || receipt.lifecycle != request.lifecycle {
+        return Err(bad());
+    }
+    if selection {
+        if !w1_null(row,7) || w1_str(row,8) != request.order.as_deref() || w1_int(row,9) != request.lifecycle
+            || w1_int(row,10) != Some(result) || w1_int(row,11) != receipt.approval
+            || w1_str(row,12) != Some("approve") { return Err(bad()); }
+    } else if w1_int(row,7) != Some(result) || !(8..=12).all(|i| w1_null(row,i)) || receipt.approval.is_some() {
+        return Err(bad());
+    }
+    Ok((request, receipt, r.clone()))
+}
+
+#[cfg(feature = "w1-isolated-test-support")]
+fn w1_replay(tx: &rusqlite::Transaction<'_>, principal: &ProductPrincipal, request: &w1_owner_codec::Request, request_bytes: &[u8]) -> Result<Option<W1OperationReceipt>, ProductError> {
+    let sql = format!("SELECT {W1_COLUMNS} FROM product_w1_operations_v1 WHERE actor_id=?1 COLLATE BINARY AND request_key=?2 COLLATE BINARY");
+    let row: Option<W1Row> = tx.query_row(&sql, params![principal.actor_id, request.key], w1_read_row).optional().map_err(|e| match e {
+        rusqlite::Error::FromSqlConversionFailure(..) | rusqlite::Error::InvalidColumnType(..) | rusqlite::Error::IntegralValueOutOfRange(..) => w1_authorization_error(),
+        other => ProductError::Database(other),
+    })?;
+    let Some(row) = row else { return Ok(None); };
+    let source = w1_str(&row,4).filter(|s| w1_text(s)).ok_or_else(w1_authorization_error)?;
+    w1_authorize_source(tx, &principal.actor_id, source)?;
+    let pure = matches!(w1_str(&row,2), Some("approve" | "revoke")) && (8..=12).all(|i| w1_null(&row,i))
+        && w1_str(&row,0).is_some() && w1_str(&row,1).is_some() && w1_int(&row,3).is_some()
+        && w1_str(&row,5).is_some() && w1_int(&row,6).is_some() && w1_int(&row,7).is_some()
+        && matches!(row[13], rusqlite::types::Value::Blob(_)) && matches!(row[14], rusqlite::types::Value::Blob(_));
+    if !pure {
+        let order = w1_str(&row,8).filter(|s| w1_text(s)).ok_or_else(w1_authorization_error)?;
+        let lifecycle = w1_int(&row,9).filter(|n| *n > 0).ok_or_else(w1_authorization_error)?;
+        w1_authorize_order(tx, principal, order, lifecycle, source)?;
+    }
+    let (stored, _, bytes) = w1_validate_row(&row, &request.installation, &request.database)?;
+    w1_validate_histories(tx, &request.installation, &request.database, &stored.source, &stored.digest,
+        stored.order.as_deref().zip(stored.lifecycle))?;
+    if !matches!(&row[13], rusqlite::types::Value::Blob(b) if b == request_bytes) { return Err(ProductError::Invariant("w1 request key conflict")); }
+    Ok(Some(w1_public_receipt(bytes)?))
+}
+
+// Validate the direct tuple's selections and their complete order sequences. Approval
+// sequences reached from those orders are checked once without expanding them again.
+#[cfg(feature = "w1-isolated-test-support")]
+fn w1_validate_histories(tx: &rusqlite::Transaction<'_>, installation: &str, database: &str, source: &str, digest: &str, order: Option<(&str, i64)>) -> Result<(i64, bool, i64), ProductError> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut orders = BTreeSet::new();
+    if let Some((o,l)) = order { orders.insert((o.to_owned(),l)); }
+    let sql = format!("SELECT {W1_COLUMNS} FROM product_w1_operations_v1 WHERE source_instance_id=?1 COLLATE BINARY AND digest=?2 COLLATE BINARY AND (operation='select' OR order_id IS NOT NULL OR lifecycle IS NOT NULL OR selection_result_revision IS NOT NULL OR referenced_approval_revision IS NOT NULL OR referenced_operation IS NOT NULL)");
+    let mut stmt = tx.prepare(&sql)?;
+    let mut rows = stmt.query(params![source,digest])?;
+    while let Some(row) = rows.next()? {
+        let raw = w1_read_row(row).map_err(isolated_schema_error)?;
+        let (q, _, _) = w1_validate_row(&raw, installation, database)?;
+        if q.operation != "select" || q.source != source || q.digest != digest { return Err(ProductError::ContractMismatch); }
+        orders.insert((q.order.ok_or(ProductError::ContractMismatch)?,q.lifecycle.ok_or(ProductError::ContractMismatch)?));
+    }
+    let mut approval_tuples = BTreeSet::new();
+    approval_tuples.insert((source.to_owned(),digest.to_owned()));
+    let mut references = Vec::new();
+    let mut requested_latest = 0;
+    for (o,l) in &orders {
+        let sql = format!("SELECT {W1_COLUMNS} FROM product_w1_operations_v1 WHERE order_id=?1 COLLATE BINARY AND lifecycle=?2 ORDER BY selection_result_revision");
+        let mut stmt = tx.prepare(&sql)?;
+        let mut rows = stmt.query(params![o,l])?;
+        let mut latest = 0i64;
+        let mut bound_source: Option<String> = None;
+        while let Some(row) = rows.next()? {
+            let raw = w1_read_row(row).map_err(isolated_schema_error)?;
+            let (q,r,_) = w1_validate_row(&raw, installation, database)?;
+            if q.operation != "select" || q.order.as_deref() != Some(o) || q.lifecycle != Some(*l)
+                || q.expected != latest || bound_source.as_ref().is_some_and(|s| s != &q.source) { return Err(ProductError::ContractMismatch); }
+            latest = r.result;
+            bound_source = Some(q.source.clone());
+            approval_tuples.insert((q.source.clone(),q.digest.clone()));
+            references.push((q.source,q.digest,r.approval.ok_or(ProductError::ContractMismatch)?));
+        }
+        if order == Some((o.as_str(),*l)) {
+            if bound_source.as_deref().is_some_and(|s| s != source) { return Err(ProductError::ContractMismatch); }
+            requested_latest = latest;
+        }
+    }
+    let mut approvals = BTreeMap::new();
+    for (s,d) in approval_tuples {
+        let sql = format!("SELECT {W1_COLUMNS} FROM product_w1_operations_v1 WHERE source_instance_id=?1 COLLATE BINARY AND digest=?2 COLLATE BINARY AND operation IN ('approve','revoke') ORDER BY approval_result_revision");
+        let mut stmt = tx.prepare(&sql)?;
+        let mut rows = stmt.query(params![s,d])?;
+        let mut latest = 0i64;
+        let mut active = false;
+        while let Some(row) = rows.next()? {
+            let raw = w1_read_row(row).map_err(isolated_schema_error)?;
+            let (q,r,_) = w1_validate_row(&raw, installation, database)?;
+            if q.source != s || q.digest != d || q.expected != latest || q.operation != if active { "revoke" } else { "approve" } { return Err(ProductError::ContractMismatch); }
+            latest = r.result;
+            active = !active;
+        }
+        approvals.insert((s,d),(latest,active));
+    }
+    for (s,d,revision) in references {
+        let Some((latest,_)) = approvals.get(&(s,d)) else { return Err(ProductError::ContractMismatch); };
+        if revision <= 0 || revision > *latest || revision % 2 != 1 { return Err(ProductError::ContractMismatch); }
+    }
+    let (latest,active) = approvals.get(&(source.to_owned(),digest.to_owned())).copied().ok_or(ProductError::ContractMismatch)?;
+    Ok((latest,active,requested_latest))
+}
+
+#[cfg(feature = "w1-isolated-test-support")]
+#[derive(Debug, PartialEq, Eq)]
+struct W1LatestSelection {
+    order: String,
+    lifecycle: i64,
+    source: String,
+    pack_digest: String,
+    selection_revision: i64,
+    referenced_approval_revision: i64,
+    current_approval_head: i64,
+    active: bool,
+}
+
+// This read is not authorization. Authenticate before invoking it, and repeat it
+// after live authority checks in any future atomic admission transaction.
+#[cfg(feature = "w1-isolated-test-support")]
+fn w1_latest_selection_in(tx: &rusqlite::Transaction<'_>, installation: &str, database: &str, order: &str, lifecycle: i64, expected_source: &str) -> Result<W1LatestSelection, ProductError> {
+    if !w1_text(order) || lifecycle <= 0 || !w1_text(expected_source) {
+        return Err(ProductError::InvalidConfig);
+    }
+    // Every operation must be checked before filtering: any raw identity column
+    // could conceal a canonical row. This scans the entire operation table on
+    // every call, with no row limit; unrelated corruption makes the read fail.
+    // Runtime grows with the table and relevant history; callers must account
+    // for this cost. This is consistency checking, not database authenticity.
+    {
+        let sql = format!("SELECT {W1_COLUMNS} FROM product_w1_operations_v1");
+        let mut stmt = tx.prepare(&sql)?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let raw = w1_read_row(row).map_err(isolated_schema_error)?;
+            w1_validate_row(&raw, installation, database)?;
+        }
+    }
+    let sql = format!("SELECT {W1_COLUMNS} FROM product_w1_operations_v1 WHERE order_id=?1 COLLATE BINARY AND lifecycle=?2 ORDER BY selection_result_revision");
+    let mut stmt = tx.prepare(&sql)?;
+    let mut rows = stmt.query(params![order, lifecycle])?;
+    let mut latest = None;
+    let mut revision = 0;
+    while let Some(row) = rows.next()? {
+        let raw = w1_read_row(row).map_err(isolated_schema_error)?;
+        let (request, receipt, _) = w1_validate_row(&raw, installation, database)?;
+        if request.operation != "select" || request.order.as_deref() != Some(order)
+            || request.lifecycle != Some(lifecycle) || request.expected != revision {
+            return Err(ProductError::ContractMismatch);
+        }
+        revision = receipt.result;
+        latest = Some((request, receipt));
+    }
+    let (request, receipt) = latest.ok_or(ProductError::Invariant("w1 selection unavailable"))?;
+    if request.source != expected_source { return Err(ProductError::Invariant("w1 selection unavailable")); }
+    let (head, active, validated_revision) = w1_validate_histories(tx, installation, database, &request.source, &request.digest, Some((order, lifecycle)))?;
+    let referenced = receipt.approval.ok_or(ProductError::ContractMismatch)?;
+    if validated_revision != revision { return Err(ProductError::ContractMismatch); }
+    if !active || head != referenced { return Err(ProductError::Invariant("w1 selection unavailable")); }
+    Ok(W1LatestSelection { order: order.to_owned(), lifecycle, source: request.source,
+        pack_digest: request.digest, selection_revision: revision,
+        referenced_approval_revision: referenced, current_approval_head: head, active })
+}
+
+// This is an empty storage container only. Selection and claim reference guards
+// are deferred; a populated row does not establish authority.
+#[cfg(feature = "w1-isolated-test-support")]
+const W1_PIN_MARKER: &str = "CREATE TABLE product_w1_isolated_marker_v1(singleton INTEGER PRIMARY KEY CHECK(singleton=1), version INTEGER NOT NULL CHECK(version=4))";
+#[cfg(feature = "w1-isolated-test-support")]
+const W1_PIN_OBJECTS: [(&str, &str, &str); 4] = [
+    ("product_w1_lifecycle_pins_v1", "table", "CREATE TABLE product_w1_lifecycle_pins_v1(order_id TEXT NOT NULL, lifecycle INTEGER NOT NULL CHECK(lifecycle>0), installation_id TEXT NOT NULL, database_id TEXT NOT NULL, source_instance_id TEXT NOT NULL, pack_digest TEXT NOT NULL, selection_revision INTEGER NOT NULL CHECK(selection_revision>0), referenced_approval_revision INTEGER NOT NULL CHECK(referenced_approval_revision>0), claim_epoch INTEGER NOT NULL CHECK(claim_epoch>0), claim_fence INTEGER NOT NULL CHECK(claim_fence>0), payload_digest TEXT NOT NULL, admission_seq INTEGER NOT NULL, admission_hash TEXT NOT NULL, PRIMARY KEY(order_id,lifecycle))"),
+    ("product_w1_lifecycle_pins_no_update", "trigger", "CREATE TRIGGER product_w1_lifecycle_pins_no_update BEFORE UPDATE ON product_w1_lifecycle_pins_v1 BEGIN SELECT RAISE(ABORT,'immutable lifecycle pin'); END"),
+    ("product_w1_lifecycle_pins_no_delete", "trigger", "CREATE TRIGGER product_w1_lifecycle_pins_no_delete BEFORE DELETE ON product_w1_lifecycle_pins_v1 BEGIN SELECT RAISE(ABORT,'immutable lifecycle pin'); END"),
+    ("product_w1_lifecycle_pins_no_replace", "trigger", "CREATE TRIGGER product_w1_lifecycle_pins_no_replace BEFORE INSERT ON product_w1_lifecycle_pins_v1 WHEN EXISTS(SELECT 1 FROM product_w1_lifecycle_pins_v1 WHERE order_id=NEW.order_id AND lifecycle=NEW.lifecycle) BEGIN SELECT RAISE(ABORT,'immutable lifecycle pin'); END"),
+];
+
+#[cfg(feature = "w1-isolated-test-support")]
+fn validate_w1_pin_schema(conn: &Connection) -> Result<(), ProductError> {
+    // SQLite lower() folds ASCII; retain original names for exact inventory equality.
+    let mut inventory = conn.prepare("SELECT type,name FROM sqlite_schema WHERE lower(name) GLOB 'product_w1_*' OR lower(tbl_name) GLOB 'product_w1_*' ORDER BY type,name").map_err(isolated_schema_error)?;
+    let actual: Vec<(String,String)> = inventory.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).map_err(isolated_schema_error)?.collect::<rusqlite::Result<_>>().map_err(isolated_schema_error)?;
+    let expected = [
+        ("index","sqlite_autoindex_product_w1_claim_authority_v1_1"), ("index","sqlite_autoindex_product_w1_claim_authority_v1_2"),
+        ("index","sqlite_autoindex_product_w1_lifecycle_pins_v1_1"),
+        ("index","sqlite_autoindex_product_w1_operations_v1_1"), ("index","sqlite_autoindex_product_w1_operations_v1_2"), ("index","sqlite_autoindex_product_w1_operations_v1_3"), ("index","sqlite_autoindex_product_w1_operations_v1_4"),
+        ("table","product_w1_claim_authority_v1"), ("table","product_w1_isolated_marker_v1"), ("table","product_w1_lifecycle_pins_v1"), ("table","product_w1_operations_v1"),
+        ("trigger","product_w1_claim_authority_no_delete"), ("trigger","product_w1_claim_authority_no_replace"), ("trigger","product_w1_claim_authority_no_update"),
+        ("trigger","product_w1_lifecycle_pins_no_delete"), ("trigger","product_w1_lifecycle_pins_no_replace"), ("trigger","product_w1_lifecycle_pins_no_update"),
+        ("trigger","product_w1_operations_no_delete"), ("trigger","product_w1_operations_no_replace"), ("trigger","product_w1_operations_no_update"),
+    ].map(|(t,n)| (t.to_string(), n.to_string()));
+    if actual != expected { return Err(ProductError::ContractMismatch); }
+    let mut stmt = conn.prepare("SELECT type,name,sql FROM sqlite_schema WHERE tbl_name='product_w1_lifecycle_pins_v1' ORDER BY type,name").map_err(isolated_schema_error)?;
+    let actual: Vec<(String,String,Option<String>)> = stmt.query_map([], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(isolated_schema_error)?.collect::<rusqlite::Result<_>>().map_err(isolated_schema_error)?;
+    let mut expected: Vec<(String,String,Option<String>)> = W1_PIN_OBJECTS.into_iter().map(|(n,t,s)| (t.into(),n.into(),Some(s.into()))).collect();
+    expected.push(("index".into(), "sqlite_autoindex_product_w1_lifecycle_pins_v1_1".into(), None));
+    expected.sort();
+    if actual != expected { return Err(ProductError::ContractMismatch); }
+    let count: i64 = conn.query_row("SELECT count(*) FROM product_w1_lifecycle_pins_v1", [], |r| r.get(0)).map_err(isolated_schema_error)?;
+    if count != 0 { return Err(ProductError::ContractMismatch); }
+    let mut fk = conn.prepare("PRAGMA foreign_key_list(product_w1_lifecycle_pins_v1)").map_err(isolated_schema_error)?;
+    if fk.query([]).map_err(isolated_schema_error)?.next().map_err(isolated_schema_error)?.is_some() { return Err(ProductError::ContractMismatch); }
+    Ok(())
+}
+
+#[cfg(feature = "w1-isolated-test-support")]
+const W1_CAPTURE_MARKER: &str = "CREATE TABLE product_w1_isolated_marker_v1(singleton INTEGER PRIMARY KEY CHECK(singleton=1), version INTEGER NOT NULL CHECK(version=3))";
+#[cfg(feature = "w1-isolated-test-support")]
+const W1_CAPTURE_OBJECTS: [(&str, &str, &str); 4] = [
+    ("product_w1_claim_authority_v1", "table", r#"CREATE TABLE product_w1_claim_authority_v1(order_id TEXT NOT NULL, lifecycle INTEGER NOT NULL CHECK(lifecycle>0), epoch INTEGER NOT NULL CHECK(epoch>0), fence INTEGER NOT NULL CHECK(fence>0), installation_id TEXT NOT NULL, database_id TEXT NOT NULL, delivery_id TEXT NOT NULL, worker_id TEXT NOT NULL, claimed_at TEXT NOT NULL, claim_lease_until TEXT NOT NULL, payload_digest TEXT NOT NULL, admission_seq INTEGER NOT NULL, admission_hash TEXT NOT NULL, service_id TEXT NOT NULL, service_revision INTEGER NOT NULL, service_lease_until TEXT NOT NULL, credential_revision INTEGER NOT NULL, credential_expires_at TEXT NOT NULL, grant_action TEXT NOT NULL CHECK(grant_action='drive_review'), grant_revision INTEGER NOT NULL, source_instance_id TEXT NOT NULL, source_generation INTEGER NOT NULL, source_instance_revision INTEGER NOT NULL, connector_id TEXT NOT NULL, connector_revision INTEGER NOT NULL, api_origin TEXT NOT NULL, repository_id TEXT NOT NULL, api_owner TEXT NOT NULL, api_repo TEXT NOT NULL, PRIMARY KEY(order_id,lifecycle,epoch), UNIQUE(fence))"#),
+    ("product_w1_claim_authority_no_update", "trigger", r#"CREATE TRIGGER product_w1_claim_authority_no_update BEFORE UPDATE ON product_w1_claim_authority_v1 BEGIN SELECT RAISE(ABORT,'immutable claim authority'); END"#),
+    ("product_w1_claim_authority_no_delete", "trigger", r#"CREATE TRIGGER product_w1_claim_authority_no_delete BEFORE DELETE ON product_w1_claim_authority_v1 BEGIN SELECT RAISE(ABORT,'immutable claim authority'); END"#),
+    ("product_w1_claim_authority_no_replace", "trigger", r#"CREATE TRIGGER product_w1_claim_authority_no_replace BEFORE INSERT ON product_w1_claim_authority_v1 WHEN EXISTS(SELECT 1 FROM product_w1_claim_authority_v1 WHERE (order_id=NEW.order_id AND lifecycle=NEW.lifecycle AND epoch=NEW.epoch) OR fence=NEW.fence) BEGIN SELECT RAISE(ABORT,'immutable claim authority'); END"#),
+];
+
+#[cfg(feature = "w1-isolated-test-support")]
+fn validate_w1_capture_schema(conn: &Connection) -> Result<(), ProductError> {
+    for (name, kind, ddl) in W1_CAPTURE_OBJECTS {
+        let object: Option<(String, String, Option<String>)> = conn.query_row(
+            "SELECT type,tbl_name,sql FROM sqlite_schema WHERE name=?1", [name],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).optional().map_err(isolated_schema_error)?;
+        if !matches!(object, Some((ref k, ref owner, Some(ref sql))) if k == kind && owner == "product_w1_claim_authority_v1" && sql == ddl) { return Err(ProductError::ContractMismatch); }
+    }
+    let mut columns = conn.prepare("PRAGMA table_info(product_w1_claim_authority_v1)").map_err(isolated_schema_error)?;
+    let actual: Vec<(String,String,i64,i64)> = columns.query_map([], |r| Ok((r.get(1)?,r.get(2)?,r.get(3)?,r.get(5)?))).map_err(isolated_schema_error)?.collect::<rusqlite::Result<_>>().map_err(isolated_schema_error)?;
+    let expected: Vec<(String,String,i64,i64)> = [
+        ("order_id","TEXT",1), ("lifecycle","INTEGER",2), ("epoch","INTEGER",3), ("fence","INTEGER",0),
+        ("installation_id","TEXT",0), ("database_id","TEXT",0), ("delivery_id","TEXT",0), ("worker_id","TEXT",0),
+        ("claimed_at","TEXT",0), ("claim_lease_until","TEXT",0), ("payload_digest","TEXT",0), ("admission_seq","INTEGER",0),
+        ("admission_hash","TEXT",0), ("service_id","TEXT",0), ("service_revision","INTEGER",0), ("service_lease_until","TEXT",0),
+        ("credential_revision","INTEGER",0), ("credential_expires_at","TEXT",0), ("grant_action","TEXT",0), ("grant_revision","INTEGER",0),
+        ("source_instance_id","TEXT",0), ("source_generation","INTEGER",0), ("source_instance_revision","INTEGER",0),
+        ("connector_id","TEXT",0), ("connector_revision","INTEGER",0), ("api_origin","TEXT",0), ("repository_id","TEXT",0),
+        ("api_owner","TEXT",0), ("api_repo","TEXT",0),
+    ].into_iter().map(|(name, ty, pk)| (name.into(),ty.into(),1,pk)).collect();
+    if actual != expected { return Err(ProductError::ContractMismatch); }
+    let extra: i64 = conn.query_row("SELECT count(*) FROM sqlite_schema WHERE tbl_name='product_w1_claim_authority_v1' AND ((type='trigger' AND name NOT IN ('product_w1_claim_authority_no_update','product_w1_claim_authority_no_delete','product_w1_claim_authority_no_replace')) OR (type='index' AND sql IS NOT NULL))", [], |r| r.get(0)).map_err(isolated_schema_error)?;
+    if extra != 0 { return Err(ProductError::ContractMismatch); }
+    let mut stmt = conn.prepare("PRAGMA index_list(product_w1_claim_authority_v1)").map_err(isolated_schema_error)?;
+    let indexes: Vec<(String,i64,String,i64)> = stmt.query_map([], |r| Ok((r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).map_err(isolated_schema_error)?.collect::<rusqlite::Result<_>>().map_err(isolated_schema_error)?;
+    let mut keys = Vec::new();
+    for (name, unique, origin, partial) in indexes {
+        if unique != 1 || partial != 0 { return Err(ProductError::ContractMismatch); }
+        let mut info = conn.prepare("SELECT name,coll FROM pragma_index_xinfo(?1) WHERE key=1 ORDER BY seqno").map_err(isolated_schema_error)?;
+        let cols: Vec<(String,String)> = info.query_map([name], |r| Ok((r.get(0)?,r.get(1)?))).map_err(isolated_schema_error)?.collect::<rusqlite::Result<_>>().map_err(isolated_schema_error)?;
+        if cols.iter().any(|(_, coll)| coll != "BINARY") { return Err(ProductError::ContractMismatch); }
+        keys.push((origin, cols.into_iter().map(|(n,_)| n).collect::<Vec<_>>()));
+    }
+    keys.sort();
+    if keys != vec![("pk".into(), vec!["order_id".into(),"lifecycle".into(),"epoch".into()]), ("u".into(), vec!["fence".into()])] { return Err(ProductError::ContractMismatch); }
+    let mut fk = conn.prepare("PRAGMA foreign_key_list(product_w1_claim_authority_v1)").map_err(isolated_schema_error)?;
+    if fk.query([]).map_err(isolated_schema_error)?.next().map_err(isolated_schema_error)?.is_some() { return Err(ProductError::ContractMismatch); }
+    let mut check = conn.prepare("PRAGMA foreign_key_check").map_err(isolated_schema_error)?;
+    if check.query([]).map_err(isolated_schema_error)?.next().map_err(isolated_schema_error)?.is_some() { return Err(ProductError::ContractMismatch); }
+    Ok(())
+}
+
+#[cfg(feature = "w1-isolated-test-support")]
+const W1_OPERATION_TABLE: &str = r#"CREATE TABLE product_w1_operations_v1(
+ actor_id TEXT COLLATE BINARY NOT NULL CHECK(typeof(actor_id)='text' AND length(CAST(actor_id AS BLOB)) BETWEEN 1 AND 256 AND instr(actor_id,char(0))=0),
+ request_key TEXT COLLATE BINARY NOT NULL CHECK(typeof(request_key)='text' AND length(CAST(request_key AS BLOB)) BETWEEN 1 AND 256 AND instr(request_key,char(0))=0),
+ operation TEXT COLLATE BINARY NOT NULL CHECK(operation IN ('approve','revoke','select')),
+ authority_revision INTEGER NOT NULL CHECK(typeof(authority_revision)='integer' AND authority_revision>=0),
+ source_instance_id TEXT COLLATE BINARY NOT NULL CHECK(typeof(source_instance_id)='text' AND length(CAST(source_instance_id AS BLOB)) BETWEEN 1 AND 256 AND instr(source_instance_id,char(0))=0),
+ digest TEXT COLLATE BINARY NOT NULL CHECK(typeof(digest)='text' AND length(CAST(digest AS BLOB))=64 AND digest NOT GLOB '*[^0-9a-f]*'),
+ expected_revision INTEGER NOT NULL CHECK(typeof(expected_revision)='integer' AND expected_revision>=0 AND expected_revision<9223372036854775807),
+ approval_result_revision INTEGER,
+ order_id TEXT COLLATE BINARY,
+ lifecycle INTEGER,
+ selection_result_revision INTEGER,
+ referenced_approval_revision INTEGER,
+ referenced_operation TEXT COLLATE BINARY,
+ request BLOB NOT NULL CHECK(typeof(request)='blob' AND length(request)<=8192),
+ receipt BLOB NOT NULL CHECK(typeof(receipt)='blob' AND length(receipt)<=8192),
+ PRIMARY KEY(actor_id,request_key),
+ UNIQUE(source_instance_id,digest,approval_result_revision),
+ UNIQUE(order_id,lifecycle,selection_result_revision),
+ UNIQUE(source_instance_id,digest,approval_result_revision,operation),
+ FOREIGN KEY(source_instance_id,digest,referenced_approval_revision,referenced_operation)
+   REFERENCES product_w1_operations_v1(source_instance_id,digest,approval_result_revision,operation),
+ CHECK((operation IN ('approve','revoke') AND typeof(approval_result_revision)='integer' AND approval_result_revision=expected_revision+1 AND order_id IS NULL AND lifecycle IS NULL AND selection_result_revision IS NULL AND referenced_approval_revision IS NULL AND referenced_operation IS NULL)
+    OR (operation='select' AND approval_result_revision IS NULL AND typeof(order_id)='text' AND length(CAST(order_id AS BLOB)) BETWEEN 1 AND 256 AND instr(order_id,char(0))=0 AND typeof(lifecycle)='integer' AND lifecycle>0 AND typeof(selection_result_revision)='integer' AND selection_result_revision=expected_revision+1 AND typeof(referenced_approval_revision)='integer' AND referenced_approval_revision>0 AND referenced_operation IS NOT NULL AND referenced_operation='approve'))
+)"#;
+#[cfg(feature = "w1-isolated-test-support")]
+const W1_OPERATION_UPDATE: &str = r#"CREATE TRIGGER product_w1_operations_no_update BEFORE UPDATE ON product_w1_operations_v1 BEGIN SELECT RAISE(ABORT,'w1 operation immutable'); END"#;
+#[cfg(feature = "w1-isolated-test-support")]
+const W1_OPERATION_DELETE: &str = r#"CREATE TRIGGER product_w1_operations_no_delete BEFORE DELETE ON product_w1_operations_v1 BEGIN SELECT RAISE(ABORT,'w1 operation immutable'); END"#;
+#[cfg(feature = "w1-isolated-test-support")]
+const W1_OPERATION_REPLACE: &str = r#"CREATE TRIGGER product_w1_operations_no_replace BEFORE INSERT ON product_w1_operations_v1 WHEN EXISTS(SELECT 1 FROM product_w1_operations_v1 o WHERE (o.actor_id=NEW.actor_id AND o.request_key=NEW.request_key) OR (NEW.approval_result_revision IS NOT NULL AND o.source_instance_id=NEW.source_instance_id AND o.digest=NEW.digest AND o.approval_result_revision=NEW.approval_result_revision) OR (NEW.selection_result_revision IS NOT NULL AND o.order_id=NEW.order_id AND o.lifecycle=NEW.lifecycle AND o.selection_result_revision=NEW.selection_result_revision)) BEGIN SELECT RAISE(ABORT,'w1 operation duplicate'); END"#;
+
+#[cfg(feature = "w1-isolated-test-support")]
+fn isolated_schema_error(error: rusqlite::Error) -> ProductError {
+    isolated_marker_query_error(error)
+}
+
+#[cfg(feature = "w1-isolated-test-support")]
+fn validate_isolated_pragmas(conn: &Connection) -> Result<(), ProductError> {
+    for pragma in ["PRAGMA foreign_keys", "PRAGMA recursive_triggers"] {
+        let value: i64 = conn.query_row(pragma, [], |row| row.get(0)).map_err(isolated_schema_error)?;
+        if value != 1 { return Err(ProductError::ContractMismatch); }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "w1-isolated-test-support")]
+fn validate_w1_operations(conn: &Connection) -> Result<(), ProductError> {
+    for (name, kind, ddl) in [
+        ("product_w1_operations_v1", "table", W1_OPERATION_TABLE),
+        ("product_w1_operations_no_update", "trigger", W1_OPERATION_UPDATE),
+        ("product_w1_operations_no_delete", "trigger", W1_OPERATION_DELETE),
+        ("product_w1_operations_no_replace", "trigger", W1_OPERATION_REPLACE),
+    ] {
+        let object: Option<(String, Option<String>)> = conn.query_row(
+            "SELECT type, sql FROM sqlite_schema WHERE name=?1", [name],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional().map_err(isolated_schema_error)?;
+        if !matches!(object, Some((ref actual_kind, Some(ref actual_ddl))) if actual_kind == kind && actual_ddl == ddl) {
+            return Err(ProductError::ContractMismatch);
+        }
+    }
+    let extra: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_schema WHERE tbl_name='product_w1_operations_v1' AND ((type='trigger' AND name NOT IN ('product_w1_operations_no_update','product_w1_operations_no_delete','product_w1_operations_no_replace')) OR (type='index' AND sql IS NOT NULL))",
+        [], |row| row.get(0),
+    ).map_err(isolated_schema_error)?;
+    if extra != 0 { return Err(ProductError::ContractMismatch); }
+    let mut indexes = conn.prepare("PRAGMA index_list(product_w1_operations_v1)").map_err(isolated_schema_error)?;
+    let index_names: Vec<(String, i64, String, i64)> = indexes.query_map([], |row| Ok((row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))).map_err(isolated_schema_error)?.collect::<rusqlite::Result<_>>().map_err(isolated_schema_error)?;
+    let mut keys = Vec::new();
+    for (name, unique, origin, partial) in index_names {
+        if unique != 1 || partial != 0 || (origin != "pk" && origin != "u") { return Err(ProductError::ContractMismatch); }
+        let mut info = conn.prepare("SELECT name,coll FROM pragma_index_xinfo(?1) WHERE key=1 ORDER BY seqno").map_err(isolated_schema_error)?;
+        let columns: Vec<(String, String)> = info.query_map([name], |row| Ok((row.get(0)?, row.get(1)?))).map_err(isolated_schema_error)?.collect::<rusqlite::Result<_>>().map_err(isolated_schema_error)?;
+        if columns.iter().any(|(_, coll)| coll != "BINARY") { return Err(ProductError::ContractMismatch); }
+        keys.push((origin, columns.into_iter().map(|(name, _)| name).collect::<Vec<_>>()));
+    }
+    keys.sort();
+    let mut expected: Vec<(String, Vec<String>)> = [
+        ("pk", vec!["actor_id", "request_key"]),
+        ("u", vec!["source_instance_id", "digest", "approval_result_revision"]),
+        ("u", vec!["order_id", "lifecycle", "selection_result_revision"]),
+        ("u", vec!["source_instance_id", "digest", "approval_result_revision", "operation"]),
+    ].into_iter().map(|(origin, columns)| (origin.into(), columns.into_iter().map(String::from).collect())).collect();
+    expected.sort();
+    if keys != expected { return Err(ProductError::ContractMismatch); }
+    let mut fk = conn.prepare("PRAGMA foreign_key_list(product_w1_operations_v1)").map_err(isolated_schema_error)?;
+    let foreign: Vec<(i64, i64, String, String, String, String, String, String)> = fk.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?))).map_err(isolated_schema_error)?.collect::<rusqlite::Result<_>>().map_err(isolated_schema_error)?;
+    let expected_fk: Vec<_> = [("source_instance_id", "source_instance_id"), ("digest", "digest"), ("referenced_approval_revision", "approval_result_revision"), ("referenced_operation", "operation")].into_iter().enumerate().map(|(seq, (from, to))| (0, seq as i64, "product_w1_operations_v1".to_string(), from.to_string(), to.to_string(), "NO ACTION".to_string(), "NO ACTION".to_string(), "NONE".to_string())).collect();
+    if foreign != expected_fk { return Err(ProductError::ContractMismatch); }
+    let mut check = conn.prepare("PRAGMA foreign_key_check").map_err(isolated_schema_error)?;
+    if check.query([]).map_err(isolated_schema_error)?.next().map_err(isolated_schema_error)?.is_some() {
+        return Err(ProductError::ContractMismatch);
+    }
+    Ok(())
+}
+
+#[cfg(all(test, feature = "w1-isolated-test-support"))]
+fn validate_isolated_marker(conn: &Connection) -> Result<(), ProductError> {
+    validate_isolated_marker_version(conn, StoreOpenMode::IsolatedReopen)
+}
+
+#[cfg(feature = "w1-isolated-test-support")]
+fn validate_isolated_marker_version(conn: &Connection, mode: StoreOpenMode) -> Result<(), ProductError> {
+    if mode == StoreOpenMode::Normal { return Err(ProductError::ContractMismatch); }
+    const DDL: &str = "CREATE TABLE product_w1_isolated_marker_v1(singleton INTEGER PRIMARY KEY CHECK(singleton=1), version INTEGER NOT NULL CHECK(version=2))";
+    let definition = isolated_marker_definition_result(conn.query_row(
+        "SELECT type, sql FROM sqlite_master WHERE name='product_w1_isolated_marker_v1'",
+        [], |row| Ok((row.get(0)?, row.get(1)?)),
+    ))?;
+    let expected = if mode.is_pin() { W1_PIN_MARKER } else if mode.is_capture() { W1_CAPTURE_MARKER } else { DDL };
+    if !matches!(definition, Some((ref kind, Some(ref sql))) if kind == "table" && sql == expected) {
+        return Err(ProductError::ContractMismatch);
+    }
+    let rows = (|| -> rusqlite::Result<Vec<(i64, i64)>> {
+        let mut stmt = conn.prepare("SELECT singleton, version FROM product_w1_isolated_marker_v1")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?.collect();
+        rows
+    })().map_err(isolated_marker_query_error)?;
+    if rows != [(1, if mode.is_pin() { 4 } else if mode.is_capture() { 3 } else { 2 })] { return Err(ProductError::ContractMismatch); }
+    Ok(())
+}
+
+#[cfg(feature = "w1-isolated-test-support")]
+fn isolated_marker_definition_result(
+    result: rusqlite::Result<(String, Option<String>)>,
+) -> Result<Option<(String, Option<String>)>, ProductError> {
+    result.optional().map_err(isolated_marker_query_error)
+}
+
+#[cfg(feature = "w1-isolated-test-support")]
+fn isolated_marker_query_error(error: rusqlite::Error) -> ProductError {
+    // Only column conversion and column shape errors indicate malformed query results.
+    // SQLite failures (including generic SQL errors) retain their database error.
+    match error {
+        rusqlite::Error::InvalidColumnType(..)
+        | rusqlite::Error::InvalidColumnIndex(..)
+        | rusqlite::Error::InvalidColumnName(..)
+        | rusqlite::Error::IntegralValueOutOfRange(..)
+        | rusqlite::Error::FromSqlConversionFailure(..) => ProductError::ContractMismatch,
+        other => ProductError::Database(other),
+    }
+}
+
+#[cfg(all(test, feature = "w1-isolated-test-support"))]
+mod isolated_marker_error_tests {
+    use super::{ProductError, isolated_marker_definition_result, isolated_marker_query_error, validate_isolated_marker};
+    use rusqlite::{Connection, Error, ffi, types::Type};
+
+    #[test]
+    fn marker_row_conversion_and_shape_errors_are_contract_mismatches() {
+        let errors = [
+            Error::InvalidColumnType(1, "version".into(), Type::Text),
+            Error::InvalidColumnIndex(1),
+            Error::InvalidColumnName("version".into()),
+            Error::IntegralValueOutOfRange(1, 256),
+            Error::FromSqlConversionFailure(1, Type::Text, Box::new(std::io::Error::other("conversion"))),
+        ];
+        for error in errors {
+            assert!(matches!(isolated_marker_query_error(error), ProductError::ContractMismatch));
+        }
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE product_w1_isolated_marker_v1(singleton INTEGER PRIMARY KEY CHECK(singleton=1), version INTEGER NOT NULL CHECK(version=2)); PRAGMA ignore_check_constraints=ON; INSERT INTO product_w1_isolated_marker_v1 VALUES(1,'invalid');").unwrap();
+        assert!(matches!(validate_isolated_marker(&conn), Err(ProductError::ContractMismatch)));
+        conn.execute_batch("DELETE FROM product_w1_isolated_marker_v1").unwrap();
+        assert!(matches!(validate_isolated_marker(&conn), Err(ProductError::ContractMismatch)));
+    }
+
+    #[test]
+    fn constructed_marker_sqlite_operational_errors_remain_database_errors() {
+        // These classify constructed errors; they do not induce real I/O or locking failures.
+        for code in [ffi::SQLITE_IOERR, ffi::SQLITE_BUSY, ffi::SQLITE_LOCKED, ffi::SQLITE_CORRUPT, ffi::SQLITE_NOMEM, ffi::SQLITE_ERROR] {
+            let error = Error::SqliteFailure(ffi::Error::new(code), None);
+            assert!(matches!(isolated_marker_query_error(error), ProductError::Database(Error::SqliteFailure(inner, _)) if inner.extended_code == code));
+        }
+    }
+
+    #[test]
+    fn marker_definition_result_classifies_shape_and_conversion_errors() {
+        // Synthetic results exercise the definition-query mapping; SQLite normally
+        // validates sqlite_master before malformed entries can reach this query.
+        let errors = [
+            Error::InvalidColumnType(0, "type".into(), Type::Integer),
+            Error::InvalidColumnIndex(1),
+            Error::InvalidColumnName("sql".into()),
+            Error::IntegralValueOutOfRange(0, 256),
+            Error::FromSqlConversionFailure(1, Type::Text, Box::new(std::io::Error::other("conversion"))),
+        ];
+        for error in errors {
+            assert!(matches!(isolated_marker_definition_result(Err(error)), Err(ProductError::ContractMismatch)));
+        }
+        assert!(matches!(isolated_marker_definition_result(Err(Error::QueryReturnedNoRows)), Ok(None)));
+    }
+
+    #[test]
+    fn marker_definition_result_preserves_sqlite_operational_errors() {
+        // Constructed errors test classification, not actual I/O or locking failures.
+        for code in [ffi::SQLITE_IOERR, ffi::SQLITE_BUSY, ffi::SQLITE_LOCKED, ffi::SQLITE_CORRUPT, ffi::SQLITE_NOMEM, ffi::SQLITE_ERROR] {
+            let error = Error::SqliteFailure(ffi::Error::new(code), None);
+            assert!(matches!(isolated_marker_definition_result(Err(error)), Err(ProductError::Database(Error::SqliteFailure(inner, _))) if inner.extended_code == code));
+        }
+    }
+}
+
+#[cfg(feature = "w1-isolated-test-support")]
+fn isolated_test_path(directory: &Path, name: &str) -> Result<PathBuf, ProductError> {
+    let mut components = Path::new(name).components();
+    if !matches!(components.next(), Some(std::path::Component::Normal(_))) || components.next().is_some() {
+        return Err(ProductError::InvalidConfig);
+    }
+    let metadata = std::fs::symlink_metadata(directory)
+        .map_err(|_| ProductError::Invariant("isolated store directory inspection failed"))?;
+    if !metadata.file_type().is_dir() { return Err(ProductError::InvalidConfig); }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 { return Err(ProductError::InvalidConfig); }
+    }
+    #[cfg(not(unix))]
+    { return Err(ProductError::InvalidConfig); }
+    #[cfg(unix)]
+    { Ok(directory.canonicalize().map_err(|_| ProductError::Invariant("isolated store directory canonicalization failed"))?.join(name)) }
+}
+
+// Read-only SQLite inspection is limited to the private rollback-journal test
+// boundary. It does not establish WAL-safe marker discovery, old-writer fencing,
+// power-loss durability, or safety of an operational migration. Pathname replacement
+// by a concurrent actor is outside this check's guarantees.
+fn reject_isolated_before_path_creation(path: &Path) -> Result<(), ProductError> {
+    match std::fs::metadata(path) {
+        Ok(_) => {
+            let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            let marker: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='product_w1_isolated_marker_v1')",
+                [], |r| r.get(0),
+            )?;
+            if marker { return Err(ProductError::ContractMismatch); }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Creating a missing component before `..` can make an apparently
+            // absent path resolve to an existing database. Fail closed there.
+            if path.components().any(|part| matches!(part, std::path::Component::ParentDir))
+                && path.parent().ok_or(ProductError::InvalidConfig)?.canonicalize().is_err()
+            {
+                return Err(ProductError::InvalidConfig);
+            }
+        }
+        Err(_) => return Err(ProductError::InvalidConfig),
+    }
+    Ok(())
+}
+
+fn initialize_product_schema_in(
+    tx: &rusqlite::Transaction<'_>,
+    config: &ProductConfig,
+    mode: StoreOpenMode,
+) -> Result<(), ProductError> {
+    initialize_product_schema_with_a01_checkpoint_in(
+        tx, config, mode,
+        #[cfg(all(test, feature = "a01-harness-support", unix))]
+        None,
+    )
+}
+
+
+fn initialize_product_schema_with_a01_checkpoint_in(
+    tx: &rusqlite::Transaction<'_>,
+    config: &ProductConfig,
+    mode: StoreOpenMode,
+    #[cfg(all(test, feature = "a01-harness-support", unix))] checkpoint: Option<usize>,
+) -> Result<(), ProductError> {
+        #[cfg(feature = "w1-isolated-test-support")]
+        if mode.is_create() {
+            if mode.is_capture() || mode.is_pin() {
+                tx.execute_batch(if mode.is_pin() { W1_PIN_MARKER } else { W1_CAPTURE_MARKER })?;
+                tx.execute("INSERT INTO product_w1_isolated_marker_v1 VALUES(1,?1)", [if mode.is_pin() { 4 } else { 3 }])?;
+                for ddl in W1_CAPTURE_OBJECTS { tx.execute_batch(ddl.2)?; }
+                if mode.is_pin() { for ddl in W1_PIN_OBJECTS { tx.execute_batch(ddl.2)?; } }
+            } else {
+                tx.execute_batch("CREATE TABLE product_w1_isolated_marker_v1(singleton INTEGER PRIMARY KEY CHECK(singleton=1), version INTEGER NOT NULL CHECK(version=2)); INSERT INTO product_w1_isolated_marker_v1 VALUES(1,2);")?;
+            }
+            for ddl in [W1_OPERATION_TABLE, W1_OPERATION_UPDATE, W1_OPERATION_DELETE, W1_OPERATION_REPLACE] {
+                tx.execute_batch(ddl)?;
+            }
+        }
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS foundry_contract(singleton INTEGER PRIMARY KEY CHECK(singleton=1), contract TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS product_meta_v1(singleton INTEGER PRIMARY KEY CHECK(singleton=1), installation_id TEXT NOT NULL, database_id TEXT NOT NULL, schema_version INTEGER NOT NULL, recovery_epoch INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE IF NOT EXISTS ledger(seq INTEGER PRIMARY KEY AUTOINCREMENT, order_id TEXT NOT NULL, from_state TEXT NOT NULL, to_state TEXT NOT NULL, event TEXT NOT NULL, actor TEXT NOT NULL, intent TEXT NOT NULL DEFAULT '', at TEXT NOT NULL, prev_hash TEXT NOT NULL, event_json TEXT, hash TEXT NOT NULL);
+             CREATE INDEX IF NOT EXISTS ledger_order_seq_v1 ON ledger(order_id,seq);
+             CREATE TRIGGER IF NOT EXISTS ledger_no_update BEFORE UPDATE ON ledger BEGIN SELECT RAISE(ABORT, 'ledger is append-only'); END;
+             CREATE TRIGGER IF NOT EXISTS ledger_no_delete BEFORE DELETE ON ledger BEGIN SELECT RAISE(ABORT, 'ledger is append-only'); END;
+             CREATE TABLE IF NOT EXISTS product_transition_receipts_v1(seq INTEGER PRIMARY KEY, event_hash TEXT NOT NULL UNIQUE, order_id TEXT NOT NULL, lifecycle INTEGER NOT NULL, expected_predecessor INTEGER NOT NULL, operation TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS product_transition_intents_v1(order_id TEXT PRIMARY KEY, lifecycle INTEGER NOT NULL, expected_predecessor INTEGER NOT NULL, operation TEXT NOT NULL);
+             CREATE TRIGGER IF NOT EXISTS product_ledger_requires_intent BEFORE INSERT ON ledger
+               WHEN (SELECT contract FROM foundry_contract WHERE singleton=1)='ProductAtomicV1'
+                 AND NOT EXISTS(SELECT 1 FROM product_transition_intents_v1 WHERE order_id=NEW.order_id)
+               BEGIN SELECT RAISE(ABORT, 'product transition receipt required'); END;
+             CREATE TRIGGER IF NOT EXISTS product_ledger_receipt AFTER INSERT ON ledger
+               WHEN (SELECT contract FROM foundry_contract WHERE singleton=1)='ProductAtomicV1'
+               BEGIN
+                 INSERT INTO product_transition_receipts_v1(seq,event_hash,order_id,lifecycle,expected_predecessor,operation)
+                   SELECT NEW.seq,NEW.hash,NEW.order_id,lifecycle,expected_predecessor,operation FROM product_transition_intents_v1 WHERE order_id=NEW.order_id;
+                 DELETE FROM product_transition_intents_v1 WHERE order_id=NEW.order_id;
+               END;
+             CREATE TABLE IF NOT EXISTS product_accounts_v1(actor_id TEXT PRIMARY KEY, role TEXT NOT NULL, enabled INTEGER NOT NULL, revision INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS product_credentials_v1(actor_id TEXT PRIMARY KEY, argon2id_phc TEXT NOT NULL, revision INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS product_sessions_v1(session_digest TEXT PRIMARY KEY, actor_id TEXT NOT NULL, authority_revision INTEGER NOT NULL, expires_at TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE IF NOT EXISTS product_login_throttle_v1(actor_id TEXT PRIMARY KEY, window_started_at TEXT NOT NULL, failures INTEGER NOT NULL, blocked_until TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS product_sources_v1(connector_id TEXT PRIMARY KEY, provider TEXT NOT NULL, origin TEXT NOT NULL, repository_id TEXT NOT NULL, scope TEXT NOT NULL, revision INTEGER NOT NULL, enabled INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS product_orders_v1(order_id TEXT PRIMARY KEY, lifecycle INTEGER NOT NULL, connector_id TEXT NOT NULL, repository_id TEXT NOT NULL, issue_id TEXT NOT NULL, task_kind TEXT NOT NULL, payload_snapshot TEXT NOT NULL, source_revision INTEGER NOT NULL, admission_seq INTEGER NOT NULL, admission_hash TEXT NOT NULL);
+             CREATE UNIQUE INDEX IF NOT EXISTS product_orders_v1_source_identity ON product_orders_v1(connector_id,repository_id,issue_id);
+             CREATE TABLE IF NOT EXISTS product_order_payload_digests_v1(order_id TEXT PRIMARY KEY, payload_digest TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS product_operations_v1(operation_id TEXT PRIMARY KEY, actor_id TEXT NOT NULL, request_key TEXT NOT NULL, request_digest TEXT NOT NULL, order_id TEXT NOT NULL, grant_id TEXT, phase TEXT NOT NULL, owner_id TEXT, epoch INTEGER, fence INTEGER, prepared_at TEXT NOT NULL, expires_at TEXT NOT NULL, scope_revision INTEGER NOT NULL DEFAULT -1, UNIQUE(actor_id, request_key));
+             CREATE TABLE IF NOT EXISTS product_grants_v1(grant_id TEXT PRIMARY KEY, token_digest TEXT NOT NULL UNIQUE, actor_id TEXT NOT NULL, order_id TEXT NOT NULL, state TEXT NOT NULL, fence INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS product_fence_counter_v1(singleton INTEGER PRIMARY KEY CHECK(singleton=1), next INTEGER NOT NULL);
+             INSERT OR IGNORE INTO product_fence_counter_v1(singleton,next) VALUES(1,0);
+             CREATE TABLE IF NOT EXISTS product_outcomes_v1(operation_id TEXT PRIMARY KEY, seq INTEGER NOT NULL UNIQUE, event_hash TEXT NOT NULL UNIQUE, receipt_json TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS product_token_consumptions_v1(token_digest TEXT PRIMARY KEY, operation_id TEXT NOT NULL UNIQUE, seq INTEGER NOT NULL UNIQUE);
+             CREATE TABLE IF NOT EXISTS product_intake_inbox_v1(delivery_id TEXT PRIMARY KEY, connector_id TEXT NOT NULL, repository_id TEXT NOT NULL, issue_id TEXT NOT NULL, version_digest TEXT NOT NULL, payload TEXT NOT NULL, state TEXT NOT NULL, retry_at TEXT);
+             CREATE TABLE IF NOT EXISTS product_intake_delivery_meta_v1(delivery_id TEXT PRIMARY KEY REFERENCES product_intake_inbox_v1(delivery_id), observed_updated_at TEXT NOT NULL, task_kind TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS product_intake_source_bindings_v1(delivery_id TEXT PRIMARY KEY,source_instance_id TEXT NOT NULL,source_revision INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS product_poll_source_bindings_v1(connector_id TEXT NOT NULL,query_fingerprint TEXT NOT NULL,source_instance_id TEXT NOT NULL,source_revision INTEGER NOT NULL,PRIMARY KEY(connector_id,query_fingerprint));
+             CREATE TABLE IF NOT EXISTS product_intake_rejections_v1(connector_id TEXT NOT NULL, query_fingerprint TEXT NOT NULL, sweep_id TEXT NOT NULL, item_digest TEXT NOT NULL, recorded_at TEXT NOT NULL, PRIMARY KEY(connector_id,query_fingerprint,sweep_id,item_digest));
+             CREATE TABLE IF NOT EXISTS product_poll_state_v1(connector_id TEXT NOT NULL, query_fingerprint TEXT NOT NULL, sweep_id TEXT NOT NULL, next_page INTEGER NOT NULL, page_ceiling INTEGER NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(connector_id, query_fingerprint));
+             CREATE TABLE IF NOT EXISTS product_poll_backoff_v1(connector_id TEXT NOT NULL, query_fingerprint TEXT NOT NULL, failures INTEGER NOT NULL, retry_at TEXT NOT NULL, PRIMARY KEY(connector_id,query_fingerprint));
+             CREATE TABLE IF NOT EXISTS product_services_v1(service_id TEXT PRIMARY KEY,revision INTEGER NOT NULL,enabled INTEGER NOT NULL,lease_until TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS product_service_credentials_v1(service_id TEXT PRIMARY KEY,verifier TEXT NOT NULL UNIQUE,credential_revision INTEGER NOT NULL,expires_at TEXT NOT NULL,issued_by TEXT NOT NULL,request_key TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS product_service_grants_v1(service_id TEXT NOT NULL,source_instance_id TEXT NOT NULL,action TEXT NOT NULL,grant_revision INTEGER NOT NULL,enabled INTEGER NOT NULL,PRIMARY KEY(service_id,source_instance_id,action));
+             CREATE TABLE IF NOT EXISTS product_service_events_v1(event_seq INTEGER PRIMARY KEY AUTOINCREMENT,service_id TEXT NOT NULL,actor_id TEXT NOT NULL,revision INTEGER NOT NULL,operation TEXT NOT NULL,request_key TEXT NOT NULL,request_digest TEXT NOT NULL,created_at TEXT NOT NULL);
+             CREATE UNIQUE INDEX IF NOT EXISTS product_service_credential_issue_once ON product_service_events_v1(service_id,operation,request_key) WHERE operation='credential_issue';
+             CREATE TABLE IF NOT EXISTS product_service_operations_v1(actor_id TEXT NOT NULL,request_key TEXT NOT NULL,request_digest TEXT NOT NULL,receipt_json TEXT NOT NULL,PRIMARY KEY(actor_id,request_key));
+             CREATE TABLE IF NOT EXISTS product_service_work_bindings_v1(order_id TEXT NOT NULL,lifecycle INTEGER NOT NULL,service_id TEXT NOT NULL,service_revision INTEGER NOT NULL,credential_revision INTEGER NOT NULL,source_instance_id TEXT NOT NULL,PRIMARY KEY(order_id,lifecycle));
+             CREATE TABLE IF NOT EXISTS product_work_backlog_v1(order_id TEXT NOT NULL, lifecycle INTEGER NOT NULL, delivery_id TEXT NOT NULL UNIQUE, state TEXT NOT NULL, available_at TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(order_id,lifecycle));
+             CREATE TABLE IF NOT EXISTS product_work_claims_v1(order_id TEXT NOT NULL, lifecycle INTEGER NOT NULL, owner_id TEXT, epoch INTEGER NOT NULL, fence INTEGER NOT NULL, state TEXT NOT NULL, lease_until TEXT, source_revision INTEGER, payload_digest TEXT, PRIMARY KEY(order_id,lifecycle));
+             CREATE TABLE IF NOT EXISTS product_review_meta_v1(singleton INTEGER PRIMARY KEY CHECK(singleton=1), installation_id TEXT NOT NULL, database_id TEXT NOT NULL, schema_version INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS product_review_holds_v1(order_id TEXT NOT NULL,lifecycle INTEGER NOT NULL,attempt INTEGER NOT NULL,originating_run INTEGER NOT NULL,activation INTEGER NOT NULL,host_epoch INTEGER NOT NULL,hold_instance_id TEXT NOT NULL,hold_revision INTEGER NOT NULL,expected_predecessor INTEGER NOT NULL,snapshot_digest TEXT NOT NULL,snapshot_json TEXT NOT NULL,allowed_targets_json TEXT NOT NULL,deadline TEXT NOT NULL,source_revision INTEGER NOT NULL,admission_seq INTEGER NOT NULL,admission_hash TEXT NOT NULL,state TEXT NOT NULL,PRIMARY KEY(order_id,lifecycle,attempt,originating_run,hold_instance_id));
+             CREATE TABLE IF NOT EXISTS product_review_hold_acceptances_v1(operation_id TEXT PRIMARY KEY,actor_id TEXT NOT NULL,request_key TEXT NOT NULL,request_digest TEXT NOT NULL,receipt_json TEXT NOT NULL,order_id TEXT NOT NULL,lifecycle INTEGER NOT NULL,attempt INTEGER NOT NULL,originating_run INTEGER NOT NULL,hold_instance_id TEXT NOT NULL,UNIQUE(actor_id,request_key),UNIQUE(order_id,lifecycle,attempt,originating_run,hold_instance_id));
+             CREATE TRIGGER IF NOT EXISTS product_review_acceptance_no_update BEFORE UPDATE ON product_review_hold_acceptances_v1 BEGIN SELECT RAISE(ABORT,'product review acceptance is immutable'); END;
+             CREATE TRIGGER IF NOT EXISTS product_review_acceptance_no_delete BEFORE DELETE ON product_review_hold_acceptances_v1 BEGIN SELECT RAISE(ABORT,'product review acceptance is immutable'); END;
+             CREATE TRIGGER IF NOT EXISTS product_review_hold_exact_cas BEFORE UPDATE ON product_review_holds_v1
+               WHEN OLD.state!='active' OR NEW.state!='accepted' OR NEW.order_id!=OLD.order_id OR NEW.lifecycle!=OLD.lifecycle OR NEW.attempt!=OLD.attempt OR NEW.originating_run!=OLD.originating_run OR NEW.activation!=OLD.activation OR NEW.host_epoch!=OLD.host_epoch OR NEW.hold_instance_id!=OLD.hold_instance_id OR NEW.hold_revision!=OLD.hold_revision OR NEW.expected_predecessor!=OLD.expected_predecessor OR NEW.snapshot_digest!=OLD.snapshot_digest OR NEW.snapshot_json!=OLD.snapshot_json OR NEW.allowed_targets_json!=OLD.allowed_targets_json OR NEW.deadline!=OLD.deadline OR NEW.source_revision!=OLD.source_revision OR NEW.admission_seq!=OLD.admission_seq OR NEW.admission_hash!=OLD.admission_hash
+               BEGIN SELECT RAISE(ABORT,'product review hold CAS binding changed'); END;
+             CREATE TRIGGER IF NOT EXISTS product_review_hold_no_delete BEFORE DELETE ON product_review_holds_v1 BEGIN SELECT RAISE(ABORT,'product review hold history is immutable'); END;
+             CREATE TABLE IF NOT EXISTS product_review_hold_progress_v1(operation_id TEXT PRIMARY KEY,phase TEXT NOT NULL,progress_revision INTEGER NOT NULL,owner_id TEXT NOT NULL,epoch INTEGER NOT NULL,fence INTEGER NOT NULL,reserved_run_id INTEGER NOT NULL,recovery_reason TEXT);
+             CREATE TABLE IF NOT EXISTS product_review_run_reservations_v1(reservation_id INTEGER PRIMARY KEY AUTOINCREMENT,operation_id TEXT NOT NULL UNIQUE,order_id TEXT NOT NULL,lifecycle INTEGER NOT NULL,attempt INTEGER NOT NULL,originating_run INTEGER NOT NULL,hold_instance_id TEXT NOT NULL,followup_run_id INTEGER);
+             CREATE TABLE IF NOT EXISTS product_review_runs_v1(order_id TEXT NOT NULL,attempt INTEGER NOT NULL,run_id TEXT NOT NULL,base_commit TEXT NOT NULL,result_commit TEXT NOT NULL,pack_digest TEXT NOT NULL,status TEXT NOT NULL,counters_json TEXT NOT NULL,hold_json TEXT,hold_instance_id TEXT,deadline INTEGER,result_json TEXT,provenance_json TEXT,product_lifecycle INTEGER NOT NULL DEFAULT 0,source_revision INTEGER NOT NULL DEFAULT 0,admission_seq INTEGER NOT NULL DEFAULT 0,admission_hash TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,PRIMARY KEY(order_id,attempt,run_id));
+             CREATE TABLE IF NOT EXISTS product_review_active_v1(order_id TEXT PRIMARY KEY,key_json TEXT NOT NULL,epoch INTEGER NOT NULL,journal_run TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS product_review_epochs_v1(order_id TEXT PRIMARY KEY,epoch INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS product_review_bindings_v1(key_json TEXT PRIMARY KEY,intent_json TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS product_review_host_accept_v1(order_id TEXT NOT NULL,attempt INTEGER NOT NULL,run_id INTEGER NOT NULL,activation INTEGER NOT NULL,PRIMARY KEY(order_id,attempt,run_id,activation));
+             CREATE TABLE IF NOT EXISTS product_review_host_results_v1(order_id TEXT NOT NULL,attempt INTEGER NOT NULL,run_id INTEGER NOT NULL,activation INTEGER NOT NULL,result_json TEXT NOT NULL,PRIMARY KEY(order_id,attempt,run_id,activation));
+             CREATE TABLE IF NOT EXISTS product_review_stages_v1(order_id TEXT NOT NULL,run_id TEXT NOT NULL,sequence INTEGER NOT NULL,stage_id TEXT NOT NULL,status TEXT NOT NULL,output_json TEXT,PRIMARY KEY(order_id,run_id,sequence));
+             CREATE TABLE IF NOT EXISTS product_review_sessions_v1(order_id TEXT NOT NULL,run_id TEXT NOT NULL,session_id TEXT NOT NULL,receipt_json TEXT NOT NULL,PRIMARY KEY(order_id,run_id,session_id));
+             CREATE TABLE IF NOT EXISTS product_review_budget_v1(order_id TEXT PRIMARY KEY,used INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS product_review_failures_v1(order_id TEXT NOT NULL,run_id TEXT NOT NULL,error TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS product_review_redrive_v1(order_id TEXT NOT NULL,run_id TEXT NOT NULL,payload TEXT NOT NULL,artifact_json TEXT NOT NULL,PRIMARY KEY(order_id,run_id,payload));",
+        )?;
+        // Run this additive migration only after the intake binding tables
+        // exist. Existing rows retain zero defaults and fail closed until an
+        // explicit source mapping/rebind supplies their provenance.
+        for table in [
+            "product_intake_source_bindings_v1",
+            "product_poll_source_bindings_v1",
+        ] {
+            let columns = {
+                let mut stmt = tx.prepare(&format!("PRAGMA table_info({table})"))?;
+                stmt.query_map([], |r| r.get::<_, String>(1))?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            for (name, definition) in [
+                ("source_instance_revision", "INTEGER NOT NULL DEFAULT 0"),
+                ("source_generation", "INTEGER NOT NULL DEFAULT 0"),
+            ] {
+                if !columns.iter().any(|column| column == name) {
+                    tx.execute(
+                        &format!("ALTER TABLE {table} ADD COLUMN {name} {definition}"),
+                        [],
+                    )?;
+                }
+            }
+        }
+        crate::product_scope::create_schema(&tx)?;
+        create_product_publish_schema(&tx)?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS product_review_work_bindings_v1(
+                order_id TEXT NOT NULL,
+                attempt INTEGER NOT NULL,
+                run_id TEXT NOT NULL,
+                lifecycle INTEGER NOT NULL,
+                delivery_id TEXT NOT NULL,
+                worker_id TEXT NOT NULL,
+                claim_epoch INTEGER NOT NULL,
+                claim_fence INTEGER NOT NULL,
+                source_revision INTEGER NOT NULL,
+                payload_digest TEXT NOT NULL,
+                task_kind TEXT NOT NULL,
+                payload_snapshot TEXT NOT NULL,
+                PRIMARY KEY(order_id,attempt,run_id)
+             );",
+        )?;
+        // Additive upgrade only: do not rewrite or remove any existing work
+        // history when opening a ProductAtomicV1 database.
+        let work_columns = {
+            let mut stmt = tx.prepare("PRAGMA table_info(product_work_claims_v1)")?;
+            stmt.query_map([], |r| r.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (name, definition) in [
+            ("lease_until", "TEXT"),
+            ("source_revision", "INTEGER"),
+            ("payload_digest", "TEXT"),
+        ] {
+            if !work_columns.iter().any(|column| column == name) {
+                tx.execute(
+                    &format!("ALTER TABLE product_work_claims_v1 ADD COLUMN {name} {definition}"),
+                    [],
+                )?;
+            }
+        }
+        let reservation_columns = {
+            let mut stmt = tx.prepare("PRAGMA table_info(product_review_run_reservations_v1)")?;
+            stmt.query_map([], |r| r.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        if !reservation_columns
+            .iter()
+            .any(|column| column == "followup_run_id")
+        {
+            tx.execute(
+                "ALTER TABLE product_review_run_reservations_v1 ADD COLUMN followup_run_id INTEGER",
+                [],
+            )?;
+            // Preserve coordinates already returned by earlier product
+            // receipts. Those historical values are treated as occupied
+            // even though the old implementation sourced them from row IDs.
+            tx.execute("UPDATE product_review_run_reservations_v1 SET followup_run_id=(SELECT json_extract(a.receipt_json,'$.reserved_run_id') FROM product_review_hold_acceptances_v1 a WHERE a.operation_id=product_review_run_reservations_v1.operation_id) WHERE followup_run_id IS NULL AND EXISTS(SELECT 1 FROM product_review_hold_acceptances_v1 a WHERE a.operation_id=product_review_run_reservations_v1.operation_id)", [])?;
+        }
+        let product_review_run_columns = {
+            let mut stmt = tx.prepare("PRAGMA table_info(product_review_runs_v1)")?;
+            stmt.query_map([], |r| r.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (name, definition) in [
+            ("product_lifecycle", "INTEGER NOT NULL DEFAULT 0"),
+            ("source_revision", "INTEGER NOT NULL DEFAULT 0"),
+            ("admission_seq", "INTEGER NOT NULL DEFAULT 0"),
+            ("admission_hash", "TEXT NOT NULL DEFAULT ''"),
+        ] {
+            if !product_review_run_columns
+                .iter()
+                .any(|column| column == name)
+            {
+                tx.execute(
+                    &format!("ALTER TABLE product_review_runs_v1 ADD COLUMN {name} {definition}"),
+                    [],
+                )?;
+            }
+        }
+        tx.execute("CREATE UNIQUE INDEX IF NOT EXISTS product_review_run_coordinates_v1 ON product_review_run_reservations_v1(order_id,followup_run_id) WHERE followup_run_id IS NOT NULL", [])?;
+        let has_grant_id = {
+            let mut stmt = tx.prepare("PRAGMA table_info(product_operations_v1)")?;
+            let columns = stmt.query_map([], |r| r.get::<_, String>(1))?;
+            columns
+                .collect::<Result<Vec<_>, _>>()?
+                .iter()
+                .any(|c| c == "grant_id")
+        };
+        if !has_grant_id {
+            tx.execute(
+                "ALTER TABLE product_operations_v1 ADD COLUMN grant_id TEXT",
+                [],
+            )?;
+        }
+        let has_scope_revision = {
+            let mut stmt = tx.prepare("PRAGMA table_info(product_operations_v1)")?;
+            let columns = stmt.query_map([], |r| r.get::<_, String>(1))?;
+            columns
+                .collect::<Result<Vec<_>, _>>()?
+                .iter()
+                .any(|column| column == "scope_revision")
+        };
+        if !has_scope_revision {
+            tx.execute(
+                "ALTER TABLE product_operations_v1 ADD COLUMN scope_revision INTEGER NOT NULL DEFAULT -1",
+                [],
+            )?;
+        }
+        let contract: Option<String> = tx
+            .query_row(
+                "SELECT contract FROM foundry_contract WHERE singleton=1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match contract.as_deref() {
+            Some("ProductAtomicV1") => {}
+            Some(_) => return Err(ProductError::ContractMismatch),
+            None => {
+                tx.execute(
+                    "INSERT INTO foundry_contract(singleton,contract) VALUES(1,'ProductAtomicV1')",
+                    [],
+                )?;
+            }
+        }
+        let meta: Option<(String, String)> = tx
+            .query_row(
+                "SELECT installation_id,database_id FROM product_meta_v1 WHERE singleton=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        match meta {
+            Some((installation, database))
+                if installation == config.installation_id && database == config.database_id => {}
+            Some(_) => return Err(ProductError::ContractMismatch),
+            None => {
+                let version = 3;
+                #[cfg(feature = "a01-harness-support")]
+                let version = if mode.is_a01() { 0x0A01 } else { version };
+                tx.execute("INSERT INTO product_meta_v1(singleton,installation_id,database_id,schema_version) VALUES(1,?1,?2,?3)", params![config.installation_id, config.database_id, version])?;
+            }
+        }
+        let review_meta: Option<(String, String, i64)> = tx
+            .query_row(
+                "SELECT installation_id,database_id,schema_version FROM product_review_meta_v1 WHERE singleton=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        match review_meta {
+            Some((installation, database, 1))
+                if installation == config.installation_id && database == config.database_id => {}
+            Some(_) => return Err(ProductError::ContractMismatch),
+            None => {
+                tx.execute(
+                    "INSERT INTO product_review_meta_v1(singleton,installation_id,database_id,schema_version) VALUES(1,?1,?2,1)",
+                    params![config.installation_id, config.database_id],
+                )?;
+            }
+        }
+        result::initialize_fresh_v3(&tx, &config.installation_id, &config.database_id)?;
+    #[cfg(feature = "a01-harness-support")]
+    if mode.is_a01() {
+        #[cfg(all(test, feature = "a01-harness-support", unix))]
+        a01_initialization_checkpoint(checkpoint, 0)?;
+        initialize_a01_binding_foundation_in(
+            tx,
+            #[cfg(all(test, feature = "a01-harness-support", unix))]
+            checkpoint,
+        )?;
+    }
+    #[cfg(feature = "a01-harness-support")]
+    if mode.is_a01_task() { a01_task::initialize_in(tx, config, &mut a01_task::TaskHooks::default())?; }
+    Ok(())
+}
+
+#[cfg(feature = "a01-harness-support")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct A01FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+
+#[cfg(feature = "a01-harness-support")]
+const A01_BINDING_FOUNDATION_DDL: [&str; 5] = [
+    r#"DROP TRIGGER product_result_bindings_no_replace;"#,
+    r#"CREATE TRIGGER product_result_bindings_no_replace
+BEFORE INSERT ON product_result_bindings_v1
+WHEN EXISTS(
+  SELECT 1
+  FROM product_result_bindings_v1 r
+  WHERE r.result_id=NEW.result_id
+     OR (
+       r.order_id=NEW.order_id
+       AND r.lifecycle=NEW.lifecycle
+       AND r.attempt=NEW.attempt
+       AND r.run_id=NEW.run_id
+       AND r.activation=NEW.activation
+       AND r.generation=NEW.generation
+     )
+     OR (
+       r.order_id=NEW.order_id
+       AND r.attempt=NEW.attempt
+       AND r.run_id=NEW.run_id
+       AND r.generation=NEW.generation
+     )
+     OR (
+       r.result_id=NEW.result_id
+       AND r.binding_digest=NEW.binding_digest
+       AND r.tuple_digest=NEW.tuple_digest
+     )
+)
+BEGIN
+  SELECT RAISE(ROLLBACK,'product result already exists');
+END;"#,
+    r#"DROP TRIGGER product_result_bindings_no_legacy_tuple;"#,
+    r#"CREATE TRIGGER product_result_bindings_no_legacy_tuple
+BEFORE INSERT ON product_result_bindings_v1
+WHEN EXISTS(
+  SELECT 1
+  FROM product_result_legacy_tuples_v1 t
+  WHERE t.order_id=NEW.order_id
+    AND t.attempt=NEW.attempt
+    AND t.run_id=NEW.run_id
+    AND t.generation=NEW.generation
+)
+BEGIN
+  SELECT RAISE(ROLLBACK,'legacy tuple cannot be adopted');
+END;"#,
+    r#"CREATE TRIGGER product_result_bindings_a01_deny_all
+BEFORE INSERT ON product_result_bindings_v1
+BEGIN
+  SELECT RAISE(ROLLBACK,'A01 result binding is disabled');
+END;"#,
+];
+
+/// Only fresh marked initialization (and its schema template) installs this foundation.
+#[cfg(feature = "a01-harness-support")]
+fn initialize_a01_binding_foundation_in(
+    tx: &rusqlite::Transaction<'_>,
+    #[cfg(all(test, feature = "a01-harness-support", unix))] checkpoint: Option<usize>,
+) -> Result<(), ProductError> {
+    for (_index, sql) in A01_BINDING_FOUNDATION_DDL.iter().enumerate() {
+        tx.execute_batch(sql)?;
+        #[cfg(all(test, feature = "a01-harness-support", unix))]
+        a01_initialization_checkpoint(checkpoint, _index + 1)?;
+    }
+    Ok(())
+}
+
+#[cfg(all(test, feature = "a01-harness-support", unix))]
+fn a01_initialization_checkpoint(
+    checkpoint: Option<usize>,
+    step: usize,
+) -> Result<(), ProductError> {
+    if checkpoint == Some(step) {
+        return Err(ProductError::Invariant("A01 initialization checkpoint"));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "a01-harness-support")]
+fn validate_a01_config(config: &ProductConfig) -> Result<(), ProductError> {
+    if config.installation_id.trim().is_empty() || config.database_id.trim().is_empty() {
+        return Err(ProductError::InvalidConfig);
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "a01-harness-support", unix))]
+fn a01_effective_uid() -> u32 {
+    unsafe extern "C" { fn geteuid() -> u32; }
+    // geteuid has no arguments, cannot fail, and does not mutate process state.
+    unsafe { geteuid() }
+}
+
+#[cfg(feature = "a01-harness-support")]
+fn a01_test_path(directory: &Path, name: &str) -> Result<PathBuf, ProductError> {
+    if !directory.is_absolute() || name.is_empty() || name.contains(['/', '\0'])
+        || name == "." || name == ".."
+    {
+        return Err(ProductError::InvalidConfig);
+    }
+    let mut parts = Path::new(name).components();
+    if !matches!(parts.next(), Some(std::path::Component::Normal(_))) || parts.next().is_some() {
+        return Err(ProductError::InvalidConfig);
+    }
+    let metadata = std::fs::symlink_metadata(directory)
+        .map_err(|_| ProductError::Invariant("A01 directory inspection failed"))?;
+    if !metadata.file_type().is_dir() {
+        return Err(ProductError::InvalidConfig);
+    }
+    #[cfg(not(unix))]
+    { Err(ProductError::InvalidConfig) }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != a01_effective_uid() || metadata.mode() & 0o077 != 0 {
+            return Err(ProductError::InvalidConfig);
+        }
+        let canonical = directory.canonicalize()
+            .map_err(|_| ProductError::Invariant("A01 directory inspection failed"))?;
+        if canonical.as_os_str() != directory.as_os_str() {
+            return Err(ProductError::InvalidConfig);
+        }
+        Ok(canonical.join(name))
+    }
+}
+
+#[cfg(feature = "a01-harness-support")]
+fn a01_require_absent(path: &Path) -> Result<(), ProductError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Err(ProductError::InvalidConfig),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(ProductError::Invariant("A01 path inspection failed")),
+    }
+}
+
+#[cfg(feature = "a01-harness-support")]
+fn a01_check_sidecars(path: &Path) -> Result<(), ProductError> {
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        a01_require_absent(Path::new(&sidecar))?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "a01-harness-support")]
+fn a01_metadata_identity(metadata: &std::fs::Metadata) -> Result<A01FileIdentity, ProductError> {
+    #[cfg(not(unix))]
+    { let _ = metadata; Err(ProductError::InvalidConfig) }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if !metadata.file_type().is_file() || metadata.uid() != a01_effective_uid()
+            || metadata.nlink() != 1 || metadata.mode() & 0o777 != 0o600
+        {
+            return Err(ProductError::InvalidConfig);
+        }
+        Ok(A01FileIdentity { device: metadata.dev(), inode: metadata.ino() })
+    }
+}
+
+#[cfg(feature = "a01-harness-support")]
+fn a01_file_identity(path: &Path) -> Result<A01FileIdentity, ProductError> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|_| ProductError::Invariant("A01 file inspection failed"))?;
+    a01_metadata_identity(&metadata)
+}
+
+#[cfg(feature = "a01-harness-support")]
+fn a01_checked_file(path: &Path, held: &std::fs::File) -> Result<A01FileIdentity, ProductError> {
+    let metadata = held.metadata()
+        .map_err(|_| ProductError::Invariant("A01 file inspection failed"))?;
+    let identity = a01_metadata_identity(&metadata)?;
+    if a01_file_identity(path)? != identity {
+        return Err(ProductError::Invariant("A01 physical identity changed"));
+    }
+    Ok(identity)
+}
+
+#[cfg(feature = "a01-harness-support")]
+fn configure_a01_connection(conn: &Connection) -> Result<(), ProductError> {
+    conn.busy_timeout(std::time::Duration::from_millis(5000))?;
+    conn.pragma_update(None, "foreign_keys", 1)?;
+    conn.pragma_update(None, "recursive_triggers", 1)?;
+    conn.pragma_update(None, "ignore_check_constraints", 0)?;
+    conn.pragma_update(None, "journal_mode", "delete")?;
+    validate_a01_pragmas(conn)
+}
+
+#[cfg(feature = "a01-harness-support")]
+fn validate_a01_pragmas(conn: &Connection) -> Result<(), ProductError> {
+    for (pragma, expected) in [
+        ("foreign_keys", 1), ("recursive_triggers", 1),
+        ("ignore_check_constraints", 0), ("busy_timeout", 5000),
+    ] {
+        let actual: i64 = conn.pragma_query_value(None, pragma, |row| row.get(0))?;
+        if actual != expected { return Err(ProductError::ContractMismatch); }
+    }
+    let journal: String = conn.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+    if journal != "delete" { return Err(ProductError::ContractMismatch); }
+    Ok(())
+}
+
+#[cfg(feature = "a01-harness-support")]
+fn a01_read_header(file: &std::fs::File) -> Result<[u8; 20], ProductError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+
+        let mut header = [0_u8; 20];
+        file.read_exact_at(&mut header, 0).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                ProductError::ContractMismatch
+            } else {
+                ProductError::Invariant("A01 header inspection failed")
+            }
+        })?;
+        Ok(header)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        Err(ProductError::InvalidConfig)
+    }
+}
+
+#[cfg(feature = "a01-harness-support")]
+fn a01_contract_error(error: rusqlite::Error) -> ProductError {
+    match error {
+        rusqlite::Error::InvalidColumnType(..)
+        | rusqlite::Error::InvalidColumnIndex(..)
+        | rusqlite::Error::InvalidColumnName(..)
+        | rusqlite::Error::IntegralValueOutOfRange(..)
+        | rusqlite::Error::FromSqlConversionFailure(..)
+        | rusqlite::Error::QueryReturnedNoRows => ProductError::ContractMismatch,
+        // Busy, I/O, storage and other operational errors keep their cause.
+        other => ProductError::Database(other),
+    }
+}
+
+#[cfg(feature = "a01-harness-support")]
+fn a01_schema_definitions(conn: &Connection) -> Result<Vec<(String, String, String, Option<String>)>, ProductError> {
+    let mut statement = conn.prepare("SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name")?;
+    let rows = statement.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+    rows.collect::<rusqlite::Result<_>>().map_err(a01_contract_error)
+}
+
+#[cfg(feature = "a01-harness-support")]
+fn validate_a01_binding_history(conn: &Connection) -> Result<(), ProductError> {
+    let has_task: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='product_a01_profile_v1' AND type='table')",[],|r|r.get(0))?;
+    if !has_task {
+        let bindings:i64=conn.query_row("SELECT count(*) FROM product_result_bindings_v1",[],|r|r.get(0))?;
+        if bindings!=0 { return Err(ProductError::ContractMismatch); }
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "a01-harness-support")]
+fn validate_a01_contract(conn: &Connection, config: &ProductConfig) -> Result<(), ProductError> {
+    validate_a01_profile_contract(conn, config, StoreOpenMode::A01Create)
+}
+
+#[cfg(feature = "a01-harness-support")]
+fn validate_a01_profile_contract(conn: &Connection, config: &ProductConfig, profile: StoreOpenMode) -> Result<(), ProductError> {
+    // Rebuild only an in-memory reference using the same trusted initializers.
+    // Compare every definition, including trigger bodies and alternate indexes;
+    // presence of a familiar object name is insufficient. Never repair disk.
+    let mut reference = Connection::open_in_memory()?;
+    reference.pragma_update(None, "foreign_keys", 1)?;
+    reference.pragma_update(None, "recursive_triggers", 1)?;
+    let tx = reference.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    initialize_product_schema_in(&tx, config, profile)?;
+    if a01_schema_definitions(conn)? != a01_schema_definitions(&tx)? {
+        return Err(ProductError::ContractMismatch);
+    }
+    // Validate the entire row set before any singleton-filtered value checks.
+    // CHECK constraints may have been disabled by a previous connection.
+    for table in [
+        "foundry_contract",
+        "product_meta_v1",
+        "product_review_meta_v1",
+        "product_result_meta_v1",
+    ] {
+        let rows: (i64, i64) = conn.query_row(
+            &format!("SELECT count(*),count(CASE WHEN singleton=1 THEN 1 END) FROM {table}"),
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).map_err(a01_contract_error)?;
+        if rows != (1, 1) {
+            return Err(ProductError::ContractMismatch);
+        }
+    }
+    let contract: (i64, String) = conn.query_row(
+        "SELECT count(*),contract FROM foundry_contract", [], |r| Ok((r.get(0)?, r.get(1)?)),
+    ).map_err(a01_contract_error)?;
+    if contract != (1, "ProductAtomicV1".into()) { return Err(ProductError::ContractMismatch); }
+    for (table, version) in [("product_meta_v1", 0x0A01), ("product_review_meta_v1", 1)] {
+        let meta: (i64, String, String, i64) = conn.query_row(
+            &format!("SELECT count(*),installation_id,database_id,schema_version FROM {table} WHERE singleton=1"),
+            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        ).map_err(a01_contract_error)?;
+        if meta != (1, config.installation_id.clone(), config.database_id.clone(), version) {
+            return Err(ProductError::ContractMismatch);
+        }
+    }
+    result::validate_v3_connection(conn, &config.installation_id, &config.database_id)
+        .map_err(|error| match error {
+            ProductError::Database(error) => a01_contract_error(error), other => other,
+        })?;
+    validate_a01_binding_history(conn)?;
+    let mut fk = conn.prepare("PRAGMA foreign_key_check")?;
+    if fk.query([])?.next()?.is_some() { return Err(ProductError::ContractMismatch); }
+    Ok(())
+}
+
+#[cfg(feature = "a01-harness-support")]
+fn validate_a01_connection(conn: &Connection, config: &ProductConfig) -> Result<(), ProductError> {
+    validate_a01_pragmas(conn)?;
+    validate_a01_contract(conn, config)
 }
 
 fn normalized_path(path: &Path) -> Result<PathBuf, ProductError> {
@@ -6271,4 +8004,4219 @@ mod scoped_stream_tests {
         let illegal = ledger_fixture(3, Some(2));
         assert!(scan(&illegal).unwrap().is_none());
     }
+}
+
+#[cfg(all(test, feature = "w1-isolated-test-support", unix))]
+mod isolated_operation_validation_tests {
+    use super::*;
+    use rusqlite::{ffi, types::Type};
+    use std::os::unix::fs::DirBuilderExt;
+
+    #[test]
+    fn operation_schema_error_classifies_synthetic_errors() {
+        // Constructed errors only: no actual I/O or locking failure is induced.
+        for code in [ffi::SQLITE_ERROR, ffi::SQLITE_IOERR, ffi::SQLITE_BUSY] {
+            let error = rusqlite::Error::SqliteFailure(ffi::Error::new(code), None);
+            assert!(matches!(isolated_schema_error(error), ProductError::Database(rusqlite::Error::SqliteFailure(inner, _)) if inner.extended_code == code));
+        }
+        let error = rusqlite::Error::InvalidColumnType(0, "value".into(), Type::Text);
+        assert!(matches!(isolated_schema_error(error), ProductError::ContractMismatch));
+    }
+
+    #[test]
+    fn actual_isolated_store_connection_pragmas_on_create_and_reopen() {
+        let root = std::env::temp_dir().join(format!("foundry-w1-connection-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let config = || ProductConfig { installation_id: "w1-install".into(), database_id: "w1-db".into() };
+        for reopen in [false, true] {
+            let store = if reopen { ProductStore::reopen_isolated_test_store(&root, "isolated.db", config()).unwrap() } else { ProductStore::create_isolated_test_store(&root, "isolated.db", config()).unwrap() };
+            for pragma in ["foreign_keys", "recursive_triggers"] {
+                assert_eq!(store.conn.query_row(&format!("PRAGMA {pragma}"), [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+            }
+            assert!(validate_isolated_pragmas(&store.conn).is_ok());
+            for pragma in ["foreign_keys", "recursive_triggers"] {
+                store.conn.pragma_update(None, pragma, "OFF").unwrap();
+                assert_eq!(store.conn.query_row(&format!("PRAGMA {pragma}"), [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+                assert!(matches!(validate_isolated_pragmas(&store.conn), Err(ProductError::ContractMismatch)));
+                store.conn.pragma_update(None, pragma, "ON").unwrap();
+                assert!(validate_isolated_pragmas(&store.conn).is_ok());
+            }
+            drop(store);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+
+#[cfg(feature = "w1-isolated-test-support")]
+#[allow(dead_code)]
+mod w1_owner_codec {
+    const REQUEST: &[u8] = b"foundry-w1-owner-operation-v2\0";
+    const RECEIPT: &[u8] = b"foundry-w1-owner-receipt-v2\0";
+    const CAP: usize = 8192;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct Invalid;
+    type Result<T> = std::result::Result<T, Invalid>;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) struct Request {
+        pub installation: String,
+        pub database: String,
+        pub operation: String,
+        pub actor: String,
+        pub source: String,
+        pub digest: String,
+        pub expected: i64,
+        pub key: String,
+        pub order: Option<String>,
+        pub lifecycle: Option<i64>,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) struct Receipt {
+        pub installation: String,
+        pub database: String,
+        pub operation: String,
+        pub actor: String,
+        pub authority: i64,
+        pub source: String,
+        pub digest: String,
+        pub expected: i64,
+        pub result: i64,
+        pub key: String,
+        pub order: Option<String>,
+        pub lifecycle: Option<i64>,
+        pub approval: Option<i64>,
+    }
+    pub(super) fn within_cap(n: usize) -> bool {
+        n <= CAP
+    }
+    fn text(s: &str) -> bool {
+        !s.is_empty() && s.len() <= 256 && !s.as_bytes().contains(&0)
+    }
+    fn common(
+        i: &str,
+        d: &str,
+        op: &str,
+        a: &str,
+        s: &str,
+        digest: &str,
+        expected: i64,
+        key: &str,
+        order: Option<&str>,
+        lifecycle: Option<i64>,
+    ) -> Result<()> {
+        if ![i, d, a, s, key].iter().all(|v| text(v))
+            || expected < 0
+            || expected == i64::MAX
+            || digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(Invalid);
+        }
+        match op {
+            "select" if order.is_some_and(text) && lifecycle.is_some_and(|n| n > 0) => Ok(()),
+            "approve" | "revoke" if order.is_none() && lifecycle.is_none() => Ok(()),
+            _ => Err(Invalid),
+        }
+    }
+    fn frame(domain: &[u8], fields: &[Option<&str>]) -> Result<Vec<u8>> {
+        let mut size = domain.len();
+        for f in fields {
+            size = size.checked_add(1).ok_or(Invalid)?;
+            if let Some(s) = f {
+                size = size
+                    .checked_add(8)
+                    .and_then(|n| n.checked_add(s.len()))
+                    .ok_or(Invalid)?;
+            }
+        }
+        if !within_cap(size) {
+            return Err(Invalid);
+        }
+        let mut out = Vec::with_capacity(size);
+        out.extend_from_slice(domain);
+        for f in fields {
+            match f {
+                None => out.push(0),
+                Some(s) => {
+                    out.push(1);
+                    out.extend_from_slice(
+                        &u64::try_from(s.len()).map_err(|_| Invalid)?.to_be_bytes(),
+                    );
+                    out.extend_from_slice(s.as_bytes());
+                }
+            }
+        }
+        Ok(out)
+    }
+    pub(super) fn encode_request(r: &Request) -> Result<Vec<u8>> {
+        common(
+            &r.installation,
+            &r.database,
+            &r.operation,
+            &r.actor,
+            &r.source,
+            &r.digest,
+            r.expected,
+            &r.key,
+            r.order.as_deref(),
+            r.lifecycle,
+        )?;
+        let expected = r.expected.to_string();
+        let lifecycle = r.lifecycle.map(|n| n.to_string());
+        frame(
+            REQUEST,
+            &[
+                Some(&r.installation),
+                Some(&r.database),
+                Some(&r.operation),
+                Some(&r.actor),
+                Some(&r.source),
+                Some(&r.digest),
+                Some(&expected),
+                Some(&r.key),
+                r.order.as_deref(),
+                lifecycle.as_deref(),
+            ],
+        )
+    }
+    pub(super) fn encode_receipt(r: &Receipt) -> Result<Vec<u8>> {
+        common(
+            &r.installation,
+            &r.database,
+            &r.operation,
+            &r.actor,
+            &r.source,
+            &r.digest,
+            r.expected,
+            &r.key,
+            r.order.as_deref(),
+            r.lifecycle,
+        )?;
+        if r.authority < 0
+            || r.expected.checked_add(1) != Some(r.result)
+            || r.result <= 0
+            || (r.operation == "select" && !r.approval.is_some_and(|n| n > 0))
+            || (r.operation != "select" && r.approval.is_some())
+        {
+            return Err(Invalid);
+        }
+        let authority = r.authority.to_string();
+        let expected = r.expected.to_string();
+        let result = r.result.to_string();
+        let lifecycle = r.lifecycle.map(|n| n.to_string());
+        let approval = r.approval.map(|n| n.to_string());
+        frame(
+            RECEIPT,
+            &[
+                Some(&r.installation),
+                Some(&r.database),
+                Some(&r.operation),
+                Some(&r.actor),
+                Some(&authority),
+                Some(&r.source),
+                Some(&r.digest),
+                Some(&expected),
+                Some(&result),
+                Some(&r.key),
+                r.order.as_deref(),
+                lifecycle.as_deref(),
+                approval.as_deref(),
+            ],
+        )
+    }
+    fn parse<'a>(input: &'a [u8], domain: &[u8], count: usize) -> Result<Vec<Option<&'a str>>> {
+        if !within_cap(input.len()) || !input.starts_with(domain) {
+            return Err(Invalid);
+        }
+        let mut at = domain.len();
+        let mut fields = Vec::with_capacity(count);
+        for _ in 0..count {
+            let tag = *input.get(at).ok_or(Invalid)?;
+            at = at.checked_add(1).ok_or(Invalid)?;
+            match tag {
+                0 => fields.push(None),
+                1 => {
+                    let end = at.checked_add(8).ok_or(Invalid)?;
+                    let prefix: [u8; 8] = input
+                        .get(at..end)
+                        .ok_or(Invalid)?
+                        .try_into()
+                        .map_err(|_| Invalid)?;
+                    let len = usize::try_from(u64::from_be_bytes(prefix)).map_err(|_| Invalid)?;
+                    let end_payload = end.checked_add(len).ok_or(Invalid)?;
+                    if !within_cap(end_payload) {
+                        return Err(Invalid);
+                    }
+                    let bytes = input.get(end..end_payload).ok_or(Invalid)?;
+                    fields.push(Some(std::str::from_utf8(bytes).map_err(|_| Invalid)?));
+                    at = end_payload;
+                }
+                _ => return Err(Invalid),
+            }
+        }
+        if at != input.len() {
+            return Err(Invalid);
+        }
+        Ok(fields)
+    }
+    fn required(f: Option<&str>) -> Result<String> {
+        Ok(f.ok_or(Invalid)?.to_owned())
+    }
+    fn number(f: Option<&str>) -> Result<i64> {
+        let s = f.ok_or(Invalid)?;
+        if s.is_empty()
+            || (s.len() > 1 && s.starts_with('0'))
+            || !s.bytes().all(|b| b.is_ascii_digit())
+        {
+            return Err(Invalid);
+        }
+        s.parse().map_err(|_| Invalid)
+    }
+    fn optional_number(f: Option<&str>) -> Result<Option<i64>> {
+        f.map(|s| number(Some(s))).transpose()
+    }
+    pub(super) fn decode_request(input: &[u8]) -> Result<Request> {
+        let f = parse(input, REQUEST, 10)?;
+        let r = Request {
+            installation: required(f[0])?,
+            database: required(f[1])?,
+            operation: required(f[2])?,
+            actor: required(f[3])?,
+            source: required(f[4])?,
+            digest: required(f[5])?,
+            expected: number(f[6])?,
+            key: required(f[7])?,
+            order: f[8].map(str::to_owned),
+            lifecycle: optional_number(f[9])?,
+        };
+        if encode_request(&r)? != input {
+            return Err(Invalid);
+        }
+        Ok(r)
+    }
+    pub(super) fn decode_receipt(input: &[u8]) -> Result<Receipt> {
+        let f = parse(input, RECEIPT, 13)?;
+        let r = Receipt {
+            installation: required(f[0])?,
+            database: required(f[1])?,
+            operation: required(f[2])?,
+            actor: required(f[3])?,
+            authority: number(f[4])?,
+            source: required(f[5])?,
+            digest: required(f[6])?,
+            expected: number(f[7])?,
+            result: number(f[8])?,
+            key: required(f[9])?,
+            order: f[10].map(str::to_owned),
+            lifecycle: optional_number(f[11])?,
+            approval: optional_number(f[12])?,
+        };
+        if encode_receipt(&r)? != input {
+            return Err(Invalid);
+        }
+        Ok(r)
+    }
+}
+
+#[cfg(all(test, feature = "w1-isolated-test-support"))]
+mod w1_owner_encoding_tests {
+    use super::w1_owner_codec::*;
+    const DR: &str = "666f756e6472792d77312d6f776e65722d6f7065726174696f6e2d763200";
+    const DC: &str = "666f756e6472792d77312d6f776e65722d726563656970742d763200";
+    const I: &str = "01000000000000000149";
+    const D: &str = "01000000000000000144";
+    const ACT: &str = "010000000000000002c3a9";
+    const S: &str = "01000000000000000153";
+    const Z: &str = "01000000000000000130";
+    const ONE: &str = "01000000000000000131";
+    const K: &str = "0100000000000000014b";
+    const O: &str = "0100000000000000014f";
+    fn request(op: &str) -> Request {
+        Request {
+            installation: "I".into(),
+            database: "D".into(),
+            operation: op.into(),
+            actor: "é".into(),
+            source: "S".into(),
+            digest: "a".repeat(64),
+            expected: 0,
+            key: "K".into(),
+            order: (op == "select").then(|| "O".into()),
+            lifecycle: (op == "select").then_some(1),
+        }
+    }
+    fn receipt(op: &str) -> Receipt {
+        let r = request(op);
+        Receipt {
+            installation: r.installation,
+            database: r.database,
+            operation: r.operation,
+            actor: r.actor,
+            authority: 7,
+            source: r.source,
+            digest: r.digest,
+            expected: r.expected,
+            result: 1,
+            key: r.key,
+            order: r.order,
+            lifecycle: r.lifecycle,
+            approval: (op == "select").then_some(1),
+        }
+    }
+    fn unhex(s: &str) -> Vec<u8> {
+        s.as_bytes()
+            .chunks_exact(2)
+            .map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap(), 16).unwrap())
+            .collect()
+    }
+    fn golden(op: &str, rec: bool) -> Vec<u8> {
+        let operation = match op {
+            "approve" => "010000000000000007617070726f7665",
+            "revoke" => "0100000000000000067265766f6b65",
+            _ => "01000000000000000673656c656374",
+        };
+        let digest = format!("010000000000000040{}", "61".repeat(64));
+        let mut parts = vec![if rec { DC } else { DR }, I, D, operation, ACT];
+        if rec {
+            parts.push("01000000000000000137");
+        }
+        parts.extend([S, &digest, Z]);
+        if rec {
+            parts.push(ONE);
+        }
+        parts.push(K);
+        if op == "select" {
+            parts.extend([O, ONE]);
+            if rec {
+                parts.push(ONE);
+            }
+        } else {
+            parts.extend(["00", "00"]);
+            if rec {
+                parts.push("00");
+            }
+        }
+        unhex(&parts.concat())
+    }
+    // Test-only framing permits malformed individual fields while retaining all other controls.
+    fn raw(rec: bool, fields: &[Option<&[u8]>]) -> Vec<u8> {
+        let mut b = unhex(if rec { DC } else { DR });
+        for f in fields {
+            if let Some(v) = f {
+                b.push(1);
+                b.extend_from_slice(&(v.len() as u64).to_be_bytes());
+                b.extend_from_slice(v);
+            } else {
+                b.push(0);
+            }
+        }
+        b
+    }
+    fn fields(rec: bool) -> Vec<Option<Vec<u8>>> {
+        let mut f: Vec<Option<Vec<u8>>> = [
+            "I",
+            "D",
+            "select",
+            "é",
+            "S",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "0",
+            "K",
+            "O",
+            "1",
+        ]
+        .iter()
+        .map(|s| Some(s.as_bytes().to_vec()))
+        .collect();
+        if rec {
+            f.insert(4, Some(b"7".to_vec()));
+            f.insert(8, Some(b"1".to_vec()));
+            f.push(Some(b"1".to_vec()));
+        }
+        f
+    }
+    fn wire(rec: bool, f: &[Option<Vec<u8>>]) -> Vec<u8> {
+        raw(rec, &f.iter().map(|v| v.as_deref()).collect::<Vec<_>>())
+    }
+    fn valid(rec: bool, b: &[u8]) -> bool {
+        if rec {
+            decode_receipt(b).is_ok()
+        } else {
+            decode_request(b).is_ok()
+        }
+    }
+    fn typed_valid(rec: bool, f: &[Option<Vec<u8>>]) -> bool {
+        let get = |i: usize| f[i].as_ref().map(|v| String::from_utf8(v.clone()).unwrap());
+        let num = |i: usize| get(i).map(|s| s.parse::<i64>().unwrap());
+        if rec {
+            encode_receipt(&Receipt {
+                installation: get(0).unwrap(),
+                database: get(1).unwrap(),
+                operation: get(2).unwrap(),
+                actor: get(3).unwrap(),
+                authority: num(4).unwrap(),
+                source: get(5).unwrap(),
+                digest: get(6).unwrap(),
+                expected: num(7).unwrap(),
+                result: num(8).unwrap(),
+                key: get(9).unwrap(),
+                order: get(10),
+                lifecycle: num(11),
+                approval: num(12),
+            })
+            .is_ok()
+        } else {
+            encode_request(&Request {
+                installation: get(0).unwrap(),
+                database: get(1).unwrap(),
+                operation: get(2).unwrap(),
+                actor: get(3).unwrap(),
+                source: get(4).unwrap(),
+                digest: get(5).unwrap(),
+                expected: num(6).unwrap(),
+                key: get(7).unwrap(),
+                order: get(8),
+                lifecycle: num(9),
+            })
+            .is_ok()
+        }
+    }
+    #[test]
+    fn w1_codec_golden_approve_revoke_select() {
+        for (op, lens) in [
+            ("approve", (182, 201)),
+            ("revoke", (181, 200)),
+            ("select", (199, 227)),
+        ] {
+            let q = golden(op, false);
+            let c = golden(op, true);
+            assert_eq!((q.len(), c.len()), lens);
+            assert_eq!(encode_request(&request(op)).unwrap(), q);
+            assert_eq!(decode_request(&q).unwrap(), request(op));
+            assert_eq!(encode_receipt(&receipt(op)).unwrap(), c);
+            assert_eq!(decode_receipt(&c).unwrap(), receipt(op));
+            assert_eq!(encode_request(&decode_request(&q).unwrap()).unwrap(), q);
+            assert_eq!(encode_receipt(&decode_receipt(&c).unwrap()).unwrap(), c);
+        }
+    }
+    #[test]
+    fn w1_codec_text_and_null_boundaries() {
+        for rec in [false, true] {
+            let ids: &[usize] = if rec {
+                &[0, 1, 3, 5, 9, 10]
+            } else {
+                &[0, 1, 3, 4, 7, 8]
+            };
+            for &idx in ids {
+                for (s, ok) in [
+                    ("x".into(), true),
+                    ("x".repeat(256), true),
+                    (String::new(), false),
+                    ("x".repeat(257), false),
+                    ("a\0b".into(), false),
+                    ("é".repeat(128), true),
+                    ("é".repeat(129), false),
+                    (format!("{}x", "é".repeat(128)), false),
+                ] {
+                    let mut f = fields(rec);
+                    f[idx] = Some(s.into_bytes());
+                    assert_eq!(valid(rec, &wire(rec, &f)), ok, "{rec} {idx}");
+                    assert_eq!(typed_valid(rec, &f), ok);
+                }
+                let mut f = fields(rec);
+                f[idx] = Some(vec![0xff]);
+                assert!(!valid(rec, &wire(rec, &f)));
+            }
+            let n = if rec { 10 } else { 8 };
+            for idx in 0..n {
+                let mut f = fields(rec);
+                f[idx] = None;
+                assert!(!valid(rec, &wire(rec, &f)), "{rec} {idx}");
+            }
+            let mut a = fields(rec);
+            a[0] = Some("é".as_bytes().to_vec());
+            let mut b = a.clone();
+            b[0] = Some("e\u{301}".as_bytes().to_vec());
+            assert!(valid(rec, &wire(rec, &a)));
+            assert!(valid(rec, &wire(rec, &b)));
+            assert_ne!(wire(rec, &a), wire(rec, &b));
+            let mut f = fields(rec);
+            f[0] = Some(vec![]);
+            assert!(!valid(rec, &wire(rec, &f)));
+            let mut f = fields(rec);
+            f[2] = Some(b"approve".to_vec());
+            let tail = if rec { 10 } else { 8 };
+            for x in &mut f[tail..] {
+                *x = None;
+            }
+            assert!(valid(rec, &wire(rec, &f)));
+            f[tail] = Some(vec![]);
+            assert!(!valid(rec, &wire(rec, &f)));
+        }
+        let mut r = request("select");
+        for s in ["", &"x".repeat(257), "x\0y"] {
+            r.order = Some(s.into());
+            assert!(encode_request(&r).is_err());
+        }
+    }
+    #[test]
+    fn w1_codec_domains_and_structure() {
+        for rec in [false, true] {
+            let f = fields(rec);
+            let b = wire(rec, &f);
+            assert!(valid(rec, &b));
+            let domain = if rec { unhex(DC) } else { unhex(DR) };
+            let count = if rec { 13 } else { 10 };
+            assert_eq!(f.len(), count, "C03 {rec}: select frame count");
+            assert_eq!(b, golden("select", rec), "C03 {rec}: valid baseline framing");
+            for omitted in 0..count {
+                let mut remaining = f.clone();
+                remaining.remove(omitted);
+                assert_eq!(remaining.len(), count - 1, "C03 {rec}: one frame removed at {omitted}");
+                assert!(!valid(rec, &wire(rec, &remaining)), "C03 {rec}: omitted frame {omitted} must fail");
+            }
+            assert!(!valid(!rec, &b));
+            let mut bad = b.clone();
+            bad[0] ^= 1;
+            assert!(!valid(rec, &bad));
+            for n in 0..domain.len() {
+                assert!(!valid(rec, &b[..n]));
+            }
+            let mut bad = b.clone();
+            bad[domain.len() - 1] = 1;
+            assert!(!valid(rec, &bad));
+            let mut bad = b.clone();
+            bad.remove(domain.len() - 1);
+            assert!(!valid(rec, &bad));
+            for tag in [2, 255] {
+                let mut bad = b.clone();
+                bad[domain.len()] = tag;
+                assert!(!valid(rec, &bad));
+            }
+            for n in domain.len()..b.len() {
+                assert!(!valid(rec, &b[..n]), "{rec} {n}");
+            }
+            let mut bad = b.clone();
+            bad.push(0);
+            assert!(!valid(rec, &bad));
+            let mut bad = b.clone();
+            bad.push(0xff);
+            assert!(!valid(rec, &bad));
+            let mut swapped = f.clone();
+            swapped.swap(0, 1);
+            let b = wire(rec, &swapped);
+            assert!(valid(rec, &b));
+            if rec {
+                let v = decode_receipt(&b).unwrap();
+                assert_eq!((v.installation, v.database), ("D".into(), "I".into()));
+            } else {
+                let v = decode_request(&b).unwrap();
+                assert_eq!((v.installation, v.database), ("D".into(), "I".into()));
+            }
+        }
+    }
+    fn maxima() -> (Request, Receipt) {
+        let mut q = request("select");
+        q.installation = "i".repeat(256);
+        q.database = "d".repeat(256);
+        q.actor = "a".repeat(256);
+        q.source = "s".repeat(256);
+        q.key = "k".repeat(256);
+        q.order = Some("o".repeat(256));
+        q.expected = i64::MAX - 1;
+        q.lifecycle = Some(i64::MAX);
+        let mut r = receipt("select");
+        r.installation = q.installation.clone();
+        r.database = q.database.clone();
+        r.actor = q.actor.clone();
+        r.source = q.source.clone();
+        r.key = q.key.clone();
+        r.order = q.order.clone();
+        r.expected = q.expected;
+        r.lifecycle = q.lifecycle;
+        r.authority = i64::MAX;
+        r.result = i64::MAX;
+        r.approval = Some(i64::MAX);
+        (q, r)
+    }
+    #[test]
+    fn w1_codec_bounded_lengths_and_maxima() {
+        let (q, r) = maxima();
+        assert_eq!(encode_request(&q).unwrap().len(), 1764);
+        assert_eq!(encode_receipt(&r).unwrap().len(), 1846);
+        assert_eq!(decode_request(&encode_request(&q).unwrap()).unwrap(), q);
+        assert_eq!(decode_receipt(&encode_receipt(&r).unwrap()).unwrap(), r);
+        if usize::BITS < 64 {
+            assert!(usize::try_from(u64::MAX).is_err());
+        }
+        assert!(within_cap(8191));
+        assert!(within_cap(8192));
+        assert!(!within_cap(8193));
+        for rec in [false, true] {
+            assert!(!valid(rec, &vec![0; 8192]));
+            assert!(!valid(rec, &vec![0; 8193]));
+            let b = wire(rec, &fields(rec));
+            let offset = if rec {
+                unhex(DC).len()
+            } else {
+                unhex(DR).len()
+            };
+            for len in [257u64, 8193, u64::MAX] {
+                let mut x = b.clone();
+                x[offset + 1..offset + 9].copy_from_slice(&len.to_be_bytes());
+                assert!(!valid(rec, &x));
+            }
+        }
+    }
+    #[test]
+    fn w1_codec_operation_digest_and_nullability() {
+        for rec in [false, true] {
+            for op in ["approve", "revoke", "select"] {
+                assert!(valid(rec, &golden(op, rec)));
+                let digest = "0123456789abcdef".repeat(4);
+                if rec {
+                    let mut value = receipt(op);
+                    value.digest = digest.clone();
+                    let encoded = encode_receipt(&value).expect("C05: valid receipt digest encodes");
+                    assert_eq!(decode_receipt(&encoded).expect("C05: receipt digest decodes").digest, digest, "C05 receipt {op}: exact digest");
+                } else {
+                    let mut value = request(op);
+                    value.digest = digest.clone();
+                    let encoded = encode_request(&value).expect("C05: valid request digest encodes");
+                    assert_eq!(decode_request(&encoded).expect("C05: request digest decodes").digest, digest, "C05 request {op}: exact digest");
+                }
+                if rec {
+                    assert!(encode_receipt(&receipt(op)).is_ok());
+                } else {
+                    assert!(encode_request(&request(op)).is_ok());
+                }
+            }
+            for op in [b"".as_slice(), b"SELECT", b"other", b"a\0b", &[0xff]] {
+                let mut f = fields(rec);
+                f[2] = Some(op.to_vec());
+                assert!(!valid(rec, &wire(rec, &f)));
+                if std::str::from_utf8(op).is_ok() {
+                    assert!(!typed_valid(rec, &f));
+                }
+            }
+            let idx = if rec { 6 } else { 5 };
+            for d in [
+                "a".repeat(63),
+                "a".repeat(64),
+                "a".repeat(65),
+                "A".repeat(64),
+                "g".repeat(64),
+                format!("{}\0", "a".repeat(63)),
+            ] {
+                let mut f = fields(rec);
+                f[idx] = Some(d.as_bytes().to_vec());
+                assert_eq!(valid(rec, &wire(rec, &f)), d == "a".repeat(64));
+                assert_eq!(typed_valid(rec, &f), d == "a".repeat(64));
+            }
+            let mut f = fields(rec);
+            f[idx] = Some(vec![0xff; 64]);
+            assert!(!valid(rec, &wire(rec, &f)));
+            for op in ["approve", "revoke", "select"] {
+                let start = if rec { 10 } else { 8 };
+                let count = if rec { 3 } else { 2 };
+                for mask in 0..(1 << count) {
+                    let mut f = fields(rec);
+                    f[2] = Some(op.as_bytes().to_vec());
+                    for j in 0..count {
+                        if mask & (1 << j) == 0 {
+                            f[start + j] = None;
+                        }
+                    }
+                    let ok = if op == "select" {
+                        mask == (1 << count) - 1
+                    } else {
+                        mask == 0
+                    };
+                    assert_eq!(valid(rec, &wire(rec, &f)), ok, "{rec} {op} {mask}");
+                    assert_eq!(typed_valid(rec, &f), ok);
+                }
+            }
+        }
+    }
+    #[test]
+    fn w1_codec_decimal_grammar() {
+        for rec in [false, true] {
+            let indexes: &[usize] = if rec { &[4, 7, 8, 11, 12] } else { &[6, 9] };
+            for &idx in indexes {
+                for v in [
+                    "+1",
+                    "-1",
+                    "01",
+                    "00",
+                    " 1",
+                    "1 ",
+                    "",
+                    "x",
+                    "١",
+                    "1\0",
+                    "9223372036854775808",
+                    "999999999999999999999999999",
+                ] {
+                    let mut f = fields(rec);
+                    f[idx] = Some(v.as_bytes().to_vec());
+                    assert!(!valid(rec, &wire(rec, &f)), "{rec} {idx} {v:?}");
+                }
+                let mut f = fields(rec);
+                f[idx] = Some(vec![0xff]);
+                assert!(!valid(rec, &wire(rec, &f)));
+                for n in [0, 1, 9, 10] {
+                    let mut f = fields(rec);
+                    f[idx] = Some(n.to_string().into_bytes());
+                    if rec && idx == 7 {
+                        f[8] = Some((n + 1).to_string().into_bytes());
+                    }
+                    if rec && idx == 8 && n > 0 {
+                        f[7] = Some((n - 1).to_string().into_bytes());
+                    }
+                    let positive = if rec {
+                        idx == 8 || idx == 11 || idx == 12
+                    } else {
+                        idx == 9
+                    };
+                    assert_eq!(valid(rec, &wire(rec, &f)), !positive || n > 0);
+                    assert_eq!(typed_valid(rec, &f), !positive || n > 0);
+                }
+            }
+        }
+    }
+    #[test]
+    fn w1_codec_numeric_ranges_and_increment() {
+        let mut q_control = request("select");
+        let mut r_control = receipt("select");
+        assert!(encode_request(&q_control).is_ok(), "C07: valid request control");
+        assert!(encode_receipt(&r_control).is_ok(), "C07: valid receipt control");
+        q_control.expected = -1;
+        assert!(encode_request(&q_control).is_err(), "C07 request: negative expected");
+        q_control = request("select");
+        q_control.lifecycle = Some(-1);
+        assert!(encode_request(&q_control).is_err(), "C07 request: negative lifecycle");
+        r_control.expected = -1;
+        assert!(encode_receipt(&r_control).is_err(), "C07 receipt: negative expected");
+        r_control = receipt("select");
+        r_control.lifecycle = Some(-1);
+        assert!(encode_receipt(&r_control).is_err(), "C07 receipt: negative lifecycle");
+        r_control = receipt("select");
+        r_control.result = -1;
+        assert!(encode_receipt(&r_control).is_err(), "C07 receipt: negative result");
+        r_control = receipt("select");
+        r_control.authority = -1;
+        assert!(encode_receipt(&r_control).is_err(), "C07 receipt: negative authority");
+        r_control = receipt("select");
+        r_control.approval = Some(-1);
+        assert!(encode_receipt(&r_control).is_err(), "C07 receipt: negative approval");
+        let (mut q, mut r) = maxima();
+        assert!(encode_request(&q).is_ok());
+        assert!(decode_request(&encode_request(&q).unwrap()).is_ok());
+        assert!(encode_receipt(&r).is_ok());
+        assert_eq!(decode_receipt(&encode_receipt(&r).unwrap()).unwrap(), r);
+        q.expected = i64::MAX;
+        assert!(encode_request(&q).is_err());
+        r.expected = i64::MAX;
+        assert!(encode_receipt(&r).is_err());
+        for rec in [false, true] {
+            let mut f = fields(rec);
+            let ei = if rec { 7 } else { 6 };
+            f[ei] = Some(i64::MAX.to_string().into_bytes());
+            assert!(!valid(rec, &wire(rec, &f)));
+        }
+        let mut r = receipt("select");
+        for n in [0, i64::MAX] {
+            r.authority = n;
+            assert!(encode_receipt(&r).is_ok());
+            assert_eq!(
+                decode_receipt(&encode_receipt(&r).unwrap())
+                    .unwrap()
+                    .authority,
+                n
+            );
+        }
+        r.authority = -1;
+        assert!(encode_receipt(&r).is_err());
+        r.authority = 0;
+        for n in [0, 1, i64::MAX] {
+            let mut q = request("select");
+            q.lifecycle = Some(n);
+            assert_eq!(encode_request(&q).is_ok(), n > 0);
+            let mut c = receipt("select");
+            c.lifecycle = Some(n);
+            assert_eq!(encode_receipt(&c).is_ok(), n > 0);
+            c.lifecycle = Some(1);
+            c.approval = Some(n);
+            assert_eq!(encode_receipt(&c).is_ok(), n > 0);
+            for (rec, idx) in [(false, 9), (true, 11), (true, 12)] {
+                let mut f = fields(rec);
+                f[idx] = Some(n.to_string().into_bytes());
+                assert_eq!(valid(rec, &wire(rec, &f)), n > 0);
+            }
+        }
+        for (expected, result, ok) in [
+            (0, 0, false),
+            (0, 1, true),
+            (1, 1, false),
+            (i64::MAX - 1, i64::MAX, true),
+            (i64::MAX, i64::MAX, false),
+        ] {
+            let mut c = receipt("select");
+            c.expected = expected;
+            c.result = result;
+            assert_eq!(encode_receipt(&c).is_ok(), ok);
+            let mut f = fields(true);
+            f[7] = Some(expected.to_string().into_bytes());
+            f[8] = Some(result.to_string().into_bytes());
+            assert_eq!(valid(true, &wire(true, &f)), ok);
+        }
+        for n in [0, i64::MAX] {
+            let mut f = fields(true);
+            f[4] = Some(n.to_string().into_bytes());
+            assert!(valid(true, &wire(true, &f)));
+        }
+    }
+    #[test]
+    fn w1_codec_canonical_reencoding() {
+        for op in ["approve", "revoke", "select"] {
+            let q = golden(op, false);
+            let r = golden(op, true);
+            assert_eq!(encode_request(&decode_request(&q).unwrap()).unwrap(), q);
+            assert_eq!(encode_receipt(&decode_receipt(&r).unwrap()).unwrap(), r);
+            assert_eq!(encode_request(&request(op)), encode_request(&request(op)));
+            let first = encode_receipt(&receipt(op)).expect("C08: first receipt encoding succeeds");
+            let second = encode_receipt(&receipt(op)).expect("C08: repeated receipt encoding succeeds");
+            assert_eq!(first, second, "C08 receipt {op}: repeated encoding differs");
+        }
+        let (q, r) = maxima();
+        let qb = encode_request(&q).unwrap();
+        let rb = encode_receipt(&r).unwrap();
+        assert_eq!(encode_request(&decode_request(&qb).unwrap()).unwrap(), qb);
+        assert_eq!(encode_receipt(&decode_receipt(&rb).unwrap()).unwrap(), rb);
+        for rec in [false, true] {
+            let mut f = fields(rec);
+            f[if rec { 7 } else { 6 }] = Some(b"00".to_vec());
+            assert!(!valid(rec, &wire(rec, &f)));
+            let mut b = wire(rec, &fields(rec));
+            b.push(0);
+            assert!(!valid(rec, &b));
+        }
+        let mut a = request("select");
+        a.installation = "é".into();
+        let mut b = a.clone();
+        b.installation = "e\u{301}".into();
+        assert_ne!(encode_request(&a).unwrap(), encode_request(&b).unwrap());
+    }
+    #[test]
+    fn w1_codec_error_context_boundary() {
+        let mut q = request("approve");
+        q.key.clear();
+        assert_eq!(encode_request(&q), Err(Invalid));
+        assert_eq!(decode_request(b"malformed"), Err(Invalid));
+        let mut r = receipt("select");
+        r.approval = None;
+        assert_eq!(encode_receipt(&r), Err(Invalid));
+        assert_eq!(decode_receipt(b"malformed"), Err(Invalid));
+    }
+}
+
+#[cfg(all(test, feature = "w1-isolated-test-support"))]
+mod w1_stage2_reader_tests {
+    use super::*;
+
+    fn context() -> ProductServiceContext {
+        ProductServiceContext { service_id: "svc".into(), service_revision: 2, credential_revision: 3, source_instance_id: "inst".into(), source_generation: 4, source_instance_revision: 5, connector_revision: 6, source_revision: 6, connector_id: "conn".into(), api_origin: "origin".into(), repository_id: "repo".into(), api_owner: "owner".into(), api_repo: "name".into() }
+    }
+    fn time() -> DateTime<Utc> { w1_canonical_time("2026-01-01T00:00:00+00:00").unwrap() }
+    fn database() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE product_services_v1(service_id TEXT,revision INTEGER,enabled INTEGER,lease_until TEXT);
+        CREATE TABLE product_service_credentials_v1(service_id TEXT,credential_revision INTEGER,expires_at TEXT);
+        CREATE TABLE product_service_grants_v1(service_id TEXT,source_instance_id TEXT,action TEXT,enabled INTEGER,grant_revision INTEGER);
+        CREATE TABLE product_scope_source_instances_v1(source_instance_id TEXT,connector_id TEXT,repository_key TEXT,enabled INTEGER,generation INTEGER,revision INTEGER);
+        CREATE TABLE product_scope_current_sources_v1(connector_id TEXT,source_instance_id TEXT);
+        CREATE TABLE product_scope_repositories_v1(repository_key TEXT,api_origin TEXT,stable_repository_id TEXT);
+        CREATE TABLE product_scope_api_locators_v1(source_instance_id TEXT,api_owner TEXT,api_repo TEXT);
+        CREATE TABLE product_sources_v1(connector_id TEXT,revision INTEGER,enabled INTEGER,origin TEXT);
+        CREATE TABLE product_work_backlog_v1(order_id TEXT,lifecycle INTEGER,delivery_id TEXT,state TEXT,available_at TEXT,attempts INTEGER);
+        CREATE TABLE product_orders_v1(order_id TEXT,lifecycle INTEGER,connector_id TEXT,repository_id TEXT,task_kind TEXT,payload_snapshot TEXT,source_revision INTEGER,admission_seq INTEGER,admission_hash TEXT);
+        CREATE TABLE product_scope_order_provenance_v1(order_id TEXT,lifecycle INTEGER,verified INTEGER,source_instance_id TEXT,admission_seq INTEGER,admission_hash TEXT);
+        CREATE TABLE product_work_claims_v1(order_id TEXT,lifecycle INTEGER,epoch INTEGER,lease_until TEXT);
+        CREATE TABLE product_transition_receipts_v1(seq INTEGER,event_hash TEXT,order_id TEXT,lifecycle INTEGER,operation TEXT);
+        INSERT INTO product_services_v1 VALUES('svc',2,1,'2026-01-01T03:00:00+00:00');
+        INSERT INTO product_service_credentials_v1 VALUES('svc',3,'2026-01-01T02:00:00+00:00');
+        INSERT INTO product_service_grants_v1 VALUES('svc','inst','drive_review',1,17);
+        INSERT INTO product_scope_source_instances_v1 VALUES('inst','conn','key',1,4,5);
+        INSERT INTO product_scope_current_sources_v1 VALUES('conn','inst');
+        INSERT INTO product_scope_repositories_v1 VALUES('key','origin','repo');
+        INSERT INTO product_scope_api_locators_v1 VALUES('inst','OWNER','NAME');
+        INSERT INTO product_sources_v1 VALUES('conn',6,1,'origin');
+        INSERT INTO product_work_backlog_v1 VALUES('order',1,'delivery','ready','2026-01-01T00:00:00+00:00',0);
+        INSERT INTO product_orders_v1 VALUES('order',1,'conn','repo','task','payload',6,8,'hash');
+        INSERT INTO product_scope_order_provenance_v1 VALUES('order',1,1,'inst',8,'hash');
+        INSERT INTO product_transition_receipts_v1 VALUES(8,'hash','order',1,'github-admission');").unwrap();
+        c
+    }
+    // Synthetic in-memory fixture; these snapshots cover every fixture table with SQLite types.
+    fn snapshot(c: &Connection) -> Vec<(String, Vec<Vec<rusqlite::types::Value>>)> {
+        let mut names = c.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").unwrap();
+        let names: Vec<String> = names.query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+        names.into_iter().map(|name| {
+            let quoted = name.replace('"', "\"\"");
+            let mut stmt = c.prepare(&format!("SELECT * FROM \"{quoted}\"")).unwrap();
+            let count = stmt.column_count();
+            let mut rows: Vec<Vec<rusqlite::types::Value>> = stmt.query_map([], |r| (0..count).map(|i| r.get(i)).collect()).unwrap().map(Result::unwrap).collect();
+            rows.sort_by_key(|row| format!("{row:?}"));
+            (name, rows)
+        }).collect()
+    }
+    #[test]
+    fn candidate_reader_provenance_binding_and_numeric_boundaries() {
+        let mut c = database();
+        let before = snapshot(&c);
+        { let tx = c.transaction().unwrap(); let candidate = w1_claim_candidate_in(&tx, &context(), time()).unwrap().unwrap(); assert_eq!(candidate.old_epoch, None); assert_eq!(candidate.attempts, 0); }
+        assert_eq!(snapshot(&c), before);
+        // Both receipts are valid for the order, but provenance names the other one.
+        c.execute("INSERT INTO product_transition_receipts_v1 VALUES(9,'other','order',1,'github-admission')", []).unwrap();
+        c.execute("UPDATE product_scope_order_provenance_v1 SET admission_seq=9,admission_hash='other'", []).unwrap();
+        let before = snapshot(&c);
+        { let tx = c.transaction().unwrap(); assert!(matches!(w1_claim_candidate_in(&tx, &context(), time()), Err(ProductError::Invariant("order provenance binding changed")))); }
+        assert_eq!(snapshot(&c), before);
+        c.execute("UPDATE product_scope_order_provenance_v1 SET admission_seq=8,admission_hash='hash'", []).unwrap();
+        c.execute("INSERT INTO product_work_claims_v1 VALUES('order',1,-1,NULL)", []).unwrap();
+        let before = snapshot(&c);
+        { let tx = c.transaction().unwrap(); assert!(matches!(w1_claim_candidate_in(&tx, &context(), time()), Err(ProductError::ContractMismatch))); }
+        assert_eq!(snapshot(&c), before);
+        c.execute("UPDATE product_work_claims_v1 SET epoch=?1", [i64::MAX]).unwrap();
+        c.execute("UPDATE product_work_backlog_v1 SET attempts=?1", [i64::MAX]).unwrap();
+        let before = snapshot(&c);
+        { let tx = c.transaction().unwrap(); let candidate = w1_claim_candidate_in(&tx, &context(), time()).unwrap().unwrap(); assert_eq!(candidate.old_epoch, Some(i64::MAX)); assert_eq!(candidate.attempts, i64::MAX); assert!(candidate.old_epoch.unwrap().checked_add(1).is_none()); assert!(candidate.attempts.checked_add(1).is_none()); }
+        assert_eq!(snapshot(&c), before);
+        c.execute("UPDATE product_work_backlog_v1 SET attempts=-1", []).unwrap();
+        let before = snapshot(&c);
+        { let tx = c.transaction().unwrap(); assert!(matches!(w1_claim_candidate_in(&tx, &context(), time()), Err(ProductError::ContractMismatch))); }
+        assert_eq!(snapshot(&c), before);
+    }
+    #[test]
+    fn candidate_reader_ordering_states_and_nonselected_corruption() {
+        let mut c = database();
+        c.execute_batch("INSERT INTO product_work_backlog_v1 VALUES('z',1,'delivery-z','retryable','2026-01-01T00:00:00+00:00',0);
+            INSERT INTO product_orders_v1 VALUES('z',1,'conn','repo','task','payload',6,9,'hash-z');
+            INSERT INTO product_scope_order_provenance_v1 VALUES('z',1,1,'inst',9,'hash-z');
+            INSERT INTO product_transition_receipts_v1 VALUES(9,'hash-z','z',1,'github-admission');").unwrap();
+        let before = snapshot(&c);
+        { let tx = c.transaction().unwrap(); assert_eq!(w1_claim_candidate_in(&tx, &context(), time()).unwrap().unwrap().order_id, "order"); }
+        assert_eq!(snapshot(&c), before);
+        c.execute("UPDATE product_work_backlog_v1 SET available_at='bad' WHERE order_id='z'", []).unwrap();
+        let before = snapshot(&c);
+        { let tx = c.transaction().unwrap(); assert!(matches!(w1_claim_candidate_in(&tx, &context(), time()), Err(ProductError::ContractMismatch))); }
+        assert_eq!(snapshot(&c), before);
+        c.execute("UPDATE product_work_backlog_v1 SET available_at='2026-01-01T00:00:00+00:00' WHERE order_id='z'", []).unwrap();
+        c.execute("INSERT INTO product_work_claims_v1 VALUES('order',1,1,'2026-01-01T00:00:01+00:00')", []).unwrap();
+        for state in ["claimed", "completed"] {
+            c.execute("UPDATE product_work_backlog_v1 SET state=?1 WHERE order_id='order'", [state]).unwrap();
+            let before = snapshot(&c);
+            { let tx = c.transaction().unwrap(); assert_eq!(w1_claim_candidate_in(&tx, &context(), time()).unwrap().unwrap().order_id, "z"); assert_eq!(w1_claim_candidate_in(&tx, &context(), time() + chrono::Duration::seconds(1)).unwrap().unwrap().order_id, "order"); }
+            assert_eq!(snapshot(&c), before);
+        }
+    }
+    #[test]
+    fn authority_reader_validates_time_and_grant_without_writes() {
+        let mut c = database();
+        let before = c.total_changes();
+        let tx = c.transaction().unwrap();
+        let authority = w1_service_authority_in(&tx, &context(), time()).unwrap();
+        assert_eq!(authority.grant_revision, 17);
+        assert_eq!(authority.grant_action, "drive_review");
+        assert_eq!(authority.service_lease_until, "2026-01-01T03:00:00+00:00");
+        assert_eq!(authority.credential_expires_at, "2026-01-01T02:00:00+00:00");
+        assert!(matches!(w1_service_authority_in(&tx, &context(), time() + chrono::Duration::hours(2)), Err(ProductError::Invariant("service authority is absent, expired, or revoked"))));
+        let mut denied = context(); denied.source_generation += 1;
+        assert!(matches!(w1_service_authority_in(&tx, &denied, time()), Err(ProductError::Invariant(_))));
+        drop(tx);
+        assert_eq!(c.total_changes(), before);
+        for bad in ["bad", "2026-01-01T03:00:00Z", "2026-01-01T04:00:00+01:00", "2026-01-01T03:00:00.000+00:00"] {
+            c.execute("UPDATE product_services_v1 SET lease_until=?1", [bad]).unwrap();
+            let before = c.total_changes();
+            let tx = c.transaction().unwrap();
+            assert!(matches!(w1_service_authority_in(&tx, &context(), time()), Err(ProductError::ContractMismatch)));
+            drop(tx); assert_eq!(c.total_changes(), before);
+        }
+        c.execute("UPDATE product_services_v1 SET lease_until='2026-01-01T03:00:00+00:00'", []).unwrap();
+        c.execute("UPDATE product_service_credentials_v1 SET expires_at='2026-01-01T02:00:00Z'", []).unwrap();
+        let tx = c.transaction().unwrap();
+        assert!(matches!(w1_service_authority_in(&tx, &context(), time()), Err(ProductError::ContractMismatch)));
+    }
+    #[test]
+    fn candidate_reader_validates_all_times_and_preserves_selection() {
+        let mut c = database();
+        let before = c.total_changes();
+        let tx = c.transaction().unwrap();
+        assert_eq!(w1_claim_candidate_in(&tx, &context(), time()).unwrap().unwrap().order_id, "order");
+        assert!(w1_claim_candidate_in(&tx, &context(), time() - chrono::Duration::seconds(1)).unwrap().is_none());
+        drop(tx); assert_eq!(c.total_changes(), before);
+        for bad in ["bad", "2026-01-01T00:00:00Z", "2026-01-01T01:00:00+01:00", "2026-01-01T00:00:00.000+00:00"] {
+            c.execute("UPDATE product_work_backlog_v1 SET available_at=?1", [bad]).unwrap();
+            let before = c.total_changes(); let tx = c.transaction().unwrap();
+            assert!(matches!(w1_claim_candidate_in(&tx, &context(), time()), Err(ProductError::ContractMismatch)));
+            drop(tx); assert_eq!(c.total_changes(), before);
+        }
+        c.execute("UPDATE product_work_backlog_v1 SET available_at='2026-01-01T00:00:00+00:00'", []).unwrap();
+        c.execute("INSERT INTO product_work_claims_v1 VALUES('order',1,1,'bad')", []).unwrap();
+        let before = c.total_changes(); let tx = c.transaction().unwrap();
+        assert!(matches!(w1_claim_candidate_in(&tx, &context(), time()), Err(ProductError::ContractMismatch)));
+        drop(tx); assert_eq!(c.total_changes(), before);
+        c.execute("UPDATE product_work_claims_v1 SET lease_until='2026-01-01T00:00:01+00:00'", []).unwrap();
+        let tx = c.transaction().unwrap();
+        assert!(w1_claim_candidate_in(&tx, &context(), time()).unwrap().is_none());
+        assert!(w1_claim_candidate_in(&tx, &context(), time() + chrono::Duration::seconds(1)).unwrap().is_some());
+    }
+}
+
+#[cfg(all(test, feature = "w1-isolated-test-support", unix))]
+mod w1_latest_selection_reader_tests {
+    use super::*;
+    use crate::product_identity::ProductPasswordKdf;
+    use std::os::unix::fs::DirBuilderExt;
+
+    struct Dir(PathBuf);
+    impl Drop for Dir { fn drop(&mut self) { std::fs::remove_dir_all(&self.0).unwrap(); } }
+
+    fn fixture() -> (Dir, ProductStore, String, DateTime<Utc>) {
+        let path = PathBuf::from("/home/cosmo/.hermes/cache/scratch").join(format!("w1-reader-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+        let dir = Dir(path);
+        let mut store = ProductStore::create_isolated_test_store(&dir.0, "db", ProductConfig { installation_id: "w1-install".into(), database_id: "w1-db".into() }).unwrap();
+        let source = ScopeSourceManifest { connector_id: "gh".into(), source_instance_id: "source-instance-1".into(), generation: 1, identity: RepositoryIdentity::canonicalized("acme", "GitHub", "https://api.github.com", "42").unwrap(), api_owner: Some("acme".into()), api_repo: Some("proj".into()), legacy_repository_locator: "acme/proj".into(), scope_query: "open".into(), enabled: true };
+        let grant = ScopeGrantManifest { actor_id: "owner".into(), source_instance_id: source.source_instance_id.clone(), capabilities: vec![ProductCapability::ReadOrder] };
+        store.bootstrap_owner_scoped("owner", &ProductPasswordKdf::hash("test-password").unwrap(), &[source], &[grant]).unwrap();
+        let now = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z").unwrap().with_timezone(&Utc);
+        let session = store.login("owner", "test-password", now).unwrap().digest().to_owned();
+        store.admit_order("order-1", "gh", "42", "issue:1", "dep-bump", "immutable task", now).unwrap();
+        (dir, store, session, now)
+    }
+
+    fn snapshot_conn(conn: &Connection) -> std::collections::BTreeMap<String, Vec<Vec<rusqlite::types::Value>>> {
+        let mut stmt = conn.prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name").unwrap();
+        let names: Vec<String> = stmt.query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+        let mut result: std::collections::BTreeMap<_, _> = names.into_iter().map(|name| {
+            let mut stmt = conn.prepare(&format!("SELECT * FROM \"{}\"", name.replace('"', "\"\""))).unwrap();
+            let n = stmt.column_count();
+            let mut rows: Vec<Vec<rusqlite::types::Value>> = stmt.query_map([], |r| (0..n).map(|i| r.get(i)).collect()).unwrap().map(Result::unwrap).collect();
+            rows.sort_by_cached_key(|r| format!("{r:?}"));
+            (name, rows)
+        }).collect();
+        let mut stmt = conn.prepare("SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name").unwrap();
+        let rows = stmt.query_map([], |r| (0..4).map(|i| r.get(i)).collect()).unwrap().map(Result::unwrap).collect();
+        result.insert("__schema__".into(), rows);
+        result
+    }
+
+    fn snapshot(path: &Path) -> std::collections::BTreeMap<String, Vec<Vec<rusqlite::types::Value>>> {
+        snapshot_conn(&Connection::open(path).unwrap())
+    }
+
+    fn read(store: &mut ProductStore, order: &str, lifecycle: i64, source: &str) -> Result<W1LatestSelection, ProductError> {
+        let tx = store.conn.transaction().unwrap();
+        let result = w1_latest_selection_in(&tx, "w1-install", "w1-db", order, lifecycle, source);
+        tx.commit().unwrap();
+        result
+    }
+
+    #[test]
+    fn latest_selection_validates_history_and_is_read_only() {
+        let (dir, mut store, session, now) = fixture();
+        let source = "source-instance-1"; let a = "a".repeat(64); let b = "b".repeat(64);
+        store.w1_change_pack_approval(&session, source, &a, 0, true, "a", now).unwrap();
+        store.w1_select_pack(&session, "order-1", 1, source, &a, 0, "s1", now).unwrap();
+        store.w1_change_pack_approval(&session, source, &b, 0, true, "b", now).unwrap();
+        store.w1_select_pack(&session, "order-1", 1, source, &b, 1, "s2", now).unwrap();
+        let before = snapshot(&dir.0.join("db"));
+        assert_eq!(read(&mut store, "order-1", 1, source).unwrap(), W1LatestSelection { order: "order-1".into(), lifecycle: 1, source: source.into(), pack_digest: b, selection_revision: 2, referenced_approval_revision: 1, current_approval_head: 1, active: true });
+        assert!(matches!(read(&mut store, "order-1", 1, "wrong-source"), Err(ProductError::Invariant("w1 selection unavailable"))));
+        assert!(matches!(read(&mut store, "wrong-order", 1, source), Err(ProductError::Invariant("w1 selection unavailable"))));
+        assert!(matches!(read(&mut store, "order-1", 2, source), Err(ProductError::Invariant("w1 selection unavailable"))));
+        assert_eq!(snapshot(&dir.0.join("db")), before);
+        // Tampering is confined to a rolled-back transaction; production triggers stay intact.
+        let tx = store.conn.transaction().unwrap();
+        tx.execute_batch("DROP TRIGGER product_w1_operations_no_update; UPDATE product_w1_operations_v1 SET receipt=x'00' WHERE request_key='s1';").unwrap();
+        let corrupted = snapshot_conn(&tx);
+        assert!(matches!(w1_latest_selection_in(&tx, "w1-install", "w1-db", "order-1", 1, source), Err(ProductError::ContractMismatch)));
+        assert_eq!(snapshot_conn(&tx), corrupted);
+        tx.rollback().unwrap();
+        assert_eq!(snapshot(&dir.0.join("db")), before);
+        let tx = store.conn.transaction().unwrap();
+        tx.execute_batch("DROP TABLE product_w1_operations_v1").unwrap();
+        let corrupted = snapshot_conn(&tx);
+        assert!(matches!(w1_latest_selection_in(&tx, "w1-install", "w1-db", "order-1", 1, source), Err(ProductError::Database(_))));
+        assert_eq!(snapshot_conn(&tx), corrupted);
+        tx.rollback().unwrap();
+        assert_eq!(snapshot(&dir.0.join("db")), before);
+    }
+
+    // Adversarial SQL simulates already-corrupted denormalized columns; it is
+    // not a normal lifecycle operation. Each mutation is rolled back.
+    #[test]
+    fn concealed_latest_and_revoke_fail_closed_without_writes() {
+        let (_dir, mut store, session, now) = fixture();
+        let source = "source-instance-1"; let a = "a".repeat(64); let b = "b".repeat(64);
+        store.w1_change_pack_approval(&session, source, &a, 0, true, "a", now).unwrap();
+        store.w1_select_pack(&session, "order-1", 1, source, &a, 0, "s1", now).unwrap();
+        store.w1_change_pack_approval(&session, source, &b, 0, true, "b", now).unwrap();
+        store.w1_select_pack(&session, "order-1", 1, source, &b, 1, "s2", now).unwrap();
+        assert_eq!(read(&mut store, "order-1", 1, source).unwrap().pack_digest, b);
+        for sql in [
+            "UPDATE product_w1_operations_v1 SET order_id='other-order' WHERE request_key='s2'",
+            "UPDATE product_w1_operations_v1 SET lifecycle=2 WHERE request_key='s2'",
+            "UPDATE product_w1_operations_v1 SET source_instance_id='other-source' WHERE request_key='s2'",
+            "UPDATE product_w1_operations_v1 SET digest='cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' WHERE request_key='s2'",
+        ] {
+            store.conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+            let tx = store.conn.transaction().unwrap();
+            tx.execute_batch("DROP TRIGGER product_w1_operations_no_update").unwrap();
+            tx.execute_batch(sql).unwrap();
+            let before = snapshot_conn(&tx);
+            assert!(matches!(w1_latest_selection_in(&tx, "w1-install", "w1-db", "order-1", 1, source), Err(ProductError::ContractMismatch)), "{sql}");
+            assert_eq!(snapshot_conn(&tx), before, "{sql}");
+            tx.rollback().unwrap();
+            store.conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        }
+        store.w1_change_pack_approval(&session, source, &b, 1, false, "revoke", now).unwrap();
+        assert!(matches!(read(&mut store, "order-1", 1, source), Err(ProductError::Invariant("w1 selection unavailable"))));
+        for sql in [
+            "UPDATE product_w1_operations_v1 SET source_instance_id='other-source' WHERE request_key='revoke'",
+            "UPDATE product_w1_operations_v1 SET digest='cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' WHERE request_key='revoke'",
+        ] {
+            store.conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+            let tx = store.conn.transaction().unwrap();
+            tx.execute_batch("DROP TRIGGER product_w1_operations_no_update").unwrap();
+            tx.execute_batch(sql).unwrap();
+            let before = snapshot_conn(&tx);
+            assert!(matches!(w1_latest_selection_in(&tx, "w1-install", "w1-db", "order-1", 1, source), Err(ProductError::ContractMismatch)), "{sql}");
+            assert_eq!(snapshot_conn(&tx), before, "{sql}");
+            tx.rollback().unwrap();
+            store.conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        }
+    }
+
+    #[test]
+    fn reapproval_requires_fresh_selection_and_preserves_replay() {
+        let (dir, mut store, session, now) = fixture();
+        let source = "source-instance-1"; let digest = "a".repeat(64);
+        store.w1_change_pack_approval(&session, source, &digest, 0, true, "a1", now).unwrap();
+        let old = store.w1_select_pack(&session, "order-1", 1, source, &digest, 0, "s1", now).unwrap();
+        let path = dir.0.join("db");
+        let before = snapshot(&path); assert_eq!(read(&mut store, "order-1", 1, source).unwrap().current_approval_head, 1); assert_eq!(snapshot(&path), before);
+        store.w1_change_pack_approval(&session, source, &digest, 1, false, "r1", now).unwrap();
+        let before = snapshot(&path); assert!(matches!(read(&mut store, "order-1", 1, source), Err(ProductError::Invariant("w1 selection unavailable")))); assert_eq!(snapshot(&path), before);
+        store.w1_change_pack_approval(&session, source, &digest, 2, true, "a2", now).unwrap();
+        let before = snapshot(&path); assert!(matches!(read(&mut store, "order-1", 1, source), Err(ProductError::Invariant("w1 selection unavailable")))); assert_eq!(snapshot(&path), before);
+        assert_eq!(store.w1_select_pack(&session, "order-1", 1, source, &digest, 0, "s1", now).unwrap(), old);
+        assert_eq!(snapshot(&path), before);
+        store.w1_select_pack(&session, "order-1", 1, source, &digest, 1, "s2", now).unwrap();
+        let before = snapshot(&path);
+        let selected = read(&mut store, "order-1", 1, source).unwrap();
+        assert_eq!((selected.pack_digest, selected.selection_revision, selected.referenced_approval_revision, selected.current_approval_head, selected.active), (digest, 2, 3, 3, true));
+        assert_eq!(snapshot(&path), before);
+    }
+}
+
+#[cfg(all(test, feature = "w1-isolated-test-support", unix))]
+mod w1_atomic_private_tests {
+    use super::*;
+    use crate::{ProductPollCursor, ProductServiceGrant};
+    use crate::product_identity::ProductPasswordKdf;
+    use std::os::unix::fs::DirBuilderExt;
+    use std::sync::Arc;
+
+    fn fixture() -> (ProductStore, ProductServiceContext, DateTime<Utc>) {
+        let dir = std::env::temp_dir().join(format!("w1-private-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        let config = ProductConfig { installation_id: "w1-install".into(), database_id: "w1-db".into() };
+        let mut store = ProductStore::create_w1_capture_test_store(&dir, "v3.db", config, Arc::new(SystemProductClock)).unwrap();
+    let source = ScopeSourceManifest { connector_id: "gh".into(), source_instance_id: "source-instance-1".into(), generation: 1, identity: RepositoryIdentity::canonicalized("acme", "GitHub", "https://api.github.com", "42").unwrap(), api_owner: Some("acme".into()), api_repo: Some("proj".into()), legacy_repository_locator: "acme/proj".into(), scope_query: "open".into(), enabled: true };
+    let grant = ScopeGrantManifest { actor_id: "owner".into(), source_instance_id: source.source_instance_id.clone(), capabilities: vec![ProductCapability::ReadOrder] };
+    store.bootstrap_owner_scoped("owner", &ProductPasswordKdf::hash("test-password").unwrap(), &[source], &[grant]).unwrap();
+    let now = SystemProductClock.now();
+    let session = store.login("owner", "test-password", now).unwrap().digest().to_owned();
+    let grants: Vec<_> = [ProductServiceAction::IntakeRead, ProductServiceAction::AdmitDelivery, ProductServiceAction::AckDelivery, ProductServiceAction::DriveReview].into_iter().map(|action| ProductServiceGrant { source_instance_id: "source-instance-1".into(), action }).collect();
+    store.manage_product_service(&session, "service", &grants, true, now + chrono::Duration::hours(3), 0, "configure", now).unwrap();
+    let token = store.issue_product_service_credential(&session, "service", 1, now + chrono::Duration::hours(2), "credential", now).unwrap().expose_once_to_file_writer().to_owned();
+    let service = store.authenticate_product_service_for_action(&token, "gh", "https://api.github.com", "42", ProductServiceAction::DriveReview, now).unwrap();
+    let issue = "issue:service-w1";
+    let payload = "immutable local adapter task";
+    let updated = now.to_rfc3339();
+    let version = crate::product::delivery_version_digest(issue, &updated, "dep-bump", payload);
+    let delivery = crate::ProductDelivery { delivery_id: crate::product::github_delivery_id("w1-install", "gh", "https://api.github.com", "42", issue, &version), connector_id: "gh".into(), repository_id: "42".into(), issue_id: issue.into(), observed_updated_at: updated.clone(), version_digest: version, task_kind: "dep-bump".into(), payload: payload.into() };
+    let cursor = ProductPollCursor { connector_id: "gh".into(), query_fingerprint: "v3-query".into(), sweep_id: "v3-sweep".into(), next_page: 1, page_ceiling: 1, updated_at: updated };
+    store.persist_intake_page_for_service(&service, &cursor, &[delivery.clone()], &[], now).unwrap();
+    let receipt = store.admit_intake_delivery_for_service(&service, &delivery.delivery_id, "service-order", now).unwrap();
+    store.mark_intake_acked_for_service(&service, &delivery.delivery_id, &receipt, now).unwrap();
+    assert_eq!(store.read_scoped_order(&session, &receipt.order_id, now).unwrap().admission_sequence, receipt.sequence);
+
+        // Test-only adapter readiness setup after genuine intake and admission.
+        assert_eq!(store.conn.execute("UPDATE product_work_backlog_v1 SET state='ready' WHERE order_id=?1 AND lifecycle=?2 AND delivery_id=?3 AND state='waiting_unsupported'", params![receipt.order_id,receipt.lifecycle,delivery.delivery_id]).unwrap(), 1);
+        (store, service, now)
+    }
+    fn snapshot(c: &Connection) -> std::collections::BTreeMap<String, Vec<Vec<rusqlite::types::Value>>> {
+        let mut names = c.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").unwrap();
+        let names: Vec<String> = names.query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+        names.into_iter().map(|name| {
+            let quoted = name.replace('"', "\"\"");
+            let mut stmt = c.prepare(&format!("SELECT * FROM \"{quoted}\"")).unwrap();
+            let count = stmt.column_count();
+            let mut rows: Vec<Vec<rusqlite::types::Value>> = stmt.query_map([], |r| (0..count).map(|i| r.get(i)).collect()).unwrap().map(Result::unwrap).collect();
+            rows.sort_by_key(|row| format!("{row:?}"));
+            (name, rows)
+        }).collect()
+    }
+    #[test]
+    fn w1_private_atomic_rollback_and_claim() {
+        use rusqlite::types::Value::{Integer, Text};
+        let (mut store, context, _) = fixture();
+        let before = snapshot(&store.conn);
+        store.w1_capture_fail_after_legacy_writes_once().unwrap();
+        assert!(matches!(w1_capture_claim_private(&mut store, &context, "", chrono::Duration::minutes(5)), Err(ProductError::InvalidConfig)));
+        assert_eq!(snapshot(&store.conn), before);
+        assert!(matches!(w1_capture_claim_private(&mut store, &context, "worker", chrono::Duration::minutes(5)), Err(ProductError::Invariant("w1 capture injected failure"))));
+        assert_eq!(snapshot(&store.conn), before);
+        let claim = match w1_capture_claim_private(&mut store, &context, "worker", chrono::Duration::minutes(5)).unwrap() { ProductWorkClaimResult::Claimed(c) => c, other => panic!("{other:?}") };
+        let mut expected = before;
+        expected.get_mut("product_fence_counter_v1").unwrap()[0][1] = Integer(claim.fence);
+        let backlog = &mut expected.get_mut("product_work_backlog_v1").unwrap()[0];
+        backlog[3] = Text("claimed".into()); backlog[5] = Integer(1);
+        expected.get_mut("product_work_claims_v1").unwrap().push(vec![Text(claim.order_id.clone()),Integer(claim.lifecycle),Text("worker".into()),Integer(1),Integer(1),Text("claimed".into()),Text(claim.lease_until.to_rfc3339()),Integer(claim.source_revision),Text(claim.payload_digest.clone())]);
+        expected.get_mut("product_service_work_bindings_v1").unwrap().push(vec![Text(claim.order_id.clone()),Integer(claim.lifecycle),Text(context.service_id.clone()),Integer(context.service_revision),Integer(context.credential_revision),Text(context.source_instance_id.clone())]);
+        let authority = w1_service_authority_in(&store.conn.unchecked_transaction().unwrap(), &context, claim.lease_until - chrono::Duration::minutes(5)).unwrap();
+        expected.get_mut("product_w1_claim_authority_v1").unwrap().push(vec![Text(claim.order_id.clone()),Integer(claim.lifecycle),Integer(1),Integer(1),Text("w1-install".into()),Text("w1-db".into()),Text(claim.delivery_id.clone()),Text("worker".into()),Text((claim.lease_until - chrono::Duration::minutes(5)).to_rfc3339()),Text(claim.lease_until.to_rfc3339()),Text(claim.payload_digest.clone()),Integer(store.conn.query_row("SELECT admission_seq FROM product_orders_v1 WHERE order_id=?1", [&claim.order_id], |r| r.get(0)).unwrap()),Text(store.conn.query_row("SELECT admission_hash FROM product_orders_v1 WHERE order_id=?1", [&claim.order_id], |r| r.get(0)).unwrap()),Text(context.service_id.clone()),Integer(context.service_revision),Text(authority.service_lease_until),Integer(context.credential_revision),Text(authority.credential_expires_at),Text(authority.grant_action),Integer(authority.grant_revision),Text(context.source_instance_id.clone()),Integer(context.source_generation),Integer(context.source_instance_revision),Text(context.connector_id.clone()),Integer(context.connector_revision),Text(context.api_origin.clone()),Text(context.repository_id.clone()),Text(context.api_owner.clone()),Text(context.api_repo.clone())]);
+        assert_eq!(snapshot(&store.conn), expected);
+    }
+    #[test]
+    fn w1_private_atomic_boundaries_and_missing_claim() {
+        let (mut store, context, _) = fixture();
+        for column in ["attempts", "fence"] {
+            if column == "attempts" { store.conn.execute("UPDATE product_work_backlog_v1 SET attempts=?1", [i64::MAX]).unwrap(); }
+            else { store.conn.execute("UPDATE product_fence_counter_v1 SET next=?1 WHERE singleton=1", [i64::MAX]).unwrap(); }
+            let before = snapshot(&store.conn);
+            assert!(matches!(w1_capture_claim_private(&mut store, &context, "worker", chrono::Duration::minutes(5)), Err(ProductError::InvalidConfig)));
+            assert_eq!(snapshot(&store.conn), before);
+            if column == "attempts" { store.conn.execute("UPDATE product_work_backlog_v1 SET attempts=0", []).unwrap(); }
+            else { store.conn.execute("UPDATE product_fence_counter_v1 SET next=0 WHERE singleton=1", []).unwrap(); }
+        }
+        for state in ["claimed", "completed"] {
+            store.conn.execute("UPDATE product_work_backlog_v1 SET state=?1", [state]).unwrap();
+            let before = snapshot(&store.conn);
+            assert!(matches!(w1_capture_claim_private(&mut store, &context, "worker", chrono::Duration::minutes(5)), Err(ProductError::ContractMismatch)));
+            assert_eq!(snapshot(&store.conn), before);
+        }
+        store.conn.execute("INSERT INTO product_work_claims_v1(order_id,lifecycle,epoch,fence,state) SELECT order_id,lifecycle,?1,1,'completed' FROM product_work_backlog_v1", [i64::MAX]).unwrap();
+        let before = snapshot(&store.conn);
+        assert!(matches!(w1_capture_claim_private(&mut store, &context, "worker", chrono::Duration::minutes(5)), Err(ProductError::InvalidConfig)));
+        assert_eq!(snapshot(&store.conn), before);
+    }
+}
+
+
+#[cfg(all(test, feature = "a01-harness-support", unix))]
+mod a01_connection_tests {
+    use super::*;
+    use std::os::unix::fs::DirBuilderExt;
+
+    fn require<T, E>(result: Result<T, E>) -> T {
+        match result { Ok(value) => value, Err(_) => panic!("A01 connection test operation failed") }
+    }
+    struct PrivateDir(PathBuf);
+    impl PrivateDir {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let stamp = require(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)).as_nanos();
+            let path = std::env::temp_dir().join(format!("foundry-a01-connection-{}-{stamp}-{serial}", std::process::id()));
+            require(std::fs::DirBuilder::new().mode(0o700).create(&path));
+            Self(require(path.canonicalize()))
+        }
+    }
+    impl Drop for PrivateDir {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+    fn config() -> ProductConfig {
+        ProductConfig { installation_id: "a01-connection-installation".into(), database_id: "a01-connection-database".into() }
+    }
+
+    #[test]
+    fn a01_returned_connections_apply_required_pragmas() {
+        let dir = PrivateDir::new();
+        let mut store = require(ProductStore::create_a01_isolated_test_store(&dir.0, "store.db", config(), std::sync::Arc::new(SystemProductClock)));
+        for reopening in [false, true] {
+            if reopening {
+                drop(store);
+                store = require(ProductStore::reopen_a01_isolated_test_store(&dir.0, "store.db", config(), std::sync::Arc::new(SystemProductClock)));
+            }
+            // Read the actual returned connection, never a stand-in connection.
+            require(validate_a01_pragmas(&store.conn));
+            require(validate_a01_contract(&store.conn, &config()));
+            assert!(store.a01_identity == Some(require(a01_file_identity(&dir.0.join("store.db")))), "A01 held physical identity mismatch");
+            assert!(matches!(store.claim_product_work("", Utc::now(), chrono::Duration::zero()), Err(ProductError::Invariant("A01 isolated store work is disabled"))), "A01 early work guard mismatch");
+            // Discriminate every readback check independently on this handle.
+            for (pragma, wrong, correct) in [
+                ("foreign_keys", 0, 1), ("recursive_triggers", 0, 1),
+                ("ignore_check_constraints", 1, 0), ("busy_timeout", 1, 5000),
+            ] {
+                require(store.conn.pragma_update(None, pragma, wrong));
+                assert!(matches!(validate_a01_pragmas(&store.conn), Err(ProductError::ContractMismatch)), "A01 pragma check missing");
+                require(store.conn.pragma_update(None, pragma, correct));
+                require(validate_a01_pragmas(&store.conn));
+            }
+            require(store.conn.pragma_update(None, "journal_mode", "persist"));
+            assert!(matches!(validate_a01_pragmas(&store.conn), Err(ProductError::ContractMismatch)), "A01 journal check missing");
+            require(store.conn.pragma_update(None, "journal_mode", "delete"));
+            require(validate_a01_pragmas(&store.conn));
+        }
+        // A byte-identical copy with matching logical identities still fails
+        // the held-file comparison. Assembly must retain this expected inode
+        // across its own independently opened participants.
+        let original = dir.0.join("store.db");
+        let held = require(std::fs::File::open(&original));
+        let copied = dir.0.join("copied.db");
+        require(std::fs::copy(&original, &copied));
+        assert!(matches!(a01_checked_file(&copied, &held), Err(ProductError::Invariant("A01 physical identity changed"))), "A01 copied file accepted as held identity");
+    }
+
+    #[test]
+    fn a01_operational_errors_remain_database_errors() {
+        for code in [rusqlite::ffi::SQLITE_BUSY, rusqlite::ffi::SQLITE_LOCKED,
+            rusqlite::ffi::SQLITE_IOERR, rusqlite::ffi::SQLITE_FULL,
+            rusqlite::ffi::SQLITE_CANTOPEN, rusqlite::ffi::SQLITE_READONLY]
+        {
+            let error = rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None);
+            assert!(matches!(a01_contract_error(error), ProductError::Database(_)), "A01 operational error reclassified");
+        }
+        let dir = PrivateDir::new();
+        let store = require(ProductStore::create_a01_isolated_test_store(&dir.0, "store.db", config(), std::sync::Arc::new(SystemProductClock)));
+        require(validate_a01_contract(&store.conn, &config()));
+        let writer = require(Connection::open(dir.0.join("store.db")));
+        require(writer.execute_batch("BEGIN EXCLUSIVE"));
+        require(store.conn.busy_timeout(std::time::Duration::ZERO));
+        let result = validate_a01_contract(&store.conn, &config());
+        assert!(matches!(result, Err(ProductError::Database(rusqlite::Error::SqliteFailure(ref error, _))) if error.code == rusqlite::ErrorCode::DatabaseBusy), "A01 real busy error reclassified");
+        require(writer.execute_batch("ROLLBACK"));
+        require(store.conn.busy_timeout(std::time::Duration::from_millis(5000)));
+        require(validate_a01_connection(&store.conn, &config()));
+    }
+
+    #[test]
+    fn a01_header_inspection_distinguishes_truncation_from_read_io() {
+        let dir = PrivateDir::new();
+        drop(require(ProductStore::create_a01_isolated_test_store(
+            &dir.0, "store.db", config(), std::sync::Arc::new(SystemProductClock),
+        )));
+        let path = dir.0.join("store.db");
+        require(require(std::fs::OpenOptions::new().write(true).open(&path)).set_len(19));
+        let before = require(std::fs::read(&path));
+        let identity = require(a01_file_identity(&path));
+        assert!(matches!(
+            ProductStore::reopen_a01_isolated_test_store(
+                &dir.0, "store.db", config(), std::sync::Arc::new(SystemProductClock),
+            ),
+            Err(ProductError::ContractMismatch)
+        ), "A01 truncated header classification changed");
+        assert!(before == require(std::fs::read(&path)), "A01 truncated header was mutated");
+        assert!(identity == require(a01_file_identity(&path)), "A01 truncated file was replaced");
+        for suffix in ["-journal", "-wal", "-shm"] {
+            assert!(!dir.0.join(format!("store.db{suffix}")).exists(),
+                "A01 truncated header created a sidecar");
+        }
+
+        // A directory descriptor gives a real operational read failure, without
+        // fault injection, process-global hooks, or access outside this fixture.
+        let directory = require(std::fs::File::open(&dir.0));
+        assert!(matches!(
+            a01_read_header(&directory),
+            Err(ProductError::Invariant("A01 header inspection failed"))
+        ), "A01 operational header read was classified as malformed content");
+    }
+}
+
+#[cfg(all(test, feature = "a01-harness-support", unix))]
+mod a01_binding_tests {
+    // Parent execution requires newly owned private TMPDIR and separate private build targets
+    // for feature configurations, with both B0 evidence activations absent.
+    use super::*;
+    use chrono::{DateTime, Utc};
+    use rusqlite::{params_from_iter, types::Value};
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::DirBuilderExt;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    #[track_caller]
+    fn require<T, E>(result: Result<T, E>) -> T {
+        match result {
+            Ok(value) => value,
+            Err(_) => panic!("A01 foundation test operation failed"),
+        }
+    }
+    struct PrivateDir(PathBuf);
+impl PrivateDir {
+    fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let stamp = require(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)).as_nanos();
+        let path = std::env::temp_dir().join(format!("foundry-a01-{}-{stamp}-{serial}", std::process::id()));
+        require(std::fs::DirBuilder::new().mode(0o700).create(&path));
+        Self(require(path.canonicalize()))
+    }
+}
+    fn now() -> DateTime<Utc> {
+    require(DateTime::parse_from_rfc3339("2026-01-01T00:00:00+00:00")).with_timezone(&Utc)
+}
+    fn config() -> ProductConfig {
+    ProductConfig { installation_id: "a01-test-installation".into(), database_id: "a01-test-database".into() }
+}
+    struct FoundationClock;
+    impl ProductClock for FoundationClock {
+        fn now(&self) -> DateTime<Utc> { now() }
+    }
+    fn clock() -> Arc<dyn ProductClock> { Arc::new(FoundationClock) }
+
+    // This prepares committed intake/admission only. It never makes backlog executable.
+    fn prepare_admission(store: &mut ProductStore) {
+        
+    require(store.bind_source("gh", "github", "https://api.github.com", "42", "42"));
+    let updated = now().to_rfc3339();
+    let version = crate::product::delivery_version_digest("issue:a01", &updated, "dep-bump", "immutable task");
+    let delivery = crate::ProductDelivery {
+        delivery_id: crate::product::github_delivery_id(&config().installation_id, "gh", "https://api.github.com", "42", "issue:a01", &version),
+        connector_id: "gh".into(), repository_id: "42".into(), issue_id: "issue:a01".into(),
+        observed_updated_at: updated.clone(), version_digest: version, task_kind: "dep-bump".into(), payload: "immutable task".into(),
+    };
+    let cursor = crate::ProductPollCursor { connector_id: "gh".into(), query_fingerprint: "a01-query".into(), sweep_id: "a01-sweep".into(), next_page: 1, page_ceiling: 1, updated_at: updated };
+    require(store.persist_intake_page(&cursor, &[delivery.clone()]));
+    let receipt = require(store.admit_intake_delivery(&delivery.delivery_id, "a01-order", now()));
+        require(store.mark_intake_acked(&delivery.delivery_id, &receipt));
+    }
+
+    fn marked(reopened: bool) -> (PrivateDir, ProductStore) {
+        let dir = PrivateDir::new();
+        let mut store = require(ProductStore::create_a01_isolated_test_store(
+            &dir.0, "foundation.sqlite", config(), clock(),
+        ));
+        prepare_admission(&mut store);
+        if reopened {
+            drop(store);
+            store = require(ProductStore::reopen_a01_isolated_test_store(
+                &dir.0, "foundation.sqlite", config(), clock(),
+            ));
+        }
+        require(validate_a01_pragmas(&store.conn));
+        (dir, store)
+    }
+
+    type State = BTreeMap<String, Vec<Vec<Value>>>;
+    fn state(conn: &Connection) -> State {
+        let mut schema = require(conn.prepare(
+            "SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name"
+        ));
+        let names = require(require(schema.query_map([], |row| row.get::<_, String>(0)))
+            .collect::<rusqlite::Result<Vec<_>>>());
+        let mut all = BTreeMap::new();
+        for name in names {
+            let escaped = name.replace('"', "\"\"");
+            let query = require(conn.prepare(&format!("SELECT * FROM \"{escaped}\"")));
+            let width = query.column_count();
+            let order = (1..=width).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+            let mut query = require(conn.prepare(&format!("SELECT * FROM \"{escaped}\" ORDER BY {order}")));
+            let rows = require(require(query.query_map([], |row| {
+                (0..width).map(|i| row.get::<_, Value>(i)).collect::<rusqlite::Result<Vec<_>>>()
+            })).collect::<rusqlite::Result<Vec<_>>>());
+            all.insert(name, rows);
+        }
+        all
+    }
+
+    const BINDING_COLUMNS: &[(&str, bool)] = &[("result_id", false), ("order_id", false), ("lifecycle", true), ("attempt", true), ("run_id", true), ("activation", true), ("generation", true), ("host_result_digest", false), ("tuple_digest", false), ("binding_digest", false), ("payload_json", false), ("receipt_json", false)];
+    const TUPLE_COLUMNS: &[(&str, bool)] = &[("order_id", false), ("attempt", true), ("run_id", true), ("generation", true), ("immutable_commit", false), ("artifact_location", false), ("generations_json", false)];
+    const LEGACY_COLUMNS: &[(&str,bool)] = &[("order_id",false),("attempt",true),("run_id",true),("generation",true)];
+    const TUPLE_TABLE: &str = "artifact_tuples";
+    const LEGACY_TABLE: &str = "product_result_legacy_tuples_v1";
+    const GUARDS: [&str; 3] = [
+        r#"CREATE TRIGGER product_result_bindings_no_replace
+BEFORE INSERT ON product_result_bindings_v1
+WHEN EXISTS(
+  SELECT 1
+  FROM product_result_bindings_v1 r
+  WHERE r.result_id=NEW.result_id
+     OR (
+       r.order_id=NEW.order_id
+       AND r.lifecycle=NEW.lifecycle
+       AND r.attempt=NEW.attempt
+       AND r.run_id=NEW.run_id
+       AND r.activation=NEW.activation
+       AND r.generation=NEW.generation
+     )
+     OR (
+       r.order_id=NEW.order_id
+       AND r.attempt=NEW.attempt
+       AND r.run_id=NEW.run_id
+       AND r.generation=NEW.generation
+     )
+     OR (
+       r.result_id=NEW.result_id
+       AND r.binding_digest=NEW.binding_digest
+       AND r.tuple_digest=NEW.tuple_digest
+     )
+)
+BEGIN
+  SELECT RAISE(ROLLBACK,'product result already exists');
+END;"#,
+r#"CREATE TRIGGER product_result_bindings_no_legacy_tuple
+BEFORE INSERT ON product_result_bindings_v1
+WHEN EXISTS(
+  SELECT 1
+  FROM product_result_legacy_tuples_v1 t
+  WHERE t.order_id=NEW.order_id
+    AND t.attempt=NEW.attempt
+    AND t.run_id=NEW.run_id
+    AND t.generation=NEW.generation
+)
+BEGIN
+  SELECT RAISE(ROLLBACK,'legacy tuple cannot be adopted');
+END;"#,
+r#"CREATE TRIGGER product_result_bindings_a01_deny_all
+BEFORE INSERT ON product_result_bindings_v1
+BEGIN
+  SELECT RAISE(ROLLBACK,'A01 result binding is disabled');
+END;"#
+    ];
+    const GUARD_NAMES: [&str; 3] = [
+        "product_result_bindings_no_replace", "product_result_bindings_no_legacy_tuple", "product_result_bindings_a01_deny_all"
+    ];
+    const MESSAGES: &[&str] = &[
+        "product result already exists", "legacy tuple cannot be adopted", "A01 result binding is disabled"
+    ];
+    const COLLISION_COLUMNS: [&[&str]; 4] = [
+        &["result_id"],
+&["order_id", "lifecycle", "attempt", "run_id", "activation", "generation"],
+&["order_id", "attempt", "run_id", "generation"],
+&["result_id", "binding_digest", "tuple_digest"]
+    ];
+    const CONFLICT_TARGETS: [&[&str]; 4] = [
+        &["result_id"],
+&["order_id", "lifecycle", "attempt", "run_id", "activation", "generation"],
+&["order_id", "attempt", "run_id", "generation"],
+&["result_id", "binding_digest", "tuple_digest"]
+    ];
+    const EPOCH_WRITE: &str = "UPDATE product_meta_v1 SET recovery_epoch = recovery_epoch + 1";
+
+    fn structural_values(columns: &[(&str, bool)], seed: i64) -> Vec<Value> {
+        columns.iter().map(|(column, integer)| {
+            if *integer { Value::Integer(seed) }
+            else { Value::Text(format!("structural-{seed}-{column}")) }
+        }).collect()
+    }
+
+    fn placeholders(len: usize) -> String {
+        (1..=len).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",")
+    }
+
+    fn insertion(table: &str, columns: &[(&str, bool)]) -> String {
+        let names = columns.iter().map(|(name, _)| *name).collect::<Vec<_>>().join(",");
+        format!("INSERT INTO {table} ({names}) VALUES ({})", placeholders(columns.len()))
+    }
+
+    fn tuple_values(binding: &[Value], seed: i64) -> Vec<Value> {
+        let mut values = structural_values(TUPLE_COLUMNS, seed);
+        for (i, (name, _)) in TUPLE_COLUMNS.iter().enumerate() {
+            if let Some(j) = BINDING_COLUMNS.iter().position(|(candidate, _)| candidate == name) {
+                values[i] = binding[j].clone();
+            }
+        }
+        values
+    }
+
+    fn earlier_writes(conn: &Connection, binding: &[Value]) {
+        assert!(require(conn.execute(EPOCH_WRITE, [])) == 1, "A01 independent write missing");
+        let tuple = tuple_values(binding, 99);
+        let legacy_exists: bool = require(conn.query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM {TUPLE_TABLE}
+                 WHERE order_id=?1 AND attempt=?2 AND run_id=?3 AND generation=?4)"
+            ),
+            rusqlite::params![tuple[0], tuple[1], tuple[2], tuple[3]],
+            |row| row.get(0),
+        ));
+        if !legacy_exists {
+            assert!(require(conn.execute(
+                &insertion(TUPLE_TABLE, TUPLE_COLUMNS),
+                params_from_iter(tuple_values(binding, 99).iter()),
+            )) == 1, "A01 structural tuple missing");
+        }
+    }
+
+    fn trigger_denial(error: &rusqlite::Error) {
+        assert!(matches!(error, rusqlite::Error::SqliteFailure(code, Some(message))
+            if code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER
+            && MESSAGES.contains(&message.as_str())), "A01 trigger denial missing");
+    }
+
+    fn ended_transaction(conn: &Connection) {
+        assert!(conn.is_autocommit(), "A01 denied transaction remained active");
+        let commit = conn.execute_batch("COMMIT");
+        assert!(matches!(commit, Err(rusqlite::Error::SqliteFailure(_, Some(ref message)))
+            if message == "cannot commit - no transaction is active"),
+            "A01 commit unexpectedly survived denial");
+    }
+
+    fn raw_probe(conn: &Connection, sql: &str, values: &[Value], binding: &[Value]) {
+        let before = state(conn);
+        require(conn.execute_batch("BEGIN IMMEDIATE"));
+        earlier_writes(conn, binding);
+        let result = conn.execute(sql, params_from_iter(values.iter()));
+        let error = match result { Err(error) => error, Ok(_) => panic!("A01 binding unexpectedly inserted") };
+        trigger_denial(&error);
+        ended_transaction(conn);
+        assert!(state(conn) == before, "A01 denial changed committed baseline");
+        require(conn.execute_batch("BEGIN IMMEDIATE; COMMIT"));
+    }
+
+    fn independently_preserved(dir: &PrivateDir, expected: &State) {
+        let observer = require(Connection::open_with_flags(
+            dir.0.join("foundation.sqlite"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ));
+        assert!(state(&observer) == *expected, "A01 durable baseline changed");
+        drop(observer);
+        let reopened = require(ProductStore::reopen_a01_isolated_test_store(
+            &dir.0, "foundation.sqlite", config(), clock(),
+        ));
+        require(validate_a01_pragmas(&reopened.conn));
+        assert!(state(&reopened.conn) == *expected, "A01 checked reopen changed baseline");
+    }
+
+    #[test]
+    fn a01_binding_raw_catch_and_commit_rolls_back_transaction() {
+        for reopened in [false, true] {
+            let (dir, store) = marked(reopened);
+            let before = state(&store.conn);
+            let binding = structural_values(BINDING_COLUMNS, 17);
+            raw_probe(&store.conn, &insertion("product_result_bindings_v1", BINDING_COLUMNS), &binding, &binding);
+            drop(store);
+            independently_preserved(&dir, &before);
+        }
+    }
+
+    // This proves finalizer-style error propagation at the SQL boundary only.
+    fn typed_insert(
+        tx: &rusqlite::Transaction<'_>,
+        binding: &[Value],
+        observed: &mut Option<rusqlite::Error>,
+    ) -> Result<(), result::ProductResultError> {
+        tx.execute(&insertion("product_result_bindings_v1", BINDING_COLUMNS), params_from_iter(binding.iter()))
+            .map_err(|error| {
+                *observed = Some(error);
+                result::ProductResultError::Conflict
+            })?;
+        Ok(())
+    }
+
+    #[test]
+    fn a01_binding_typed_error_rolls_back_before_wrapper_drop() {
+        for reopened in [false, true] {
+            let (dir, mut store) = marked(reopened);
+            let before = state(&store.conn);
+            let binding = structural_values(BINDING_COLUMNS, 23);
+            let tx = require(store.conn.transaction_with_behavior(TransactionBehavior::Immediate));
+            earlier_writes(&tx, &binding);
+            let mut observed = None;
+            assert!(matches!(typed_insert(&tx, &binding, &mut observed),
+                Err(result::ProductResultError::Conflict)), "A01 typed denial missing");
+            let error = match observed { Some(error) => error, None => panic!("A01 SQL denial missing") };
+            trigger_denial(&error);
+            // Observe while the wrapper is still alive; its destructor is not the rollback witness.
+            assert!(tx.is_autocommit(), "A01 typed transaction remained active");
+            assert!(matches!(tx.commit(), Err(rusqlite::Error::SqliteFailure(_, Some(ref message)))
+                if message == "cannot commit - no transaction is active"),
+                "A01 typed commit unexpectedly survived denial");
+            assert!(state(&store.conn) == before, "A01 typed denial changed baseline");
+            require(store.conn.execute_batch("BEGIN IMMEDIATE; COMMIT"));
+            drop(store);
+            independently_preserved(&dir, &before);
+        }
+    }
+
+    fn forms() -> Vec<String> {
+        let base = insertion("product_result_bindings_v1", BINDING_COLUMNS);
+        let mut forms = vec![base.clone()];
+        for action in ["IGNORE", "REPLACE", "ABORT", "FAIL", "ROLLBACK"] {
+            forms.push(base.replacen("INSERT", &format!("INSERT OR {action}"), 1));
+        }
+        forms.push(format!("{base} ON CONFLICT DO NOTHING"));
+        forms.push(format!("{base} ON CONFLICT DO UPDATE SET result_id=excluded.result_id"));
+        for target in CONFLICT_TARGETS {
+            for action in ["DO NOTHING", "DO UPDATE SET result_id=excluded.result_id"] {
+                forms.push(format!("{base} ON CONFLICT ({}) {action}", target.join(",")));
+            }
+        }
+        forms
+    }
+
+    #[test]
+    fn a01_binding_input_forms_and_nulls_deny_on_fresh_and_reopen() {
+        for reopened in [false, true] {
+            let (dir, store) = marked(reopened);
+            let before = state(&store.conn);
+            let binding = structural_values(BINDING_COLUMNS, 31);
+            for sql in forms() { raw_probe(&store.conn, &sql, &binding, &binding); }
+            let sql = insertion("product_result_bindings_v1", BINDING_COLUMNS);
+            for i in 0..binding.len() {
+                let mut values = binding.clone();
+                values[i] = Value::Null;
+                raw_probe(&store.conn, &sql, &values, &binding);
+            }
+            raw_probe(&store.conn, &sql, &vec![Value::Null; binding.len()], &binding);
+            raw_probe(&store.conn, "INSERT INTO product_result_bindings_v1 DEFAULT VALUES", &[], &binding);
+            drop(store);
+            independently_preserved(&dir, &before);
+        }
+    }
+
+    fn multirow_forms() -> [String; 2] {
+        let base = insertion("product_result_bindings_v1", BINDING_COLUMNS);
+        let names = BINDING_COLUMNS.iter().map(|(name, _)| *name).collect::<Vec<_>>().join(",");
+        let slots = placeholders(BINDING_COLUMNS.len());
+        [
+            format!("{base}, ({slots})"),
+            format!("INSERT INTO product_result_bindings_v1 ({names}) SELECT {slots} UNION ALL SELECT {slots}"),
+        ]
+    }
+
+    #[test]
+    fn a01_binding_multirow_denial_preserves_committed_evidence() {
+        for reopened in [false, true] {
+            let (dir, store) = marked(reopened);
+            let before = state(&store.conn);
+            let binding = structural_values(BINDING_COLUMNS, 37);
+            for sql in multirow_forms() { raw_probe(&store.conn, &sql, &binding, &binding); }
+            drop(store);
+            independently_preserved(&dir, &before);
+        }
+    }
+
+    // Deliberately synthetic ordinary-schema laboratory. Never returned by a product opener.
+    fn laboratory(case: usize, order: &[usize], rollback: bool) -> (Connection, Vec<Value>) {
+        let mut conn = require(Connection::open_in_memory());
+        let tx = require(conn.transaction_with_behavior(TransactionBehavior::Immediate));
+        require(initialize_product_schema_in(&tx, &config(), StoreOpenMode::Normal));
+        require(tx.commit());
+        require(conn.pragma_update(None, "foreign_keys", false));
+
+        // Temporarily remove insertion guards solely for synthetic laboratory seeding.
+        let guards: Vec<(String, String)> = {
+            let mut statement = require(conn.prepare(
+                "SELECT name,sql FROM sqlite_schema WHERE type='trigger' AND (tbl_name=?1 OR tbl_name=?2) AND sql LIKE '%BEFORE INSERT%'"
+            ));
+            require(require(statement.query_map(
+                rusqlite::params!["product_result_bindings_v1", LEGACY_TABLE],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )).collect::<rusqlite::Result<Vec<_>>>())
+        };
+        for (name, _) in &guards { require(conn.execute_batch(&format!("DROP TRIGGER {name}"))); }
+        let seed = structural_values(BINDING_COLUMNS, 51);
+        let mut candidate = structural_values(BINDING_COLUMNS, 61);
+        if case < 4 || case == 5 {
+            let matching = if case == 5 { COLLISION_COLUMNS[0] } else { COLLISION_COLUMNS[case] };
+            for name in matching {
+                let i = match BINDING_COLUMNS.iter().position(|(column, _)| column == name) {
+                    Some(i) => i, None => panic!("A01 structural collision key missing"),
+                };
+                candidate[i] = seed[i].clone();
+            }
+            assert!(require(conn.execute(&insertion("product_result_bindings_v1", BINDING_COLUMNS),
+                params_from_iter(seed.iter()))) == 1, "A01 laboratory seed missing");
+        }
+        if case == 4 || case == 5 {
+            let mut values = structural_values(LEGACY_COLUMNS, 71);
+            for (i, (name, _)) in LEGACY_COLUMNS.iter().enumerate() {
+                if let Some(j) = BINDING_COLUMNS.iter().position(|(column, _)| column == name) {
+                    values[i] = candidate[j].clone();
+                }
+            }
+            assert!(require(conn.execute(&insertion(LEGACY_TABLE, LEGACY_COLUMNS),
+                params_from_iter(values.iter()))) == 1, "A01 laboratory legacy seed missing");
+        }
+        // Restore the original census and other insertion guards before installing the tested delta.
+        for (_, sql) in &guards { require(conn.execute_batch(sql)); }
+        require(conn.pragma_update(None, "foreign_keys", true));
+        require(conn.pragma_update(None, "recursive_triggers", true));
+        for name in &GUARD_NAMES[..2] { require(conn.execute_batch(&format!("DROP TRIGGER {name}"))); }
+        for index in order {
+            let sql = if rollback { GUARDS[*index].to_owned() }
+                else { require(guards.iter().find(|(name, _)| name.as_str() == GUARD_NAMES[*index])
+                    .map(|(_, sql)| sql.clone()).ok_or(())) };
+            require(conn.execute_batch(&sql));
+        }
+        (conn, candidate)
+    }
+
+    #[test]
+    fn a01_binding_structural_conflict_matrix_rolls_back() {
+        // Six-column overlap also hits the four-column key; digest overlap also hits the primary key.
+        for case in 0..7 {
+            let (conn, binding) = laboratory(case, &[0, 1, 2], true);
+            for sql in forms().into_iter().chain(multirow_forms()) {
+                raw_probe(&conn, &sql, &binding, &binding);
+            }
+        }
+    }
+
+    #[test]
+    fn a01_binding_structural_trigger_orders_are_independent() {
+        for order in [[0,1,2], [0,2,1], [1,0,2], [1,2,0], [2,0,1], [2,1,0]] {
+            for case in 0..7 {
+                let (conn, binding) = laboratory(case, &order, true);
+                raw_probe(&conn, &insertion("product_result_bindings_v1", BINDING_COLUMNS), &binding, &binding);
+            }
+        }
+        // Incomplete enforcement exists only in the laboratory, to discriminate each replacement.
+        for case in 0..6 {
+            let guard_name = if case == 4 {
+                "product_result_bindings_no_legacy_tuple"
+            } else {
+                "product_result_bindings_no_replace"
+            };
+            let guard = require(GUARD_NAMES.iter().position(|name| *name == guard_name).ok_or(()));
+            let (conn, binding) = laboratory(case, &[guard], true);
+            for sql in forms().into_iter().chain(multirow_forms()) {
+                raw_probe(&conn, &sql, &binding, &binding);
+            }
+        }
+    }
+
+    #[test]
+    fn a01_binding_probe_distinguishes_abort_from_rollback() {
+        let (conn, binding) = laboratory(0, &[0], false);
+        let before = state(&conn);
+        let baseline_epoch: i64 = require(conn.query_row(
+            "SELECT recovery_epoch FROM product_meta_v1", [], |row| row.get(0),
+        ));
+        require(conn.execute_batch("BEGIN IMMEDIATE"));
+        earlier_writes(&conn, &binding);
+        let error = match conn.execute(&insertion("product_result_bindings_v1", BINDING_COLUMNS),
+            params_from_iter(binding.iter())) {
+            Err(error) => error, Ok(_) => panic!("A01 ordinary duplicate guard missing"),
+        };
+        trigger_denial(&error);
+        assert!(!conn.is_autocommit(), "A01 ABORT calibration lost transaction");
+        require(conn.execute_batch("COMMIT"));
+        assert!(state(&conn) != before, "A01 ABORT calibration lost earlier writes");
+        // Prove both independent effects survived the explicit commit.
+        let prior_epoch: i64 = require(conn.query_row(
+            "SELECT recovery_epoch FROM product_meta_v1", [], |row| row.get(0),
+        ));
+        assert!(prior_epoch == baseline_epoch + 1, "A01 ABORT calibration epoch missing");
+        let tuples: i64 = require(conn.query_row(
+            &format!("SELECT count(*) FROM {TUPLE_TABLE}"), [], |row| row.get(0),
+        ));
+        assert!(tuples == 1, "A01 ABORT calibration tuple missing");
+    }
+
+    #[test]
+    fn a01_binding_structural_carrier_multirow_rolls_back_earlier_rows() {
+        let (conn, binding) = laboratory(6, &[0, 1, 2], true);
+        require(conn.execute_batch("CREATE TABLE foundation_carrier(position INTEGER PRIMARY KEY)"));
+        let literals = binding.iter().map(|value| match value {
+            Value::Integer(value) => value.to_string(),
+            Value::Text(value) => format!("'{}'", value.replace('\'', "''")),
+            _ => panic!("A01 carrier structural value unsupported"),
+        }).collect::<Vec<_>>().join(",");
+        let names = BINDING_COLUMNS.iter().map(|(name, _)| *name).collect::<Vec<_>>().join(",");
+        require(conn.execute_batch(&format!(
+            "CREATE TRIGGER foundation_carrier_second AFTER INSERT ON foundation_carrier
+             WHEN NEW.position=2 BEGIN INSERT INTO product_result_bindings_v1 ({names}) VALUES ({literals}); END"
+        )));
+        let before = state(&conn);
+        require(conn.execute_batch("BEGIN IMMEDIATE"));
+        earlier_writes(&conn, &binding);
+        let error = match conn.execute("INSERT INTO foundation_carrier VALUES (1),(2)", []) {
+            Err(error) => error, Ok(_) => panic!("A01 carrier denial missing"),
+        };
+        trigger_denial(&error);
+        ended_transaction(&conn);
+        assert!(state(&conn) == before, "A01 carrier earlier row survived rollback");
+        require(conn.execute_batch("BEGIN IMMEDIATE; COMMIT"));
+    }
+
+    #[test]
+    fn a01_binding_initialization_is_atomic() {
+        for step in 0..8 {
+            let dir = PrivateDir::new();
+            let result = ProductStore::create_a01_isolated_test_store_with_checkpoint(
+                &dir.0, "foundation.sqlite", config(), clock(), Some(step),
+            );
+            assert!(matches!(result, Err(ProductError::Invariant("A01 initialization checkpoint"))),
+                "A01 initialization checkpoint was not reached");
+            let observer = require(Connection::open_with_flags(
+                dir.0.join("foundation.sqlite"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            ));
+            let objects: i64 = require(observer.query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'", [], |row| row.get(0),
+            ));
+            let discriminator: i64 = require(observer.pragma_query_value(None, "user_version", |row| row.get(0)));
+            assert!(objects == 0 && discriminator == 0, "A01 failed initialization left schema or marker");
+        }
+    }
+    #[test]
+    fn a01_binding_foundation_history_census() {
+        // Only the census helper sees these synthetic ordinary-schema laboratory rows.
+        let (empty, binding) = laboratory(6, &[0, 1, 2], true);
+        require(validate_a01_binding_history(&empty));
+        require(empty.execute(&insertion(TUPLE_TABLE, TUPLE_COLUMNS),
+            params_from_iter(tuple_values(&binding, 97).iter())));
+        require(validate_a01_binding_history(&empty));
+        let (populated, _) = laboratory(0, &[0, 1, 2], true);
+        assert!(matches!(validate_a01_binding_history(&populated),
+            Err(ProductError::ContractMismatch)), "A01 binding history was adopted");
+    }
+    #[test]
+    fn a01_binding_exact_schema_delta_is_marked_only() {
+        let (_dir, store) = marked(false);
+        let actual = require(a01_schema_definitions(&store.conn));
+        let mut ordinary = require(Connection::open_in_memory());
+        let tx = require(ordinary.transaction_with_behavior(TransactionBehavior::Immediate));
+        require(initialize_product_schema_in(&tx, &config(), StoreOpenMode::Normal));
+        require(tx.commit());
+        let mut expected = require(a01_schema_definitions(&ordinary));
+        let tokens = |sql: &str| sql.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+        for index in 0..3 {
+            let row = (
+                "trigger".to_owned(), GUARD_NAMES[index].to_owned(),
+                "product_result_bindings_v1".to_owned(),
+                Some(GUARDS[index].trim_end_matches(';').to_owned()),
+            );
+            if index < 2 {
+                let original = require(expected.iter_mut().find(|item| item.1 == GUARD_NAMES[index]).ok_or(()));
+                let sql = require(original.3.as_ref().ok_or(()));
+                assert!(sql.contains("RAISE(ABORT"), "A01 ordinary guard action changed");
+                assert!(tokens(sql) == tokens(&GUARDS[index].trim_end_matches(';').replace("RAISE(ROLLBACK", "RAISE(ABORT")),
+                    "A01 replacement changed ordinary predicate");
+                *original = row;
+            } else {
+                assert!(!expected.iter().any(|item| item.1 == GUARD_NAMES[index]),
+                    "A01 denial leaked into ordinary schema");
+                expected.push(row);
+            }
+        }
+        expected.sort();
+        assert!(actual == expected, "A01 schema changed beyond the exact foundation delta");
+    }
+
+    #[test]
+    fn a01_binding_foundation_tuple_only_reopens() {
+        let (dir, store) = marked(false);
+        let binding = structural_values(BINDING_COLUMNS, 83);
+        assert!(require(store.conn.execute(&insertion(TUPLE_TABLE, TUPLE_COLUMNS),
+            params_from_iter(tuple_values(&binding, 83).iter()))) == 1,
+            "A01 tuple-only write missing");
+        let before = state(&store.conn);
+        drop(store);
+        independently_preserved(&dir, &before);
+    }
+
+    #[test]
+    fn a01_binding_foundation_connection_observations() {
+        fn observe(
+            store: &ProductStore,
+        ) -> Result<(i64, i64, i64, i64, String, i32, bool), ProductError> {
+            let foreign_keys = store.conn
+                .pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
+            let recursive_triggers = store.conn
+                .pragma_query_value(None, "recursive_triggers", |row| row.get(0))?;
+            let ignore_check_constraints = store.conn
+                .pragma_query_value(None, "ignore_check_constraints", |row| row.get(0))?;
+            let busy_timeout = store.conn
+                .pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
+            let journal_mode = store.conn
+                .pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+            let tx = store.conn.unchecked_transaction()?;
+            let denial = tx.execute(
+                "INSERT INTO product_result_bindings_v1 (
+                    result_id, order_id, lifecycle, attempt, run_id, activation, generation,
+                    host_result_digest, tuple_digest, binding_digest, payload_json, receipt_json
+                 ) VALUES (?1, ?1, 1, 1, ?1, 1, 1, ?1, ?1, ?1, '{}', '{}')",
+                ["foundation-observation"],
+            ).err().ok_or_else(|| ProductError::Invariant(
+                "A01 foundation observation unexpectedly admitted a binding".into(),
+            ))?;
+            let ended_transaction = tx.is_autocommit();
+            let extended_code = match denial {
+                rusqlite::Error::SqliteFailure(error, _) => error.extended_code,
+                error => return Err(ProductError::Database(error)),
+            };
+            drop(tx);
+            Ok((
+                foreign_keys,
+                recursive_triggers,
+                ignore_check_constraints,
+                busy_timeout,
+                journal_mode,
+                extended_code,
+                ended_transaction,
+            ))
+        }
+        for reopened in [false, true] {
+            let (_dir, store) = marked(reopened);
+            let before: i64 = require(store.conn.query_row(
+                "SELECT count(*) FROM product_result_bindings_v1", [], |row| row.get(0),
+            ));
+            assert_eq!(before, 0, "A01 foundation binding census mismatch");
+            let (foreign_keys, recursive_triggers, ignore_check_constraints, busy_timeout,
+                journal_mode, denial_code, ended_transaction) = require(observe(&store));
+            assert_eq!(foreign_keys, 1);
+            assert_eq!(recursive_triggers, 1);
+            assert_eq!(ignore_check_constraints, 0);
+            assert!((0..=5000).contains(&busy_timeout));
+            assert_eq!(journal_mode.to_ascii_lowercase(), "delete");
+            assert_eq!(denial_code, rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER);
+            assert!(ended_transaction, "A01 denial must roll back the transaction");
+            let after: i64 = require(store.conn.query_row(
+                "SELECT count(*) FROM product_result_bindings_v1", [], |row| row.get(0),
+            ));
+            assert_eq!(after, 0, "A01 foundation binding census mismatch");
+        }
+    }
+
+}
+
+
+// Bounded experimental task profile. No producer or result authority is granted.
+#[cfg(feature = "a01-harness-support")]
+mod a01_task {
+    use super::*;
+    use serde::{Deserialize, Serialize};
+    const PROFILE: &str = "task-claim-v1";
+    const TASK_KIND: &str = "a01-fixed-v1";
+    const TASK_BYTES: &[u8] = b"foundry-a01-fixed-task-v1\n";
+    const PERMISSION_GUARD_DDL: &str = r#"CREATE TRIGGER product_result_bindings_a01_permission_guard
+BEFORE INSERT ON product_result_bindings_v1
+BEGIN
+  SELECT CASE
+    WHEN t.order_id IS NULL
+      OR p.seq IS NULL
+      OR json_type(p.j,'$.kind') IS NULL
+      OR json_type(t.j,'$.bridge_permission') IS NOT 'object'
+      OR json_type(t.j,'$.bridge_permission.grant_id') IS NOT 'text'
+      OR json_type(t.j,'$.bridge_permission.grant_revision') IS NOT 'integer'
+      OR json_extract(t.j,'$.bridge_permission.grant_revision') <= 0
+      OR json_type(t.j,'$.bridge_permission.subject_id') IS NOT 'text'
+      OR json_type(t.j,'$.bridge_permission.source_instance_id') IS NOT 'text'
+    THEN RAISE(ROLLBACK,'A01 bridge permission not bound')
+
+    WHEN json_extract(t.j,'$.bridge_permission.subject_id') IS NOT t.actor_id
+      OR json_extract(t.j,'$.bridge_permission.source_instance_id')
+           IS NOT t.source_instance_id
+      OR json_extract(t.j,'$.admission.store.installation_id')
+           IS NOT m.installation_id
+      OR json_extract(t.j,'$.admission.store.database_id')
+           IS NOT m.database_id
+      OR json_extract(p.j,'$.kind') IS NOT 'a01-passed-bridge-v1'
+      OR json_extract(p.j,'$.task') IS NOT t.j
+      OR json_extract(p.j,'$.claim') IS NOT json_object(
+           'store',json_object(
+             'installation_id',m.installation_id,
+             'database_id',m.database_id),
+           'order_id',c.order_id,
+           'lifecycle',c.lifecycle,
+           'task_revision',c.task_revision,
+           'delivery_id',c.delivery_id,
+           'worker_id',c.worker_id,
+           'epoch',c.epoch,
+           'fence',c.fence,
+           'claimed_at_ns',c.claimed_at_ns,
+           'lease_until_ns',c.lease_until_ns,
+           'lease_until_text',c.lease_until_text,
+           'source_revision',c.source_revision,
+           'payload_digest',c.payload_digest,
+           'service_id',c.service_id,
+           'service_revision',c.service_revision,
+           'credential_revision',c.credential_revision,
+           'source_instance_id',c.source_instance_id)
+      OR p.order_id IS NOT NEW.order_id
+      OR p.hash IS NOT json_extract(n.j,'$.s1_event_hash')
+      OR p.event IS NOT 'InspectionPassed'
+      OR p.to_state IS NOT 'waiting'
+      OR r.order_id IS NOT NEW.order_id
+      OR r.lifecycle IS NOT NEW.lifecycle
+      OR COALESCE(r.operation IN (
+           'a01-passed-bridge-v1','review-hold-commit-pass'),0) <> 1
+      OR r.expected_predecessor
+           IS NOT json_extract(p.j,'$.predecessor_seq')
+      OR json_extract(p.j,'$.host_key.order') IS NOT NEW.order_id
+      OR json_extract(p.j,'$.host_key.attempt') IS NOT NEW.attempt
+      OR json_extract(p.j,'$.host_key.run') IS NOT NEW.run_id
+      OR json_extract(p.j,'$.host_key.activation') IS NOT NEW.activation
+      OR json_extract(p.j,'$.host_result_digest')
+           IS NOT NEW.host_result_digest
+      OR json_extract(n.j,'$.work.delivery_id') IS NOT c.delivery_id
+      OR json_extract(n.j,'$.work.worker_id') IS NOT c.worker_id
+      OR json_extract(n.j,'$.work.claim_epoch') IS NOT c.epoch
+      OR json_extract(n.j,'$.work.claim_fence') IS NOT c.fence
+      OR json_extract(n.j,'$.work.source_revision') IS NOT c.source_revision
+      OR json_extract(n.j,'$.work.payload_digest') IS NOT c.payload_digest
+      OR json_extract(n.j,'$.work.authority.service_id') IS NOT t.service_id
+      OR json_extract(n.j,'$.work.authority.service_revision')
+           IS NOT t.service_revision
+      OR json_extract(n.j,'$.work.authority.credential_revision')
+           IS NOT t.credential_revision
+      OR json_extract(n.j,'$.work.authority.drive_review_grant_revision')
+           IS NOT t.drive_review_grant_revision
+      OR json_extract(n.j,'$.work.authority.source_instance_id')
+           IS NOT t.source_instance_id
+      OR json_extract(n.j,'$.work.authority.source_generation')
+           IS NOT t.source_generation
+      OR json_extract(n.j,'$.work.authority.source_instance_revision')
+           IS NOT t.source_instance_revision
+      OR json_extract(n.j,'$.work.authority.connector_revision')
+           IS NOT t.connector_revision
+      OR o.hash IS NOT json_extract(p.j,'$.output_event_hash')
+      OR o.order_id IS NOT NEW.order_id
+      OR ro.operation IS NOT 'a01-producer-output-v1'
+      OR ro.lifecycle IS NOT NEW.lifecycle
+      OR json_extract(o.j,'$.task') IS NOT t.j
+      OR json_extract(o.j,'$.claim') IS NOT json_extract(p.j,'$.claim')
+      OR json_extract(o.j,'$.base_commit')
+           IS NOT json_extract(n.j,'$.host_result.base_commit')
+      OR json_extract(o.j,'$.result_commit')
+           IS NOT json_extract(n.j,'$.host_result.generations[0].commit')
+    THEN RAISE(ROLLBACK,'A01 bridge permission identity mismatch')
+
+    WHEN t.operation IS NOT 'authorize'
+      OR t.revision IS NOT (
+           SELECT MAX(x.revision)
+           FROM product_a01_task_revisions_v1 x
+           WHERE x.order_id=NEW.order_id AND x.lifecycle=NEW.lifecycle)
+      OR g.enabled IS NOT 1
+      OR g.grant_id IS NOT json_extract(t.j,'$.bridge_permission.grant_id')
+      OR g.grant_revision
+           IS NOT json_extract(t.j,'$.bridge_permission.grant_revision')
+      OR a.enabled IS NOT 1
+      OR a.role IS NOT 'owner'
+      OR a.revision IS NOT t.actor_account_revision
+      OR sr.revision IS NOT t.actor_scope_revision
+      OR rg.enabled IS NOT 1
+      OR rg.grant_revision IS NOT t.read_order_grant_revision
+    THEN RAISE(ROLLBACK,'A01 bridge permission revoked')
+    ELSE NULL
+  END
+  FROM (
+    SELECT CASE WHEN json_valid(NEW.payload_json)
+      THEN NEW.payload_json ELSE '{}' END AS j
+  ) n
+  LEFT JOIN product_meta_v1 m ON m.singleton=1
+  LEFT JOIN product_a01_claim_snapshots_v1 c
+    ON c.order_id=NEW.order_id AND c.lifecycle=NEW.lifecycle
+  LEFT JOIN (
+    SELECT *,CASE WHEN json_valid(CAST(receipt_bytes AS TEXT))
+      THEN CAST(receipt_bytes AS TEXT) ELSE '{}' END AS j
+    FROM product_a01_task_revisions_v1
+  ) t ON t.order_id=c.order_id AND t.lifecycle=c.lifecycle
+       AND t.revision=c.task_revision
+  LEFT JOIN (
+    SELECT *,CASE WHEN json_valid(intent)
+      THEN intent ELSE '{}' END AS j FROM ledger
+  ) p ON p.seq=json_extract(n.j,'$.s1_sequence')
+  LEFT JOIN product_transition_receipts_v1 r
+    ON r.seq=p.seq AND r.event_hash=p.hash
+  LEFT JOIN (
+    SELECT *,CASE WHEN json_valid(intent)
+      THEN intent ELSE '{}' END AS j FROM ledger
+  ) o ON o.seq=json_extract(p.j,'$.output_sequence')
+  LEFT JOIN product_transition_receipts_v1 ro
+    ON ro.seq=o.seq AND ro.event_hash=o.hash
+  LEFT JOIN product_scope_grants_v1 g
+    ON g.subject_id=t.actor_id
+       AND g.source_instance_id=t.source_instance_id
+       AND g.capability='a01_bridge_passed'
+  LEFT JOIN product_accounts_v1 a ON a.actor_id=t.actor_id
+  LEFT JOIN product_scope_subject_revisions_v1 sr
+    ON sr.subject_id=t.actor_id
+       AND sr.source_instance_id=t.source_instance_id
+  LEFT JOIN product_scope_grants_v1 rg
+    ON rg.subject_id=t.actor_id
+       AND rg.source_instance_id=t.source_instance_id
+       AND rg.capability='read_order';
+END;"#;
+
+    const DDL: &[&str] = &[
+r#"CREATE TABLE product_a01_profile_v1 (
+    singleton INTEGER NOT NULL PRIMARY KEY CHECK(singleton = 1),
+    version INTEGER NOT NULL CHECK(version = 1),
+    profile TEXT NOT NULL CHECK(profile = 'task-claim-v1'),
+    installation_id TEXT NOT NULL
+        CHECK(length(CAST(installation_id AS BLOB)) BETWEEN 1 AND 256),
+    database_id TEXT NOT NULL
+        CHECK(length(CAST(database_id AS BLOB)) BETWEEN 1 AND 256)
+) STRICT, WITHOUT ROWID;"#,
+r#"CREATE TABLE product_a01_task_revisions_v1 (
+    profile_singleton INTEGER NOT NULL CHECK(profile_singleton = 1),
+    order_id TEXT NOT NULL
+        CHECK(length(CAST(order_id AS BLOB)) BETWEEN 1 AND 256),
+    lifecycle INTEGER NOT NULL,
+    revision INTEGER NOT NULL,
+    expected_revision INTEGER NOT NULL
+        CHECK(expected_revision >= 0
+          AND expected_revision < 9223372036854775807),
+    operation TEXT NOT NULL CHECK(operation IN ('authorize', 'revoke')),
+    actor_id TEXT NOT NULL
+        CHECK(length(CAST(actor_id AS BLOB)) BETWEEN 1 AND 256),
+    actor_account_revision INTEGER NOT NULL,
+    actor_scope_revision INTEGER NOT NULL,
+    read_order_grant_revision INTEGER NOT NULL,
+    request_key TEXT NOT NULL
+        CHECK(length(CAST(request_key AS BLOB)) BETWEEN 1 AND 128),
+
+    delivery_id TEXT NOT NULL
+        CHECK(length(CAST(delivery_id AS BLOB)) BETWEEN 1 AND 256),
+    admission_seq INTEGER NOT NULL,
+    admission_hash TEXT NOT NULL
+        CHECK(length(CAST(admission_hash AS BLOB)) = 64
+          AND instr(admission_hash, char(0)) = 0
+          AND admission_hash NOT GLOB '*[^0-9a-f]*'),
+    raw_kind TEXT NOT NULL
+        CHECK(length(CAST(raw_kind AS BLOB)) BETWEEN 1 AND 128),
+    raw_payload_digest TEXT NOT NULL
+        CHECK(length(CAST(raw_payload_digest AS BLOB)) = 64
+          AND instr(raw_payload_digest, char(0)) = 0
+          AND raw_payload_digest NOT GLOB '*[^0-9a-f]*'),
+
+    source_instance_id TEXT NOT NULL
+        CHECK(length(CAST(source_instance_id AS BLOB)) BETWEEN 1 AND 256),
+    source_generation INTEGER NOT NULL,
+    source_instance_revision INTEGER NOT NULL,
+    connector_id TEXT NOT NULL
+        CHECK(length(CAST(connector_id AS BLOB)) BETWEEN 1 AND 256),
+    connector_revision INTEGER NOT NULL,
+    repository_key TEXT NOT NULL
+        CHECK(length(CAST(repository_key AS BLOB)) BETWEEN 1 AND 256),
+    repository_provider TEXT NOT NULL
+        CHECK(length(CAST(repository_provider AS BLOB)) BETWEEN 1 AND 128),
+    api_origin TEXT NOT NULL
+        CHECK(length(CAST(api_origin AS BLOB)) BETWEEN 1 AND 2048),
+    stable_repository_id TEXT NOT NULL
+        CHECK(length(CAST(stable_repository_id AS BLOB)) BETWEEN 1 AND 256),
+    api_owner TEXT NOT NULL
+        CHECK(length(CAST(api_owner AS BLOB)) BETWEEN 1 AND 256),
+    api_repo TEXT NOT NULL
+        CHECK(length(CAST(api_repo AS BLOB)) BETWEEN 1 AND 256),
+
+    service_id TEXT NOT NULL
+        CHECK(length(CAST(service_id AS BLOB)) BETWEEN 1 AND 256),
+    service_revision INTEGER NOT NULL,
+    credential_revision INTEGER NOT NULL,
+    drive_review_grant_revision INTEGER NOT NULL,
+    service_lease_until_ns INTEGER NOT NULL
+        CHECK(service_lease_until_ns >= 0),
+    credential_expires_at_ns INTEGER NOT NULL
+        CHECK(credential_expires_at_ns >= 0),
+
+    task_kind TEXT NOT NULL CHECK(task_kind = 'a01-fixed-v1'),
+    task_bytes BLOB NOT NULL
+        CHECK(task_bytes =
+              CAST('foundry-a01-fixed-task-v1' || char(10) AS BLOB)),
+    task_digest TEXT NOT NULL
+        CHECK(length(CAST(task_digest AS BLOB)) = 64
+          AND instr(task_digest, char(0)) = 0
+          AND task_digest NOT GLOB '*[^0-9a-f]*'),
+
+    authorized_at_ns INTEGER NOT NULL CHECK(authorized_at_ns >= 0),
+    expires_at_ns INTEGER NOT NULL,
+    checked_at_ns INTEGER NOT NULL,
+    request_bytes BLOB NOT NULL
+        CHECK(length(request_bytes) BETWEEN 1 AND 65536),
+    receipt_bytes BLOB NOT NULL
+        CHECK(length(receipt_bytes) BETWEEN 1 AND 65536),
+
+    PRIMARY KEY(order_id, lifecycle, revision),
+    UNIQUE(actor_id, request_key),
+
+    CHECK(min(lifecycle, revision, actor_account_revision,
+              actor_scope_revision, read_order_grant_revision,
+              admission_seq, source_generation, source_instance_revision,
+              connector_revision, service_revision, credential_revision,
+              drive_review_grant_revision) > 0),
+    CHECK(revision = expected_revision + 1),
+    CHECK(expires_at_ns > authorized_at_ns),
+    CHECK(checked_at_ns >= authorized_at_ns),
+    CHECK(operation <> 'authorize'
+          OR checked_at_ns = authorized_at_ns),
+
+    FOREIGN KEY(profile_singleton)
+        REFERENCES product_a01_profile_v1(singleton),
+    FOREIGN KEY(order_id)
+        REFERENCES product_orders_v1(order_id),
+    FOREIGN KEY(order_id, lifecycle)
+        REFERENCES product_work_backlog_v1(order_id, lifecycle),
+    FOREIGN KEY(delivery_id)
+        REFERENCES product_intake_inbox_v1(delivery_id),
+    FOREIGN KEY(admission_seq)
+        REFERENCES product_transition_receipts_v1(seq),
+    FOREIGN KEY(actor_id)
+        REFERENCES product_accounts_v1(actor_id),
+    FOREIGN KEY(source_instance_id)
+        REFERENCES product_scope_source_instances_v1(source_instance_id),
+    FOREIGN KEY(repository_key)
+        REFERENCES product_scope_repositories_v1(repository_key),
+    FOREIGN KEY(service_id)
+        REFERENCES product_services_v1(service_id)
+) STRICT, WITHOUT ROWID;"#,
+r#"CREATE TABLE product_a01_claim_snapshots_v1 (
+    order_id TEXT NOT NULL
+        CHECK(length(CAST(order_id AS BLOB)) BETWEEN 1 AND 256),
+    lifecycle INTEGER NOT NULL CHECK(lifecycle > 0),
+    task_revision INTEGER NOT NULL CHECK(task_revision > 0),
+    delivery_id TEXT NOT NULL
+        CHECK(length(CAST(delivery_id AS BLOB)) BETWEEN 1 AND 256),
+    worker_id TEXT NOT NULL
+        CHECK(length(CAST(worker_id AS BLOB)) BETWEEN 1 AND 128),
+    epoch INTEGER NOT NULL CHECK(epoch = 1),
+    fence INTEGER NOT NULL CHECK(fence > 0),
+    claimed_at_ns INTEGER NOT NULL CHECK(claimed_at_ns >= 0),
+    lease_until_ns INTEGER NOT NULL CHECK(lease_until_ns > claimed_at_ns),
+    lease_until_text TEXT NOT NULL
+        CHECK(length(CAST(lease_until_text AS BLOB)) = 30),
+    source_revision INTEGER NOT NULL CHECK(source_revision > 0),
+    payload_digest TEXT NOT NULL
+        CHECK(length(CAST(payload_digest AS BLOB)) = 64
+          AND instr(payload_digest, char(0)) = 0
+          AND payload_digest NOT GLOB '*[^0-9a-f]*'),
+    service_id TEXT NOT NULL
+        CHECK(length(CAST(service_id AS BLOB)) BETWEEN 1 AND 256),
+    service_revision INTEGER NOT NULL CHECK(service_revision > 0),
+    credential_revision INTEGER NOT NULL CHECK(credential_revision > 0),
+    source_instance_id TEXT NOT NULL
+        CHECK(length(CAST(source_instance_id AS BLOB)) BETWEEN 1 AND 256),
+
+    PRIMARY KEY(order_id, lifecycle),
+    UNIQUE(fence),
+
+    FOREIGN KEY(order_id, lifecycle, task_revision)
+        REFERENCES product_a01_task_revisions_v1
+                   (order_id, lifecycle, revision),
+    FOREIGN KEY(order_id, lifecycle)
+        REFERENCES product_work_claims_v1(order_id, lifecycle),
+    FOREIGN KEY(order_id, lifecycle)
+        REFERENCES product_service_work_bindings_v1(order_id, lifecycle),
+    FOREIGN KEY(delivery_id)
+        REFERENCES product_intake_inbox_v1(delivery_id)
+) STRICT, WITHOUT ROWID;"#,
+r#"CREATE TRIGGER product_a01_profile_insert_guard
+BEFORE INSERT ON product_a01_profile_v1
+BEGIN
+    SELECT CASE WHEN
+        EXISTS(SELECT 1 FROM product_a01_profile_v1)
+        OR NOT EXISTS(
+            SELECT 1 FROM product_meta_v1
+            WHERE singleton = 1
+              AND installation_id = NEW.installation_id
+              AND database_id = NEW.database_id
+              AND schema_version = 2561
+        )
+    THEN RAISE(ROLLBACK, 'A01 profile insert denied') END;
+END;"#,
+r#"CREATE TRIGGER product_a01_profile_no_update
+BEFORE UPDATE ON product_a01_profile_v1
+BEGIN
+    SELECT RAISE(ROLLBACK, 'A01 profile is immutable');
+END;"#,
+r#"CREATE TRIGGER product_a01_profile_no_delete
+BEFORE DELETE ON product_a01_profile_v1
+BEGIN
+    SELECT RAISE(ROLLBACK, 'A01 profile is immutable');
+END;"#,
+r#"CREATE TRIGGER product_a01_task_insert_guard
+BEFORE INSERT ON product_a01_task_revisions_v1
+BEGIN
+    SELECT CASE WHEN EXISTS(
+        SELECT 1 FROM product_a01_task_revisions_v1
+        WHERE (order_id = NEW.order_id
+               AND lifecycle = NEW.lifecycle
+               AND revision = NEW.revision)
+           OR (actor_id = NEW.actor_id AND request_key = NEW.request_key)
+    ) THEN RAISE(ROLLBACK, 'A01 task identity already exists') END;
+
+    SELECT CASE WHEN NEW.expected_revision IS NOT COALESCE((
+        SELECT max(revision) FROM product_a01_task_revisions_v1
+        WHERE order_id = NEW.order_id AND lifecycle = NEW.lifecycle
+    ), 0)
+    THEN RAISE(ROLLBACK, 'A01 task revision conflict') END;
+
+    SELECT CASE WHEN COALESCE((
+        SELECT operation FROM product_a01_task_revisions_v1
+        WHERE order_id = NEW.order_id
+          AND lifecycle = NEW.lifecycle
+          AND revision = NEW.expected_revision
+    ), 'none') <> CASE
+        WHEN NEW.operation = 'authorize' AND NEW.expected_revision = 0
+            THEN 'none'
+        WHEN NEW.operation = 'authorize' THEN 'revoke'
+        ELSE 'authorize'
+    END
+    THEN RAISE(ROLLBACK, 'A01 task operation conflict') END;
+
+    SELECT CASE WHEN NEW.operation = 'authorize' AND (
+        EXISTS(
+            SELECT 1 FROM product_work_claims_v1
+            WHERE order_id = NEW.order_id AND lifecycle = NEW.lifecycle
+        )
+        OR EXISTS(
+            SELECT 1 FROM product_a01_claim_snapshots_v1
+            WHERE order_id = NEW.order_id AND lifecycle = NEW.lifecycle
+        )
+    ) THEN RAISE(ROLLBACK, 'A01 task already claimed') END;
+END;"#,
+r#"CREATE TRIGGER product_a01_task_no_update
+BEFORE UPDATE ON product_a01_task_revisions_v1
+BEGIN
+    SELECT RAISE(ROLLBACK, 'A01 task history is immutable');
+END;"#,
+r#"CREATE TRIGGER product_a01_task_no_delete
+BEFORE DELETE ON product_a01_task_revisions_v1
+BEGIN
+    SELECT RAISE(ROLLBACK, 'A01 task history is immutable');
+END;"#,
+r#"CREATE TRIGGER product_a01_claim_insert_guard
+BEFORE INSERT ON product_a01_claim_snapshots_v1
+BEGIN
+    SELECT CASE WHEN EXISTS(
+        SELECT 1 FROM product_a01_claim_snapshots_v1
+        WHERE (order_id = NEW.order_id AND lifecycle = NEW.lifecycle)
+           OR fence = NEW.fence
+    ) THEN RAISE(ROLLBACK, 'A01 claim identity already exists') END;
+
+    SELECT CASE WHEN NOT EXISTS(
+        SELECT 1
+        FROM product_a01_task_revisions_v1 r
+        JOIN product_work_claims_v1 c
+          ON c.order_id = r.order_id AND c.lifecycle = r.lifecycle
+        JOIN product_work_backlog_v1 b
+          ON b.order_id = r.order_id AND b.lifecycle = r.lifecycle
+        JOIN product_service_work_bindings_v1 w
+          ON w.order_id = r.order_id AND w.lifecycle = r.lifecycle
+        WHERE r.order_id = NEW.order_id
+          AND r.lifecycle = NEW.lifecycle
+          AND r.revision = NEW.task_revision
+          AND r.operation = 'authorize'
+          AND r.revision = (
+              SELECT max(x.revision)
+              FROM product_a01_task_revisions_v1 x
+              WHERE x.order_id = r.order_id AND x.lifecycle = r.lifecycle
+          )
+          AND r.delivery_id = NEW.delivery_id
+          AND r.connector_revision = NEW.source_revision
+          AND r.raw_payload_digest = NEW.payload_digest
+          AND r.service_id = NEW.service_id
+          AND r.service_revision = NEW.service_revision
+          AND r.credential_revision = NEW.credential_revision
+          AND r.source_instance_id = NEW.source_instance_id
+          AND NEW.claimed_at_ns >= r.authorized_at_ns
+          AND NEW.claimed_at_ns < r.expires_at_ns
+          AND NEW.lease_until_ns <= min(
+              r.expires_at_ns,
+              r.service_lease_until_ns,
+              r.credential_expires_at_ns
+          )
+          AND c.owner_id = NEW.worker_id
+          AND c.epoch = NEW.epoch
+          AND c.fence = NEW.fence
+          AND c.state = 'claimed'
+          AND c.lease_until = NEW.lease_until_text
+          AND c.source_revision = NEW.source_revision
+          AND c.payload_digest = NEW.payload_digest
+          AND b.delivery_id = NEW.delivery_id
+          AND b.state = 'claimed'
+          AND b.attempts = 1
+          AND w.service_id = NEW.service_id
+          AND w.service_revision = NEW.service_revision
+          AND w.credential_revision = NEW.credential_revision
+          AND w.source_instance_id = NEW.source_instance_id
+    ) THEN RAISE(ROLLBACK, 'A01 claim evidence mismatch') END;
+END;"#,
+r#"CREATE TRIGGER product_a01_claim_no_update
+BEFORE UPDATE ON product_a01_claim_snapshots_v1
+BEGIN
+    SELECT RAISE(ROLLBACK, 'A01 claim snapshot is immutable');
+END;"#,
+r#"CREATE TRIGGER product_a01_claim_no_delete
+BEFORE DELETE ON product_a01_claim_snapshots_v1
+BEGIN
+    SELECT RAISE(ROLLBACK, 'A01 claim snapshot is immutable');
+END;"#,
+    PERMISSION_GUARD_DDL,
+];
+
+    #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct A01TaskStoreRef {
+        pub installation_id:String,
+        pub database_id:String,
+    }
+
+    #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct A01TaskAdmissionExpectation {
+        pub store:A01TaskStoreRef,
+        pub order_id:String,
+        pub lifecycle:i64,
+        pub delivery_id:String,
+        pub admission_seq:i64,
+        pub admission_hash:String,
+        pub raw_kind:String,
+        pub raw_payload_digest:String,
+        pub source_instance_id:String,
+        pub source_generation:i64,
+        pub source_instance_revision:i64,
+        pub connector_id:String,
+        pub connector_revision:i64,
+        pub repository_key:String,
+        pub repository_provider:String,
+        pub api_origin:String,
+        pub stable_repository_id:String,
+        pub api_owner:String,
+        pub api_repo:String,
+    }
+
+    #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct A01TaskOwnerExpectation {
+        pub account_revision:i64,
+        pub scope_revision:i64,
+        pub read_order_grant_revision:i64,
+    }
+
+    #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct A01TaskServiceExpectation {
+        pub service_id:String,
+        pub service_revision:i64,
+        pub credential_revision:i64,
+        pub drive_review_grant_revision:i64,
+        pub service_lease_until_ns:i64,
+        pub credential_expires_at_ns:i64,
+    }
+
+    #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct A01BridgePermissionRef {
+        pub grant_id: String,
+        pub grant_revision: i64,
+        pub subject_id: String,
+        pub source_instance_id: String,
+    }
+
+    #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct A01AuthorizeTaskRequest {
+        pub bridge_permission: A01BridgePermissionRef,
+        pub request_key:String,
+        pub expected_revision:i64,
+        pub admission:A01TaskAdmissionExpectation,
+        pub owner:A01TaskOwnerExpectation,
+        pub service:A01TaskServiceExpectation,
+        pub expires_at_ns:i64,
+    }
+
+    #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct A01RevokeTaskRequest {
+        pub request_key:String,
+        pub expected_revision:i64,
+        pub admission:A01TaskAdmissionExpectation,
+        pub owner:A01TaskOwnerExpectation,
+    }
+
+    #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct A01TaskReceipt {
+        pub bridge_permission: A01BridgePermissionRef,
+        pub version:u32,
+        pub profile:String,
+        pub operation:A01TaskOperation,
+        pub actor_id:String,
+        pub request_key:String,
+        pub expected_revision:i64,
+        pub revision:i64,
+        pub admission:A01TaskAdmissionExpectation,
+        pub owner:A01TaskOwnerExpectation,
+        pub service:A01TaskServiceExpectation,
+        pub task_kind:String,
+        pub task_bytes:Vec<u8>,
+        pub task_digest:String,
+        pub authorized_at_ns:i64,
+        pub expires_at_ns:i64,
+        pub checked_at_ns:i64,
+    }
+
+    #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct A01TaskClaimView {
+        pub store:A01TaskStoreRef,
+        pub order_id:String,
+        pub lifecycle:i64,
+        pub task_revision:i64,
+        pub delivery_id:String,
+        pub worker_id:String,
+        pub epoch:i64,
+        pub fence:i64,
+        pub claimed_at_ns:i64,
+        pub lease_until_ns:i64,
+        pub lease_until_text:String,
+        pub source_revision:i64,
+        pub payload_digest:String,
+        pub service_id:String,
+        pub service_revision:i64,
+        pub credential_revision:i64,
+        pub source_instance_id:String,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum A01TaskOperation { Authorize, Revoke }
+
+    /// Retained by the creator; intentionally has no constructor, Debug or serde.
+    pub struct A01TaskStoreIdentity {
+        installation_id: String,
+        database_id: String,
+        file: A01FileIdentity,
+    }
+
+    impl ProductStore {
+    #[cfg(feature = "a01-harness-support")]
+
+pub fn create_a01_task_claim_test_store(
+        directory: &Path,
+        name: &str,
+        config: ProductConfig,
+        clock: std::sync::Arc<dyn ProductClock>,
+
+    ) -> Result<(ProductStore, A01TaskStoreIdentity), ProductError> {
+        validate_a01_config(&config)?;
+        let path = a01_test_path(directory, name)?;
+        a01_require_absent(&path)?;
+        a01_check_sidecars(&path)?;
+        #[cfg(not(unix))]
+        { let _ = clock; Err(ProductError::InvalidConfig) }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let held = std::fs::OpenOptions::new().read(true).write(true)
+                .create_new(true).mode(0o600).open(&path)
+                .map_err(|_| ProductError::Invariant("A01 exclusive file creation failed"))?;
+            let identity = a01_checked_file(&path, &held)?;
+            // The fresh schema and discriminator share open_internal's one
+            // IMMEDIATE initialization transaction. No ordinary v3 is committed.
+            let mut store = Self::open_internal_with_checkpoint(
+            &path, config, clock, StoreOpenMode::A01TaskCreate,
+            #[cfg(all(test, feature = "a01-harness-support", unix))]
+            None,
+        )?;
+            if a01_checked_file(&path, &held)? != identity {
+                return Err(ProductError::Invariant("A01 physical identity changed"));
+            }
+            a01_check_sidecars(&path)?;
+            store.a01_identity = Some(identity);
+            let retained = A01TaskStoreIdentity {
+                installation_id: store.installation_id.clone(),
+                database_id: store.database_id.clone(), file: identity,
+            };
+            Ok((store, retained))
+        }
+    }
+
+    #[cfg(feature = "a01-harness-support")]
+    pub fn reopen_a01_task_claim_test_store(
+        directory: &Path,
+        name: &str,
+        config: ProductConfig,
+        clock: std::sync::Arc<dyn ProductClock>,
+        retained: &A01TaskStoreIdentity,
+    ) -> Result<ProductStore, ProductError> {
+        validate_a01_config(&config)?;
+        if retained.installation_id != config.installation_id || retained.database_id != config.database_id {
+            return Err(ProductError::ContractMismatch);
+        }
+        let path = a01_test_path(directory, name)?;
+        a01_check_sidecars(&path)?;
+        // A foreign regular file fails the retained identity contract before
+        // checking the permissions required of this store's own file.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|_| ProductError::Invariant("A01 file inspection failed"))?;
+            if metadata.file_type().is_file()
+                && (metadata.dev() != retained.file.device || metadata.ino() != retained.file.inode)
+            {
+                return Err(ProductError::ContractMismatch);
+            }
+        }
+        a01_file_identity(&path)?;
+        let held = std::fs::File::open(&path)
+            .map_err(|_| ProductError::Invariant("A01 file inspection failed"))?;
+        let identity = a01_checked_file(&path, &held)?;
+        if identity != retained.file { return Err(ProductError::ContractMismatch); }
+        // Reject WAL format before SQLite inspection can create WAL/SHM files.
+        #[cfg(unix)]
+        {
+            let header = a01_read_header(&held)?;
+            if &header[..16] != b"SQLite format 3\0" || header[18..20] != [1, 1] {
+                return Err(ProductError::ContractMismatch);
+            }
+        }
+        {
+            let inspection = Connection::open_with_flags(
+                &path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+            inspection.busy_timeout(std::time::Duration::from_secs(5))?;
+            let tx = inspection.unchecked_transaction()?;
+            let journal: String = tx.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+            if journal != "delete" { return Err(ProductError::ContractMismatch); }
+            validate_a01_task_contract(&tx, &config)?;
+            tx.commit()?;
+        }
+        if a01_checked_file(&path, &held)? != identity {
+            return Err(ProductError::Invariant("A01 physical identity changed"));
+        }
+        a01_check_sidecars(&path)?;
+        let conn = Connection::open_with_flags(
+            &path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )?;
+        configure_a01_connection(&conn)?;
+        {
+            let tx = conn.unchecked_transaction()?;
+            validate_a01_task_connection(&tx, &config)?;
+            tx.commit()?;
+        }
+        if a01_checked_file(&path, &held)? != identity {
+            return Err(ProductError::Invariant("A01 physical identity changed"));
+        }
+        a01_check_sidecars(&path)?;
+        Ok(Self {
+            conn,
+            open_mode: StoreOpenMode::A01TaskReopen,
+            a01_identity: Some(identity),
+            path,
+            installation_id: config.installation_id,
+            database_id: config.database_id,
+            clock,
+            #[cfg(feature = "w1-isolated-test-support")]
+            w1_capture_fail_after_legacy_writes: false,
+            #[cfg(feature = "w1-isolated-test-support")]
+            w1_capture_busy_observer: None,
+            review_config: None,
+            artifact_root: None,
+            artifact_root_handle: None,
+            active_review_claim: None,
+            active_review_claim_lock: None,
+            #[cfg(any(test, feature = "p2-test-support"))]
+            charge_budget_observer: None,
+        })
+    }
+
+    }
+
+    #[derive(Default)]
+    pub(super) struct TaskHooks<'a> {
+        #[cfg(all(test, unix))]
+        callback: Option<&'a mut dyn FnMut(&str) -> Result<(), ProductError>>,
+        lifetime: std::marker::PhantomData<&'a ()>,
+    }
+    impl<'a> TaskHooks<'a> {
+        #[cfg(all(test, unix))]
+        pub(super) fn with_callback(callback: &'a mut dyn FnMut(&str) -> Result<(),ProductError>) -> Self {
+            Self{callback:Some(callback),lifetime:std::marker::PhantomData}
+        }
+        fn hit(&mut self, name: &str) -> Result<(), ProductError> {
+            #[cfg(all(test, unix))]
+            if let Some(callback) = self.callback.as_mut() { callback(name)?; }
+            let _ = name;
+            Ok(())
+        }
+    }
+    fn evidence(reason: &'static str) -> ProductError { ProductError::Invariant(reason) }
+    fn unavailable() -> ProductError { ProductError::Invariant("A01 authorization unavailable") }
+    fn conflict() -> ProductError { ProductError::Invariant("A01 revision conflict") }
+    fn ineligible() -> ProductError { ProductError::Invariant("A01 task not eligible") }
+    fn auth_error(e: ProductError) -> ProductError {
+        match e { ProductError::Invariant(_) => unavailable(), ProductError::Database(e)=>stored_error(e), other => other }
+    }
+    fn scope_error(e: ProductError) -> ProductError {
+        match e {
+            ProductError::Invariant("role does not permit capability" | "order scope provenance unavailable" | "repository capability grant unavailable" | "current source instance is unavailable")=>unavailable(),
+            ProductError::Invariant(_)=>evidence("A01 scope invariant invalid"),
+            ProductError::Database(e)=>stored_error(e), other=>other,
+        }
+    }
+    fn stored_error(e: rusqlite::Error) -> ProductError {
+        match e {
+            rusqlite::Error::InvalidColumnType(..) | rusqlite::Error::IntegralValueOutOfRange(..)
+            | rusqlite::Error::FromSqlConversionFailure(..) | rusqlite::Error::QueryReturnedNoRows => evidence("A01 stored row missing or malformed"),
+            other => ProductError::Database(other),
+        }
+    }
+    fn one(n: usize) -> Result<(), ProductError> { if n == 1 { Ok(()) } else { Err(conflict()) } }
+    pub(super) fn finish<T>(tx: rusqlite::Transaction<'_>, result: Result<T, ProductError>, hooks: &mut TaskHooks<'_>) -> Result<T, ProductError> {
+        match result.and_then(|v| { hooks.hit("precommit")?; Ok(v) }) {
+            Ok(v) => { tx.commit()?; Ok(v) }
+            Err(e) => { if !tx.is_autocommit() { tx.rollback()?; } Err(e) }
+        }
+    }
+    pub(super) fn initialize_in(tx: &rusqlite::Transaction<'_>, config: &ProductConfig, hooks: &mut TaskHooks<'_>) -> Result<(), ProductError> {
+        tx.execute_batch("DROP TRIGGER IF EXISTS product_result_bindings_a01_deny_all")?;
+        for (i, ddl) in DDL.iter().enumerate() {
+            tx.execute_batch(ddl)?;
+            hooks.hit(&format!("schema-{i}"))?;
+        }
+        one(tx.execute("INSERT INTO product_a01_profile_v1 VALUES(1,1,?1,?2,?3)", params![PROFILE,config.installation_id,config.database_id])?)?;
+        hooks.hit("profile")
+    }
+    // One strict conversion path for every participating time. Chrono alone
+    // accepts leap seconds and silently consumes fractional digits beyond nine.
+    pub(super) fn time_ns(value: &str) -> Result<i64, ProductError> {
+        let bytes = value.as_bytes();
+        if bytes.len() < 20 || bytes.get(10) != Some(&b'T') || bytes.get(16) != Some(&b':')
+            || !bytes.get(17..19).is_some_and(|v| v.iter().all(u8::is_ascii_digit) && v[0] < b'6') {
+            return Err(evidence("A01 timestamp layout invalid"));
+        }
+        let mut end = 19;
+        if bytes.get(end) == Some(&b'.') {
+            end += 1;
+            let begin = end;
+            while bytes.get(end).is_some_and(u8::is_ascii_digit) { end += 1; }
+            if end == begin { return Err(evidence("A01 timestamp fraction precision invalid: end")); }
+        if end - begin > 9 { return Err(evidence("A01 timestamp fraction precision invalid: end check 2")); }
+        }
+        if !(bytes.get(end..) == Some(&b"Z"[..]) || (bytes.len() == end + 6
+            && matches!(bytes[end], b'+' | b'-') && bytes[end+3] == b':'
+            && bytes[end+1..end+3].iter().all(u8::is_ascii_digit)
+            && bytes[end+4..end+6].iter().all(u8::is_ascii_digit))) { return Err(evidence("A01 timestamp timezone invalid")); }
+        let time = DateTime::parse_from_rfc3339(value).map_err(|_| evidence("A01 RFC3339 timestamp invalid"))?.with_timezone(&Utc);
+        clock_ns(time)
+    }
+    fn clock_ns(time: DateTime<Utc>) -> Result<i64, ProductError> {
+        if time.timestamp_subsec_nanos() >= 1_000_000_000 { return Err(evidence("A01 clock leap second unsupported")); }
+        time.timestamp_nanos_opt().filter(|n| *n >= 0).ok_or_else(|| evidence("A01 clock nanoseconds out of range"))
+    }
+    fn datetime(ns: i64) -> Result<DateTime<Utc>, ProductError> {
+        if ns < 0 { return Err(evidence("A01 datetime nanoseconds negative")); }
+        DateTime::from_timestamp(ns / 1_000_000_000, (ns % 1_000_000_000) as u32).ok_or_else(|| evidence("A01 datetime nanoseconds out of range"))
+    }
+    fn canonical<T: Serialize>(value: &T) -> Result<Vec<u8>, ProductError> {
+        let bytes = serde_json::to_vec(value).map_err(|_| evidence("A01 canonical JSON serialization failed"))?;
+        if bytes.is_empty() || bytes.len() > 65536 { return Err(ProductError::InvalidConfig); }
+        Ok(bytes)
+    }
+    fn decode<T: Serialize + serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, ProductError> {
+        if bytes.is_empty() { return Err(evidence("A01 canonical JSON byte length invalid: bytes.is_empty")); }
+        if bytes.len() > 65536 { return Err(evidence("A01 canonical JSON byte length invalid: bytes.len")); }
+        let value: T = serde_json::from_slice(bytes).map_err(|_| evidence("A01 canonical JSON deserialization failed"))?;
+        if canonical(&value).map_err(|_| evidence("A01 canonical JSON reserialization failed"))? != bytes { return Err(evidence("A01 canonical JSON round-trip mismatch")); }
+        Ok(value)
+    }
+    fn text(value: &str, max: usize) -> bool {
+        !value.trim().is_empty() && value.len() <= max && !value.as_bytes().contains(&0)
+    }
+    fn digest(value: &str) -> bool {
+        value.len() == 64 && value.bytes().all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(&v))
+    }
+    fn validate_admission(a: &A01TaskAdmissionExpectation) -> Result<(), ProductError> {
+        if [a.lifecycle,a.admission_seq,a.source_generation,a.source_instance_revision,a.connector_revision].iter().any(|v| *v <= 0)
+            || [&a.store.installation_id,&a.store.database_id,&a.order_id,&a.delivery_id,&a.source_instance_id,&a.connector_id,&a.repository_key,&a.stable_repository_id,&a.api_owner,&a.api_repo].iter().any(|v| !text(v,256))
+            || !text(&a.raw_kind,128) || !text(&a.repository_provider,128) || !text(&a.api_origin,2048)
+            || !digest(&a.admission_hash) || !digest(&a.raw_payload_digest) { return Err(ProductError::InvalidConfig); }
+        Ok(())
+    }
+    fn validate_owner(o: &A01TaskOwnerExpectation) -> Result<(), ProductError> {
+        if [o.account_revision,o.scope_revision,o.read_order_grant_revision].iter().any(|v| *v <= 0) { return Err(ProductError::InvalidConfig); }
+        Ok(())
+    }
+    fn validate_service(v: &A01TaskServiceExpectation) -> Result<(), ProductError> {
+        if !text(&v.service_id,256) || [v.service_revision,v.credential_revision,v.drive_review_grant_revision].iter().any(|n| *n <= 0)
+            || v.service_lease_until_ns < 0 || v.credential_expires_at_ns < 0 { return Err(ProductError::InvalidConfig); }
+        Ok(())
+    }
+    fn validate_key(key: &str, revision: i64) -> Result<(), ProductError> {
+        if !text(key,128) || !(0..i64::MAX).contains(&revision) { return Err(ProductError::InvalidConfig); }
+        Ok(())
+    }
+    fn task_digest() -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"foundry-product-task-v1\0");
+        for value in [TASK_KIND.as_bytes(), TASK_BYTES] { h.update((value.len() as u64).to_be_bytes()); h.update(value); }
+        hex::encode(h.finalize())
+    }
+    #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Context {
+        service_id: String, service_revision: i64, credential_revision: i64,
+        source_instance_id: String, source_generation: i64, source_instance_revision: i64,
+        connector_revision: i64, source_revision: i64, connector_id: String,
+        api_origin: String, repository_id: String, api_owner: String, api_repo: String,
+    }
+    impl From<&ProductServiceContext> for Context {
+        fn from(c: &ProductServiceContext) -> Self {
+            Self { service_id:c.service_id.clone(),service_revision:c.service_revision,credential_revision:c.credential_revision,
+                source_instance_id:c.source_instance_id.clone(),source_generation:c.source_generation,source_instance_revision:c.source_instance_revision,
+                connector_revision:c.connector_revision,source_revision:c.source_revision,connector_id:c.connector_id.clone(),
+                api_origin:c.api_origin.clone(),repository_id:c.repository_id.clone(),api_owner:c.api_owner.clone(),api_repo:c.api_repo.clone() }
+        }
+    }
+    #[derive(Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct AuthorizeEnvelope {
+        version: u32, profile: String, operation: A01TaskOperation, actor_id: String,
+        request: A01AuthorizeTaskRequest, context: Context, task_kind: String, task_bytes: Vec<u8>,
+    }
+    #[derive(Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct RevokeEnvelope {
+        version: u32, profile: String, operation: A01TaskOperation, actor_id: String, request: A01RevokeTaskRequest,
+    }
+    fn session(tx: &rusqlite::Transaction<'_>, key: &str, now: i64) -> Result<ProductPrincipal, ProductError> {
+        // Explicit strict wrapper: the ordinary resolver intentionally retains its
+        // original RFC3339 behavior outside this profile.
+        let expiry: Option<String> = tx.query_row("SELECT expires_at FROM product_sessions_v1 WHERE session_digest=?1", [key], |r| r.get(0)).optional().map_err(stored_error)?;
+        let expiry = time_ns(&expiry.ok_or_else(unavailable)?)?;
+        let principal = resolve_session_in(tx,key,datetime(now)?).map_err(auth_error)?;
+        if principal.role != "owner" || expiry <= now { return Err(unavailable()); }
+        Ok(principal)
+    }
+    fn visible(tx: &rusqlite::Transaction<'_>, principal: &ProductPrincipal, a: &A01TaskAdmissionExpectation, current: bool) -> Result<ScopedOrderView,ProductError> {
+        let v = require_order_capability_in(tx,principal,&a.order_id,ProductCapability::ReadOrder,current).map_err(scope_error)?;
+        if v.lifecycle != a.lifecycle || v.source_instance_id != a.source_instance_id || v.repository_key != a.repository_key { return Err(unavailable()); }
+        Ok(v)
+    }
+    fn owner(tx: &rusqlite::Transaction<'_>, principal: &ProductPrincipal, a: &A01TaskAdmissionExpectation, expected: &A01TaskOwnerExpectation, current: bool) -> Result<(),ProductError> {
+        let v = visible(tx,principal,a,current)?;
+        if principal.authority_revision != expected.account_revision || v.scope_revision != expected.scope_revision || v.grant_revision != expected.read_order_grant_revision { return Err(unavailable()); }
+        Ok(())
+    }
+    fn issuing_owner(tx: &rusqlite::Transaction<'_>, receipt: &A01TaskReceipt) -> Result<(),ProductError> {
+        let row: Option<(String,i64)> = tx.query_row("SELECT role,revision FROM product_accounts_v1 WHERE actor_id=?1 AND enabled=1", [&receipt.actor_id], |r| Ok((r.get(0)?,r.get(1)?))).optional().map_err(stored_error)?;
+        let (role,revision) = row.ok_or_else(unavailable)?;
+        if role != "owner" { return Err(unavailable()); }
+        owner(tx,&ProductPrincipal{actor_id:receipt.actor_id.clone(),role,authority_revision:revision},&receipt.admission,&receipt.owner,true)
+    }
+    // Reads deadlines without SQL text comparisons and checks independent
+    // connector, instance, credential and action grant revisions.
+    fn authority(tx: &rusqlite::Transaction<'_>, c: &ProductServiceContext, now: i64) -> Result<A01TaskServiceExpectation,ProductError> {
+        let row: Option<(String,String,i64)> = tx.query_row(
+            "SELECT s.lease_until,k.expires_at,g.grant_revision FROM product_services_v1 s JOIN product_service_credentials_v1 k USING(service_id) JOIN product_service_grants_v1 g ON g.service_id=s.service_id JOIN product_scope_source_instances_v1 i ON i.source_instance_id=g.source_instance_id JOIN product_scope_current_sources_v1 cs ON cs.connector_id=i.connector_id AND cs.source_instance_id=i.source_instance_id JOIN product_sources_v1 ps ON ps.connector_id=i.connector_id JOIN product_scope_repositories_v1 r ON r.repository_key=i.repository_key JOIN product_scope_api_locators_v1 l USING(source_instance_id) WHERE s.service_id=?1 AND s.enabled=1 AND s.revision=?2 AND k.credential_revision=?3 AND g.source_instance_id=?4 AND g.action='drive_review' AND g.enabled=1 AND i.enabled=1 AND i.generation=?5 AND i.revision=?6 AND ps.revision=?7 AND ps.enabled=1 AND i.connector_id=?8 AND r.api_origin=?9 AND r.stable_repository_id=?10 AND ps.origin=?9 AND ps.repository_id=?10 AND ps.provider=r.provider AND l.api_owner=?11 COLLATE NOCASE AND l.api_repo=?12 COLLATE NOCASE",
+            params![c.service_id,c.service_revision,c.credential_revision,c.source_instance_id,c.source_generation,c.source_instance_revision,c.connector_revision,c.connector_id,c.api_origin,c.repository_id,c.api_owner,c.api_repo],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(stored_error)?;
+        let (lease,expiry,grant) = row.ok_or_else(unavailable)?;
+        let service_lease_until_ns=time_ns(&lease)?; let credential_expires_at_ns=time_ns(&expiry)?;
+        if c.source_revision != c.connector_revision || grant <= 0 || service_lease_until_ns <= now || credential_expires_at_ns <= now { return Err(unavailable()); }
+        Ok(A01TaskServiceExpectation { service_id:c.service_id.clone(),service_revision:c.service_revision,credential_revision:c.credential_revision,drive_review_grant_revision:grant,service_lease_until_ns,credential_expires_at_ns })
+    }
+    fn context_for(r: &A01TaskReceipt) -> ProductServiceContext {
+        let a=&r.admission; let v=&r.service;
+        ProductServiceContext { service_id:v.service_id.clone(),service_revision:v.service_revision,credential_revision:v.credential_revision,
+            source_instance_id:a.source_instance_id.clone(),source_generation:a.source_generation,source_instance_revision:a.source_instance_revision,
+            connector_revision:a.connector_revision,source_revision:a.connector_revision,connector_id:a.connector_id.clone(),
+            api_origin:a.api_origin.clone(),repository_id:a.stable_repository_id.clone(),api_owner:a.api_owner.clone(),api_repo:a.api_repo.clone() }
+    }
+    fn context_matches(c: &Context, a: &A01TaskAdmissionExpectation, v: &A01TaskServiceExpectation) -> bool {
+        c.service_id==v.service_id && c.service_revision==v.service_revision && c.credential_revision==v.credential_revision
+            && c.source_instance_id==a.source_instance_id && c.source_generation==a.source_generation && c.source_instance_revision==a.source_instance_revision
+            && c.connector_revision==a.connector_revision && c.source_revision==a.connector_revision && c.connector_id==a.connector_id
+            && c.api_origin==a.api_origin && c.repository_id==a.stable_repository_id && c.api_owner.eq_ignore_ascii_case(&a.api_owner) && c.api_repo.eq_ignore_ascii_case(&a.api_repo)
+    }
+    fn admission(tx: &rusqlite::Transaction<'_>, a: &A01TaskAdmissionExpectation) -> Result<(String,String,i64),ProductError> {
+        let store: (String,String) = tx.query_row("SELECT installation_id,database_id FROM product_meta_v1 WHERE singleton=1",[],|r|Ok((r.get(0)?,r.get(1)?))).map_err(stored_error)?;
+        if store != (a.store.installation_id.clone(),a.store.database_id.clone()) { return Err(evidence("A01 admission store identity mismatch")); }
+        let raw: Option<(String,String,String,String,String,String,i64,String)> = tx.query_row(
+            "SELECT o.task_kind,o.payload_snapshot,i.issue_id,i.version_digest,m.observed_updated_at,b.state,b.attempts,b.available_at FROM product_work_backlog_v1 b JOIN product_orders_v1 o ON o.order_id=b.order_id AND o.lifecycle=b.lifecycle JOIN product_intake_inbox_v1 i ON i.delivery_id=b.delivery_id JOIN product_intake_delivery_meta_v1 m USING(delivery_id) JOIN product_order_payload_digests_v1 d ON d.order_id=o.order_id JOIN product_scope_order_provenance_v1 p ON p.order_id=o.order_id AND p.lifecycle=o.lifecycle JOIN product_intake_source_bindings_v1 ib ON ib.delivery_id=i.delivery_id JOIN product_scope_source_instances_v1 si ON si.source_instance_id=p.source_instance_id JOIN product_scope_repositories_v1 sr ON sr.repository_key=si.repository_key JOIN product_transition_receipts_v1 tr ON tr.seq=o.admission_seq WHERE o.order_id=?1 AND o.lifecycle=?2 AND b.delivery_id=?3 AND i.state='acked' AND o.connector_id=?4 AND i.connector_id=o.connector_id AND o.repository_id=?5 AND i.repository_id=o.repository_id AND i.issue_id=o.issue_id AND o.source_revision=?6 AND o.admission_seq=?7 AND o.admission_hash=?8 AND o.task_kind=?9 AND m.task_kind=o.task_kind AND i.payload=o.payload_snapshot AND d.payload_digest=?10 AND p.verified=1 AND p.source_instance_id=?11 AND p.admission_seq=o.admission_seq AND p.admission_hash=o.admission_hash AND ib.source_instance_id=p.source_instance_id AND ib.source_revision=o.source_revision AND ib.source_generation=?12 AND ib.source_instance_revision=?13 AND si.connector_id=o.connector_id AND si.repository_key=?14 AND si.generation=ib.source_generation AND sr.provider=?15 AND sr.api_origin=?16 AND sr.stable_repository_id=o.repository_id AND tr.order_id=o.order_id AND tr.lifecycle=o.lifecycle AND tr.event_hash=o.admission_hash AND tr.operation='github-admission'",
+            params![a.order_id,a.lifecycle,a.delivery_id,a.connector_id,a.stable_repository_id,a.connector_revision,a.admission_seq,a.admission_hash,a.raw_kind,a.raw_payload_digest,a.source_instance_id,a.source_generation,a.source_instance_revision,a.repository_key,a.repository_provider,a.api_origin],
+            |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?))).optional().map_err(stored_error)?;
+        let (kind,payload,issue,version,updated,state,attempts,available)=raw.ok_or_else(|| evidence("A01 admission delivery missing"))?;
+        if payload_digest(&kind,&payload)!=a.raw_payload_digest || delivery_version_digest(&issue,&updated,&kind,&payload)!=version
+            || github_delivery_id(&a.store.installation_id,&a.connector_id,&a.api_origin,&a.stable_repository_id,&issue,&version)!=a.delivery_id { return Err(evidence("A01 admission delivery identity mismatch")); }
+        let (seq,lifecycle,_verified_state)=verified_order_state_in(tx,&a.order_id).map_err(|e| match e {ProductError::Invariant(_)=>evidence("A01 admission ledger state invalid"),other=>other})?;
+        if seq < a.admission_seq { return Err(evidence("A01 admission sequence or lifecycle mismatch: seq")); }
+        if i64::from(lifecycle).checked_add(1)!=Some(a.lifecycle) { return Err(evidence("A01 admission sequence or lifecycle mismatch: from")); }
+        time_ns(&available)?;
+        Ok((payload,state,attempts))
+    }
+    fn no_execution(tx: &rusqlite::Transaction<'_>, a: &A01TaskAdmissionExpectation) -> Result<(),ProductError> {
+        for table in ["product_work_claims_v1","product_a01_claim_snapshots_v1","product_service_work_bindings_v1",
+            "product_review_work_bindings_v1","product_review_runs_v1","product_review_sessions_v1","product_review_host_accept_v1",
+            "product_review_holds_v1","product_review_hold_acceptances_v1","product_review_run_reservations_v1","product_review_active_v1",
+            "product_review_epochs_v1","product_review_host_results_v1","product_review_stages_v1","product_review_budget_v1",
+            "product_review_failures_v1","product_review_redrive_v1","product_artifacts_v1","product_result_bindings_v1"] {
+            let exists: bool=tx.query_row(&format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE order_id=?1)"),[&a.order_id],|r|r.get(0))?;
+            if exists { return Err(ineligible()); }
+        }
+        Ok(())
+    }
+
+    const COLUMNS: &str = "profile_singleton,order_id,lifecycle,revision,expected_revision,operation,actor_id,actor_account_revision,actor_scope_revision,read_order_grant_revision,request_key,delivery_id,admission_seq,admission_hash,raw_kind,raw_payload_digest,source_instance_id,source_generation,source_instance_revision,connector_id,connector_revision,repository_key,repository_provider,api_origin,stable_repository_id,api_owner,api_repo,service_id,service_revision,credential_revision,drive_review_grant_revision,service_lease_until_ns,credential_expires_at_ns,task_kind,task_bytes,task_digest,authorized_at_ns,expires_at_ns,checked_at_ns,request_bytes,receipt_bytes";
+    fn operation(op: A01TaskOperation) -> &'static str { match op { A01TaskOperation::Authorize=>"authorize",A01TaskOperation::Revoke=>"revoke" } }
+    fn values(r: &A01TaskReceipt, request: &[u8]) -> Result<Vec<rusqlite::types::Value>, ProductError> {
+        Ok(vec![
+            rusqlite::types::Value::from(1_i64),
+            rusqlite::types::Value::from(r.admission.order_id.clone()),
+            rusqlite::types::Value::from(r.admission.lifecycle),
+            rusqlite::types::Value::from(r.revision),
+            rusqlite::types::Value::from(r.expected_revision),
+            rusqlite::types::Value::from(operation(r.operation).to_owned()),
+            rusqlite::types::Value::from(r.actor_id.clone()),
+            rusqlite::types::Value::from(r.owner.account_revision),
+            rusqlite::types::Value::from(r.owner.scope_revision),
+            rusqlite::types::Value::from(r.owner.read_order_grant_revision),
+            rusqlite::types::Value::from(r.request_key.clone()),
+            rusqlite::types::Value::from(r.admission.delivery_id.clone()),
+            rusqlite::types::Value::from(r.admission.admission_seq),
+            rusqlite::types::Value::from(r.admission.admission_hash.clone()),
+            rusqlite::types::Value::from(r.admission.raw_kind.clone()),
+            rusqlite::types::Value::from(r.admission.raw_payload_digest.clone()),
+            rusqlite::types::Value::from(r.admission.source_instance_id.clone()),
+            rusqlite::types::Value::from(r.admission.source_generation),
+            rusqlite::types::Value::from(r.admission.source_instance_revision),
+            rusqlite::types::Value::from(r.admission.connector_id.clone()),
+            rusqlite::types::Value::from(r.admission.connector_revision),
+            rusqlite::types::Value::from(r.admission.repository_key.clone()),
+            rusqlite::types::Value::from(r.admission.repository_provider.clone()),
+            rusqlite::types::Value::from(r.admission.api_origin.clone()),
+            rusqlite::types::Value::from(r.admission.stable_repository_id.clone()),
+            rusqlite::types::Value::from(r.admission.api_owner.clone()),
+            rusqlite::types::Value::from(r.admission.api_repo.clone()),
+            rusqlite::types::Value::from(r.service.service_id.clone()),
+            rusqlite::types::Value::from(r.service.service_revision),
+            rusqlite::types::Value::from(r.service.credential_revision),
+            rusqlite::types::Value::from(r.service.drive_review_grant_revision),
+            rusqlite::types::Value::from(r.service.service_lease_until_ns),
+            rusqlite::types::Value::from(r.service.credential_expires_at_ns),
+            rusqlite::types::Value::from(r.task_kind.clone()),
+            rusqlite::types::Value::from(r.task_bytes.clone()),
+            rusqlite::types::Value::from(r.task_digest.clone()),
+            rusqlite::types::Value::from(r.authorized_at_ns),
+            rusqlite::types::Value::from(r.expires_at_ns),
+            rusqlite::types::Value::from(r.checked_at_ns),
+            rusqlite::types::Value::from(request.to_vec()),
+            rusqlite::types::Value::from(canonical(r)?),
+        ])
+    }
+    struct TaskRow { receipt: A01TaskReceipt, request: Vec<u8> }
+    fn read_row(row: &rusqlite::Row<'_>) -> Result<TaskRow,ProductError> {
+        let request: Vec<u8> = row.get(39).map_err(stored_error)?;
+        let bytes: Vec<u8> = row.get(40).map_err(stored_error)?;
+        let receipt: A01TaskReceipt=decode(&bytes)?;
+        validate_receipt(&receipt)?;
+        for (i,expected) in values(&receipt,&request)?.iter().enumerate() {
+            let actual: rusqlite::types::Value=row.get(i).map_err(stored_error)?;
+            if &actual!=expected { return Err(evidence("A01 task row columns differ from receipt")); }
+        }
+        validate_envelope(&receipt,&request)?;
+        Ok(TaskRow{receipt,request})
+    }
+    fn validate_receipt(r: &A01TaskReceipt) -> Result<(),ProductError> {
+        validate_admission(&r.admission).map_err(|_|evidence("A01 task receipt admission invalid"))?;
+        if !text(&r.bridge_permission.grant_id,256) || r.bridge_permission.grant_revision <= 0
+            || !text(&r.bridge_permission.subject_id,256) || !text(&r.bridge_permission.source_instance_id,256)
+            || (r.operation == A01TaskOperation::Authorize && r.bridge_permission.subject_id != r.actor_id)
+            || r.bridge_permission.source_instance_id != r.admission.source_instance_id { return Err(evidence("A01 task receipt bridge permission invalid")); }
+        validate_owner(&r.owner).map_err(|_|evidence("A01 task receipt owner invalid"))?;
+        validate_service(&r.service).map_err(|_|evidence("A01 task receipt service invalid"))?;
+        validate_key(&r.request_key,r.expected_revision).map_err(|_|evidence("A01 task receipt request key invalid"))?;
+        if r.version!=1 || r.profile!=PROFILE || !text(&r.actor_id,256) || r.revision!=r.expected_revision.checked_add(1).ok_or_else(|| evidence("A01 task receipt revision exhausted"))?
+            || r.task_kind!=TASK_KIND || r.task_bytes!=TASK_BYTES || r.task_digest!=task_digest()
+            || r.authorized_at_ns<0 || r.expires_at_ns<=r.authorized_at_ns || r.checked_at_ns<r.authorized_at_ns
+            || (r.operation==A01TaskOperation::Authorize && r.checked_at_ns!=r.authorized_at_ns) { return Err(evidence("A01 task receipt fields invalid")); }
+        Ok(())
+    }
+    fn validate_envelope(r: &A01TaskReceipt, bytes: &[u8]) -> Result<(),ProductError> {
+        match r.operation {
+            A01TaskOperation::Authorize=> {
+                let e: AuthorizeEnvelope=decode(bytes)?;
+                if e.version!=1 || e.profile!=PROFILE || e.operation!=r.operation || e.actor_id!=r.actor_id
+                    || e.request.request_key!=r.request_key || e.request.expected_revision!=r.expected_revision || e.request.admission!=r.admission
+                    || e.request.bridge_permission!=r.bridge_permission || e.request.owner!=r.owner || e.request.service!=r.service || e.request.expires_at_ns!=r.expires_at_ns
+                    || e.task_kind!=TASK_KIND || e.task_bytes!=TASK_BYTES || !context_matches(&e.context,&r.admission,&r.service) { return Err(evidence("A01 task envelope binding mismatch")); }
+            }
+            A01TaskOperation::Revoke=> {
+                let e: RevokeEnvelope=decode(bytes)?;
+                if e.version!=1 || e.profile!=PROFILE || e.operation!=r.operation || e.actor_id!=r.actor_id
+                    || e.request.request_key!=r.request_key || e.request.expected_revision!=r.expected_revision
+                    || e.request.admission!=r.admission || e.request.owner!=r.owner { return Err(evidence("A01 task envelope request mismatch")); }
+            }
+        }
+        Ok(())
+    }
+    fn latest(tx: &Connection, a: &A01TaskAdmissionExpectation) -> Result<Option<TaskRow>,ProductError> {
+        let mut stmt=tx.prepare(&format!("SELECT {COLUMNS} FROM product_a01_task_revisions_v1 WHERE order_id=?1 AND lifecycle=?2 ORDER BY revision DESC LIMIT 1"))?;
+        let mut rows=stmt.query(params![a.order_id,a.lifecycle])?;
+        rows.next()?.map(read_row).transpose()
+    }
+    fn local(tx: &Connection, actor: &str, key: &str) -> Result<Option<TaskRow>,ProductError> {
+        let mut stmt=tx.prepare(&format!("SELECT {COLUMNS} FROM product_a01_task_revisions_v1 WHERE actor_id=?1 AND request_key=?2"))?;
+        let mut rows=stmt.query(params![actor,key])?;
+        rows.next()?.map(read_row).transpose()
+    }
+    fn replay(tx: &rusqlite::Transaction<'_>, principal: &ProductPrincipal, key: &str, request: &[u8]) -> Result<Option<A01TaskReceipt>,ProductError> {
+        let Some(row)=local(tx,&principal.actor_id,key)? else { return Ok(None); };
+        visible(tx,principal,&row.receipt.admission,false)?;
+        if row.request!=request { return Err(ProductError::Invariant("A01 request conflict")); }
+        Ok(Some(row.receipt))
+    }
+    fn insert(tx: &rusqlite::Transaction<'_>, receipt: &A01TaskReceipt, request: &[u8]) -> Result<(),ProductError> {
+        validate_receipt(receipt)?; validate_envelope(receipt,request)?;
+        let values=values(receipt,request)?;
+        let placeholders=vec!["?";values.len()].join(",");
+        one(tx.execute(&format!("INSERT INTO product_a01_task_revisions_v1({COLUMNS}) VALUES({placeholders})"),rusqlite::params_from_iter(values.iter()))?)
+    }
+    impl ProductStore {
+        pub fn authorize_a01_task(&mut self, session_digest: &str, context: &ProductServiceContext, request: &A01AuthorizeTaskRequest) -> Result<A01TaskReceipt,ProductError> {
+            authorize(self,session_digest,context,request,&mut TaskHooks::default())
+        }
+        pub fn revoke_a01_task(&mut self, session_digest: &str, request: &A01RevokeTaskRequest) -> Result<A01TaskReceipt,ProductError> {
+            revoke(self,session_digest,request,&mut TaskHooks::default())
+        }
+        pub fn read_a01_task_receipt(&mut self, session_digest: &str, request_key: &str) -> Result<Option<A01TaskReceipt>,ProductError> {
+            if !self.open_mode.is_a01_task() { return Err(ProductError::ContractMismatch); }
+            validate_key(request_key,0)?;
+            let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let result=(|| {
+                let now=clock_ns(self.clock.now())?; let p=session(&tx,session_digest,now)?;
+                let Some(row)=local(&tx,&p.actor_id,request_key)? else {return Ok(None);};
+                match visible(&tx,&p,&row.receipt.admission,false) {
+                    Ok(_)=>Ok(Some(row.receipt)), Err(ProductError::Invariant("A01 authorization unavailable"))=>Ok(None), Err(e)=>Err(e),
+                }
+            })();
+            finish(tx,result,&mut TaskHooks::default())
+        }
+        pub fn read_a01_task_claim(&mut self, session_digest: &str, order_id: &str, lifecycle: i64) -> Result<Option<A01TaskClaimView>,ProductError> {
+            if !self.open_mode.is_a01_task() { return Err(ProductError::ContractMismatch); }
+            if !text(order_id,256) || lifecycle<=0 { return Err(ProductError::InvalidConfig); }
+            let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let result=(|| {
+                let now=clock_ns(self.clock.now())?; let p=session(&tx,session_digest,now)?;
+                let v=require_order_capability_in(&tx,&p,order_id,ProductCapability::ReadOrder,false).map_err(scope_error)?;
+                if v.lifecycle!=lifecycle { return Err(unavailable()); }
+                snapshot(&tx,&A01TaskStoreRef{installation_id:self.installation_id.clone(),database_id:self.database_id.clone()},order_id,lifecycle)
+            })();
+            finish(tx,result,&mut TaskHooks::default())
+        }
+    }
+    pub(super) fn authorize(store: &mut ProductStore, key: &str, context: &ProductServiceContext, request: &A01AuthorizeTaskRequest, hooks: &mut TaskHooks<'_>) -> Result<A01TaskReceipt,ProductError> {
+        if !store.open_mode.is_a01_task() { return Err(ProductError::ContractMismatch); }
+        validate_admission(&request.admission)?; validate_owner(&request.owner)?; validate_service(&request.service)?; validate_key(&request.request_key,request.expected_revision)?;
+        if request.expires_at_ns<0 { return Err(ProductError::InvalidConfig); }
+        hooks.hit("before-lock")?;
+        let tx=store.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result=(|| {
+            let now=clock_ns(store.clock.now())?; hooks.hit("after-lock")?;
+            let p=session(&tx,key,now)?;
+            let envelope=AuthorizeEnvelope{version:1,profile:PROFILE.into(),operation:A01TaskOperation::Authorize,actor_id:p.actor_id.clone(),request:request.clone(),context:Context::from(context),task_kind:TASK_KIND.into(),task_bytes:TASK_BYTES.to_vec()};
+            let bytes=canonical(&envelope)?;
+            if let Some(receipt)=replay(&tx,&p,&request.request_key,&bytes)? {return Ok(receipt);}
+            owner(&tx,&p,&request.admission,&request.owner,true)?;
+            permission(&tx, &request.bridge_permission, &p.actor_id, &request.admission.source_instance_id)?;
+            if request.expires_at_ns<=now { return Err(ProductError::InvalidConfig); }
+            let previous=latest(&tx,&request.admission)?;
+            if previous.as_ref().map_or(0,|v|v.receipt.revision)!=request.expected_revision {return Err(conflict());}
+            if previous.as_ref().is_some_and(|v| v.receipt.operation!=A01TaskOperation::Revoke) {return Err(ineligible());}
+            if previous.as_ref().is_some_and(|v| v.receipt.admission!=request.admission) {return Err(evidence("A01 authorization admission changed"));}
+            if !context_matches(&envelope.context,&request.admission,&request.service) || authority(&tx,context,now)?!=request.service {return Err(unavailable());}
+            let (_,state,attempts)=admission(&tx,&request.admission)?;
+            if state!="waiting_unsupported" || attempts!=0 {return Err(ineligible());}
+            queued(&tx, &request.admission.order_id)?;
+            no_execution(&tx,&request.admission)?;
+            let r=A01TaskReceipt{bridge_permission:request.bridge_permission.clone(),version:1,profile:PROFILE.into(),operation:A01TaskOperation::Authorize,actor_id:p.actor_id,request_key:request.request_key.clone(),expected_revision:request.expected_revision,revision:request.expected_revision.checked_add(1).ok_or(ProductError::InvalidConfig)?,admission:request.admission.clone(),owner:request.owner.clone(),service:request.service.clone(),task_kind:TASK_KIND.into(),task_bytes:TASK_BYTES.to_vec(),task_digest:task_digest(),authorized_at_ns:now,expires_at_ns:request.expires_at_ns,checked_at_ns:now};
+            insert(&tx,&r,&bytes)?; hooks.hit("authorize-insert")?;
+            one(tx.execute("UPDATE product_work_backlog_v1 SET state='ready' WHERE order_id=?1 AND lifecycle=?2 AND delivery_id=?3 AND state='waiting_unsupported' AND attempts=0",params![r.admission.order_id,r.admission.lifecycle,r.admission.delivery_id])?)?;
+            hooks.hit("authorize-ready")?; Ok(r)
+        })();
+        finish(tx,result,hooks)
+    }
+    pub(super) fn revoke(store: &mut ProductStore, key: &str, request: &A01RevokeTaskRequest, hooks: &mut TaskHooks<'_>) -> Result<A01TaskReceipt,ProductError> {
+        if !store.open_mode.is_a01_task() { return Err(ProductError::ContractMismatch); }
+        validate_admission(&request.admission)?; validate_owner(&request.owner)?; validate_key(&request.request_key,request.expected_revision)?;
+        hooks.hit("before-lock")?;
+        let tx=store.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result=(|| {
+            let now=clock_ns(store.clock.now())?; hooks.hit("after-lock")?;
+            let p=session(&tx,key,now)?;
+            let bytes=canonical(&RevokeEnvelope{version:1,profile:PROFILE.into(),operation:A01TaskOperation::Revoke,actor_id:p.actor_id.clone(),request:request.clone()})?;
+            if let Some(receipt)=replay(&tx,&p,&request.request_key,&bytes)? {return Ok(receipt);}
+            owner(&tx,&p,&request.admission,&request.owner,false)?;
+            let previous=latest(&tx,&request.admission)?.ok_or_else(conflict)?.receipt;
+            if previous.revision!=request.expected_revision {return Err(conflict());}
+            if previous.operation!=A01TaskOperation::Authorize {return Err(ineligible());}
+            if previous.admission!=request.admission {return Err(evidence("A01 revocation admission changed"));}
+            let mut r=previous;
+            r.operation=A01TaskOperation::Revoke; r.actor_id=p.actor_id; r.request_key=request.request_key.clone(); r.expected_revision=request.expected_revision;
+            r.revision=request.expected_revision.checked_add(1).ok_or(ProductError::InvalidConfig)?; r.owner=request.owner.clone(); r.checked_at_ns=now;
+            let (_,state,attempts)=admission(&tx,&r.admission)?;
+            if state=="ready" { no_execution(&tx,&r.admission)?; }
+            else if state=="claimed" && attempts==1 {
+                snapshot(&tx,&r.admission.store,&r.admission.order_id,r.admission.lifecycle)?.ok_or_else(|| evidence("A01 revocation claim snapshot missing"))?;
+            } else {return Err(ineligible());}
+            insert(&tx,&r,&bytes)?; hooks.hit("revoke-insert")?;
+            if state=="ready" {
+                one(tx.execute("UPDATE product_work_backlog_v1 SET state='waiting_unsupported' WHERE order_id=?1 AND lifecycle=?2 AND state='ready' AND attempts=0",params![r.admission.order_id,r.admission.lifecycle])?)?;
+            } else if state!="claimed" {return Err(ineligible());}
+            hooks.hit("revoke-backlog")?; Ok(r)
+        })();
+        finish(tx,result,hooks)
+    }
+
+    const SNAPSHOT_COLUMNS: &str = "order_id,lifecycle,task_revision,delivery_id,worker_id,epoch,fence,claimed_at_ns,lease_until_ns,lease_until_text,source_revision,payload_digest,service_id,service_revision,credential_revision,source_instance_id";
+    fn snapshot(tx: &rusqlite::Transaction<'_>, store: &A01TaskStoreRef, order: &str, lifecycle: i64) -> Result<Option<A01TaskClaimView>,ProductError> {
+        let v=tx.query_row(&format!("SELECT {SNAPSHOT_COLUMNS} FROM product_a01_claim_snapshots_v1 WHERE order_id=?1 AND lifecycle=?2"),params![order,lifecycle],|r|Ok(A01TaskClaimView{
+            store:store.clone(),order_id:r.get(0)?,lifecycle:r.get(1)?,task_revision:r.get(2)?,delivery_id:r.get(3)?,worker_id:r.get(4)?,epoch:r.get(5)?,fence:r.get(6)?,claimed_at_ns:r.get(7)?,lease_until_ns:r.get(8)?,lease_until_text:r.get(9)?,source_revision:r.get(10)?,payload_digest:r.get(11)?,service_id:r.get(12)?,service_revision:r.get(13)?,credential_revision:r.get(14)?,source_instance_id:r.get(15)?
+        })).optional().map_err(stored_error)?;
+        if let Some(v)=&v { validate_snapshot(tx,v)?; }
+        Ok(v)
+    }
+    fn validate_snapshot(tx: &rusqlite::Transaction<'_>, v: &A01TaskClaimView) -> Result<(),ProductError> {
+        if !text(&v.worker_id,128) || v.epoch!=1 || v.fence<=0 || v.claimed_at_ns<0 || v.lease_until_ns<=v.claimed_at_ns
+            || time_ns(&v.lease_until_text)?!=v.lease_until_ns || datetime(v.lease_until_ns)?.to_rfc3339_opts(chrono::SecondsFormat::Nanos,true)!=v.lease_until_text { return Err(evidence("A01 claim snapshot fields or lease text invalid")); }
+        let mut stmt=tx.prepare(&format!("SELECT {COLUMNS} FROM product_a01_task_revisions_v1 WHERE order_id=?1 AND lifecycle=?2 AND revision=?3"))?;
+        let mut rows=stmt.query(params![v.order_id,v.lifecycle,v.task_revision])?;
+        let r=read_row(rows.next()?.ok_or_else(|| evidence("A01 claim snapshot task receipt missing"))?)?.receipt;
+        if r.operation!=A01TaskOperation::Authorize || v.store!=r.admission.store || v.delivery_id!=r.admission.delivery_id
+            || v.source_revision!=r.admission.connector_revision || v.payload_digest!=r.admission.raw_payload_digest
+            || v.service_id!=r.service.service_id || v.service_revision!=r.service.service_revision || v.credential_revision!=r.service.credential_revision
+            || v.source_instance_id!=r.admission.source_instance_id || v.claimed_at_ns<r.authorized_at_ns || v.claimed_at_ns>=r.expires_at_ns
+            || v.lease_until_ns>r.expires_at_ns.min(r.service.service_lease_until_ns).min(r.service.credential_expires_at_ns) { return Err(evidence("A01 claim snapshot task binding or lease cap invalid")); }
+        // Historical equalities deliberately do not require latest authorization,
+        // live deadlines or mutable account/source/service revisions.
+        let equal: bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM product_work_claims_v1 c JOIN product_work_backlog_v1 b USING(order_id,lifecycle) JOIN product_service_work_bindings_v1 w USING(order_id,lifecycle) WHERE c.order_id=?1 AND c.lifecycle=?2 AND c.owner_id=?3 AND c.epoch=?4 AND c.fence=?5 AND ((c.state='claimed' AND b.state='claimed' AND c.lease_until=?6) OR (c.state='completed' AND b.state='completed' AND EXISTS(SELECT 1 FROM product_review_runs_v1 rr JOIN product_review_work_bindings_v1 rw ON rw.order_id=rr.order_id AND rw.attempt=rr.attempt AND rw.run_id=rr.run_id JOIN product_review_host_results_v1 hr ON hr.order_id=rr.order_id AND hr.attempt=rr.attempt AND rr.run_id=hr.order_id||':'||hr.attempt||':'||hr.run_id||':'||hr.activation WHERE rr.order_id=c.order_id AND rr.product_lifecycle=c.lifecycle AND rr.status IN ('passed','failed','resolved') AND hr.result_json=rr.result_json AND rw.worker_id=c.owner_id AND rw.claim_epoch=c.epoch AND rw.claim_fence=c.fence AND rw.delivery_id=b.delivery_id AND rw.source_revision=c.source_revision AND rw.payload_digest=c.payload_digest))) AND c.source_revision=?7 AND c.payload_digest=?8 AND b.delivery_id=?9 AND b.attempts=1 AND w.service_id=?10 AND w.service_revision=?11 AND w.credential_revision=?12 AND w.source_instance_id=?13)",params![v.order_id,v.lifecycle,v.worker_id,v.epoch,v.fence,v.lease_until_text,v.source_revision,v.payload_digest,v.delivery_id,v.service_id,v.service_revision,v.credential_revision,v.source_instance_id],|r|r.get(0))?;
+        if !equal {return Err(evidence("A01 claim snapshot current row mismatch"));}
+        let next: i64=tx.query_row("SELECT next FROM product_fence_counter_v1 WHERE singleton=1",[],|r|r.get(0)).map_err(stored_error)?;
+        if next<v.fence {return Err(evidence("A01 claim snapshot fence counter invalid"));}
+        Ok(())
+    }
+    pub(super) fn claim(store: &mut ProductStore, context: &ProductServiceContext, worker: &str, lease: chrono::Duration, hooks: &mut TaskHooks<'_>) -> Result<ProductWorkClaimResult,ProductError> {
+        if !store.open_mode.is_a01_task() {return Err(ProductError::ContractMismatch);}
+        if !text(worker,128) || lease<=chrono::Duration::zero() || lease>chrono::Duration::hours(1) {return Err(ProductError::InvalidConfig);}
+        let duration=lease.num_nanoseconds().ok_or(ProductError::InvalidConfig)?;
+        hooks.hit("before-lock")?;
+        let tx=store.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result=(|| {
+            let now=clock_ns(store.clock.now())?; hooks.hit("after-lock")?;
+            let live=authority(&tx,context,now)?;
+            let mut stmt=tx.prepare(&format!("SELECT {cols} FROM product_a01_task_revisions_v1 r JOIN product_work_backlog_v1 b ON b.order_id=r.order_id AND b.lifecycle=r.lifecycle WHERE b.state='ready' AND r.operation='authorize' AND r.service_id=?1 AND r.source_instance_id=?2 AND r.revision=(SELECT max(revision) FROM product_a01_task_revisions_v1 x WHERE x.order_id=r.order_id AND x.lifecycle=r.lifecycle) AND NOT EXISTS(SELECT 1 FROM product_work_claims_v1 c WHERE c.order_id=r.order_id AND c.lifecycle=r.lifecycle) AND NOT EXISTS(SELECT 1 FROM product_a01_claim_snapshots_v1 c WHERE c.order_id=r.order_id AND c.lifecycle=r.lifecycle)",cols=COLUMNS.split(',').map(|c|format!("r.{c}")).collect::<Vec<_>>().join(",")))?;
+            let mut rows=stmt.query(params![context.service_id,context.source_instance_id])?;
+            let mut candidates=Vec::new();
+            while let Some(row)=rows.next()? {
+                let row=read_row(row)?;
+                let a=&row.receipt.admission;
+                let available: String=tx.query_row("SELECT available_at FROM product_work_backlog_v1 WHERE order_id=?1 AND lifecycle=?2",params![a.order_id,a.lifecycle],|r|r.get(0)).map_err(stored_error)?;
+                let available=time_ns(&available)?;
+                if available<=now && row.receipt.authorized_at_ns<=now && now<row.receipt.expires_at_ns {candidates.push((available,row.receipt));}
+            }
+            drop(rows); drop(stmt);
+            candidates.sort_by(|a,b|a.0.cmp(&b.0).then_with(||a.1.admission.order_id.cmp(&b.1.admission.order_id)));
+            let Some((_,r))=candidates.into_iter().next() else {return Ok(ProductWorkClaimResult::Empty);};
+            if live!=r.service || !context_matches(&Context::from(context),&r.admission,&r.service) {return Err(unavailable());}
+            issuing_owner(&tx,&r)?;
+            permission(&tx,&r.bridge_permission,&r.actor_id,&r.admission.source_instance_id)?;
+            let (payload,state,attempts)=admission(&tx,&r.admission)?;
+            if state!="ready" || attempts!=0 {return Err(ineligible());}
+            queued(&tx, &r.admission.order_id)?;
+            no_execution(&tx,&r.admission)?;
+            let attempts=attempts.checked_add(1).ok_or_else(|| evidence("A01 claim attempt counter exhausted"))?;
+            let old:i64=tx.query_row("SELECT next FROM product_fence_counter_v1 WHERE singleton=1",[],|r|r.get(0)).map_err(stored_error)?;
+            if !(0..i64::MAX).contains(&old) {return Err(evidence("A01 claim fence counter out of range"));}
+            let fence=old.checked_add(1).ok_or_else(|| evidence("A01 claim fence counter exhausted"))?;
+            let end=now.checked_add(duration).ok_or(ProductError::InvalidConfig)?.min(r.expires_at_ns).min(live.service_lease_until_ns).min(live.credential_expires_at_ns);
+            if end<=now {return Err(unavailable());}
+            let until=datetime(end)?;
+            let until_text=until.to_rfc3339_opts(chrono::SecondsFormat::Nanos,true);
+            if time_ns(&until_text)?!=end {return Err(evidence("A01 claim lease timestamp round-trip mismatch"));}
+            let a=&r.admission;
+            one(tx.execute("UPDATE product_fence_counter_v1 SET next=?1 WHERE singleton=1 AND next=?2",params![fence,old])?)?; hooks.hit("fence")?;
+            one(tx.execute("INSERT INTO product_work_claims_v1(order_id,lifecycle,owner_id,epoch,fence,state,lease_until,source_revision,payload_digest) VALUES(?1,?2,?3,1,?4,'claimed',?5,?6,?7)",params![a.order_id,a.lifecycle,worker,fence,until_text,a.connector_revision,a.raw_payload_digest])?)?; hooks.hit("claim")?;
+            one(tx.execute("INSERT INTO product_service_work_bindings_v1(order_id,lifecycle,service_id,service_revision,credential_revision,source_instance_id) VALUES(?1,?2,?3,?4,?5,?6)",params![a.order_id,a.lifecycle,live.service_id,live.service_revision,live.credential_revision,a.source_instance_id])?)?; hooks.hit("binding")?;
+            one(tx.execute("UPDATE product_work_backlog_v1 SET state='claimed',attempts=?1 WHERE order_id=?2 AND lifecycle=?3 AND delivery_id=?4 AND state='ready' AND attempts=0",params![attempts,a.order_id,a.lifecycle,a.delivery_id])?)?; hooks.hit("backlog")?;
+            one(tx.execute(&format!("INSERT INTO product_a01_claim_snapshots_v1({SNAPSHOT_COLUMNS}) VALUES(?1,?2,?3,?4,?5,1,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)"),params![a.order_id,a.lifecycle,r.revision,a.delivery_id,worker,fence,now,end,until_text,a.connector_revision,a.raw_payload_digest,live.service_id,live.service_revision,live.credential_revision,a.source_instance_id])?)?; hooks.hit("snapshot")?;
+            Ok(ProductWorkClaimResult::Claimed(ProductWorkClaim{order_id:a.order_id.clone(),lifecycle:a.lifecycle,delivery_id:a.delivery_id.clone(),worker_id:worker.into(),epoch:1,fence,source_revision:a.connector_revision,payload_digest:a.raw_payload_digest.clone(),service_binding:Some(foundry_exec::ReviewServiceBinding{service_id:live.service_id,service_revision:live.service_revision,credential_revision:live.credential_revision,source_instance_id:a.source_instance_id.clone()}),lease_until:until,task_kind:a.raw_kind.clone(),payload_snapshot:payload}))
+        })();
+        finish(tx,result,hooks)
+    }
+    pub(super) fn validate_a01_task_connection(tx: &rusqlite::Transaction<'_>, config: &ProductConfig) -> Result<(),ProductError> {
+        validate_a01_pragmas(tx)?;
+        validate_a01_task_contract(tx,config)
+    }
+    fn validate_a01_task_contract(tx: &rusqlite::Transaction<'_>, config: &ProductConfig) -> Result<(),ProductError> {
+        validate_a01_profile_contract(tx,config,StoreOpenMode::A01TaskCreate)?;
+        let profile:(i64,i64,i64,String,String,String)=tx.query_row("SELECT count(*),singleton,version,profile,installation_id,database_id FROM product_a01_profile_v1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).map_err(a01_contract_error)?;
+        if profile!=(1,1,1,PROFILE.into(),config.installation_id.clone(),config.database_id.clone()) {return Err(ProductError::ContractMismatch);}
+        let result=(|| {
+            let mut statement=tx.prepare(&format!("SELECT {COLUMNS} FROM product_a01_task_revisions_v1 ORDER BY order_id,lifecycle,revision"))?;
+            let mut rows=statement.query([])?;
+            let mut previous:Option<A01TaskReceipt>=None;
+            while let Some(row)=rows.next()? {
+                let r=read_row(row)?.receipt;
+                admission(tx,&r.admission)?;
+                let prior=previous.as_ref().filter(|p|p.admission.order_id==r.admission.order_id && p.admission.lifecycle==r.admission.lifecycle);
+                if r.expected_revision!=prior.map_or(0,|p|p.revision) { return Err(evidence("A01 task revision history discontinuity: r.expected_revision")); }
+        if r.operation==prior.map_or(A01TaskOperation::Revoke,|p|p.operation) { return Err(evidence("A01 task revision history discontinuity: r.operation")); }
+                if let Some(p)=prior {
+                    if p.admission!=r.admission {return Err(evidence("A01 task history admission changed"));}
+                    if r.operation==A01TaskOperation::Revoke && (r.service!=p.service || r.task_digest!=p.task_digest || r.authorized_at_ns!=p.authorized_at_ns || r.expires_at_ns!=p.expires_at_ns) {return Err(evidence("A01 task revocation history changed authorization"));}
+                }
+                previous=Some(r);
+            }
+            let mut stmt=tx.prepare("SELECT order_id,lifecycle FROM product_a01_claim_snapshots_v1")?;
+            let keys=stmt.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let store=A01TaskStoreRef{installation_id:config.installation_id.clone(),database_id:config.database_id.clone()};
+            for (order,lifecycle) in keys {snapshot(tx,&store,&order,lifecycle)?.ok_or_else(|| evidence("A01 claim census snapshot missing"))?;}
+            let orphan:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM product_work_claims_v1 c WHERE NOT EXISTS(SELECT 1 FROM product_a01_claim_snapshots_v1 s WHERE s.order_id=c.order_id AND s.lifecycle=c.lifecycle)) OR EXISTS(SELECT 1 FROM product_service_work_bindings_v1 c WHERE NOT EXISTS(SELECT 1 FROM product_a01_claim_snapshots_v1 s WHERE s.order_id=c.order_id AND s.lifecycle=c.lifecycle))",[],|r|r.get(0))?;
+            if orphan {return Err(evidence("A01 claim snapshot orphaned"));}
+            validate_binding_history_in(tx)?;
+            // Every ready/claimed backlog must be accounted for by this profile;
+            // history is inspected without asking mutable authority to be live.
+            let mut stmt=tx.prepare("SELECT order_id,lifecycle,state,attempts FROM product_work_backlog_v1")?;
+            let backlogs=stmt.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            for (order,lifecycle,state,attempts) in backlogs {
+                let mut stmt=tx.prepare(&format!("SELECT {COLUMNS} FROM product_a01_task_revisions_v1 WHERE order_id=?1 AND lifecycle=?2 ORDER BY revision DESC LIMIT 1"))?;
+                let mut rows=stmt.query(params![order,lifecycle])?;
+                let latest=rows.next()?.map(read_row).transpose()?;
+                let snap=snapshot(tx,&store,&order,lifecycle)?;
+                match (latest,snap) {
+                    (None,None) if state=="waiting_unsupported" && attempts==0=>{},
+                    (Some(row),None) if attempts==0 && state==if row.receipt.operation==A01TaskOperation::Authorize {"ready"} else {"waiting_unsupported"}=>{},
+                    (Some(row),Some(snap)) if matches!(state.as_str(),"claimed"|"completed") && attempts==1 && (row.receipt.revision==snap.task_revision || (row.receipt.operation==A01TaskOperation::Revoke && snap.task_revision.checked_add(1)==Some(row.receipt.revision)))=>{},
+                    _=>return Err(evidence("A01 task backlog and claim census mismatch")),
+                }
+            }
+            Ok(())
+        })();
+        result.map_err(|e|match e {ProductError::Invariant(_)=>ProductError::ContractMismatch,other=>other})
+    }
+
+
+    #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct A01ProducerReservation {
+        pub task: A01TaskReceipt,
+        pub claim: A01TaskClaimView,
+        pub request_key: String,
+        pub attempt: u64,
+        pub run: u64,
+        pub activation: u64,
+        pub predecessor_seq: i64,
+        pub sequence: i64,
+        pub event_hash: String,
+    }
+    #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct A01AcceptedProducerOutput {
+        pub reservation: A01ProducerReservation,
+        pub output: String,
+        pub base_commit: String,
+        pub result_commit: String,
+        pub intent: foundry_exec::ExecutionIntent,
+        pub sequence: i64,
+        pub event_hash: String,
+    }
+    #[derive(Debug, thiserror::Error)]
+    pub enum A01ProducerError {
+        #[error("A01 producer operation rejected")]
+        Product(#[from] ProductError),
+        #[error("A01 producer commit uncertain")]
+        CommitUncertain,
+    }
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ProducerStart {
+        kind: String, task: A01TaskReceipt, claim: A01TaskClaimView,
+        request_key: String, attempt: u64, run: u64, activation: u64, predecessor_seq: i64,
+    }
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ProducerOutput {
+        kind: String, task: A01TaskReceipt, claim: A01TaskClaimView,
+        reservation: A01ProducerReservation, output: String,
+        base_commit: String, result_commit: String, intent: foundry_exec::ExecutionIntent,
+    }
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct PassedBridge {
+        kind: String, task: A01TaskReceipt, claim: A01TaskClaimView,
+        output_sequence: i64, output_event_hash: String,
+        host_key: foundry_exec::HostKey, host_result_digest: String, predecessor_seq: i64,
+    }
+    fn queued(tx: &rusqlite::Transaction<'_>, order: &str) -> Result<(),ProductError> {
+        if verified_order_state_in(tx,order)?.2 != "queued" { return Err(ineligible()); }
+        Ok(())
+    }
+    fn permission(tx: &rusqlite::Transaction<'_>, p: &A01BridgePermissionRef, actor: &str, source: &str) -> Result<(),ProductError> {
+        if p.subject_id != actor || p.source_instance_id != source || p.grant_revision <= 0 { return Err(unavailable()); }
+        let exact: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM product_scope_grants_v1 WHERE subject_id=?1 AND source_instance_id=?2 AND capability='a01_bridge_passed' AND enabled=1 AND grant_id=?3 AND grant_revision=?4)",params![actor,source,p.grant_id,p.grant_revision],|r|r.get(0))?;
+        if !exact { return Err(unavailable()); } Ok(())
+    }
+    impl ProductStore {
+        pub fn read_a01_bridge_permission(&mut self, session_digest: &str, source_instance_id: &str) -> Result<Option<A01BridgePermissionRef>,ProductError> {
+            if !self.open_mode.is_a01_task() { return Err(ProductError::ContractMismatch); }
+            if !text(source_instance_id,256) { return Err(ProductError::InvalidConfig); }
+            let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let p=session(&tx,session_digest,clock_ns(self.clock.now())?)?;
+            let value=tx.query_row("SELECT grant_id,grant_revision,subject_id,source_instance_id FROM product_scope_grants_v1 WHERE subject_id=?1 AND source_instance_id=?2 AND capability='a01_bridge_passed' AND enabled=1",params![p.actor_id,source_instance_id],|r|Ok(A01BridgePermissionRef{grant_id:r.get(0)?,grant_revision:r.get(1)?,subject_id:r.get(2)?,source_instance_id:r.get(3)?})).optional().map_err(stored_error)?;
+            tx.commit()?; Ok(value)
+        }
+        pub fn reserve_a01_producer(&mut self, service: &ProductServiceContext, claim: &ProductWorkClaim, task_revision: i64, request_key: &str) -> Result<A01ProducerReservation,A01ProducerError> {
+            if !self.open_mode.is_a01_task() { return Err(ProductError::ContractMismatch.into()); }
+            validate_key(request_key,0)?;
+            let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(ProductError::from)?;
+            let now=clock_ns(self.clock.now())?;
+            let (task,snap)=task_claim(&tx,&claim.order_id,claim.lifecycle)?;
+            if task.revision!=task_revision { return Err(conflict().into()); }
+            live(&tx,&task,&snap,service,claim,now)?;
+            let current=replayed(&tx,&claim.order_id)?;
+            if current.order.state().to_string()!="queued" { return Err(ineligible().into()); }
+            let attempt=u64::from(current.order.attempt().max(1));
+            let start=ProducerStart{kind:"a01-producer-start-v1".into(),task:task.clone(),claim:snap.clone(),request_key:request_key.into(),attempt,run:1,activation:1,predecessor_seq:current.last_seq};
+            let (sequence,event_hash,actual_attempt)=append(&tx,&claim.order_id,claim.lifecycle,OrderEvent::DieStarted,"a01-producer-start-v1",&canonical(&start)?,datetime(now)?)?;
+            if actual_attempt!=attempt {return Err(evidence("A01 producer reservation attempt mismatch").into());}
+            let r=A01ProducerReservation{task,claim:snap,request_key:request_key.into(),attempt,run:1,activation:1,predecessor_seq:current.last_seq,sequence,event_hash};
+            tx.commit().map_err(|_|A01ProducerError::CommitUncertain)?; Ok(r)
+        }
+        pub fn accept_a01_producer_output(&mut self, service: &ProductServiceContext, claim: &ProductWorkClaim, reservation: &A01ProducerReservation, output: &str) -> Result<A01AcceptedProducerOutput,A01ProducerError> {
+            if !self.open_mode.is_a01_task() { return Err(ProductError::ContractMismatch.into()); }
+            if output.is_empty() || output.len()>4096 || output.as_bytes().contains(&0) {return Err(ProductError::InvalidConfig.into());}
+            let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(ProductError::from)?;
+            let now=clock_ns(self.clock.now())?;
+            validate_reservation(&tx,reservation)?;
+            live(&tx,&reservation.task,&reservation.claim,service,claim,now)?;
+            let current=replayed(&tx,&claim.order_id)?;
+            if current.last_seq!=reservation.sequence || current.order.state().to_string()!="working" {return Err(ineligible().into());}
+            let (base_commit,result_commit)=commits(reservation,output);
+            let intent=foundry_exec::ExecutionIntent{order:foundry_exec::OrderId(claim.order_id.clone()),attempt:foundry_exec::Attempt(reservation.attempt),run:foundry_exec::RunId(reservation.run),activation:reservation.activation,generation:foundry_exec::Generation(0),epoch:foundry_exec::Epoch(reservation.claim.epoch as u64),external_ref:format!("review:{}:{}:{}..{}",claim.order_id,reservation.attempt,base_commit,result_commit),recorded_at:datetime(now)?};
+            let original=ProducerOutput{kind:"a01-producer-output-v1".into(),task:reservation.task.clone(),claim:reservation.claim.clone(),reservation:reservation.clone(),output:output.into(),base_commit:base_commit.clone(),result_commit:result_commit.clone(),intent:intent.clone()};
+            let (sequence,event_hash,_)=append(&tx,&claim.order_id,claim.lifecycle,OrderEvent::DieSucceeded{attempt:reservation.attempt.try_into().map_err(|_|evidence("A01 producer output attempt out of range"))?},"a01-producer-output-v1",&canonical(&original)?,datetime(now)?)?;
+            let accepted=A01AcceptedProducerOutput{reservation:reservation.clone(),output:output.into(),base_commit,result_commit,intent,sequence,event_hash};
+            one(tx.execute("INSERT INTO product_review_redrive_v1(order_id,run_id,payload,artifact_json) VALUES(?1,?2,'a01-producer-output-v1',?3)",params![claim.order_id,journal(reservation),String::from_utf8(canonical(&accepted)?).map_err(|_|evidence("A01 producer output receipt UTF-8 invalid"))?]).map_err(ProductError::from)?)?;
+            tx.commit().map_err(|_|A01ProducerError::CommitUncertain)?; Ok(accepted)
+        }
+        pub fn read_a01_producer_output(&mut self, service: &ProductServiceContext, claim: &ProductWorkClaim, reservation: &A01ProducerReservation) -> Result<Option<A01AcceptedProducerOutput>,A01ProducerError> {
+            if !self.open_mode.is_a01_task() {return Err(ProductError::ContractMismatch.into());}
+            let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(ProductError::from)?;
+            let now=clock_ns(self.clock.now())?;
+            validate_reservation(&tx,reservation)?;
+            live(&tx,&reservation.task,&reservation.claim,service,claim,now)?;
+            let accepted=output_for(&tx,&claim.order_id)?;
+            if accepted.as_ref().is_some_and(|a| a.reservation!=*reservation) {return Err(evidence("A01 producer output reservation mismatch").into());}
+            tx.commit().map_err(|_|A01ProducerError::CommitUncertain)?; Ok(accepted)
+        }
+    }
+    fn task_claim(tx: &rusqlite::Transaction<'_>, order: &str, lifecycle: i64) -> Result<(A01TaskReceipt,A01TaskClaimView),ProductError> {
+        let store=tx.query_row("SELECT installation_id,database_id FROM product_meta_v1 WHERE singleton=1",[],|r|Ok(A01TaskStoreRef{installation_id:r.get(0)?,database_id:r.get(1)?}))?;
+        let snap=snapshot(tx,&store,order,lifecycle)?.ok_or_else(|| evidence("A01 producer claim snapshot missing"))?;
+        let mut st=tx.prepare(&format!("SELECT {COLUMNS} FROM product_a01_task_revisions_v1 WHERE order_id=?1 AND lifecycle=?2 AND revision=?3"))?;
+        let mut rows=st.query(params![order,lifecycle,snap.task_revision])?;
+        let task=read_row(rows.next()?.ok_or_else(|| evidence("A01 producer task receipt missing"))?)?.receipt;
+        admission(tx,&task.admission)?;
+        Ok((task,snap))
+    }
+    fn live(tx: &rusqlite::Transaction<'_>, task: &A01TaskReceipt, snap: &A01TaskClaimView, service: &ProductServiceContext, claim: &ProductWorkClaim, now: i64) -> Result<(),ProductError> {
+        validate_respective_claim(task,snap,claim)?;
+        let latest=latest(tx,&task.admission)?.ok_or_else(|| evidence("A01 producer latest task receipt missing"))?.receipt;
+        if latest!=*task || now<task.authorized_at_ns || now>=task.expires_at_ns || now>=snap.lease_until_ns {return Err(unavailable());}
+        issuing_owner(tx,task)?;
+        permission(tx,&task.bridge_permission,&task.actor_id,&task.admission.source_instance_id)?;
+        if !context_matches(&Context::from(service),&task.admission,&task.service) || authority(tx,service,now)?!=task.service {return Err(unavailable());}
+        let active:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM product_work_claims_v1 WHERE order_id=?1 AND lifecycle=?2 AND owner_id=?3 AND epoch=?4 AND fence=?5 AND state='claimed' AND lease_until=?6)",params![snap.order_id,snap.lifecycle,snap.worker_id,snap.epoch,snap.fence,snap.lease_until_text],|r|r.get(0))?;
+        if !active {return Err(unavailable());} Ok(())
+    }
+    fn validate_respective_claim(task: &A01TaskReceipt, s: &A01TaskClaimView, c: &ProductWorkClaim) -> Result<(),ProductError> {
+        if c.order_id!=s.order_id || c.lifecycle!=s.lifecycle || c.delivery_id!=s.delivery_id || c.worker_id!=s.worker_id
+            || c.epoch!=s.epoch || c.fence!=s.fence || c.source_revision!=s.source_revision || c.payload_digest!=s.payload_digest
+            || clock_ns(c.lease_until)?!=s.lease_until_ns || c.task_kind!=task.admission.raw_kind
+            || payload_digest(&c.task_kind,&c.payload_snapshot)!=s.payload_digest
+            || !c.service_binding.as_ref().is_some_and(|b|b.service_id==s.service_id && b.service_revision==s.service_revision && b.credential_revision==s.credential_revision && b.source_instance_id==s.source_instance_id) {return Err(evidence("A01 producer work claim binding mismatch"));} Ok(())
+    }
+    fn journal(r: &A01ProducerReservation) -> String {
+        format!("{}:{}:{}:{}",r.claim.order_id,r.attempt,r.run,r.activation)
+    }
+    fn commits(r: &A01ProducerReservation, output: &str) -> (String,String) {
+        let a=&r.task.admission; let c=&r.claim;
+        let lifecycle=a.lifecycle.to_string(); let revision=r.task.revision.to_string(); let epoch=c.epoch.to_string(); let fence=c.fence.to_string(); let seq=r.sequence.to_string();
+        let inputs=[a.store.installation_id.as_str(),a.store.database_id.as_str(),a.order_id.as_str(),&lifecycle,&revision,&r.task.task_digest,&c.worker_id,&epoch,&fence,&seq,&r.event_hash,output];
+        (crate::product_scope::framed_hash("foundry-a01-producer-base-v1",&inputs),crate::product_scope::framed_hash("foundry-a01-producer-result-v1",&inputs))
+    }
+    fn replayed(tx:&rusqlite::Transaction<'_>, order:&str) -> Result<crate::replay::ReplayedOrder,ProductError> {
+        replayed_through(tx,order,i64::MAX)
+    }
+    fn replayed_through(tx: &rusqlite::Transaction<'_>, order:&str, sequence:i64) -> Result<crate::replay::ReplayedOrder,ProductError> {
+        let mut st=tx.prepare("SELECT seq,order_id,from_state,to_state,event,actor,intent,at,prev_hash,hash,event_json FROM ledger WHERE seq<=?1 ORDER BY seq")?;
+        let rows=st.query_map([sequence],|r|Ok(crate::sqlite::LedgerRow{seq:r.get(0)?,order_id:r.get(1)?,from_state:r.get(2)?,to_state:r.get(3)?,event:r.get(4)?,actor:r.get(5)?,intent:r.get(6)?,at:r.get(7)?,prev_hash:r.get(8)?,hash:r.get(9)?,event_json:r.get(10)?}))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let orders=crate::replay::replay(&rows,crate::sqlite::SqliteLedger::verify_rows).map_err(|_|evidence("A01 producer ledger replay or chain invalid"))?;
+        orders.into_iter().rev().find(|r|r.order_id==order).ok_or_else(|| evidence("A01 producer replayed order missing"))
+    }
+    fn append(tx: &rusqlite::Transaction<'_>, order: &str, lifecycle: i64, event: OrderEvent, operation: &str, bytes: &[u8], now: DateTime<Utc>) -> Result<(i64,String,u64),ProductError> {
+        use sha2::Digest;
+        let mut current=replayed(tx,order)?;
+        if i64::from(current.lifecycle)+1!=lifecycle {return Err(evidence("A01 producer transition lifecycle mismatch"));}
+        let predecessor=current.last_seq;
+        let attempt=current.order.attempt().max(1);
+        let from=current.order.state().to_string();
+        let to=current.order.transition(event.clone(),attempt).map_err(|_|evidence("A01 producer order transition invalid"))?.to_string();
+        let seq:i64=tx.query_row("SELECT COALESCE(MAX(seq),0)+1 FROM ledger",[],|r|r.get(0))?;
+        let previous:String=tx.query_row("SELECT hash FROM ledger ORDER BY seq DESC LIMIT 1",[],|r|r.get(0))?;
+        let event_text=format!("{event:?}"); let event_json=crate::event_json::event_to_json(&event);
+        let actor="Service/a01-producer"; let intent=std::str::from_utf8(bytes).map_err(|_|evidence("A01 producer transition intent UTF-8 invalid"))?; let at=now.to_rfc3339();
+        let v1=format!("{seq}|{order}|{from}|{to}|{event_text}|{actor}|{intent}|{at}|{previous}");
+        let hash=hex::encode(sha2::Sha256::digest(crate::event_json::v2_hash_payload(&v1,&event_json).as_bytes()));
+        one(tx.execute("INSERT INTO product_transition_intents_v1(order_id,lifecycle,expected_predecessor,operation) VALUES(?1,?2,?3,?4)",params![order,lifecycle,predecessor,operation])?)?;
+        one(tx.execute("INSERT INTO ledger(order_id,from_state,to_state,event,actor,intent,at,prev_hash,event_json,hash) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![order,from,to,event_text,actor,intent,at,previous,event_json,hash])?)?;
+        receipt(tx,seq,&hash,order,lifecycle,operation,predecessor)?;
+        Ok((seq,hash,u64::from(current.order.attempt())))
+    }
+    fn receipt(tx: &rusqlite::Transaction<'_>, seq: i64, hash: &str, order: &str, lifecycle: i64, op: &str, predecessor: i64) -> Result<(),ProductError> {
+        let exact:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM product_transition_receipts_v1 WHERE seq=?1 AND event_hash=?2 AND order_id=?3 AND lifecycle=?4 AND operation=?5 AND expected_predecessor=?6) AND NOT EXISTS(SELECT 1 FROM product_transition_intents_v1 WHERE order_id=?3)",params![seq,hash,order,lifecycle,op,predecessor],|r|r.get(0))?;
+        if !exact {return Err(evidence("A01 producer transition receipt mismatch"));} Ok(())
+    }
+    fn validate_reservation(tx: &rusqlite::Transaction<'_>, r: &A01ProducerReservation) -> Result<(),ProductError> {
+        let (task,snap)=task_claim(tx,&r.claim.order_id,r.claim.lifecycle)?;
+        if r.task!=task { return Err(evidence("A01 producer reservation task or execution coordinates mismatch: r.task")); }
+        if r.claim!=snap { return Err(evidence("A01 producer reservation task or execution coordinates mismatch: r.claim")); }
+        if r.attempt==0 { return Err(evidence("A01 producer reservation task or execution coordinates mismatch: r.attempt")); }
+        if r.run!=1 { return Err(evidence("A01 producer reservation task or execution coordinates mismatch: r.run")); }
+        if r.activation!=1 { return Err(evidence("A01 producer reservation task or execution coordinates mismatch: r.activation")); }
+        validate_key(&r.request_key,0).map_err(|_|evidence("A01 producer reservation request key invalid"))?;
+        let (intent,hash,event,from,to):(String,String,String,String,String)=tx.query_row("SELECT intent,hash,event,from_state,to_state FROM ledger WHERE seq=?1 AND order_id=?2",params![r.sequence,r.claim.order_id],|v|Ok((v.get(0)?,v.get(1)?,v.get(2)?,v.get(3)?,v.get(4)?))).map_err(stored_error)?;
+        let start:ProducerStart=decode(intent.as_bytes())?;
+        if start.kind!="a01-producer-start-v1" { return Err(evidence("A01 producer reservation ledger provenance mismatch: start.kind")); }
+        if start.task!=r.task { return Err(evidence("A01 producer reservation ledger provenance mismatch: start.task")); }
+        if start.claim!=r.claim { return Err(evidence("A01 producer reservation ledger provenance mismatch: start.claim")); }
+        if start.request_key!=r.request_key { return Err(evidence("A01 producer reservation ledger provenance mismatch: start.request_key")); }
+        if start.attempt!=r.attempt { return Err(evidence("A01 producer reservation ledger provenance mismatch: start.attempt")); }
+        if start.run!=r.run { return Err(evidence("A01 producer reservation ledger provenance mismatch: start.run")); }
+        if start.activation!=r.activation { return Err(evidence("A01 producer reservation ledger provenance mismatch: start.activation")); }
+        if start.predecessor_seq!=r.predecessor_seq { return Err(evidence("A01 producer reservation ledger provenance mismatch: start.predecessor_seq")); }
+        if hash!=r.event_hash { return Err(evidence("A01 producer reservation ledger provenance mismatch: hash")); }
+        if event!="DieStarted" { return Err(evidence("A01 producer reservation ledger provenance mismatch: event")); }
+        if from!="queued" { return Err(evidence("A01 producer reservation ledger provenance mismatch: from")); }
+        if to!="working" { return Err(evidence("A01 producer reservation ledger provenance mismatch: to")); }
+        receipt(tx,r.sequence,&r.event_hash,&r.claim.order_id,r.claim.lifecycle,"a01-producer-start-v1",r.predecessor_seq)?;
+        replayed(tx,&r.claim.order_id)?; Ok(())
+    }
+    fn output_for(tx: &rusqlite::Transaction<'_>, order: &str) -> Result<Option<A01AcceptedProducerOutput>,ProductError> {
+        let mut st=tx.prepare("SELECT artifact_json,run_id FROM product_review_redrive_v1 WHERE order_id=?1 AND payload='a01-producer-output-v1'")?;
+        let rows=st.query_map([order],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let original_count:i64=tx.query_row("SELECT count(*) FROM ledger l JOIN product_transition_receipts_v1 r ON r.seq=l.seq AND r.event_hash=l.hash WHERE l.order_id=?1 AND r.operation='a01-producer-output-v1'",[order],|r|r.get(0))?;
+        if rows.is_empty() && original_count==0 {return Ok(None);}
+        if rows.len()!=1 { return Err(evidence("A01 producer output mirror or ledger count invalid: rows.len")); }
+        if original_count!=1 { return Err(evidence("A01 producer output mirror or ledger count invalid: original_count")); }
+        let a:A01AcceptedProducerOutput=decode(rows[0].0.as_bytes())?;
+        let r=&a.reservation;
+        validate_reservation(tx,r)?;
+        if r.claim.order_id!=order { return Err(evidence("A01 producer output mirror identity or bytes invalid: r.claim.order_id")); }
+        if rows[0].1!=journal(r) { return Err(evidence("A01 producer output mirror identity or bytes invalid: rows")); }
+        if a.output.is_empty() { return Err(evidence("A01 producer output mirror identity or bytes invalid: a.output.is_empty")); }
+        if a.output.len()>4096 { return Err(evidence("A01 producer output mirror identity or bytes invalid: a.output.len")); }
+        if a.output.as_bytes().contains(&0) { return Err(evidence("A01 producer output mirror identity or bytes invalid: a.output.as_bytes")); }
+        let (intent,hash,at,event,from,to):(String,String,String,String,String,String)=tx.query_row("SELECT intent,hash,at,event,from_state,to_state FROM ledger WHERE seq=?1 AND order_id=?2",params![a.sequence,order],|v|Ok((v.get(0)?,v.get(1)?,v.get(2)?,v.get(3)?,v.get(4)?,v.get(5)?))).map_err(stored_error)?;
+        let original:ProducerOutput=decode(intent.as_bytes())?;
+        let (base,result)=commits(r,&a.output);
+        if original.kind!="a01-producer-output-v1" { return Err(evidence("A01 producer output immutable provenance mismatch: original.kind")); }
+        if original.task!=r.task { return Err(evidence("A01 producer output immutable provenance mismatch: original.task")); }
+        if original.claim!=r.claim { return Err(evidence("A01 producer output immutable provenance mismatch: original.claim")); }
+        if original.reservation!=*r { return Err(evidence("A01 producer output immutable provenance mismatch: original.reservation")); }
+        if original.output!=a.output { return Err(evidence("A01 producer output immutable provenance mismatch: original.output")); }
+        if original.base_commit!=a.base_commit { return Err(evidence("A01 producer output immutable provenance mismatch: original.base_commit")); }
+        if original.result_commit!=a.result_commit { return Err(evidence("A01 producer output immutable provenance mismatch: original.result_commit")); }
+        if original.intent!=a.intent { return Err(evidence("A01 producer output immutable provenance mismatch: original.intent")); }
+        if hash!=a.event_hash { return Err(evidence("A01 producer output immutable provenance mismatch: hash")); }
+        if a.base_commit!=base { return Err(evidence("A01 producer output immutable provenance mismatch: a.base_commit")); }
+        if a.result_commit!=result { return Err(evidence("A01 producer output immutable provenance mismatch: a.result_commit")); }
+        if a.intent.order.0!=order { return Err(evidence("A01 producer output immutable provenance mismatch: a.intent.order.0")); }
+        if a.intent.attempt.0!=r.attempt { return Err(evidence("A01 producer output immutable provenance mismatch: a.intent.attempt.0")); }
+        if a.intent.run.0!=r.run { return Err(evidence("A01 producer output immutable provenance mismatch: a.intent.run.0")); }
+        if a.intent.activation!=r.activation { return Err(evidence("A01 producer output immutable provenance mismatch: a.intent.activation")); }
+        if a.intent.epoch.0!=r.claim.epoch as u64 { return Err(evidence("A01 producer output immutable provenance mismatch: a.intent.epoch.0")); }
+        if a.intent.generation.0!=0 { return Err(evidence("A01 producer output immutable provenance mismatch: a.intent.generation.0")); }
+        if a.intent.external_ref!=format!("review:{order}:{}:{base}..{result}",r.attempt) { return Err(evidence("A01 producer output immutable provenance mismatch: a.intent.external_ref")); }
+        if clock_ns(a.intent.recorded_at)?!=time_ns(&at)? { return Err(evidence("A01 producer output immutable provenance mismatch: clock_ns")); }
+        if event!=format!("{:?}",OrderEvent::DieSucceeded{attempt:r.attempt.try_into().map_err(|_|evidence("A01 producer output evidence attempt out of range"))?}) { return Err(evidence("A01 producer output immutable provenance mismatch: event")); }
+        if from!="working" { return Err(evidence("A01 producer output immutable provenance mismatch: from")); }
+
+        let mut predecessor = replayed_through(tx,order,r.sequence)?;
+        let attempt = r.attempt.try_into().map_err(|_|evidence("A01 producer output evidence attempt out of range"))?;
+        let expected_to = predecessor.order.transition(OrderEvent::DieSucceeded{attempt},attempt)
+            .map_err(|_|evidence("A01 producer output domain transition invalid"))?.to_string();
+        if to!=expected_to { return Err(evidence("A01 producer output immutable provenance mismatch: to")); }
+        receipt(tx,a.sequence,&a.event_hash,order,r.claim.lifecycle,"a01-producer-output-v1",r.sequence)?;
+        Ok(Some(a))
+    }
+    pub(super) fn canonical_review_in(tx: &rusqlite::Transaction<'_>, order: &str) -> Result<bool,ProductError> {
+        let marked:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='product_a01_profile_v1')",[],|r|r.get(0))?;
+        if !marked {return Ok(false);}
+        Ok(output_for(tx,order)?.is_some())
+    }
+    pub(super) fn validate_host_intent_in(tx: &rusqlite::Transaction<'_>, intent: &foundry_exec::ExecutionIntent) -> Result<(),ProductError> {
+        if canonical_review_in(tx,&intent.order.0)? {
+            let output=output_for(tx,&intent.order.0)?.ok_or_else(|| evidence("A01 host intent producer output missing"))?;
+            if output.intent!=*intent {return Err(evidence("A01 host intent producer binding mismatch"));}
+        }
+        Ok(())
+    }
+    pub(super) fn passed_provenance_in(tx: &rusqlite::Transaction<'_>, intent: &foundry_exec::ExecutionIntent, result: &foundry_exec::HostResult, now: DateTime<Utc>) -> Result<Option<Vec<u8>>,ProductError> {
+        if !canonical_review_in(tx,&intent.order.0)? {return Ok(None);}
+        let a=output_for(tx,&intent.order.0)?.ok_or_else(|| evidence("A01 bridge producer output missing"))?;
+        let r=&a.reservation; let task=&r.task; let snap=&r.claim;
+        if intent.order!=a.intent.order { return Err(evidence("A01 bridge host result lineage mismatch: intent.order")); }
+        if intent.attempt!=a.intent.attempt { return Err(evidence("A01 bridge host result lineage mismatch: intent.attempt")); }
+        if intent.activation!=a.intent.activation { return Err(evidence("A01 bridge host result lineage mismatch: intent.activation")); }
+        if result.base_commit!=a.base_commit { return Err(evidence("A01 bridge host result lineage mismatch: result.base_commit")); }
+        if !result.generations.first().is_some_and(|g|g.generation==0 && g.commit==a.result_commit) { return Err(evidence("A01 bridge host result lineage mismatch: result.generations.first")); }
+        // Original immutable evidence is checked above. Only ordinary loss of
+        // current authority takes the evidence-only completion branch.
+        let payload=admission(tx,&task.admission)?.0;
+        let actual=ProductWorkClaim{order_id:snap.order_id.clone(),lifecycle:snap.lifecycle,delivery_id:snap.delivery_id.clone(),worker_id:snap.worker_id.clone(),epoch:snap.epoch,fence:snap.fence,source_revision:snap.source_revision,payload_digest:snap.payload_digest.clone(),service_binding:Some(foundry_exec::ReviewServiceBinding{service_id:snap.service_id.clone(),service_revision:snap.service_revision,credential_revision:snap.credential_revision,source_instance_id:snap.source_instance_id.clone()}),lease_until:datetime(snap.lease_until_ns)?,task_kind:task.admission.raw_kind.clone(),payload_snapshot:payload};
+        match live(tx,task,snap,&context_for(task),&actual,clock_ns(now)?) {
+            Ok(())=>{}, Err(ProductError::Invariant("A01 authorization unavailable"))=>return Ok(None), Err(e)=>return Err(e),
+        }
+        let predecessor=replayed(tx,&intent.order.0)?.last_seq;
+        canonical(&PassedBridge{kind:"a01-passed-bridge-v1".into(),task:task.clone(),claim:snap.clone(),output_sequence:a.sequence,output_event_hash:a.event_hash,host_key:foundry_exec::HostKey{order:intent.order.0.clone(),attempt:intent.attempt.0,run:intent.run.0,activation:intent.activation},host_result_digest:product_host_result_digest(result).map_err(|_|evidence("A01 bridge host result digest invalid"))?,predecessor_seq:predecessor}).map(Some)
+    }
+    pub(super) fn complete_bridge_in(tx: &rusqlite::Transaction<'_>, intent: &foundry_exec::ExecutionIntent, result: &foundry_exec::HostResult, now: DateTime<Utc>) -> Result<(),ProductError> {
+        if let Some(bytes)=passed_provenance_in(tx,intent,result,now)? {
+            let lifecycle=output_for(tx,&intent.order.0)?.ok_or_else(|| evidence("A01 bridge completion producer output missing"))?.reservation.claim.lifecycle;
+            append(tx,&intent.order.0,lifecycle,OrderEvent::InspectionPassed,"a01-passed-bridge-v1",&bytes,now)?;
+        }
+        Ok(())
+    }
+
+    fn validate_binding_history_in(tx: &rusqlite::Transaction<'_>) -> Result<(),ProductError> {
+        let mut st=tx.prepare("SELECT order_id,lifecycle,attempt,run_id,activation,generation,tuple_digest,payload_json FROM product_result_bindings_v1")?;
+        let rows=st.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,i64>(3)?,r.get::<_,i64>(4)?,r.get::<_,i64>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        // Reuse the frozen predicate for historical identity, never current grants.
+        let guard = PERMISSION_GUARD_DDL;
+        let query=guard.split_once("  SELECT CASE").ok_or_else(|| evidence("A01 binding history guard query marker missing"))?.1;
+        let before_revocation=query.split_once("    WHEN t.operation IS NOT 'authorize'").ok_or_else(|| evidence("A01 binding history revocation marker missing"))?.0;
+        let from=query.split_once("  FROM (").ok_or_else(|| evidence("A01 binding history FROM marker missing"))?.1;
+        let mut query=format!("SELECT CASE{before_revocation} ELSE 0 END FROM ({from}");
+        query=query.trim_end().strip_suffix("END;").ok_or_else(|| evidence("A01 binding history query terminator missing"))?.trim_end().to_owned();
+        query=query.replace("RAISE(ROLLBACK,'A01 bridge permission not bound')","1")
+            .replace("RAISE(ROLLBACK,'A01 bridge permission identity mismatch')","1");
+        for name in ["order_id","lifecycle","attempt","run_id","activation","host_result_digest","payload_json"] {
+            query=query.replace(&format!("NEW.{name}"),&format!(":{name}"));
+        }
+        for (order,lifecycle,attempt,run,activation,generation,tuple,payload) in rows {
+            let value:serde_json::Value=serde_json::from_str(&payload).map_err(|_|evidence("A01 binding history payload JSON invalid"))?;
+            let host:foundry_exec::HostResult=serde_json::from_value(value["host_result"].clone()).map_err(|_|evidence("A01 binding history host result invalid"))?;
+            let digest=product_host_result_digest(&host).map_err(|_|evidence("A01 binding history host result digest invalid"))?;
+            let rejected:i64=tx.query_row(&query,rusqlite::named_params!{":order_id":order,":lifecycle":lifecycle,":attempt":attempt,":run_id":run,":activation":activation,":host_result_digest":digest,":payload_json":payload},|r|r.get(0))?;
+            if rejected!=0 {return Err(evidence("A01 binding history provenance guard rejected"));}
+            let bridge_seq=value["s1_sequence"].as_i64().ok_or_else(|| evidence("A01 binding history bridge sequence missing"))?;
+            let bridge_json:String=tx.query_row("SELECT intent FROM ledger WHERE seq=?1",[bridge_seq],|r|r.get(0))?;
+            let bridge:PassedBridge=decode(bridge_json.as_bytes())?;
+            let output=output_for(tx,&order)?.ok_or_else(|| evidence("A01 binding history producer output missing"))?;
+            if bridge.task!=output.reservation.task { return Err(evidence("A01 binding history producer provenance mismatch: bridge.task")); }
+        if bridge.claim!=output.reservation.claim { return Err(evidence("A01 binding history producer provenance mismatch: bridge.claim")); }
+        if bridge.output_sequence!=output.sequence { return Err(evidence("A01 binding history producer provenance mismatch: bridge.output_sequence")); }
+        if bridge.output_event_hash!=output.event_hash { return Err(evidence("A01 binding history producer provenance mismatch: bridge.output_event_hash")); }
+            super::result::approval_result_in(tx,&order,lifecycle,attempt,run,generation,&tuple,&host.result_commit).map_err(|_|evidence("A01 binding history approval lineage invalid"))?;
+            replayed(tx,&order)?;
+        }
+        Ok(())
+    }
+    // Test-only corruption carrier: keep the typed envelopes and flattened
+    // columns consistent so the history census, rather than the codec, rejects.
+    #[cfg(all(test, unix))]
+    pub(super) fn forge_history_for_test(conn: &Connection, key: &str, case: &str) -> Result<(),ProductError> {
+        let tx=conn.unchecked_transaction()?;
+        let mut row=local(&tx,"owner",key)?.ok_or_else(|| evidence("A01 test history task missing"))?;
+        match case {
+            "gap"=>{row.receipt.expected_revision=2;row.receipt.revision=3;},
+            "initial-revoke"=>row.receipt.operation=A01TaskOperation::Revoke,
+            "repeated-authorize"=>row.receipt.operation=A01TaskOperation::Authorize,
+            _=>return Err(evidence("A01 test history mutation unknown")),
+        }
+        let r=&row.receipt;
+        row.request=match r.operation {
+            A01TaskOperation::Authorize=>canonical(&AuthorizeEnvelope{version:1,profile:PROFILE.into(),operation:r.operation,actor_id:r.actor_id.clone(),request:A01AuthorizeTaskRequest{bridge_permission:r.bridge_permission.clone(),request_key:r.request_key.clone(),expected_revision:r.expected_revision,admission:r.admission.clone(),owner:r.owner.clone(),service:r.service.clone(),expires_at_ns:r.expires_at_ns},context:Context::from(&context_for(r)),task_kind:TASK_KIND.into(),task_bytes:TASK_BYTES.to_vec()})?,
+            A01TaskOperation::Revoke=>canonical(&RevokeEnvelope{version:1,profile:PROFILE.into(),operation:r.operation,actor_id:r.actor_id.clone(),request:A01RevokeTaskRequest{request_key:r.request_key.clone(),expected_revision:r.expected_revision,admission:r.admission.clone(),owner:r.owner.clone()}})?,
+        };
+        let triggers={
+            let mut st=tx.prepare("SELECT name,sql FROM sqlite_schema WHERE type='trigger' AND tbl_name='product_a01_task_revisions_v1'")?;
+            let rows=st.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (name,_) in &triggers {tx.execute_batch(&format!("DROP TRIGGER \"{name}\""))?;}
+        one(tx.execute("DELETE FROM product_a01_task_revisions_v1 WHERE actor_id='owner' AND request_key=?1",[key])?)?;
+        insert(&tx,&row.receipt,&row.request)?;
+        for (_,ddl) in &triggers {tx.execute_batch(ddl)?;}
+        tx.commit()?;
+        Ok(())
+    }
+
+}
+
+#[cfg(feature = "a01-harness-support")]
+pub use a01_task::{A01BridgePermissionRef,A01ProducerReservation,A01AcceptedProducerOutput,A01ProducerError,A01TaskStoreRef,A01TaskAdmissionExpectation,A01TaskOwnerExpectation,A01TaskServiceExpectation,A01AuthorizeTaskRequest,A01RevokeTaskRequest,A01TaskReceipt,A01TaskClaimView,A01TaskOperation,A01TaskStoreIdentity};
+
+
+#[cfg(all(test, feature = "a01-harness-support", unix))]
+mod a01_task_tests {
+    use super::a01_task;
+use chrono::{DateTime, Duration, Utc};
+use crate::{ProductClock, ProductConfig, ProductError, ProductStore};
+use rusqlite::{Connection, params, types::Value};
+use std::collections::BTreeMap;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+// All test failures use fixed diagnostics, including fallible fixture setup.
+#[track_caller]
+fn require<T, E>(result: Result<T, E>) -> T {
+    match result { Ok(value) => value, Err(_) => panic!("A01 test operation failed") }
+}
+
+#[track_caller]
+fn require_fixture<T>(
+    result: rusqlite::Result<T>,
+    case: &'static str,
+    stage: &'static str,
+) -> T {
+    match result {
+        Ok(value) => value,
+        Err(rusqlite::Error::SqliteFailure(code, _)) => panic!(
+            "A01 fixture operation failed: case={case} stage={stage} sqlite_code={}",
+            code.extended_code
+        ),
+        Err(_) => panic!(
+            "A01 fixture operation failed: case={case} stage={stage} sqlite_code=none"
+        ),
+    }
+}
+
+struct PrivateDir(PathBuf);
+impl PrivateDir {
+    fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let stamp = require(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)).as_nanos();
+        let path = std::env::temp_dir().join(format!("foundry-a01-{}-{stamp}-{serial}", std::process::id()));
+        require(std::fs::DirBuilder::new().mode(0o700).create(&path));
+        Self(require(path.canonicalize()))
+    }
+}
+impl Drop for PrivateDir {
+    fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+}
+
+struct FixedClock;
+impl ProductClock for FixedClock { fn now(&self) -> DateTime<Utc> { now() } }
+fn now() -> DateTime<Utc> {
+    require(DateTime::parse_from_rfc3339("2026-01-01T00:00:00+00:00")).with_timezone(&Utc)
+}
+fn clock() -> Arc<dyn ProductClock> { Arc::new(FixedClock) }
+fn config() -> ProductConfig {
+    ProductConfig { installation_id: "a01-test-installation".into(), database_id: "a01-test-database".into() }
+}
+fn create(dir: &PrivateDir) -> ProductStore {
+    require(ProductStore::create_a01_isolated_test_store(&dir.0, "store.db", config(), clock()))
+}
+fn reopen(dir: &PrivateDir) -> ProductStore {
+    require(ProductStore::reopen_a01_isolated_test_store(&dir.0, "store.db", config(), clock()))
+}
+fn read_db(path: &Path) -> Connection {
+    require(Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY))
+}
+fn count(path: &Path, table: &str) -> i64 {
+    require(read_db(path).query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0)))
+}
+
+type Files = BTreeMap<PathBuf, (u32, u32, u64, Vec<u8>)>;
+fn files(dir: &Path, database_bytes: bool) -> Files {
+    fn visit(root: &Path, dir: &Path, database_bytes: bool, out: &mut Files) {
+        for entry in require(std::fs::read_dir(dir)) {
+            let entry = require(entry);
+            let path = entry.path();
+            let meta = require(std::fs::symlink_metadata(&path));
+            let relative = require(path.strip_prefix(root)).to_path_buf();
+            let bytes = if meta.file_type().is_symlink() {
+                use std::os::unix::ffi::OsStrExt;
+                require(std::fs::read_link(&path)).as_os_str().as_bytes().to_vec()
+            } else if meta.is_file() && (database_bytes || relative != Path::new("store.db")) {
+                require(std::fs::read(&path))
+            } else { Vec::new() };
+            out.insert(relative, (meta.mode(), meta.uid(), meta.nlink(), bytes));
+            if meta.is_dir() { visit(root, &path, database_bytes, out); }
+        }
+    }
+    let mut out = BTreeMap::new();
+    visit(dir, dir, database_bytes, &mut out);
+    out
+}
+
+// Keep rows and schema private. Never use assert_eq! on these observations.
+fn logical(path: &Path) -> BTreeMap<String, Vec<Vec<Value>>> {
+    let conn = read_db(path);
+    let mut names = require(conn.prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name"));
+    let names: Vec<String> = require(require(names.query_map([], |r| r.get(0))).collect());
+    let mut out = BTreeMap::new();
+    for name in names {
+        let quoted = name.replace('"', "\"\"");
+        let mut st = require(conn.prepare(&format!("SELECT * FROM \"{quoted}\"")));
+        let columns = st.column_count();
+        let mut rows: Vec<Vec<Value>> = require(require(st.query_map([], |r| {
+            (0..columns).map(|i| r.get(i)).collect::<rusqlite::Result<_>>()
+        })).collect());
+        rows.sort_by_cached_key(|row| format!("{row:?}"));
+        out.insert(name, rows);
+    }
+    let mut st = require(conn.prepare("SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name"));
+    out.insert("schema definitions".into(), require(require(st.query_map([], |r| {
+        (0..4).map(|i| r.get(i)).collect::<rusqlite::Result<_>>()
+    })).collect()));
+    out
+}
+fn preserved(dir: &PrivateDir) -> (BTreeMap<String, Vec<Vec<Value>>>, Files) {
+    (logical(&dir.0.join("store.db")), files(&dir.0, false))
+}
+use crate::product::{A01AuthorizeTaskRequest, A01RevokeTaskRequest, A01TaskAdmissionExpectation,
+    A01TaskOwnerExpectation, A01TaskServiceExpectation, A01TaskStoreRef, A01TaskStoreIdentity};
+
+struct TaskClock(std::sync::Mutex<DateTime<Utc>>);
+impl ProductClock for TaskClock { fn now(&self) -> DateTime<Utc> { *require(self.0.lock()) } }
+impl TaskClock { fn set(&self, value: DateTime<Utc>) { *require(self.0.lock())=value; } }
+
+// Transport is simulated. Admission, authentication and every positive write
+// use the real ledger APIs. This fixture never seeds ready or claim evidence.
+struct TaskClaimFixture {
+    dir: PrivateDir,
+    store: ProductStore,
+    identity: A01TaskStoreIdentity,
+    clock: Arc<TaskClock>,
+    session: String,
+    service: crate::ProductServiceContext,
+    authorization: A01AuthorizeTaskRequest,
+}
+impl TaskClaimFixture {
+    fn new() -> Self {
+        use crate::{ProductCapability, ProductServiceAction, ProductServiceGrant, ScopeGrantManifest, ScopeSourceManifest, RepositoryIdentity};
+        use crate::product_identity::ProductPasswordKdf;
+        let dir=PrivateDir::new();
+        let clock=Arc::new(TaskClock(std::sync::Mutex::new(now())));
+        let (mut store,identity)=require(ProductStore::create_a01_task_claim_test_store(&dir.0,"store.db",config(),clock.clone()));
+        let source=ScopeSourceManifest{connector_id:"gh".into(),source_instance_id:"task-source".into(),generation:1,
+            identity:require(RepositoryIdentity::canonicalized("acme","GitHub","https://api.github.com","42")),
+            api_owner:Some("acme".into()),api_repo:Some("project".into()),legacy_repository_locator:"acme/project".into(),scope_query:"open".into(),enabled:true};
+        let grants=[ScopeGrantManifest{actor_id:"owner".into(),source_instance_id:"task-source".into(),capabilities:vec![ProductCapability::ReadOrder]}];
+        require(store.bootstrap_owner_scoped("owner",&require(ProductPasswordKdf::hash("task-profile-fixture-password")),&[source],&grants));
+        let session=require(store.login("owner","task-profile-fixture-password",now())).digest().to_owned();
+        require(store.create_account(&session,"bridge-admin","owner",&require(ProductPasswordKdf::hash("task-admin-fixture-password")),now()));
+        let admin=require(store.login("bridge-admin","task-admin-fixture-password",now())).digest().to_owned();
+        let db=read_db(store.path());
+        let scope_revision:i64=require(db.query_row("SELECT revision FROM product_scope_subject_revisions_v1 WHERE subject_id='owner' AND source_instance_id='task-source'",[],|r|r.get(0)));
+        drop(db);
+        require(store.change_product_scope(&admin,"owner","task-source",ProductCapability::A01BridgePassed,crate::ScopeMutation::Grant,scope_revision,"bridge-grant",now()));
+        let bridge_permission=require(require(store.read_a01_bridge_permission(&session,"task-source")).ok_or(()));
+        let grants:Vec<_>=[ProductServiceAction::IntakeRead,ProductServiceAction::AdmitDelivery,ProductServiceAction::AckDelivery,ProductServiceAction::DriveReview]
+            .into_iter().map(|action|ProductServiceGrant{source_instance_id:"task-source".into(),action}).collect();
+        require(store.manage_product_service(&session,"task-service",&grants,true,now()+Duration::hours(4),0,"service",now()));
+        let credential=require(store.issue_product_service_credential(&session,"task-service",1,now()+Duration::hours(3),"credential",now()));
+        let service=require(store.authenticate_product_service_for_action(credential.expose_once_to_file_writer(),"gh","https://api.github.com","42",ProductServiceAction::DriveReview,now()));
+        let payload=r#"{"issue_number":17,"title":"A bounded task","body":"original input"}"#;
+        let updated=now().to_rfc3339();
+        let version=crate::product::delivery_version_digest("issue:17",&updated,"github-issue",payload);
+        let delivery=crate::ProductDelivery{delivery_id:crate::product::github_delivery_id(&config().installation_id,"gh","https://api.github.com","42","issue:17",&version),connector_id:"gh".into(),repository_id:"42".into(),issue_id:"issue:17".into(),observed_updated_at:updated.clone(),version_digest:version,task_kind:"github-issue".into(),payload:payload.into()};
+        let cursor=crate::ProductPollCursor{connector_id:"gh".into(),query_fingerprint:"task-query".into(),sweep_id:"task-sweep".into(),next_page:1,page_ceiling:1,updated_at:updated};
+        require(store.persist_intake_page_for_service(&service,&cursor,&[delivery.clone()],&[],now()));
+        let receipt=require(store.admit_intake_delivery_for_service(&service,&delivery.delivery_id,"task-order",now()));
+        require(store.mark_intake_acked_for_service(&service,&delivery.delivery_id,&receipt,now()));
+        let view=require(store.read_scoped_order(&session,&receipt.order_id,now()));
+        let db=read_db(store.path());
+        let account_revision=require(db.query_row("SELECT revision FROM product_accounts_v1 WHERE actor_id='owner'",[],|r|r.get(0)));
+        let (source_generation,source_instance_revision,connector_revision,provider,api_origin,repository_id,api_owner,api_repo):(i64,i64,i64,String,String,String,String,String)=require(db.query_row("SELECT i.generation,i.revision,s.revision,r.provider,r.api_origin,r.stable_repository_id,l.api_owner,l.api_repo FROM product_scope_source_instances_v1 i JOIN product_scope_repositories_v1 r USING(repository_key) JOIN product_scope_api_locators_v1 l USING(source_instance_id) JOIN product_sources_v1 s ON s.connector_id=i.connector_id WHERE i.source_instance_id='task-source'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?))));
+        let (service_revision,credential_revision,drive_review_grant_revision):(i64,i64,i64)=require(db.query_row("SELECT s.revision,c.credential_revision,g.grant_revision FROM product_services_v1 s JOIN product_service_credentials_v1 c USING(service_id) JOIN product_service_grants_v1 g USING(service_id) WHERE g.action='drive_review'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))));
+        let raw_payload_digest=task_raw_digest(&delivery.task_kind,&delivery.payload);
+        let authorization=A01AuthorizeTaskRequest{bridge_permission,request_key:"authorize".into(),expected_revision:0,
+            admission:A01TaskAdmissionExpectation{store:A01TaskStoreRef{installation_id:config().installation_id,database_id:config().database_id},order_id:receipt.order_id,lifecycle:receipt.lifecycle,delivery_id:delivery.delivery_id,admission_seq:receipt.sequence,admission_hash:receipt.event_hash,raw_kind:delivery.task_kind,raw_payload_digest,source_instance_id:view.source_instance_id,source_generation,source_instance_revision,connector_id:"gh".into(),connector_revision,repository_key:view.repository_key,repository_provider:provider,api_origin,stable_repository_id:repository_id,api_owner,api_repo},
+            owner:A01TaskOwnerExpectation{account_revision,scope_revision:view.scope_revision,read_order_grant_revision:view.grant_revision},
+            service:A01TaskServiceExpectation{service_id:"task-service".into(),service_revision,credential_revision,drive_review_grant_revision,service_lease_until_ns:require((now()+Duration::hours(4)).timestamp_nanos_opt().ok_or(())),credential_expires_at_ns:require((now()+Duration::hours(3)).timestamp_nanos_opt().ok_or(()))},
+            expires_at_ns:require((now()+Duration::hours(2)).timestamp_nanos_opt().ok_or(()))};
+        drop(db);
+        Self{dir,store,identity,clock,session,service,authorization}
+    }
+    fn authorize(&mut self) -> crate::product::A01TaskReceipt {
+        require(self.store.authorize_a01_task(&self.session,&self.service,&self.authorization))
+    }
+    fn claim(&mut self) -> crate::ProductWorkClaim {
+        match require(self.store.claim_product_work_for_service(&self.service,"task-worker",now()-Duration::days(1),Duration::minutes(10))) {
+            crate::ProductWorkClaimResult::Claimed(c)=>c,_=>panic!("A01 task claim missing"),
+        }
+    }
+    fn revoke_request(&self, revision: i64) -> A01RevokeTaskRequest {
+        A01RevokeTaskRequest{request_key:format!("revoke-{revision}"),expected_revision:revision,admission:self.authorization.admission.clone(),owner:self.authorization.owner.clone()}
+    }
+    fn reopen(self) -> Self {
+        let Self{dir,store,identity,clock,session,service,authorization}=self;
+        drop(store);
+        let store=require(ProductStore::reopen_a01_task_claim_test_store(&dir.0,"store.db",config(),clock.clone(),&identity));
+        Self{dir,store,identity,clock,session,service,authorization}
+    }
+    fn empty(&mut self) {
+        assert!(matches!(require(self.store.claim_product_work_for_service(&self.service,"another-worker",now(),Duration::minutes(5))),crate::ProductWorkClaimResult::Empty),"A01 duplicate acquisition");
+    }
+}
+fn task_raw_digest(kind: &str,payload: &str) -> String {
+    use sha2::{Digest,Sha256};
+    let mut h=Sha256::new();h.update(b"foundry-product-intake-v1\0");
+    for bytes in [kind.as_bytes(),payload.as_bytes()] {h.update((bytes.len() as u64).to_be_bytes());h.update(bytes);}
+    hex::encode(h.finalize())
+}
+
+    fn injected(name: &str,target: &str) -> Result<(),ProductError> {
+        if name==target {Err(ProductError::Invariant("A01 test checkpoint"))} else {Ok(())}
+    }
+    #[test]
+    fn a01_task_initialization_dispatch_and_rollback() {
+        use super::{initialize_product_schema_in,StoreOpenMode};
+        for mode in [StoreOpenMode::Normal,StoreOpenMode::A01Create,StoreOpenMode::A01TaskCreate] {
+            let mut conn=require(Connection::open_in_memory());
+            require(conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA recursive_triggers=ON; PRAGMA ignore_check_constraints=OFF;"));
+            let tx=require(conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate));
+            require(initialize_product_schema_in(&tx,&config(),mode));
+            let tables:i64=require(tx.query_row("SELECT count(*) FROM sqlite_schema WHERE name LIKE 'product_a01_%' AND type='table'",[],|r|r.get(0)));
+            assert!(tables==if mode==StoreOpenMode::A01TaskCreate {3} else {0},"A01 initialization dispatch mismatch");
+            require(tx.rollback());
+        }
+        let targets:Vec<String>=(0..12).map(|i|format!("schema-{i}")).chain(["profile".into(),"precommit".into()]).collect();
+        for target in targets {
+            let mut conn=require(Connection::open_in_memory());require(conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA recursive_triggers=ON; PRAGMA ignore_check_constraints=OFF;"));
+            let tx=require(conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate));
+            require(initialize_product_schema_in(&tx,&config(),StoreOpenMode::A01Create));
+            let mut callback=|name:&str|injected(name,&target);
+            let mut hooks=a01_task::TaskHooks::with_callback(&mut callback);
+            let result=a01_task::initialize_in(&tx,&config(),&mut hooks);
+            assert!(a01_task::finish(tx,result,&mut hooks).is_err(),"A01 initialization fault missed");
+            let tables:i64=require(conn.query_row("SELECT count(*) FROM sqlite_schema WHERE type='table'",[],|r|r.get(0)));
+            assert!(tables==0 && conn.is_autocommit(),"A01 partial initialization committed");
+        }
+    }
+    #[test]
+    fn a01_task_write_boundaries_roll_back() {
+        for (operation,targets) in [
+            ("authorize",&["authorize-insert","authorize-ready","precommit"][..]),
+            ("revoke",&["revoke-insert","revoke-backlog","precommit"][..]),
+            ("claim",&["fence","claim","binding","backlog","snapshot","precommit"][..]),
+        ] {
+            for target in targets {
+                let mut f=TaskClaimFixture::new();if operation!="authorize" {f.authorize();}
+                let before=preserved(&f.dir);let bytes=files(&f.dir.0,true);
+                let mut callback=|name:&str|injected(name,target);
+                let mut hooks=a01_task::TaskHooks::with_callback(&mut callback);
+                let failed=match operation {
+                    "authorize"=>a01_task::authorize(&mut f.store,&f.session,&f.service,&f.authorization,&mut hooks).is_err(),
+                    "revoke"=>{let r=f.revoke_request(1);a01_task::revoke(&mut f.store,&f.session,&r,&mut hooks).is_err()},
+                    _=>a01_task::claim(&mut f.store,&f.service,"worker",Duration::minutes(1),&mut hooks).is_err(),
+                };
+                assert!(failed && f.store.conn.is_autocommit(),"A01 write checkpoint failed to roll back");
+                assert!(before==preserved(&f.dir) && bytes==files(&f.dir.0,true),"A01 write checkpoint committed partial state");
+            }
+        }
+    }
+    #[test]
+    fn a01_task_after_lock_time_is_authoritative() {
+        use std::sync::mpsc::sync_channel;
+        let mut f=TaskClaimFixture::new();
+        f.authorization.expires_at_ns=require((now()+Duration::seconds(1)).timestamp_nanos_opt().ok_or(()));f.authorize();
+        let mut competing=require(Connection::open(f.store.path()));
+        let guard=require(competing.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate));
+        let (sent,ack)=sync_channel(1);
+        let clock=f.clock.clone();
+        let result=std::thread::scope(|scope| {
+            let worker=scope.spawn(|| {
+                let mut callback=|name:&str| {if name=="before-lock" {require(sent.send(()));} Ok(())};
+                a01_task::claim(&mut f.store,&f.service,"worker",Duration::minutes(1),&mut a01_task::TaskHooks::with_callback(&mut callback))
+            });
+            require(ack.recv_timeout(std::time::Duration::from_secs(2)));
+            clock.set(now()+Duration::seconds(1));
+            require(guard.commit());require(worker.join())
+        });
+        assert!(matches!(require(result),crate::ProductWorkClaimResult::Empty),"A01 caller or pre-lock time authorized expired claim");
+        assert!(count(f.store.path(),"product_work_claims_v1")==0,"A01 post-lock expiry wrote claim");
+    }
+    #[test]
+    fn a01_task_revoke_claim_lock_orders_and_two_claimers() {
+        use std::sync::mpsc::sync_channel;
+        for revoke_first in [true,false] {
+            let mut f=TaskClaimFixture::new();f.authorize();let revoke=f.revoke_request(1);
+            let mut contender=require(ProductStore::reopen_a01_task_claim_test_store(&f.dir.0,"store.db",config(),f.clock.clone(),&f.identity));
+            let (first_sent,first_ack)=sync_channel(1);let (second_sent,second_ack)=sync_channel(1);let (release,wait)=sync_channel(1); let wait=std::sync::Mutex::new(wait);
+            std::thread::scope(|scope| {
+                let first=scope.spawn(|| {
+                    let mut callback=|name:&str| {if name=="after-lock" {require(first_sent.send(()));require(require(wait.lock()).recv_timeout(std::time::Duration::from_secs(3)));} Ok(())};
+                    let mut hooks=a01_task::TaskHooks::with_callback(&mut callback);
+                    if revoke_first {a01_task::revoke(&mut f.store,&f.session,&revoke,&mut hooks).map(|_|false)}
+                    else {a01_task::claim(&mut f.store,&f.service,"first",Duration::minutes(1),&mut hooks).map(|r|matches!(r,crate::ProductWorkClaimResult::Claimed(_)))}
+                });
+                require(first_ack.recv_timeout(std::time::Duration::from_secs(2)));
+                let second=scope.spawn(|| {
+                    let mut callback=|name:&str| {if name=="before-lock" {require(second_sent.send(()));} Ok(())};
+                    let mut hooks=a01_task::TaskHooks::with_callback(&mut callback);
+                    if revoke_first {a01_task::claim(&mut contender,&f.service,"second",Duration::minutes(1),&mut hooks).map(|r|matches!(r,crate::ProductWorkClaimResult::Claimed(_)))}
+                    else {a01_task::revoke(&mut contender,&f.session,&revoke,&mut hooks).map(|_|false)}
+                });
+                require(second_ack.recv_timeout(std::time::Duration::from_secs(2)));require(release.send(()));
+                assert!(require(require(first.join()))==!revoke_first,"A01 first lock order mismatch");
+                assert!(!require(require(second.join())),"A01 revoke lock order allowed new claim");
+            });
+            assert!(count(f.store.path(),"product_work_claims_v1")==if revoke_first {0} else {1},"A01 revoke/claim serialization mismatch");
+            let f=f.reopen();assert!(count(f.store.path(),"product_a01_task_revisions_v1")==2,"A01 lock order lost history");
+        }
+        let mut f=TaskClaimFixture::new();f.authorize();
+        let mut other=require(ProductStore::reopen_a01_task_claim_test_store(&f.dir.0,"store.db",config(),f.clock.clone(),&f.identity));
+        let (sent,ack)=sync_channel(1);let (release,wait)=sync_channel(1); let wait=std::sync::Mutex::new(wait);let (sent2,ack2)=sync_channel(1);
+        std::thread::scope(|scope| {
+            let first=scope.spawn(|| {
+                let mut callback=|name:&str| {if name=="after-lock" {require(sent.send(()));require(require(wait.lock()).recv_timeout(std::time::Duration::from_secs(3)));} Ok(())};
+                a01_task::claim(&mut f.store,&f.service,"first",Duration::minutes(1),&mut a01_task::TaskHooks::with_callback(&mut callback))
+            });
+            require(ack.recv_timeout(std::time::Duration::from_secs(2)));
+            let second=scope.spawn(|| {
+                let mut callback=|name:&str| {if name=="before-lock" {require(sent2.send(()));} Ok(())};
+                a01_task::claim(&mut other,&f.service,"second",Duration::minutes(1),&mut a01_task::TaskHooks::with_callback(&mut callback))
+            });
+            require(ack2.recv_timeout(std::time::Duration::from_secs(2)));require(release.send(()));
+            assert!(matches!(require(require(first.join())),crate::ProductWorkClaimResult::Claimed(_)),"A01 first claimer lost claim");
+            assert!(matches!(require(require(second.join())),crate::ProductWorkClaimResult::Empty),"A01 two claimers both acquired");
+        });
+        assert!(count(f.store.path(),"product_a01_claim_snapshots_v1")==1,"A01 two claimers wrote extra snapshots");
+    }
+    #[test]
+    fn a01_task_integer_and_time_boundaries() {
+        for (time,expected) in [("1970-01-01T00:00:00Z",0),("1970-01-01T10:00:00.000000001+10:00",1),("2262-04-11T23:47:16.854775807Z",i64::MAX)] {
+            assert!(require(a01_task::time_ns(time))==expected,"A01 timestamp boundary changed");
+        }
+        for bad in ["1969-12-31T23:59:59.999999999Z","2262-04-11T23:47:16.854775808Z","2016-12-31T23:59:60Z","2026-01-01T00:00:00.0000000000Z","2026-01-01t00:00:00z","2026-02-30T00:00:00Z","2026-01-01T00:00:00Z trailing"] {
+            assert!(a01_task::time_ns(bad).is_err(),"A01 invalid time accepted");
+        }
+        let mut f=TaskClaimFixture::new();assert!(f.authorization.expected_revision==0 && f.authorize().revision==1,"A01 zero-to-positive revision failed");
+        for sql in ["UPDATE product_fence_counter_v1 SET next=9223372036854775807","UPDATE product_fence_counter_v1 SET next=-1","UPDATE product_work_backlog_v1 SET attempts=9223372036854775807"] {
+            let mut f=TaskClaimFixture::new();f.authorize();require(require(Connection::open(f.store.path())).execute_batch(sql));let before=preserved(&f.dir);
+            assert!(f.store.claim_product_work_for_service(&f.service,"worker",now(),Duration::minutes(1)).is_err(),"A01 integer overflow accepted");
+            assert!(before==preserved(&f.dir),"A01 integer overflow mutated state");
+        }
+        let mut f=TaskClaimFixture::new();f.authorization.expected_revision=i64::MAX;let before=preserved(&f.dir);
+        assert!(matches!(f.store.authorize_a01_task(&f.session,&f.service,&f.authorization),Err(ProductError::InvalidConfig)),"A01 revision overflow accepted");assert!(before==preserved(&f.dir),"A01 revision overflow wrote evidence");
+        for (table,column) in [("product_services_v1","lease_until"),("product_service_credentials_v1","expires_at"),("product_work_backlog_v1","available_at")] {
+            for bad in ["bad","2016-12-31T23:59:60Z","2026-01-01T00:00:00.1234567890Z"] {
+                let mut f=TaskClaimFixture::new();f.authorize();require(require(Connection::open(f.store.path())).execute(&format!("UPDATE {table} SET {column}=?1"),[bad]));let before=preserved(&f.dir);
+                assert!(f.store.claim_product_work_for_service(&f.service,"worker",now(),Duration::minutes(1)).is_err(),"A01 malformed participating time accepted");assert!(before==preserved(&f.dir),"A01 malformed time wrote state");
+            }
+        }
+    }
+
+    #[test]
+    fn a01_task_sql_immutability_and_conflict_modes() {
+        let mut f=TaskClaimFixture::new();f.authorize();f.claim();
+        for (table,keys) in [
+            ("product_a01_profile_v1",&["primary"][..]),
+            ("product_a01_task_revisions_v1",&["primary","actor-key"][..]),
+            ("product_a01_claim_snapshots_v1",&["primary","fence"][..]),
+        ] {
+            for key in keys {
+                for mode in ["INSERT","INSERT OR IGNORE","INSERT OR REPLACE","UPSERT"] {
+                    let before=preserved(&f.dir);let bytes=files(&f.dir.0,true);
+                    let db=require(Connection::open(f.store.path()));require(db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA recursive_triggers=ON; BEGIN IMMEDIATE; UPDATE product_fence_counter_v1 SET next=next+1"));
+                    let columns:Vec<String>={let mut st=require(db.prepare(&format!("PRAGMA table_info({table})")));require(require(st.query_map([],|r|r.get(1))).collect())};
+                    let select=columns.iter().map(|c|match (table,*key,c.as_str()) {
+                        ("product_a01_task_revisions_v1","primary","request_key")=>"'collision-key'".into(),
+                        ("product_a01_task_revisions_v1","actor-key","revision")=>"revision+1".into(),
+                        ("product_a01_task_revisions_v1","actor-key","expected_revision")=>"expected_revision+1".into(),
+                        ("product_a01_claim_snapshots_v1","primary","fence")=>"fence+1".into(),
+                        ("product_a01_claim_snapshots_v1","fence","order_id")=>"'another-order'".into(),
+                        _=>format!("\"{c}\""),
+                    }).collect::<Vec<String>>().join(",");
+                    let names=columns.iter().map(|c|format!("\"{c}\"")).collect::<Vec<_>>().join(",");
+                    let prefix=if mode=="UPSERT" {"INSERT"} else {mode};let suffix=if mode=="UPSERT" {" ON CONFLICT DO UPDATE SET lifecycle=excluded.lifecycle"} else {""};
+                    let suffix=if mode=="UPSERT" && table=="product_a01_profile_v1" {" ON CONFLICT DO NOTHING"} else {suffix};
+                    assert!(db.execute_batch(&format!("{prefix} INTO {table}({names}) SELECT {select} FROM {table} WHERE 1{suffix}")).is_err() && db.is_autocommit(),"A01 unique conflict did not roll back transaction");
+                    drop(db);assert!(before==preserved(&f.dir) && bytes==files(&f.dir.0,true),"A01 conflict committed unrelated write");
+                }
+            }
+            for operation in [format!("UPDATE {table} SET {}={}",if table=="product_a01_profile_v1" {"version"} else {"lifecycle"},if table=="product_a01_profile_v1" {"version"} else {"lifecycle"}),format!("DELETE FROM {table}")] {
+                let before=preserved(&f.dir);let db=require(Connection::open(f.store.path()));
+                require(db.execute_batch("PRAGMA recursive_triggers=ON; BEGIN IMMEDIATE; UPDATE product_fence_counter_v1 SET next=next+1"));
+                assert!(db.execute_batch(&operation).is_err() && db.is_autocommit(),"A01 matched mutation did not roll back");drop(db);
+                assert!(before==preserved(&f.dir),"A01 matched mutation committed earlier write");
+            }
+        }
+        // These probes reach ordinary constraints, rather than a duplicate guard.
+        // A new revoke identity is legal at the BEFORE INSERT trigger boundary.
+        for (field,value,ignore) in [("task_bytes","NULL",false),("task_bytes","NULL",true),("task_bytes","'wrong storage class'",false),("task_kind","'wrong-kind'",false),("task_kind","'wrong-kind'",true),("actor_id","'missing-actor'",false)] {
+            let before=preserved(&f.dir);let db=require(Connection::open(f.store.path()));
+            require(db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA recursive_triggers=ON; BEGIN IMMEDIATE; UPDATE product_fence_counter_v1 SET next=next+1"));
+            let columns:Vec<String>={let mut st=require(db.prepare("PRAGMA table_info(product_a01_task_revisions_v1)"));require(require(st.query_map([],|r|r.get(1))).collect())};
+            let select=columns.iter().map(|c|if c==field {value.to_owned()} else {match c.as_str() {"operation"=>"'revoke'".into(),"request_key"=>"'constraint-probe'".into(),"revision"=>"2".into(),"expected_revision"=>"1".into(),_=>format!("\"{c}\"")}}).collect::<Vec<_>>().join(",");
+            let prefix=if ignore {"INSERT OR IGNORE"} else {"INSERT"};
+            let result=db.execute(&format!("{prefix} INTO product_a01_task_revisions_v1 SELECT {select} FROM product_a01_task_revisions_v1"),[]);
+            assert!(if ignore {matches!(result,Ok(0))} else {result.is_err()},"A01 ordinary constraint result mismatch");
+            assert!(!db.is_autocommit(),"A01 ordinary statement constraint unexpectedly rolled back transaction");
+            let counter:i64=require(db.query_row("SELECT next FROM product_fence_counter_v1 WHERE singleton=1",[],|r|r.get(0)));assert!(counter==2,"A01 statement-abort control lost earlier write");
+            require(db.execute_batch("ROLLBACK"));drop(db);assert!(before==preserved(&f.dir),"A01 explicit constraint rollback changed evidence");
+        }
+    }
+    fn damage_restore(path: &Path, table: &str, sql: &str) {
+        let mut db=require(Connection::open(path));
+        require(db.execute_batch("PRAGMA foreign_keys=OFF; PRAGMA ignore_check_constraints=ON"));
+        let triggers:Vec<(String,String)>={let mut st=require(db.prepare("SELECT name,sql FROM sqlite_schema WHERE type='trigger' AND tbl_name=?1"));require(require(st.query_map([table],|r|Ok((r.get(0)?,r.get(1)?)))).collect())};
+        let tx=require(db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate));
+        for (name,_) in &triggers {require(tx.execute_batch(&format!("DROP TRIGGER \"{name}\"")));}
+        require(tx.execute_batch(sql));
+        for (_,ddl) in &triggers {require(tx.execute_batch(ddl));}
+        require(tx.commit());
+    }
+    fn rejected_without_repair(f: &TaskClaimFixture) {
+        let before=preserved(&f.dir);let bytes=files(&f.dir.0,true);
+        assert!(matches!(ProductStore::reopen_a01_task_claim_test_store(&f.dir.0,"store.db",config(),f.clock.clone(),&f.identity),Err(ProductError::ContractMismatch)),"A01 damaged history reopened");
+        assert!(before==preserved(&f.dir) && bytes==files(&f.dir.0,true),"A01 damaged history was repaired");
+    }
+    #[test]
+    fn a01_task_snapshot_and_history_census() {
+        for case in ["gap","initial-revoke","repeated-authorize"] {
+            let mut f=TaskClaimFixture::new();f.authorize();
+            let key=if case=="repeated-authorize" {
+                let r=f.revoke_request(1);require(f.store.revoke_a01_task(&f.session,&r));r.request_key
+            } else {"authorize".into()};
+            require(a01_task::forge_history_for_test(&f.store.conn,&key,case));
+            rejected_without_repair(&f);
+        }
+        for (column,value) in [("order_id","'missing'"),("lifecycle","2"),("task_revision","2"),("delivery_id","'substitution'"),("worker_id","'other-worker'"),("epoch","2"),("fence","2"),("claimed_at_ns","0"),("lease_until_ns","lease_until_ns+1"),("lease_until_text","'2026-01-01T00:10:00.000000001Z'"),("source_revision","2"),("payload_digest","'invalid'"),("service_id","'other-service'"),("service_revision","2"),("credential_revision","2"),("source_instance_id","'other-source'")] {
+            let mut f=TaskClaimFixture::new();f.authorize();f.claim();
+            damage_restore(f.store.path(),"product_a01_claim_snapshots_v1",&format!("UPDATE product_a01_claim_snapshots_v1 SET {column}={value}"));
+            rejected_without_repair(&f);
+        }
+        for sql in [
+            "UPDATE product_a01_task_revisions_v1 SET revision=3,expected_revision=2",
+            "UPDATE product_a01_task_revisions_v1 SET operation='revoke'",
+            "UPDATE product_a01_task_revisions_v1 SET receipt_bytes=CAST(' {}' AS BLOB)",
+            "UPDATE product_a01_task_revisions_v1 SET request_bytes=CAST('{}' AS BLOB)",
+            "UPDATE product_a01_task_revisions_v1 SET raw_payload_digest='invalid'",
+            "UPDATE product_a01_task_revisions_v1 SET admission_seq=999",
+            "UPDATE product_a01_task_revisions_v1 SET expires_at_ns=authorized_at_ns",
+        ] {
+            let mut f=TaskClaimFixture::new();f.authorize();damage_restore(f.store.path(),"product_a01_task_revisions_v1",sql);rejected_without_repair(&f);
+        }
+        for sql in ["UPDATE product_work_claims_v1 SET owner_id='other'","UPDATE product_work_claims_v1 SET lease_until='malformed'","UPDATE product_service_work_bindings_v1 SET service_revision=2","UPDATE product_work_backlog_v1 SET attempts=2"] {
+            let mut f=TaskClaimFixture::new();f.authorize();f.claim();require(require(Connection::open(f.store.path())).execute_batch(sql));rejected_without_repair(&f);
+        }
+        let mut f=TaskClaimFixture::new();f.authorize();f.claim();let r=f.revoke_request(1);require(f.store.revoke_a01_task(&f.session,&r));
+        f.clock.set(now()+Duration::hours(6));
+        require(require(Connection::open(f.store.path())).execute_batch("UPDATE product_accounts_v1 SET revision=revision+1; UPDATE product_services_v1 SET revision=revision+1; UPDATE product_scope_source_instances_v1 SET enabled=0,revision=revision+1"));
+        let before=preserved(&f.dir);let f=f.reopen();assert!(before==preserved(&f.dir),"A01 historical reopen repaired expired/revoked authority");
+    }
+
 }

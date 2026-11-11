@@ -126,6 +126,7 @@ fn append_hold_outcome_in(
     receipt: &ProductHoldAcceptance,
     decision: &foundry_exec::ReviewHoldAction,
     at: chrono::DateTime<chrono::Utc>,
+    _host: Option<(&ExecutionIntent,&HostResult)>,
 ) -> Result<(), HostError> {
     let mut statement = tx.prepare(
         "SELECT seq,order_id,from_state,to_state,event,actor,intent,at,prev_hash,hash,event_json FROM ledger ORDER BY seq",
@@ -159,7 +160,7 @@ fn append_hold_outcome_in(
         .ok_or_else(|| HostError::Acceptance("hold outcome has no verified S1 lifecycle".into()))?;
     if current.lifecycle as i64 + 1 != receipt.lifecycle
         || current.order.attempt() as i64 != receipt.attempt
-        || current.order.state().to_string() != "waiting"
+        || (current.order.state().to_string() != "waiting" && !a01_review_state_in(tx,&receipt.order_id,&current.order.state().to_string())?)
         || current.last_seq != receipt.predecessor_seq
     {
         return Err(HostError::Acceptance(
@@ -207,9 +208,18 @@ fn append_hold_outcome_in(
     };
     let actor_text = format!("{:?}/{}", actor.kind, actor.id);
     let at_text = at.to_rfc3339();
+    let intent = receipt.operation_id.clone();
+    #[cfg(feature = "a01-harness-support")]
+    let intent = if matches!(decision,foundry_exec::ReviewHoldAction::CommitPass) {
+        match _host {
+            Some((key,result)) => super::a01_task::passed_provenance_in(tx,key,result,at).map_err(db_error)?
+                .map(|bytes| String::from_utf8(bytes).map_err(db_error)).transpose()?.unwrap_or(intent),
+            None => intent,
+        }
+    } else { intent };
     let v1 = format!(
         "{seq}|{}|{from}|{to}|{event_text}|{actor_text}|{}|{at_text}|{previous_hash}",
-        receipt.order_id, receipt.operation_id
+        receipt.order_id, intent
     );
     let event_hash = hex::encode(sha2::Sha256::digest(
         crate::event_json::v2_hash_payload(&v1, &event_json).as_bytes(),
@@ -220,9 +230,16 @@ fn append_hold_outcome_in(
     ).map_err(db_error)?;
     tx.execute(
         "INSERT INTO ledger(order_id,from_state,to_state,event,actor,intent,at,prev_hash,event_json,hash) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-        rusqlite::params![receipt.order_id,from,to,event_text,actor_text,receipt.operation_id,at_text,previous_hash,event_json,event_hash],
+        rusqlite::params![receipt.order_id,from,to,event_text,actor_text,intent,at_text,previous_hash,event_json,event_hash],
     ).map_err(db_error)?;
     Ok(())
+}
+
+fn a01_review_state_in(tx: &rusqlite::Transaction<'_>, order: &str, state: &str) -> Result<bool,HostError> {
+    #[cfg(feature = "a01-harness-support")]
+    if state == "review" { return super::a01_task::canonical_review_in(tx,order).map_err(db_error); }
+    let _ = (tx,order,state);
+    Ok(false)
 }
 
 fn validate_work_claim_in(
@@ -394,7 +411,8 @@ fn validate_admitted(
     store: &ProductStore,
     order: &str,
 ) -> Result<(i64, i64, String, String, i64), HostError> {
-    let row = store.conn.query_row(
+    let tx = store.conn.unchecked_transaction().map_err(db_error)?;
+    let row = tx.query_row(
         "SELECT o.lifecycle,o.source_revision,o.repository_id,s.enabled,s.revision,o.admission_seq,o.admission_hash FROM product_orders_v1 o JOIN product_sources_v1 s ON s.connector_id=o.connector_id WHERE o.order_id=?1",
         [order], |r| Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?,r.get::<_,i64>(4)?,r.get::<_,i64>(5)?,r.get::<_,String>(6)?)),
     ).optional().map_err(db_error)?.ok_or_else(|| HostError::Acceptance("review order has no durable product admission".into()))?;
@@ -421,7 +439,7 @@ fn validate_admitted(
         || !matches!(
             state.as_str(),
             "queued" | "working" | "held" | "waiting" | "inspecting"
-        )
+        ) && !a01_review_state_in(&tx,order,&state)?
     {
         return Err(HostError::Acceptance(
             "product lifecycle does not admit review work".into(),
@@ -465,13 +483,13 @@ fn validate_admitted_in(
         )
         .optional()
         .map_err(db_error)?;
-    if !latest.is_some_and(|(seq, state)| {
-        seq >= admission_seq
-            && matches!(
-                state.as_str(),
-                "queued" | "working" | "held" | "waiting" | "inspecting"
-            )
-    }) {
+    let allowed = match latest {
+        Some((seq,state)) => seq >= admission_seq && (
+            matches!(state.as_str(),"queued"|"working"|"held"|"waiting"|"inspecting")
+            || a01_review_state_in(tx,order,&state)?),
+        None => false,
+    };
+    if !allowed {
         return Err(HostError::Acceptance(
             "product lifecycle does not admit review work".into(),
         ));
@@ -501,6 +519,14 @@ impl ReviewAdmissionStore for ProductStore {
         intent: &ExecutionIntent,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), HostError> {
+        #[cfg(feature = "a01-harness-support")]
+        if self.open_mode.is_a01() && !self.open_mode.is_a01_task() {
+            return Err(HostError::Acceptance("A01 isolated store claim validation is disabled".into()));
+        }
+        #[cfg(feature = "w1-isolated-test-support")]
+        if self.open_mode.is_pin() {
+            return Err(HostError::Acceptance("isolated product work claim requires an atomic pin".into()));
+        }
         if claim.order_id != intent.order.0
             || claim.worker_id.trim().is_empty()
             || claim.epoch <= 0
@@ -535,6 +561,17 @@ impl ReviewAdmissionStore for ProductStore {
                 "product work claim was reclaimed or its source changed".into(),
             ));
         }
+        #[cfg(feature = "a01-harness-support")]
+        {
+            if self.open_mode.is_a01_task()
+                && !super::a01_task::canonical_review_in(&tx, &intent.order.0).map_err(db_error)?
+            {
+                return Err(HostError::Acceptance(
+                    "A01 task claim requires accepted producer output".into(),
+                ));
+            }
+            super::a01_task::validate_host_intent_in(&tx,intent).map_err(db_error)?;
+        }
         super::service::validate_review_work_claim_in(&tx, claim, now).map_err(|_| {
             HostError::Acceptance("review service authority is absent or expired".into())
         })?;
@@ -545,6 +582,21 @@ impl ReviewAdmissionStore for ProductStore {
         &mut self,
         request: ReviewAdmissionRequest,
     ) -> Result<ReviewAdmission, HostError> {
+        #[cfg(feature = "a01-harness-support")]
+        if self.open_mode.is_a01() && !self.open_mode.is_a01_task() {
+            return Err(HostError::Acceptance("A01 isolated store review admission is disabled".into()));
+        }
+        #[cfg(feature = "a01-harness-support")]
+        if self.open_mode.is_a01_task() {
+            let tx = self.conn.unchecked_transaction().map_err(db_error)?;
+            if !super::a01_task::canonical_review_in(&tx, &request.intent.order.0).map_err(db_error)? {
+                return Err(HostError::Acceptance(
+                    "A01 task review admission requires accepted producer output".into(),
+                ));
+            }
+            super::a01_task::validate_host_intent_in(&tx, &request.intent).map_err(db_error)?;
+            tx.commit().map_err(db_error)?;
+        }
         let cfg = self
             .review_config
             .as_ref()
@@ -574,6 +626,21 @@ impl ReviewAdmissionStore for ProductStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db_error)?;
+        #[cfg(feature = "a01-harness-support")]
+        super::a01_task::validate_host_intent_in(&tx,intent).map_err(db_error)?;
+        if self.open_mode != super::StoreOpenMode::Normal && !a01_review_state_in(&tx,&intent.order.0,"review")? {
+            // Check the marker on this connection while holding the writer lock.
+            // Missing, malformed, or mismatched markers all fail closed as well.
+            let marker = tx.query_row(
+                "SELECT version FROM product_w1_isolated_marker_v1 WHERE singleton=1",
+                [],
+                |row| row.get::<_, i64>(0),
+            ).optional();
+            if !matches!(marker, Ok(Some(2))) {
+                return Err(HostError::Acceptance("isolated product review admission requires an atomic pin".into()));
+            }
+            return Err(HostError::Acceptance("isolated product review admission requires an atomic pin".into()));
+        }
         let now = clock.now();
         let (lifecycle, source_revision, _, admission_hash, admission_seq) =
             validate_admitted_in(&tx, &intent.order.0)?;
@@ -882,6 +949,10 @@ impl ReviewDispatchStore for ProductStore {
             ));
         }
         tx.execute("INSERT INTO product_review_host_results_v1(order_id,attempt,run_id,activation,result_json) VALUES(?1,?2,?3,?4,?5)",params![request.intent.order.0,request.intent.attempt.0 as i64,request.intent.run.0 as i64,request.intent.activation as i64,result]).map_err(db_error)?;
+        #[cfg(feature = "a01-harness-support")]
+        if self.open_mode.is_a01_task() && status == "passed" {
+            super::a01_task::complete_bridge_in(&tx,&request.intent,&request.result,now).map_err(db_error)?;
+        }
         if let (Some(snapshot), Some(saved), Some(hold_id)) =
             (request.held_snapshot.as_ref(), hold_json, hold_id)
         {
@@ -1477,6 +1548,10 @@ impl ReviewHostStore for ProductStore {
                 "product continuation result binding is missing".into(),
             ));
         }
+        #[cfg(feature = "a01-harness-support")]
+        if self.open_mode.is_a01_task() && request.result.held.is_none() && request.result.exit_code == 0 {
+            super::a01_task::complete_bridge_in(&tx,&request.intent,&request.result,self.clock.now()).map_err(db_error)?;
+        }
         if let Some(hold) = request.result.held.as_ref() {
             let acceptance_json: String = tx.query_row(
                 "SELECT a.receipt_json FROM product_review_hold_acceptances_v1 a JOIN product_review_run_reservations_v1 q ON q.operation_id=a.operation_id WHERE a.operation_id=?1 AND q.followup_run_id=?2",
@@ -1569,6 +1644,7 @@ impl ReviewHostStore for ProductStore {
         session_digest: &str,
         operation_id: &str,
         _now: chrono::DateTime<chrono::Utc>,
+        preflight: &mut dyn FnMut(&std::path::Path, &str) -> Result<(), HostError>,
     ) -> Result<foundry_exec::ReviewAcceptedHold, HostError> {
         let preliminary: String = self
             .conn
@@ -1593,6 +1669,9 @@ impl ReviewHostStore for ProductStore {
             .as_ref()
             .map(|config| config.pack_digest.clone())
             .ok_or_else(|| unsupported("pinned review pack is not configured"))?;
+        let artifact_root = self.review_config.as_ref()
+            .ok_or_else(|| unsupported("review roots are not configured"))?
+            .artifact_root.clone();
         let lock = self.claim_resume(&claim_run_id)?.ok_or_else(|| {
             HostError::Worker("accepted review continuation is already claimed".into())
         })?;
@@ -1890,6 +1969,20 @@ impl ReviewHostStore for ProductStore {
                 params![receipt.order_id, receipt.attempt, journal_run],
                 |r| r.get(0),
             ).map_err(db_error)?;
+            let origin_authority_count: i64 = tx.query_row(
+                "SELECT count(*) FROM product_review_authority_v1 WHERE order_id=?1 AND attempt=?2 AND run_id=?3 AND activation=?4",
+                params![receipt.order_id, receipt.attempt, receipt.originating_run, receipt.activation],
+                |r| r.get(0),
+            ).map_err(db_error)?;
+            if origin_authority_count != 1 {
+                return Err(HostError::Acceptance(
+                    "accepted continuation has no exact originating authority snapshot".into(),
+                ));
+            }
+            // Keep the writer transaction and claim lock held across preflight.
+            // The snapshot identity comes from the validated immutable hold.
+            let snapshot_root = artifact_root.join(format!("{:x}", Sha256::digest(snapshot.snapshot_run_id.as_bytes())));
+            preflight(&snapshot_root, &configured_pack)?;
             let mut followup_intent = snapshot.intent.clone();
             followup_intent.run =
                 foundry_exec::RunId(u64::try_from(followup_run).map_err(db_error)?);
@@ -2086,7 +2179,7 @@ impl ReviewHostStore for ProductStore {
                 ));
             }
         };
-        append_hold_outcome_in(&tx, &stored, &claim.decision, now)?;
+        append_hold_outcome_in(&tx, &stored, &claim.decision, now, Some((&claim.snapshot.intent,&result)))?;
         let n=tx.execute("UPDATE product_review_runs_v1 SET status=?1,hold_json=?2,result_json=?3 WHERE order_id=?4 AND attempt=?5 AND run_id=?6 AND status='held'",params![status,encode_continuation_snapshot(&claim.snapshot)?,result_json,claim.binding.order_id,claim.binding.attempt as i64,claim.binding.journal_run]).map_err(db_error)?;
         if n != 1 {
             return Err(HostError::Worker(
@@ -2452,6 +2545,7 @@ fn ensure_new_work(
     if !state
         .as_deref()
         .is_some_and(|s| matches!(s, "queued" | "working" | "held" | "waiting" | "inspecting"))
+        && !a01_review_state_in(tx,&intent.order.0,state.as_deref().unwrap_or(""))?
     {
         return Err(HostError::Acceptance(
             "product lifecycle no longer admits review work".into(),
@@ -2630,7 +2724,7 @@ fn ensure_product_source_for_new_stage(
         || !matches!(
             state.as_str(),
             "queued" | "working" | "held" | "waiting" | "inspecting"
-        )
+        ) && !a01_review_state_in(tx,order,&state)?
     {
         return Err(HostError::Acceptance(
             "product lifecycle no longer admits continuation work".into(),

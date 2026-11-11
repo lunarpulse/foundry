@@ -130,6 +130,9 @@ enum Cmd {
         credential_ref: Option<String>,
         #[arg(long, default_value_t = false)]
         once: bool,
+        #[cfg(feature = "a01-harness-support")]
+        #[arg(long, hide = true)]
+        a01_local_provider_test: bool,
         #[arg(long, default_value_t = 300)]
         every: u64,
     },
@@ -2075,6 +2078,8 @@ async fn main() {
             private,
             credential_ref,
             once,
+            #[cfg(feature = "a01-harness-support")]
+            a01_local_provider_test,
             every,
         } => {
             product_watch_cmd(
@@ -2089,6 +2094,8 @@ async fn main() {
                 credential_ref,
                 once,
                 every,
+                #[cfg(feature = "a01-harness-support")]
+                a01_local_provider_test,
             )
             .await
         }
@@ -2708,6 +2715,299 @@ impl foundry_domain::ports::SecretProvider for EnvSecretProvider {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProductWorkClass {
+    Empty,
+    Unsupported,
+    Claimed,
+}
+
+impl From<&foundry_ledger::ProductWorkClaimResult> for ProductWorkClass {
+    fn from(result: &foundry_ledger::ProductWorkClaimResult) -> Self {
+        match result {
+            foundry_ledger::ProductWorkClaimResult::Empty => Self::Empty,
+            foundry_ledger::ProductWorkClaimResult::Unsupported { .. } => Self::Unsupported,
+            foundry_ledger::ProductWorkClaimResult::Claimed(_) => Self::Claimed,
+        }
+    }
+}
+
+trait ProductProducerAvailability {
+    fn is_available(&self) -> bool;
+}
+
+struct UnavailableProductProducer;
+
+impl ProductProducerAvailability for UnavailableProductProducer {
+    fn is_available(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ProductTickDecision {
+    Continue,
+    Exit(i32),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ProductPreflight {
+    Skipped,
+    Available,
+    Unavailable,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ProductTickEvent<'a> {
+    Summary(&'a str),
+    Diagnostic(&'a str),
+}
+
+fn dispatch_product_tick(
+    work: ProductWorkClass,
+    producer: &impl ProductProducerAvailability,
+    once: bool,
+    summary: &str,
+    mut sink: impl FnMut(ProductTickEvent<'_>),
+) -> (ProductPreflight, ProductTickDecision) {
+    sink(ProductTickEvent::Summary(summary));
+    let preflight = if work != ProductWorkClass::Claimed {
+        ProductPreflight::Skipped
+    } else if producer.is_available() {
+        ProductPreflight::Available
+    } else {
+        ProductPreflight::Unavailable
+    };
+    if preflight == ProductPreflight::Unavailable {
+        sink(ProductTickEvent::Diagnostic(
+            "product producer unavailable",
+        ));
+        return (preflight, ProductTickDecision::Exit(1));
+    }
+    let decision = if once {
+        ProductTickDecision::Exit(0)
+    } else {
+        ProductTickDecision::Continue
+    };
+    (preflight, decision)
+}
+
+
+/// Bounded A01 assembly. Its DTOs, producer and fake selection share one feature.
+#[cfg(feature = "a01-harness-support")]
+pub(crate) mod a01_coordinator {
+    use foundry_ledger::{ProductServiceContext, ProductStore, ProductWorkClaim};
+    use foundry_ledger::product::{A01AcceptedProducerOutput,A01ProducerReservation};
+    use foundry_line::PackReviewHost;
+    pub(crate) trait Producer {
+        fn ensure_available(&self) -> Result<(),String>;
+        fn produce(&mut self, task: &[u8], claim: &ProductWorkClaim,
+            reservation: &A01ProducerReservation) -> Result<String,String>;
+    }
+    pub(crate) struct AcceptedDispatch {
+        pub output: A01AcceptedProducerOutput,
+        pub host: foundry_exec::HostResult,
+    }
+    pub(crate) fn dispatch(
+        store: &mut ProductStore, service: &ProductServiceContext,
+        claim: &ProductWorkClaim, task_revision: i64, request_key: &str,
+        producer: &mut impl Producer, host: &mut PackReviewHost,
+    ) -> Result<AcceptedDispatch,String> {
+        producer.ensure_available().map_err(|_|"A01 producer unavailable")?;
+        host.ensure_product_executor_available().map_err(|_|"A01 executor unavailable")?;
+        let reservation=store.reserve_a01_producer(service,claim,task_revision,request_key)
+            .map_err(|_|"A01 reservation rejected")?;
+        let output=producer.produce(&reservation.task.task_bytes,claim,&reservation)
+            .map_err(|_|"A01 producer failed")?;
+        store.accept_a01_producer_output(service,claim,&reservation,&output)
+            .map_err(|_|"A01 output acceptance rejected or uncertain")?;
+        // Dispatch consumes only a committed, independently revalidated receipt.
+        let accepted=store.read_a01_producer_output(service,claim,&reservation)
+            .map_err(|_|"A01 output read-back rejected")?.ok_or("A01 output missing")?;
+        if accepted.output!=output || accepted.reservation!=reservation {
+            return Err("A01 output read-back mismatch".into());
+        }
+        let result=host.try_dispatch_product_work(&accepted.intent,claim)
+            .map_err(|_|"A01 host rejected")?;
+        Ok(AcceptedDispatch{output:accepted,host:result})
+    }
+}
+
+#[cfg(test)]
+mod product_coordinator_tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+
+    struct Probe {
+        calls: Cell<usize>,
+        available: bool,
+    }
+
+    impl ProductProducerAvailability for Probe {
+        fn is_available(&self) -> bool {
+            self.calls.set(self.calls.get() + 1);
+            self.available
+        }
+    }
+
+    fn check(
+        work: ProductWorkClass,
+        available: bool,
+        once: bool,
+    ) -> (
+        (ProductPreflight, ProductTickDecision),
+        usize,
+        Vec<&'static str>,
+    ) {
+        let probe = Probe {
+            calls: Cell::new(0),
+            available,
+        };
+        let output = RefCell::new(Vec::new());
+        let decision = dispatch_product_tick(
+            work,
+            &probe,
+            once,
+            "summary",
+            |event| output.borrow_mut().push(match event {
+                ProductTickEvent::Summary(_) => "summary",
+                ProductTickEvent::Diagnostic(_) => "unavailable",
+            }),
+        );
+        (decision, probe.calls.get(), output.into_inner())
+    }
+
+    #[test]
+    fn empty_skips_producer_preflight() {
+        assert_eq!(
+            ProductWorkClass::from(&foundry_ledger::ProductWorkClaimResult::Empty),
+            ProductWorkClass::Empty
+        );
+        for once in [false, true] {
+            assert_eq!(
+                check(ProductWorkClass::Empty, false, once),
+                (
+                    (
+                        ProductPreflight::Skipped,
+                        if once {
+                            ProductTickDecision::Exit(0)
+                        } else {
+                            ProductTickDecision::Continue
+                        }
+                    ),
+                    0,
+                    vec!["summary"]
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_skips_producer_preflight() {
+        let result = foundry_ledger::ProductWorkClaimResult::Unsupported {
+            order_id: String::new(),
+            task_kind: String::new(),
+        };
+        assert_eq!(
+            ProductWorkClass::from(&result),
+            ProductWorkClass::Unsupported
+        );
+        for once in [false, true] {
+            assert_eq!(
+                check(ProductWorkClass::Unsupported, false, once),
+                (
+                    (
+                        ProductPreflight::Skipped,
+                        if once {
+                            ProductTickDecision::Exit(0)
+                        } else {
+                            ProductTickDecision::Continue
+                        }
+                    ),
+                    0,
+                    vec!["summary"]
+                )
+            );
+        }
+    }
+
+    struct CountingUnavailableProducer {
+        calls: Cell<usize>,
+        inner: UnavailableProductProducer,
+    }
+
+    impl ProductProducerAvailability for CountingUnavailableProducer {
+        fn is_available(&self) -> bool {
+            self.calls.set(self.calls.get() + 1);
+            self.inner.is_available()
+        }
+    }
+
+    #[test]
+    fn claimed_rejects_unavailable_producer() {
+        assert!(!UnavailableProductProducer.is_available());
+        for once in [false, true] {
+            // The claimed classification is synthetic; no real claimed fixture is available.
+            let producer = CountingUnavailableProducer {
+                calls: Cell::new(0),
+                inner: UnavailableProductProducer,
+            };
+            let mut events = Vec::new();
+            let decision = dispatch_product_tick(
+                ProductWorkClass::Claimed,
+                &producer,
+                once,
+                "synthetic claimed summary",
+                |event| events.push(match event {
+                    ProductTickEvent::Summary(content) => ("summary", content.to_owned()),
+                    ProductTickEvent::Diagnostic(content) => ("diagnostic", content.to_owned()),
+                }),
+            );
+            assert_eq!(
+                decision,
+                (ProductPreflight::Unavailable, ProductTickDecision::Exit(1))
+            );
+            assert_eq!(producer.calls.get(), 1);
+            assert_eq!(
+                events,
+                vec![
+                    ("summary", "synthetic claimed summary".to_owned()),
+                    ("diagnostic", "product producer unavailable".to_owned()),
+                ]
+            );
+            assert_eq!(
+                check(ProductWorkClass::Claimed, false, once),
+                (
+                    (ProductPreflight::Unavailable, ProductTickDecision::Exit(1)),
+                    1,
+                    vec!["summary", "unavailable"]
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn claimed_accepts_available_preflight_without_executing() {
+        for once in [false, true] {
+            assert_eq!(
+                check(ProductWorkClass::Claimed, true, once),
+                (
+                    (
+                        ProductPreflight::Available,
+                        if once {
+                            ProductTickDecision::Exit(0)
+                        } else {
+                            ProductTickDecision::Continue
+                        }
+                    ),
+                    1,
+                    vec!["summary"]
+                )
+            );
+        }
+    }
+}
+
 async fn product_watch_cmd(
     db: &str,
     installation_id: String,
@@ -2720,7 +3020,16 @@ async fn product_watch_cmd(
     credential_ref: Option<String>,
     once: bool,
     every: u64,
+    #[cfg(feature = "a01-harness-support")] a01_local_provider_test: bool,
 ) -> i32 {
+    #[cfg(feature = "a01-harness-support")]
+    let allow_loopback_http = a01_local_provider_test;
+    #[cfg(not(feature = "a01-harness-support"))]
+    let allow_loopback_http = false;
+    #[cfg(feature = "a01-harness-support")]
+    if a01_local_provider_test {
+        println!("test_transport=a01-local-provider; acceptance=A01-NOT-RUN");
+    }
     let (owner, name) = repo.split_once('/').unwrap_or((repo.as_str(), ""));
     if owner.is_empty() || name.is_empty() || (private && credential_ref.is_none()) {
         eprintln!("product watch configuration rejected");
@@ -2739,7 +3048,7 @@ async fn product_watch_cmd(
             repository_id: repository_id.clone(),
             private,
             credential_ref: credential_ref.clone(),
-            allow_loopback_http: false,
+            allow_loopback_http,
             max_pages_per_tick: 5,
             now: chrono::Utc::now(),
         };
@@ -2778,22 +3087,36 @@ async fn product_watch_cmd(
         })
         .await;
         match result {
-            Ok(Ok((poll, drain))) => println!(
-                "product intake: pages={} fetched={} admitted={} acknowledged={} retryable={} permanent={} work={}",
-                poll.pages,
-                poll.fetched,
-                drain.admitted,
-                drain.acknowledged,
-                drain.retryable_failures,
-                drain.permanent_failures,
-                match drain.work_claim {
-                    foundry_ledger::ProductWorkClaimResult::Empty => "empty",
-                    foundry_ledger::ProductWorkClaimResult::Unsupported { .. } =>
-                        "waiting-unsupported",
-                    foundry_ledger::ProductWorkClaimResult::Claimed(_) =>
-                        "claimed-awaiting-adapter",
+            Ok(Ok((poll, drain))) => {
+                let work = ProductWorkClass::from(&drain.work_claim);
+                let summary = format!(
+                    "product intake: pages={} fetched={} admitted={} acknowledged={} retryable={} permanent={} work={}",
+                    poll.pages,
+                    poll.fetched,
+                    drain.admitted,
+                    drain.acknowledged,
+                    drain.retryable_failures,
+                    drain.permanent_failures,
+                    match work {
+                        ProductWorkClass::Empty => "empty",
+                        ProductWorkClass::Unsupported => "waiting-unsupported",
+                        ProductWorkClass::Claimed => "claimed-awaiting-adapter",
+                    }
+                );
+                let decision = dispatch_product_tick(
+                    work,
+                    &UnavailableProductProducer,
+                    once,
+                    &summary,
+                    |event| match event {
+                        ProductTickEvent::Summary(content) => println!("{content}"),
+                        ProductTickEvent::Diagnostic(content) => eprintln!("{content}"),
+                    },
+                );
+                if let (_, ProductTickDecision::Exit(code)) = decision {
+                    return code;
                 }
-            ),
+            }
             Ok(Err(error)) => {
                 eprintln!("{error}");
                 return 1;
@@ -2802,9 +3125,6 @@ async fn product_watch_cmd(
                 eprintln!("product intake worker failed");
                 return 1;
             }
-        }
-        if once {
-            return 0;
         }
         tokio::time::sleep(std::time::Duration::from_secs(every.max(1))).await;
     }

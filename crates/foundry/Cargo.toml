@@ -6,6 +6,7 @@ license.workspace = true
 
 [features]
 default = []
+a01-harness-support = ["foundry-ledger/a01-harness-support", "foundry-line/a01-harness-support"]
 p2-test-support = ["foundry-ledger/p2-test-support", "foundry-line/p2-test-support", "foundry-serve/p2-test-support"]
 
 [[bin]]

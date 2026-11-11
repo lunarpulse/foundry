@@ -147,6 +147,7 @@ pub enum ProductCapability {
     ExportEvidence,
     ReadOperationalAudit,
     PublishApproved,
+    A01BridgePassed,
 }
 
 impl ProductCapability {
@@ -160,6 +161,7 @@ impl ProductCapability {
             Self::ExportEvidence => "export_evidence",
             Self::ReadOperationalAudit => "read_operational_audit",
             Self::PublishApproved => "publish_approved",
+            Self::A01BridgePassed => "a01_bridge_passed",
         }
     }
 
@@ -173,11 +175,13 @@ impl ProductCapability {
             "export_evidence" => Ok(Self::ExportEvidence),
             "read_operational_audit" => Ok(Self::ReadOperationalAudit),
             "publish_approved" => Ok(Self::PublishApproved),
+            "a01_bridge_passed" => Ok(Self::A01BridgePassed),
             _ => Err(ScopeInputError),
         }
     }
 
     pub fn allowed_for_role(self, role: &str) -> bool {
+        if self == Self::A01BridgePassed { return role == "owner"; }
         match role {
             "viewer" | "operator" => self == Self::ReadOrder,
             "approver" | "owner" => true,

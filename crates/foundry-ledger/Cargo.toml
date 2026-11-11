@@ -7,6 +7,8 @@ license.workspace = true
 [features]
 default = []
 p2-test-support = []
+w1-isolated-test-support = []
+a01-harness-support = []
 
 [dependencies]
 foundry-domain = { path = "../foundry-domain" }
