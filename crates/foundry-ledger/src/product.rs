@@ -223,11 +223,11 @@ pub enum ProductError {
     Database(#[from] rusqlite::Error),
 }
 
-#[cfg(feature = "w1-isolated-test-support")]
+#[cfg(any(feature = "w1-isolated-test-support", feature = "product-pack-pins"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum W1Operation { Approve, Revoke, Select }
 
-#[cfg(feature = "w1-isolated-test-support")]
+#[cfg(any(feature = "w1-isolated-test-support", feature = "product-pack-pins"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct W1OperationReceipt {
     pub canonical: Vec<u8>,
@@ -372,6 +372,23 @@ pub struct ProductConfig {
     pub installation_id: String,
     pub database_id: String,
 }
+
+#[cfg(feature = "product-pack-pins")]
+#[derive(Debug, Clone, Default)]
+pub struct PackRegistryConfig {
+    /// Pack snapshots keyed by their canonical digest.
+    pub snapshots: std::collections::BTreeMap<String, PathBuf>,
+}
+
+#[cfg(feature = "product-pack-pins")]
+fn registered_pack_snapshot(registry: Option<&PackRegistryConfig>, digest: &str) -> bool {
+    let Some(path) = registry.and_then(|r| r.snapshots.get(digest)) else {
+        return false;
+    };
+    foundry_pack::load_pack(path).is_ok_and(|snapshot| snapshot.digest() == digest)
+}
+
+pub type ProductStoreConfig = ProductConfig;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdmissionReceipt {
@@ -614,6 +631,10 @@ pub struct ProductStore {
     installation_id: String,
     database_id: String,
     clock: std::sync::Arc<dyn ProductClock>,
+    #[cfg(feature = "product-pack-pins")]
+    product_registry: Option<PackRegistryConfig>,
+    #[cfg(all(feature = "product-pack-pins", feature = "p2-test-support"))]
+    product_pin_commit_hook: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
     #[cfg(feature = "w1-isolated-test-support")]
     w1_capture_fail_after_legacy_writes: bool,
     #[cfg(feature = "w1-isolated-test-support")]
@@ -777,6 +798,10 @@ fn create_a01_isolated_test_store_with_checkpoint(
             installation_id: config.installation_id,
             database_id: config.database_id,
             clock,
+            #[cfg(feature = "product-pack-pins")]
+            product_registry: None,
+            #[cfg(all(feature = "product-pack-pins", feature = "p2-test-support"))]
+            product_pin_commit_hook: None,
             #[cfg(feature = "w1-isolated-test-support")]
             w1_capture_fail_after_legacy_writes: false,
             #[cfg(feature = "w1-isolated-test-support")]
@@ -1231,6 +1256,270 @@ fn create_a01_isolated_test_store_with_checkpoint(
         Ok(public)
     }
 
+    #[cfg(feature = "product-pack-pins")]
+    pub fn create_product_pin_store(
+        path: &Path,
+        config: &ProductConfig,
+    ) -> Result<Self, ProductError> {
+        let store = Self::open(path, config.clone())?;
+        let version: i64 = store.conn.query_row(
+            "SELECT schema_version FROM product_meta_v1 WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )?;
+        if version != 4 {
+            return Err(ProductError::ContractMismatch);
+        }
+        Ok(store)
+    }
+
+    #[cfg(feature = "product-pack-pins")]
+    pub fn with_product_registry(mut self, registry: PackRegistryConfig) -> Self {
+        self.product_registry = Some(registry);
+        self
+    }
+
+    #[cfg(all(feature = "product-pack-pins", feature = "p2-test-support"))]
+    #[doc(hidden)]
+    pub fn arm_product_pin_commit_hook(
+        &mut self,
+        reached: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        self.product_pin_commit_hook = Some((reached, release));
+    }
+
+    #[cfg(all(feature = "product-pack-pins", feature = "p2-test-support"))]
+    #[doc(hidden)]
+    pub fn set_product_pin_test_busy_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<(), ProductError> {
+        self.conn
+            .busy_timeout(timeout)
+            .map_err(ProductError::Database)
+    }
+
+    #[cfg(feature = "product-pack-pins")]
+    pub fn change_pack_approval(
+        &mut self,
+        session_digest: &str,
+        source_instance_id: &str,
+        digest: &str,
+        expected_approval_revision: i64,
+        approve: bool,
+        request_key: &str,
+        now: DateTime<Utc>,
+    ) -> Result<W1OperationReceipt, ProductError> {
+        use w1_owner_codec::{Receipt, Request, encode_receipt, encode_request};
+        if !w1_text(source_instance_id)
+            || !w1_text(request_key)
+            || digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || expected_approval_revision < 0
+            || expected_approval_revision.checked_add(1).is_none()
+        {
+            return Err(ProductError::InvalidConfig);
+        }
+        require_product_pin_version(&self.conn)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let principal = resolve_session_in(&tx, session_digest, now).map_err(|e| match e {
+            ProductError::Invariant(
+                "session invalid" | "session expiry invalid" | "session expired, revoked, or stale",
+            ) => w1_authorization_error(),
+            other => other,
+        })?;
+        if principal.role != "owner" {
+            return Err(w1_authorization_error());
+        }
+        w1_authorize_source(&tx, &principal.actor_id, source_instance_id)?;
+        let operation = if approve { "approve" } else { "revoke" };
+        let request = Request {
+            installation: self.installation_id.clone(),
+            database: self.database_id.clone(),
+            operation: operation.into(),
+            actor: principal.actor_id.clone(),
+            source: source_instance_id.into(),
+            digest: digest.into(),
+            expected: expected_approval_revision,
+            key: request_key.into(),
+            order: None,
+            lifecycle: None,
+        };
+        let request_bytes = encode_request(&request).map_err(|_| ProductError::InvalidConfig)?;
+        if let Some(receipt) = product_w1_replay(&tx, &principal, &request, &request_bytes)? {
+            tx.commit()?;
+            return Ok(receipt);
+        }
+        let (latest, active, _) = w1_validate_histories(
+            &tx,
+            &self.installation_id,
+            &self.database_id,
+            source_instance_id,
+            digest,
+            None,
+        )?;
+        if latest != expected_approval_revision {
+            return Err(ProductError::Invariant("w1 stale revision"));
+        }
+        if active == approve {
+            return Err(ProductError::Invariant("w1 approval state invalid"));
+        }
+        let receipt = Receipt {
+            installation: request.installation.clone(),
+            database: request.database.clone(),
+            operation: operation.into(),
+            actor: request.actor.clone(),
+            authority: principal.authority_revision,
+            source: request.source.clone(),
+            digest: request.digest.clone(),
+            expected: request.expected,
+            result: request.expected + 1,
+            key: request.key.clone(),
+            order: None,
+            lifecycle: None,
+            approval: None,
+        };
+        let bytes = encode_receipt(&receipt).map_err(|_| ProductError::ContractMismatch)?;
+        let public = w1_public_receipt(bytes.clone())?;
+        tx.execute("INSERT INTO product_w1_operations_v1(actor_id,request_key,operation,authority_revision,source_instance_id,digest,expected_revision,approval_result_revision,order_id,lifecycle,selection_result_revision,referenced_approval_revision,referenced_operation,request,receipt) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,NULL,NULL,NULL,NULL,NULL,?9,?10)",
+            params![principal.actor_id, request_key, operation, principal.authority_revision, source_instance_id, digest, expected_approval_revision, receipt.result, request_bytes, bytes])?;
+        tx.commit()?;
+        Ok(public)
+    }
+
+    #[cfg(feature = "product-pack-pins")]
+    pub fn select_order_pack(
+        &mut self,
+        session_digest: &str,
+        order_id: &str,
+        lifecycle: i64,
+        source_instance_id: &str,
+        digest: &str,
+        expected_selection_revision: i64,
+        request_key: &str,
+        now: DateTime<Utc>,
+    ) -> Result<W1OperationReceipt, ProductError> {
+        use w1_owner_codec::{Receipt, Request, encode_receipt, encode_request};
+        if !w1_text(order_id)
+            || lifecycle <= 0
+            || !w1_text(source_instance_id)
+            || !w1_text(request_key)
+            || digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || expected_selection_revision < 0
+            || expected_selection_revision.checked_add(1).is_none()
+        {
+            return Err(ProductError::InvalidConfig);
+        }
+        require_product_pin_version(&self.conn)?;
+        #[cfg(feature = "p2-test-support")]
+        let commit_hook = self.product_pin_commit_hook.take();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let principal = resolve_session_in(&tx, session_digest, now).map_err(|e| match e {
+            ProductError::Invariant(
+                "session invalid" | "session expiry invalid" | "session expired, revoked, or stale",
+            ) => w1_authorization_error(),
+            other => other,
+        })?;
+        if principal.role != "owner" {
+            return Err(w1_authorization_error());
+        }
+        w1_authorize_source(&tx, &principal.actor_id, source_instance_id)?;
+        w1_authorize_order(&tx, &principal, order_id, lifecycle, source_instance_id)?;
+        // Snapshot registration is an authenticated availability check. Keep it
+        // ahead of request-key replay so an unavailable snapshot cannot be
+        // revived through an old receipt, but never expose or load registry
+        // entries for an unauthenticated caller.
+        if !registered_pack_snapshot(self.product_registry.as_ref(), digest) {
+            return Err(ProductError::Invariant("w1 selection unavailable"));
+        }
+        let request = Request {
+            installation: self.installation_id.clone(),
+            database: self.database_id.clone(),
+            operation: "select".into(),
+            actor: principal.actor_id.clone(),
+            source: source_instance_id.into(),
+            digest: digest.into(),
+            expected: expected_selection_revision,
+            key: request_key.into(),
+            order: Some(order_id.into()),
+            lifecycle: Some(lifecycle),
+        };
+        let request_bytes = encode_request(&request).map_err(|_| ProductError::InvalidConfig)?;
+        if let Some(receipt) = product_w1_replay(&tx, &principal, &request, &request_bytes)? {
+            tx.commit()?;
+            return Ok(receipt);
+        }
+        let (approval_revision, active, selection_revision) = w1_validate_histories(
+            &tx,
+            &self.installation_id,
+            &self.database_id,
+            source_instance_id,
+            digest,
+            Some((order_id, lifecycle)),
+        )?;
+        let blocked: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM product_review_runs_v1 WHERE order_id=?1 AND product_lifecycle=?2) OR EXISTS(SELECT 1 FROM product_review_holds_v1 WHERE order_id=?1 AND lifecycle=?2) OR EXISTS(SELECT 1 FROM product_review_active_v1 WHERE order_id=?1) OR EXISTS(SELECT 1 FROM product_w1_lifecycle_pins_v1 WHERE order_id=?1 AND lifecycle=?2)", params![order_id,lifecycle], |r| r.get(0))?;
+        if blocked {
+            return Err(ProductError::Invariant("w1 selection blocked by review"));
+        }
+        if selection_revision != expected_selection_revision {
+            return Err(ProductError::Invariant("w1 stale revision"));
+        }
+        if !active {
+            return Err(ProductError::Invariant("w1 approval inactive"));
+        }
+        let receipt = Receipt {
+            installation: request.installation.clone(),
+            database: request.database.clone(),
+            operation: "select".into(),
+            actor: request.actor.clone(),
+            authority: principal.authority_revision,
+            source: request.source.clone(),
+            digest: request.digest.clone(),
+            expected: request.expected,
+            result: request.expected + 1,
+            key: request.key.clone(),
+            order: request.order.clone(),
+            lifecycle: request.lifecycle,
+            approval: Some(approval_revision),
+        };
+        let bytes = encode_receipt(&receipt).map_err(|_| ProductError::ContractMismatch)?;
+        let public = w1_public_receipt(bytes.clone())?;
+        tx.execute("INSERT INTO product_w1_operations_v1(actor_id,request_key,operation,authority_revision,source_instance_id,digest,expected_revision,approval_result_revision,order_id,lifecycle,selection_result_revision,referenced_approval_revision,referenced_operation,request,receipt) VALUES(?1,?2,'select',?3,?4,?5,?6,NULL,?7,?8,?9,?10,'approve',?11,?12)", params![principal.actor_id,request_key,principal.authority_revision,source_instance_id,digest,expected_selection_revision,order_id,lifecycle,receipt.result,approval_revision,request_bytes,bytes])?;
+        let (scope_revision, grant_revision): (i64,i64) = tx.query_row("SELECT r.revision,g.grant_revision FROM product_scope_subject_revisions_v1 r JOIN product_scope_grants_v1 g ON g.subject_id=r.subject_id AND g.source_instance_id=r.source_instance_id WHERE r.subject_id=?1 AND r.source_instance_id=?2 AND g.capability=?3 AND g.enabled=1", params![principal.actor_id,source_instance_id,ProductCapability::ReadOrder.as_str()], |r| Ok((r.get(0)?,r.get(1)?))).map_err(|_| w1_authorization_error())?;
+        tx.execute("INSERT INTO product_w1_grant_sidecar_v1(order_id,lifecycle,selection_revision,selector_subject_id,scope_revision,grant_revision) VALUES(?1,?2,?3,?4,?5,?6)", params![order_id,lifecycle,receipt.result,principal.actor_id,scope_revision,grant_revision])?;
+        #[cfg(feature = "p2-test-support")]
+        if let Some((reached, release)) = commit_hook {
+            reached.send(()).map_err(|_| {
+                ProductError::Invariant("product pin commit hook notification unavailable")
+            })?;
+            match release.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(()) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(ProductError::Invariant(
+                        "product pin commit hook release timed out",
+                    ));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(ProductError::Invariant(
+                        "product pin commit hook release disconnected",
+                    ));
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(public)
+    }
+
     pub fn open(path: &Path, config: ProductConfig) -> Result<Self, ProductError> {
         Self::open_with_clock(path, config, std::sync::Arc::new(SystemProductClock))
     }
@@ -1465,12 +1754,29 @@ fn open_internal_with_checkpoint(
             if !matches!(meta.as_ref(), Some((installation, database, version))
                 if installation == &config.installation_id
                     && database == &config.database_id
-                    && *version == 3)
+                    && (*version == 3 || (cfg!(feature = "product-pack-pins") && *version == 4)))
             {
                 return Err(ProductError::ContractMismatch);
             }
             // Product v3 keeps its result schema stable. The publication
             // ledger is an additive v3-compatible extension.
+            #[cfg(feature = "product-pack-pins")]
+            if meta.as_ref().is_some_and(|(_, _, version)| *version == 4) {
+                result::validate_product_v4_connection(
+                    &conn,
+                    &config.installation_id,
+                    &config.database_id,
+                )
+                .map_err(v4_schema_error)?;
+                validate_product_pack_pin_schema(&conn)?;
+            } else {
+                result::validate_v3_connection(
+                    &conn,
+                    &config.installation_id,
+                    &config.database_id,
+                )?;
+            }
+            #[cfg(not(feature = "product-pack-pins"))]
             result::validate_v3_connection(&conn, &config.installation_id, &config.database_id)?;
             if mode == StoreOpenMode::Normal {
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1496,6 +1802,10 @@ fn open_internal_with_checkpoint(
                 installation_id: config.installation_id,
                 database_id: config.database_id,
                 clock,
+                #[cfg(feature = "product-pack-pins")]
+                product_registry: None,
+                #[cfg(all(feature = "product-pack-pins", feature = "p2-test-support"))]
+                product_pin_commit_hook: None,
                 #[cfg(feature = "w1-isolated-test-support")]
                 w1_capture_fail_after_legacy_writes: false,
                 #[cfg(feature = "w1-isolated-test-support")]
@@ -1557,6 +1867,10 @@ fn open_internal_with_checkpoint(
             installation_id: config.installation_id,
             database_id: config.database_id,
             clock,
+            #[cfg(feature = "product-pack-pins")]
+            product_registry: None,
+            #[cfg(all(feature = "product-pack-pins", feature = "p2-test-support"))]
+            product_pin_commit_hook: None,
             #[cfg(feature = "w1-isolated-test-support")]
             w1_capture_fail_after_legacy_writes: false,
             #[cfg(feature = "w1-isolated-test-support")]
@@ -6026,17 +6340,17 @@ fn require_order_capability_in(
     Ok(view)
 }
 
-#[cfg(feature = "w1-isolated-test-support")]
+#[cfg(any(feature = "w1-isolated-test-support", feature = "product-pack-pins"))]
 fn w1_text(s: &str) -> bool {
     !s.is_empty() && s.len() <= 256 && !s.as_bytes().contains(&0)
 }
 
-#[cfg(feature = "w1-isolated-test-support")]
+#[cfg(any(feature = "w1-isolated-test-support", feature = "product-pack-pins"))]
 fn w1_authorization_error() -> ProductError {
     ProductError::Invariant("w1 authorization or binding unavailable")
 }
 
-#[cfg(feature = "w1-isolated-test-support")]
+#[cfg(any(feature = "w1-isolated-test-support", feature = "product-pack-pins"))]
 fn w1_authorize_source(tx: &rusqlite::Transaction<'_>, actor: &str, source: &str) -> Result<(), ProductError> {
     let authorized: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM product_scope_source_instances_v1 i          JOIN product_scope_current_sources_v1 c ON c.source_instance_id=i.source_instance_id AND c.connector_id=i.connector_id          JOIN product_scope_grants_v1 g ON g.source_instance_id=i.source_instance_id AND g.subject_id=?1 AND g.capability=?3 AND g.enabled=1          JOIN product_scope_subject_revisions_v1 r ON r.source_instance_id=i.source_instance_id AND r.subject_id=g.subject_id          WHERE i.source_instance_id=?2 AND i.enabled=1)",
@@ -6045,7 +6359,7 @@ fn w1_authorize_source(tx: &rusqlite::Transaction<'_>, actor: &str, source: &str
     if authorized { Ok(()) } else { Err(w1_authorization_error()) }
 }
 
-#[cfg(feature = "w1-isolated-test-support")]
+#[cfg(any(feature = "w1-isolated-test-support", feature = "product-pack-pins"))]
 fn w1_public_receipt(canonical: Vec<u8>) -> Result<W1OperationReceipt, ProductError> {
     let r = w1_owner_codec::decode_receipt(&canonical).map_err(|_| ProductError::ContractMismatch)?;
     let operation = match r.operation.as_str() {
@@ -6058,7 +6372,7 @@ fn w1_public_receipt(canonical: Vec<u8>) -> Result<W1OperationReceipt, ProductEr
         order_id: r.order, lifecycle: r.lifecycle, approval_revision: r.approval })
 }
 
-#[cfg(feature = "w1-isolated-test-support")]
+#[cfg(any(feature = "w1-isolated-test-support", feature = "product-pack-pins"))]
 fn w1_authorize_order(tx: &rusqlite::Transaction<'_>, principal: &ProductPrincipal, order: &str, lifecycle: i64, source: &str) -> Result<(), ProductError> {
     let view = require_order_capability_in(tx, principal, order, ProductCapability::ReadOrder, true)
         .map_err(|e| match e {
@@ -6070,27 +6384,27 @@ fn w1_authorize_order(tx: &rusqlite::Transaction<'_>, principal: &ProductPrincip
     Ok(())
 }
 
-#[cfg(feature = "w1-isolated-test-support")]
+#[cfg(any(feature = "w1-isolated-test-support", feature = "product-pack-pins"))]
 const W1_COLUMNS: &str = "actor_id,request_key,operation,authority_revision,source_instance_id,digest,expected_revision,approval_result_revision,order_id,lifecycle,selection_result_revision,referenced_approval_revision,referenced_operation,request,receipt";
 
-#[cfg(feature = "w1-isolated-test-support")]
+#[cfg(any(feature = "w1-isolated-test-support", feature = "product-pack-pins"))]
 type W1Row = Vec<rusqlite::types::Value>;
-#[cfg(feature = "w1-isolated-test-support")]
+#[cfg(any(feature = "w1-isolated-test-support", feature = "product-pack-pins"))]
 fn w1_read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<W1Row> {
     (0..15).map(|i| row.get(i)).collect()
 }
-#[cfg(feature = "w1-isolated-test-support")]
+#[cfg(any(feature = "w1-isolated-test-support", feature = "product-pack-pins"))]
 fn w1_str(row: &W1Row, n: usize) -> Option<&str> {
     match &row[n] { rusqlite::types::Value::Text(s) => Some(s), _ => None }
 }
-#[cfg(feature = "w1-isolated-test-support")]
+#[cfg(any(feature = "w1-isolated-test-support", feature = "product-pack-pins"))]
 fn w1_int(row: &W1Row, n: usize) -> Option<i64> {
     match row[n] { rusqlite::types::Value::Integer(v) => Some(v), _ => None }
 }
-#[cfg(feature = "w1-isolated-test-support")]
+#[cfg(any(feature = "w1-isolated-test-support", feature = "product-pack-pins"))]
 fn w1_null(row: &W1Row, n: usize) -> bool { matches!(row[n], rusqlite::types::Value::Null) }
 
-#[cfg(feature = "w1-isolated-test-support")]
+#[cfg(any(feature = "w1-isolated-test-support", feature = "product-pack-pins"))]
 fn w1_validate_row(row: &W1Row, installation: &str, database: &str) -> Result<(w1_owner_codec::Request, w1_owner_codec::Receipt, Vec<u8>), ProductError> {
     use rusqlite::types::Value;
     let bad = || ProductError::ContractMismatch;
@@ -6099,7 +6413,15 @@ fn w1_validate_row(row: &W1Row, installation: &str, database: &str) -> Result<(w
     let receipt = w1_owner_codec::decode_receipt(r).map_err(|_| bad())?;
     let result = request.expected.checked_add(1).ok_or_else(bad)?;
     let selection = request.operation == "select";
-    if request.installation != installation || request.database != database
+    if !w1_text(&request.actor)
+        || !w1_text(&request.key)
+        || !w1_text(&request.source)
+        || request
+            .order
+            .as_deref()
+            .is_some_and(|order| !w1_text(order))
+        || request.installation != installation
+        || request.database != database
         || w1_str(row,0) != Some(&request.actor) || w1_str(row,1) != Some(&request.key)
         || w1_str(row,2) != Some(&request.operation) || w1_str(row,4) != Some(&request.source)
         || w1_str(row,5) != Some(&request.digest) || w1_int(row,6) != Some(request.expected)
@@ -6120,7 +6442,7 @@ fn w1_validate_row(row: &W1Row, installation: &str, database: &str) -> Result<(w
     Ok((request, receipt, r.clone()))
 }
 
-#[cfg(feature = "w1-isolated-test-support")]
+#[cfg(any(feature = "w1-isolated-test-support", feature = "product-pack-pins"))]
 fn w1_replay(tx: &rusqlite::Transaction<'_>, principal: &ProductPrincipal, request: &w1_owner_codec::Request, request_bytes: &[u8]) -> Result<Option<W1OperationReceipt>, ProductError> {
     let sql = format!("SELECT {W1_COLUMNS} FROM product_w1_operations_v1 WHERE actor_id=?1 COLLATE BINARY AND request_key=?2 COLLATE BINARY");
     let row: Option<W1Row> = tx.query_row(&sql, params![principal.actor_id, request.key], w1_read_row).optional().map_err(|e| match e {
@@ -6146,9 +6468,55 @@ fn w1_replay(tx: &rusqlite::Transaction<'_>, principal: &ProductPrincipal, reque
     Ok(Some(w1_public_receipt(bytes)?))
 }
 
+#[cfg(feature = "product-pack-pins")]
+fn product_w1_replay(
+    tx: &rusqlite::Transaction<'_>,
+    principal: &ProductPrincipal,
+    request: &w1_owner_codec::Request,
+    request_bytes: &[u8],
+) -> Result<Option<W1OperationReceipt>, ProductError> {
+    let sql = format!(
+        "SELECT {W1_COLUMNS} FROM product_w1_operations_v1 WHERE actor_id=?1 COLLATE BINARY AND request_key=?2 COLLATE BINARY"
+    );
+    let row: Option<W1Row> = tx
+        .query_row(&sql, params![principal.actor_id, request.key], w1_read_row)
+        .optional()?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let source = w1_str(&row, 4)
+        .filter(|s| w1_text(s))
+        .ok_or_else(w1_authorization_error)?;
+    w1_authorize_source(tx, &principal.actor_id, source)?;
+    let pure =
+        matches!(w1_str(&row, 2), Some("approve" | "revoke")) && (8..=12).all(|i| w1_null(&row, i));
+    if !pure {
+        let order = w1_str(&row, 8)
+            .filter(|s| w1_text(s))
+            .ok_or_else(w1_authorization_error)?;
+        let lifecycle = w1_int(&row, 9)
+            .filter(|n| *n > 0)
+            .ok_or_else(w1_authorization_error)?;
+        w1_authorize_order(tx, principal, order, lifecycle, source)?;
+    }
+    let (stored, _, bytes) = w1_validate_row(&row, &request.installation, &request.database)?;
+    if !matches!(&row[13],rusqlite::types::Value::Blob(b) if b==request_bytes) {
+        return Err(ProductError::Invariant("w1 request key conflict"));
+    }
+    w1_validate_histories(
+        tx,
+        &request.installation,
+        &request.database,
+        &stored.source,
+        &stored.digest,
+        stored.order.as_deref().zip(stored.lifecycle),
+    )?;
+    Ok(Some(w1_public_receipt(bytes)?))
+}
+
 // Validate the direct tuple's selections and their complete order sequences. Approval
 // sequences reached from those orders are checked once without expanding them again.
-#[cfg(feature = "w1-isolated-test-support")]
+#[cfg(any(feature = "w1-isolated-test-support", feature = "product-pack-pins"))]
 fn w1_validate_histories(tx: &rusqlite::Transaction<'_>, installation: &str, database: &str, source: &str, digest: &str, order: Option<(&str, i64)>) -> Result<(i64, bool, i64), ProductError> {
     use std::collections::{BTreeMap, BTreeSet};
     let mut orders = BTreeSet::new();
@@ -6211,7 +6579,7 @@ fn w1_validate_histories(tx: &rusqlite::Transaction<'_>, installation: &str, dat
     Ok((latest,active,requested_latest))
 }
 
-#[cfg(feature = "w1-isolated-test-support")]
+#[cfg(any(feature = "w1-isolated-test-support", feature = "product-pack-pins"))]
 #[derive(Debug, PartialEq, Eq)]
 struct W1LatestSelection {
     order: String,
@@ -6227,7 +6595,37 @@ struct W1LatestSelection {
 // This read is not authorization. Authenticate before invoking it, and repeat it
 // after live authority checks in any future atomic admission transaction.
 #[cfg(feature = "w1-isolated-test-support")]
-fn w1_latest_selection_in(tx: &rusqlite::Transaction<'_>, installation: &str, database: &str, order: &str, lifecycle: i64, expected_source: &str) -> Result<W1LatestSelection, ProductError> {
+fn w1_latest_selection_in(
+    tx: &rusqlite::Transaction<'_>,
+    installation: &str,
+    database: &str,
+    order: &str,
+    lifecycle: i64,
+    expected_source: &str,
+) -> Result<W1LatestSelection, ProductError> {
+    let selected = w1_selection_state_in(
+        tx,
+        installation,
+        database,
+        order,
+        lifecycle,
+        expected_source,
+    )?;
+    if !selected.active {
+        return Err(ProductError::Invariant("w1 selection unavailable"));
+    }
+    Ok(selected)
+}
+
+#[cfg(any(feature = "w1-isolated-test-support", feature = "product-pack-pins"))]
+fn w1_selection_state_in(
+    tx: &rusqlite::Transaction<'_>,
+    installation: &str,
+    database: &str,
+    order: &str,
+    lifecycle: i64,
+    expected_source: &str,
+) -> Result<W1LatestSelection, ProductError> {
     if !w1_text(order) || lifecycle <= 0 || !w1_text(expected_source) {
         return Err(ProductError::InvalidConfig);
     }
@@ -6265,17 +6663,23 @@ fn w1_latest_selection_in(tx: &rusqlite::Transaction<'_>, installation: &str, da
     let (head, active, validated_revision) = w1_validate_histories(tx, installation, database, &request.source, &request.digest, Some((order, lifecycle)))?;
     let referenced = receipt.approval.ok_or(ProductError::ContractMismatch)?;
     if validated_revision != revision { return Err(ProductError::ContractMismatch); }
-    if !active || head != referenced { return Err(ProductError::Invariant("w1 selection unavailable")); }
-    Ok(W1LatestSelection { order: order.to_owned(), lifecycle, source: request.source,
-        pack_digest: request.digest, selection_revision: revision,
-        referenced_approval_revision: referenced, current_approval_head: head, active })
+    Ok(W1LatestSelection {
+        order: order.to_owned(),
+        lifecycle,
+        source: request.source,
+        pack_digest: request.digest,
+        selection_revision: revision,
+        referenced_approval_revision: referenced,
+        current_approval_head: head,
+        active: active && head == referenced,
+    })
 }
 
 // This is an empty storage container only. Selection and claim reference guards
 // are deferred; a populated row does not establish authority.
-#[cfg(feature = "w1-isolated-test-support")]
+#[cfg(any(feature = "w1-isolated-test-support", feature = "product-pack-pins"))]
 const W1_PIN_MARKER: &str = "CREATE TABLE product_w1_isolated_marker_v1(singleton INTEGER PRIMARY KEY CHECK(singleton=1), version INTEGER NOT NULL CHECK(version=4))";
-#[cfg(feature = "w1-isolated-test-support")]
+#[cfg(any(feature = "w1-isolated-test-support", feature = "product-pack-pins"))]
 const W1_PIN_OBJECTS: [(&str, &str, &str); 4] = [
     ("product_w1_lifecycle_pins_v1", "table", "CREATE TABLE product_w1_lifecycle_pins_v1(order_id TEXT NOT NULL, lifecycle INTEGER NOT NULL CHECK(lifecycle>0), installation_id TEXT NOT NULL, database_id TEXT NOT NULL, source_instance_id TEXT NOT NULL, pack_digest TEXT NOT NULL, selection_revision INTEGER NOT NULL CHECK(selection_revision>0), referenced_approval_revision INTEGER NOT NULL CHECK(referenced_approval_revision>0), claim_epoch INTEGER NOT NULL CHECK(claim_epoch>0), claim_fence INTEGER NOT NULL CHECK(claim_fence>0), payload_digest TEXT NOT NULL, admission_seq INTEGER NOT NULL, admission_hash TEXT NOT NULL, PRIMARY KEY(order_id,lifecycle))"),
     ("product_w1_lifecycle_pins_no_update", "trigger", "CREATE TRIGGER product_w1_lifecycle_pins_no_update BEFORE UPDATE ON product_w1_lifecycle_pins_v1 BEGIN SELECT RAISE(ABORT,'immutable lifecycle pin'); END"),
@@ -6283,7 +6687,242 @@ const W1_PIN_OBJECTS: [(&str, &str, &str); 4] = [
     ("product_w1_lifecycle_pins_no_replace", "trigger", "CREATE TRIGGER product_w1_lifecycle_pins_no_replace BEFORE INSERT ON product_w1_lifecycle_pins_v1 WHEN EXISTS(SELECT 1 FROM product_w1_lifecycle_pins_v1 WHERE order_id=NEW.order_id AND lifecycle=NEW.lifecycle) BEGIN SELECT RAISE(ABORT,'immutable lifecycle pin'); END"),
 ];
 
-#[cfg(feature = "w1-isolated-test-support")]
+#[cfg(feature = "product-pack-pins")]
+const PRODUCT_W1_PIN_OBJECTS: [(&str, &str, &str); 4] = [
+    (
+        "product_w1_lifecycle_pins_v1",
+        "table",
+        "CREATE TABLE product_w1_lifecycle_pins_v1(order_id TEXT NOT NULL, lifecycle INTEGER NOT NULL CHECK(lifecycle>0), installation_id TEXT NOT NULL, database_id TEXT NOT NULL, source_instance_id TEXT NOT NULL, pack_digest TEXT NOT NULL, selection_revision INTEGER NOT NULL CHECK(selection_revision>0), referenced_approval_revision INTEGER NOT NULL CHECK(referenced_approval_revision>0), service_id TEXT NOT NULL, request_key TEXT COLLATE BINARY NOT NULL CHECK(typeof(request_key)='text' AND length(CAST(request_key AS BLOB)) BETWEEN 1 AND 256 AND instr(CAST(request_key AS BLOB),x'00')=0), claim_epoch INTEGER NOT NULL CHECK(claim_epoch>0), claim_fence INTEGER NOT NULL CHECK(claim_fence>0), payload_digest TEXT NOT NULL, admission_seq INTEGER NOT NULL, admission_hash TEXT NOT NULL, PRIMARY KEY(order_id,lifecycle), UNIQUE(service_id,request_key))",
+    ),
+    (
+        "product_w1_lifecycle_pins_no_update",
+        "trigger",
+        "CREATE TRIGGER product_w1_lifecycle_pins_no_update BEFORE UPDATE ON product_w1_lifecycle_pins_v1 BEGIN SELECT RAISE(ABORT,'immutable lifecycle pin'); END",
+    ),
+    (
+        "product_w1_lifecycle_pins_no_delete",
+        "trigger",
+        "CREATE TRIGGER product_w1_lifecycle_pins_no_delete BEFORE DELETE ON product_w1_lifecycle_pins_v1 BEGIN SELECT RAISE(ABORT,'immutable lifecycle pin'); END",
+    ),
+    (
+        "product_w1_lifecycle_pins_no_replace",
+        "trigger",
+        "CREATE TRIGGER product_w1_lifecycle_pins_no_replace BEFORE INSERT ON product_w1_lifecycle_pins_v1 WHEN EXISTS(SELECT 1 FROM product_w1_lifecycle_pins_v1 WHERE order_id=NEW.order_id AND lifecycle=NEW.lifecycle) BEGIN SELECT RAISE(ABORT,'immutable lifecycle pin'); END",
+    ),
+];
+
+#[cfg(feature = "product-pack-pins")]
+const PRODUCT_W1_GRANT_SIDECAR: [(&str, &str); 4] = [
+    (
+        "product_w1_grant_sidecar_v1",
+        "CREATE TABLE product_w1_grant_sidecar_v1(order_id TEXT NOT NULL, lifecycle INTEGER NOT NULL CHECK(lifecycle>0), selection_revision INTEGER NOT NULL CHECK(selection_revision>0), selector_subject_id TEXT NOT NULL, scope_revision INTEGER NOT NULL, grant_revision INTEGER NOT NULL, PRIMARY KEY(order_id,lifecycle,selection_revision))",
+    ),
+    (
+        "product_w1_grant_sidecar_no_update",
+        "CREATE TRIGGER product_w1_grant_sidecar_no_update BEFORE UPDATE ON product_w1_grant_sidecar_v1 BEGIN SELECT RAISE(ABORT,'w1 grant sidecar immutable'); END",
+    ),
+    (
+        "product_w1_grant_sidecar_no_delete",
+        "CREATE TRIGGER product_w1_grant_sidecar_no_delete BEFORE DELETE ON product_w1_grant_sidecar_v1 BEGIN SELECT RAISE(ABORT,'w1 grant sidecar immutable'); END",
+    ),
+    (
+        "product_w1_grant_sidecar_no_replace",
+        "CREATE TRIGGER product_w1_grant_sidecar_no_replace BEFORE INSERT ON product_w1_grant_sidecar_v1 WHEN EXISTS(SELECT 1 FROM product_w1_grant_sidecar_v1 WHERE order_id=NEW.order_id AND lifecycle=NEW.lifecycle AND selection_revision=NEW.selection_revision) BEGIN SELECT RAISE(ABORT,'w1 grant sidecar immutable'); END",
+    ),
+];
+
+#[cfg(feature = "product-pack-pins")]
+fn initialize_product_pack_pin_schema(tx: &rusqlite::Transaction<'_>) -> Result<(), ProductError> {
+    for ddl in W1_CAPTURE_OBJECTS {
+        tx.execute_batch(ddl.2)?;
+    }
+    for ddl in [
+        W1_OPERATION_TABLE,
+        W1_OPERATION_UPDATE,
+        W1_OPERATION_DELETE,
+        W1_OPERATION_REPLACE,
+    ] {
+        tx.execute_batch(ddl)?;
+    }
+    for ddl in PRODUCT_W1_PIN_OBJECTS {
+        tx.execute_batch(ddl.2)?;
+    }
+    for (_, ddl) in PRODUCT_W1_GRANT_SIDECAR {
+        tx.execute_batch(ddl)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "product-pack-pins")]
+fn require_product_pin_version(conn: &Connection) -> Result<(), ProductError> {
+    let version: Option<i64> = conn
+        .query_row(
+            "SELECT schema_version FROM product_meta_v1 WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if version == Some(4) {
+        Ok(())
+    } else {
+        Err(ProductError::ContractMismatch)
+    }
+}
+
+#[cfg(feature = "product-pack-pins")]
+fn v4_schema_error(error: ProductError) -> ProductError {
+    match error {
+        ProductError::Database(rusqlite::Error::SqliteFailure(code, _))
+            if code.code == rusqlite::ErrorCode::Unknown =>
+        {
+            ProductError::ContractMismatch
+        }
+        other => other,
+    }
+}
+
+#[cfg(feature = "product-pack-pins")]
+fn validate_product_pack_pin_schema(conn: &Connection) -> Result<(), ProductError> {
+    let marker: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='product_w1_isolated_marker_v1')",
+        [],
+        |r| r.get(0),
+    )?;
+    if marker {
+        return Err(ProductError::ContractMismatch);
+    }
+    validate_w1_operations(conn)?;
+    validate_w1_capture_schema(conn)?;
+    for (name, kind, ddl) in PRODUCT_W1_PIN_OBJECTS {
+        let actual: Option<(String, Option<String>)> = conn
+            .query_row(
+                "SELECT type,sql FROM sqlite_schema WHERE name=?1",
+                [name],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if !matches!(actual,Some((ref actual_kind,Some(ref actual_ddl))) if actual_kind==kind&&actual_ddl==ddl)
+        {
+            return Err(ProductError::ContractMismatch);
+        }
+    }
+    for (name, ddl) in PRODUCT_W1_GRANT_SIDECAR {
+        let kind = if name.ends_with("_v1") {
+            "table"
+        } else {
+            "trigger"
+        };
+        let actual: Option<(String, Option<String>)> = conn
+            .query_row(
+                "SELECT type,sql FROM sqlite_schema WHERE name=?1",
+                [name],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if !matches!(actual,Some((ref actual_kind,Some(ref actual_ddl))) if actual_kind==kind&&actual_ddl==ddl)
+        {
+            return Err(ProductError::ContractMismatch);
+        }
+    }
+    let mismatch: i64 = conn.query_row("SELECT (SELECT count(*) FROM product_w1_grant_sidecar_v1 s WHERE s.selector_subject_id='' OR NOT EXISTS(SELECT 1 FROM product_w1_operations_v1 o WHERE o.operation='select' AND o.order_id=s.order_id AND o.lifecycle=s.lifecycle AND o.selection_result_revision=s.selection_revision AND o.actor_id=s.selector_subject_id)) + (SELECT count(*) FROM product_w1_operations_v1 o WHERE o.operation='select' AND NOT EXISTS(SELECT 1 FROM product_w1_grant_sidecar_v1 s WHERE s.order_id=o.order_id AND s.lifecycle=o.lifecycle AND s.selection_revision=o.selection_result_revision AND s.selector_subject_id=o.actor_id))", [], |r|r.get(0))?;
+    if mismatch != 0 {
+        return Err(ProductError::ContractMismatch);
+    }
+    validate_product_pin_rows(conn)?;
+    Ok(())
+}
+
+#[cfg(feature = "product-pack-pins")]
+fn validate_product_pin_rows(conn: &Connection) -> Result<(), ProductError> {
+    let tx = conn.unchecked_transaction()?;
+    let meta: (String, String) = tx.query_row(
+        "SELECT installation_id,database_id FROM product_meta_v1 WHERE singleton=1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let mut all = tx.prepare(&format!(
+        "SELECT {W1_COLUMNS} FROM product_w1_operations_v1"
+    ))?;
+    let mut rows = all.query([])?;
+    while let Some(row) = rows.next()? {
+        let raw = w1_read_row(row)?;
+        let (request, _, _) = w1_validate_row(&raw, &meta.0, &meta.1)?;
+        w1_validate_histories(
+            &tx,
+            &meta.0,
+            &meta.1,
+            &request.source,
+            &request.digest,
+            request.order.as_deref().zip(request.lifecycle),
+        )?;
+    }
+    drop(rows);
+    drop(all);
+    // Do not require product_w1_claim_authority_v1 here. That table is written
+    // only by the isolated capture-store claim path; normal v4 claims (including
+    // legitimate expired-claim reclaims) can create pins without such a row.
+    let mut pins = tx.prepare("SELECT order_id,lifecycle,installation_id,database_id,source_instance_id,pack_digest,selection_revision,referenced_approval_revision,service_id,request_key,claim_epoch,claim_fence,payload_digest,admission_seq,admission_hash FROM product_w1_lifecycle_pins_v1 ORDER BY order_id,lifecycle")?;
+    let mut rows = pins.query([])?;
+    while let Some(row) = rows.next()? {
+        let order: String = row.get(0)?;
+        let lifecycle: i64 = row.get(1)?;
+        let installation: String = row.get(2)?;
+        let database: String = row.get(3)?;
+        let source: String = row.get(4)?;
+        let digest: String = row.get(5)?;
+        let selection: i64 = row.get(6)?;
+        let approval: i64 = row.get(7)?;
+        let selector: String = row.get(8)?;
+        let request_key: String = row.get(9)?;
+        let epoch: i64 = row.get(10)?;
+        let fence: i64 = row.get(11)?;
+        let payload: String = row.get(12)?;
+        let seq: i64 = row.get(13)?;
+        let hash: String = row.get(14)?;
+        if order.is_empty()
+            || lifecycle <= 0
+            || installation != meta.0
+            || database != meta.1
+            || source.is_empty()
+            || digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || selection <= 0
+            || approval <= 0
+            || selector.is_empty()
+            || request_key.is_empty()
+            || request_key.len() > 256
+            || request_key.as_bytes().contains(&0)
+            || epoch <= 0
+            || fence <= 0
+            || payload.len() != 64
+            || !payload
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || seq <= 0
+            || hash.len() != 64
+        {
+            return Err(ProductError::ContractMismatch);
+        }
+        let operation: Option<(String,String,i64)> = tx.query_row("SELECT source_instance_id,digest,referenced_approval_revision FROM product_w1_operations_v1 WHERE operation='select' AND order_id=?1 AND lifecycle=?2 AND selection_result_revision=?3",params![order,lifecycle,selection],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+        if !matches!(operation,Some((ref operation_source,ref operation_digest,approval_revision)) if operation_source==&source && operation_digest==&digest && approval_revision==approval)
+        {
+            return Err(ProductError::ContractMismatch);
+        }
+        let admission: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM product_orders_v1 o JOIN product_transition_receipts_v1 r ON r.seq=o.admission_seq AND r.event_hash=o.admission_hash JOIN ledger l ON l.seq=r.seq AND l.hash=r.event_hash WHERE o.order_id=?1 AND o.lifecycle=?2 AND o.admission_seq=?3 AND o.admission_hash=?4 AND r.operation='github-admission' AND l.order_id=o.order_id)",params![order,lifecycle,seq,hash],|r|r.get(0))?;
+        let provenance: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM product_scope_order_provenance_v1 WHERE order_id=?1 AND lifecycle=?2 AND source_instance_id=?3 AND admission_seq=?4 AND admission_hash=?5 AND verified=1)",params![order,lifecycle,source,seq,hash],|r|r.get(0))?;
+        if !admission || !provenance {
+            return Err(ProductError::ContractMismatch);
+        }
+    }
+    drop(rows);
+    drop(pins);
+    tx.commit()?;
+    Ok(())
+}
+
+#[cfg(any(feature = "w1-isolated-test-support", feature = "product-pack-pins"))]
 fn validate_w1_pin_schema(conn: &Connection) -> Result<(), ProductError> {
     // SQLite lower() folds ASCII; retain original names for exact inventory equality.
     let mut inventory = conn.prepare("SELECT type,name FROM sqlite_schema WHERE lower(name) GLOB 'product_w1_*' OR lower(tbl_name) GLOB 'product_w1_*' ORDER BY type,name").map_err(isolated_schema_error)?;
@@ -6311,9 +6950,9 @@ fn validate_w1_pin_schema(conn: &Connection) -> Result<(), ProductError> {
     Ok(())
 }
 
-#[cfg(feature = "w1-isolated-test-support")]
+#[cfg(any(feature = "w1-isolated-test-support", feature = "product-pack-pins"))]
 const W1_CAPTURE_MARKER: &str = "CREATE TABLE product_w1_isolated_marker_v1(singleton INTEGER PRIMARY KEY CHECK(singleton=1), version INTEGER NOT NULL CHECK(version=3))";
-#[cfg(feature = "w1-isolated-test-support")]
+#[cfg(any(feature = "w1-isolated-test-support", feature = "product-pack-pins"))]
 const W1_CAPTURE_OBJECTS: [(&str, &str, &str); 4] = [
     ("product_w1_claim_authority_v1", "table", r#"CREATE TABLE product_w1_claim_authority_v1(order_id TEXT NOT NULL, lifecycle INTEGER NOT NULL CHECK(lifecycle>0), epoch INTEGER NOT NULL CHECK(epoch>0), fence INTEGER NOT NULL CHECK(fence>0), installation_id TEXT NOT NULL, database_id TEXT NOT NULL, delivery_id TEXT NOT NULL, worker_id TEXT NOT NULL, claimed_at TEXT NOT NULL, claim_lease_until TEXT NOT NULL, payload_digest TEXT NOT NULL, admission_seq INTEGER NOT NULL, admission_hash TEXT NOT NULL, service_id TEXT NOT NULL, service_revision INTEGER NOT NULL, service_lease_until TEXT NOT NULL, credential_revision INTEGER NOT NULL, credential_expires_at TEXT NOT NULL, grant_action TEXT NOT NULL CHECK(grant_action='drive_review'), grant_revision INTEGER NOT NULL, source_instance_id TEXT NOT NULL, source_generation INTEGER NOT NULL, source_instance_revision INTEGER NOT NULL, connector_id TEXT NOT NULL, connector_revision INTEGER NOT NULL, api_origin TEXT NOT NULL, repository_id TEXT NOT NULL, api_owner TEXT NOT NULL, api_repo TEXT NOT NULL, PRIMARY KEY(order_id,lifecycle,epoch), UNIQUE(fence))"#),
     ("product_w1_claim_authority_no_update", "trigger", r#"CREATE TRIGGER product_w1_claim_authority_no_update BEFORE UPDATE ON product_w1_claim_authority_v1 BEGIN SELECT RAISE(ABORT,'immutable claim authority'); END"#),
@@ -6321,7 +6960,7 @@ const W1_CAPTURE_OBJECTS: [(&str, &str, &str); 4] = [
     ("product_w1_claim_authority_no_replace", "trigger", r#"CREATE TRIGGER product_w1_claim_authority_no_replace BEFORE INSERT ON product_w1_claim_authority_v1 WHEN EXISTS(SELECT 1 FROM product_w1_claim_authority_v1 WHERE (order_id=NEW.order_id AND lifecycle=NEW.lifecycle AND epoch=NEW.epoch) OR fence=NEW.fence) BEGIN SELECT RAISE(ABORT,'immutable claim authority'); END"#),
 ];
 
-#[cfg(feature = "w1-isolated-test-support")]
+#[cfg(any(feature = "w1-isolated-test-support", feature = "product-pack-pins"))]
 fn validate_w1_capture_schema(conn: &Connection) -> Result<(), ProductError> {
     for (name, kind, ddl) in W1_CAPTURE_OBJECTS {
         let object: Option<(String, String, Option<String>)> = conn.query_row(
@@ -6364,7 +7003,7 @@ fn validate_w1_capture_schema(conn: &Connection) -> Result<(), ProductError> {
     Ok(())
 }
 
-#[cfg(feature = "w1-isolated-test-support")]
+#[cfg(any(feature = "w1-isolated-test-support", feature = "product-pack-pins"))]
 const W1_OPERATION_TABLE: &str = r#"CREATE TABLE product_w1_operations_v1(
  actor_id TEXT COLLATE BINARY NOT NULL CHECK(typeof(actor_id)='text' AND length(CAST(actor_id AS BLOB)) BETWEEN 1 AND 256 AND instr(actor_id,char(0))=0),
  request_key TEXT COLLATE BINARY NOT NULL CHECK(typeof(request_key)='text' AND length(CAST(request_key AS BLOB)) BETWEEN 1 AND 256 AND instr(request_key,char(0))=0),
@@ -6390,11 +7029,11 @@ const W1_OPERATION_TABLE: &str = r#"CREATE TABLE product_w1_operations_v1(
  CHECK((operation IN ('approve','revoke') AND typeof(approval_result_revision)='integer' AND approval_result_revision=expected_revision+1 AND order_id IS NULL AND lifecycle IS NULL AND selection_result_revision IS NULL AND referenced_approval_revision IS NULL AND referenced_operation IS NULL)
     OR (operation='select' AND approval_result_revision IS NULL AND typeof(order_id)='text' AND length(CAST(order_id AS BLOB)) BETWEEN 1 AND 256 AND instr(order_id,char(0))=0 AND typeof(lifecycle)='integer' AND lifecycle>0 AND typeof(selection_result_revision)='integer' AND selection_result_revision=expected_revision+1 AND typeof(referenced_approval_revision)='integer' AND referenced_approval_revision>0 AND referenced_operation IS NOT NULL AND referenced_operation='approve'))
 )"#;
-#[cfg(feature = "w1-isolated-test-support")]
+#[cfg(any(feature = "w1-isolated-test-support", feature = "product-pack-pins"))]
 const W1_OPERATION_UPDATE: &str = r#"CREATE TRIGGER product_w1_operations_no_update BEFORE UPDATE ON product_w1_operations_v1 BEGIN SELECT RAISE(ABORT,'w1 operation immutable'); END"#;
-#[cfg(feature = "w1-isolated-test-support")]
+#[cfg(any(feature = "w1-isolated-test-support", feature = "product-pack-pins"))]
 const W1_OPERATION_DELETE: &str = r#"CREATE TRIGGER product_w1_operations_no_delete BEFORE DELETE ON product_w1_operations_v1 BEGIN SELECT RAISE(ABORT,'w1 operation immutable'); END"#;
-#[cfg(feature = "w1-isolated-test-support")]
+#[cfg(any(feature = "w1-isolated-test-support", feature = "product-pack-pins"))]
 const W1_OPERATION_REPLACE: &str = r#"CREATE TRIGGER product_w1_operations_no_replace BEFORE INSERT ON product_w1_operations_v1 WHEN EXISTS(SELECT 1 FROM product_w1_operations_v1 o WHERE (o.actor_id=NEW.actor_id AND o.request_key=NEW.request_key) OR (NEW.approval_result_revision IS NOT NULL AND o.source_instance_id=NEW.source_instance_id AND o.digest=NEW.digest AND o.approval_result_revision=NEW.approval_result_revision) OR (NEW.selection_result_revision IS NOT NULL AND o.order_id=NEW.order_id AND o.lifecycle=NEW.lifecycle AND o.selection_result_revision=NEW.selection_result_revision)) BEGIN SELECT RAISE(ABORT,'w1 operation duplicate'); END"#;
 
 #[cfg(feature = "w1-isolated-test-support")]
@@ -6402,7 +7041,15 @@ fn isolated_schema_error(error: rusqlite::Error) -> ProductError {
     isolated_marker_query_error(error)
 }
 
-#[cfg(feature = "w1-isolated-test-support")]
+#[cfg(all(
+    feature = "product-pack-pins",
+    not(feature = "w1-isolated-test-support")
+))]
+fn isolated_schema_error(error: rusqlite::Error) -> ProductError {
+    ProductError::Database(error)
+}
+
+#[cfg(any(feature = "w1-isolated-test-support", feature = "product-pack-pins"))]
 fn validate_isolated_pragmas(conn: &Connection) -> Result<(), ProductError> {
     for pragma in ["PRAGMA foreign_keys", "PRAGMA recursive_triggers"] {
         let value: i64 = conn.query_row(pragma, [], |row| row.get(0)).map_err(isolated_schema_error)?;
@@ -6411,7 +7058,7 @@ fn validate_isolated_pragmas(conn: &Connection) -> Result<(), ProductError> {
     Ok(())
 }
 
-#[cfg(feature = "w1-isolated-test-support")]
+#[cfg(any(feature = "w1-isolated-test-support", feature = "product-pack-pins"))]
 fn validate_w1_operations(conn: &Connection) -> Result<(), ProductError> {
     for (name, kind, ddl) in [
         ("product_w1_operations_v1", "table", W1_OPERATION_TABLE),
@@ -6883,7 +7530,11 @@ fn initialize_product_schema_with_a01_checkpoint_in(
                 if installation == config.installation_id && database == config.database_id => {}
             Some(_) => return Err(ProductError::ContractMismatch),
             None => {
-                let version = 3;
+            let version = if cfg!(feature = "product-pack-pins") && mode == StoreOpenMode::Normal {
+                4
+            } else {
+                3
+            };
                 #[cfg(feature = "a01-harness-support")]
                 let version = if mode.is_a01() { 0x0A01 } else { version };
                 tx.execute("INSERT INTO product_meta_v1(singleton,installation_id,database_id,schema_version) VALUES(1,?1,?2,?3)", params![config.installation_id, config.database_id, version])?;
@@ -6908,6 +7559,10 @@ fn initialize_product_schema_with_a01_checkpoint_in(
             }
         }
         result::initialize_fresh_v3(&tx, &config.installation_id, &config.database_id)?;
+    #[cfg(feature = "product-pack-pins")]
+    if mode == StoreOpenMode::Normal {
+        initialize_product_pack_pin_schema(&tx)?;
+    }
     #[cfg(feature = "a01-harness-support")]
     if mode.is_a01() {
         #[cfg(all(test, feature = "a01-harness-support", unix))]
@@ -8048,7 +8703,7 @@ mod isolated_operation_validation_tests {
 }
 
 
-#[cfg(feature = "w1-isolated-test-support")]
+#[cfg(any(feature = "w1-isolated-test-support", feature = "product-pack-pins"))]
 #[allow(dead_code)]
 mod w1_owner_codec {
     const REQUEST: &[u8] = b"foundry-w1-owner-operation-v2\0";
@@ -10810,6 +11465,10 @@ pub fn create_a01_task_claim_test_store(
             installation_id: config.installation_id,
             database_id: config.database_id,
             clock,
+                #[cfg(feature = "product-pack-pins")]
+                product_registry: None,
+                #[cfg(all(feature = "product-pack-pins", feature = "p2-test-support"))]
+                product_pin_commit_hook: None,
             #[cfg(feature = "w1-isolated-test-support")]
             w1_capture_fail_after_legacy_writes: false,
             #[cfg(feature = "w1-isolated-test-support")]

@@ -28,14 +28,17 @@ pub mod sqlite;
 pub use mirror::{Mirror, MirrorLine, MirrorState};
 #[cfg(feature = "p2-test-support")]
 pub use product::P2ReviewPreparation;
+#[cfg(feature = "product-pack-pins")]
+pub use product::PackRegistryConfig;
 pub use product::{
     AdmissionReceipt, ProductApprovalIntent, ProductApprovalReceipt, ProductArtifactContent,
     ProductArtifactInfo, ProductClock, ProductConfig, ProductError, ProductHoldAcceptance,
     ProductHoldDecision, ProductHoldExpectation, ProductPublishAuthorization, ProductPublishStart,
     ProductResultArtifactContent, ProductResultError, ProductResultExpectation, ProductResultInfo,
     ProductReviewConfig, ProductServiceAction, ProductServiceContext, ProductServiceCredential,
-    ProductServiceGrant, ProductServiceReceipt, ProductServiceView, ProductStore, ProductWorkClaim,
-    ProductWorkClaimResult, SystemProductClock, product_host_result_digest,
+    ProductServiceGrant, ProductServiceReceipt, ProductServiceView, ProductStore,
+    ProductStoreConfig, ProductWorkClaim, ProductWorkClaimResult, SystemProductClock,
+    product_host_result_digest,
 };
 #[cfg(feature = "p2-test-support")]
 pub use product::{ChargeBudgetObservation, ChargeBudgetObserver};

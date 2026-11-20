@@ -412,6 +412,17 @@ pub(super) fn validate_v3_connection(
     Ok(())
 }
 
+/// Validate the result-owned portion of a general ProductAtomicV1 v4 store.
+/// The product module validates the v4 pin tables and discriminator separately;
+/// result metadata and its immutable v3 wire remain unchanged.
+pub(super) fn validate_product_v4_connection(
+    conn: &Connection,
+    installation: &str,
+    database: &str,
+) -> Result<(), ProductError> {
+    validate_v3_connection(conn, installation, database)
+}
+
 impl ProductStore {
     #[cfg(feature = "p2-test-support")]
     pub fn prepare_p2_review_fixture(

@@ -4,9 +4,9 @@
 use foundry_exec::{
     ArtifactTuple, ArtifactTupleKey, Attempt, DispatchHost, DurableReviewRun, EmitLog, EmitReceipt,
     EmitSink, Epoch, ExecutionIntent, HostError, HostKey, HostResult, IntentLog, OrderId,
-    PromotionReceipt, ReviewAdmission, ReviewAdmissionRequest, ReviewAdmissionStore,
-    ReviewDispatchStore, ReviewHostStore, ReviewStageFinish, ReviewStageFinishRequest,
-    ReviewStageStart, RunId, TupleStore,
+    ProductSelectionBinding, PromotionReceipt, ReviewAdmission, ReviewAdmissionRequest,
+    ReviewAdmissionStore, ReviewDispatchStore, ReviewHostStore, ReviewStageFinish,
+    ReviewStageFinishRequest, ReviewStageStart, RunId, SelectedReviewAdmissionRequest, TupleStore,
 };
 use foundry_pack::{EngineAction, GraphEngine, RunInput, load_pack};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -662,6 +662,7 @@ impl PackReviewHost {
             Box::new(store),
             Some(standalone_db_path),
             false,
+            false,
         )
     }
     /// Construct the same frozen-pack algorithm over ProductAtomicV1 storage.
@@ -670,10 +671,52 @@ impl PackReviewHost {
     pub fn with_product_store(
         pack_path: impl AsRef<Path>,
         executor: impl StageExecutor + 'static,
+        store: foundry_ledger::ProductStore,
+        artifact_root: impl AsRef<Path>,
+        session_root: impl AsRef<Path>,
+        claim_root: impl AsRef<Path>,
+    ) -> Result<Self, HostError> {
+        Self::with_product_store_pack_mode(
+            pack_path,
+            executor,
+            store,
+            artifact_root,
+            session_root,
+            claim_root,
+            false,
+        )
+    }
+
+    /// Construct a ProductStore host for the pack selected and approved for its order.
+    /// This opt-in entry point is available only with product-pack-pins enabled.
+    #[cfg(feature = "product-pack-pins")]
+    pub fn with_selected_product_pack(
+        pack_path: impl AsRef<Path>,
+        executor: impl StageExecutor + 'static,
+        store: foundry_ledger::ProductStore,
+        artifact_root: impl AsRef<Path>,
+        session_root: impl AsRef<Path>,
+        claim_root: impl AsRef<Path>,
+    ) -> Result<Self, HostError> {
+        Self::with_product_store_pack_mode(
+            pack_path,
+            executor,
+            store,
+            artifact_root,
+            session_root,
+            claim_root,
+            true,
+        )
+    }
+
+    fn with_product_store_pack_mode(
+        pack_path: impl AsRef<Path>,
+        executor: impl StageExecutor + 'static,
         mut store: foundry_ledger::ProductStore,
         artifact_root: impl AsRef<Path>,
         session_root: impl AsRef<Path>,
         claim_root: impl AsRef<Path>,
+        allow_selected_pack: bool,
     ) -> Result<Self, HostError> {
         if !pack_path.as_ref().is_absolute() {
             return Err(HostError::Persistence(
@@ -682,7 +725,7 @@ impl PackReviewHost {
         }
         let snapshot =
             load_pack(pack_path.as_ref()).map_err(|e| HostError::Persistence(e.to_string()))?;
-        if snapshot.digest() != REVIEW_PACK_DIGEST {
+        if snapshot.digest() != REVIEW_PACK_DIGEST && !allow_selected_pack {
             return Err(HostError::Persistence(format!(
                 "unexpected review pack digest: {}",
                 snapshot.digest()
@@ -696,7 +739,14 @@ impl PackReviewHost {
                 pack_digest: snapshot.digest().to_owned(),
             })
             .map_err(|e| HostError::Persistence(e.to_string()))?;
-        Self::with_store(pack_path, executor, Box::new(store), None, true)
+        Self::with_store(
+            pack_path,
+            executor,
+            Box::new(store),
+            None,
+            true,
+            allow_selected_pack,
+        )
     }
     fn with_store(
         pack_path: impl AsRef<Path>,
@@ -704,6 +754,7 @@ impl PackReviewHost {
         store: Box<dyn ReviewHostStore>,
         standalone_db_path: Option<PathBuf>,
         product_store: bool,
+        allow_selected_pack: bool,
     ) -> Result<Self, HostError> {
         if !pack_path.as_ref().is_absolute() {
             return Err(HostError::Persistence(
@@ -712,7 +763,7 @@ impl PackReviewHost {
         }
         let snap =
             load_pack(pack_path.as_ref()).map_err(|e| HostError::Persistence(e.to_string()))?;
-        if snap.digest() != REVIEW_PACK_DIGEST {
+        if snap.digest() != REVIEW_PACK_DIGEST && (!product_store || !allow_selected_pack) {
             return Err(HostError::Persistence(format!(
                 "unexpected review pack digest: {}",
                 snap.digest()
@@ -912,7 +963,23 @@ impl PackReviewHost {
         intent: &ExecutionIntent,
         claim: &foundry_ledger::ProductWorkClaim,
     ) -> Result<HostResult, HostError> {
-        self.try_dispatch_with_product_work(intent, Some(claim.review_binding()))
+        self.try_dispatch_with_product_work(intent, Some(claim.review_binding()), None)
+    }
+
+    /// Product host front door for W1 selected-pack activation. Selection pin
+    /// and review activation are committed by the store in one transaction.
+    pub fn try_dispatch_selected_product_work(
+        &mut self,
+        intent: &ExecutionIntent,
+        claim: &foundry_ledger::ProductWorkClaim,
+        binding: ProductSelectionBinding,
+        request_key: impl Into<String>,
+    ) -> Result<HostResult, HostError> {
+        self.try_dispatch_with_product_work(
+            intent,
+            Some(claim.review_binding()),
+            Some((binding, request_key.into())),
+        )
     }
 
     /// Run the genuine frozen-pack host and then ask ProductStore to finalize
@@ -945,6 +1012,7 @@ impl PackReviewHost {
         &mut self,
         intent: &ExecutionIntent,
         product_work: Option<foundry_exec::ReviewWorkClaim>,
+        selected_request: Option<(ProductSelectionBinding, String)>,
     ) -> Result<HostResult, HostError> {
         if self.product_store && product_work.is_none() {
             return Err(HostError::Acceptance(
@@ -963,28 +1031,60 @@ impl PackReviewHost {
         }
         validate_intent(intent)?;
         self.check_binding(intent)?;
-        if let Some(r) = self.store.load_review_result(&key)? {
-            return Ok(r);
-        }
-        let resolved_attempt = self.store.resolved_attempt(&order, attempt)?;
-        if !resolved_attempt {
-            self.executor.ensure_available()?;
+        let selected_activation = selected_request.is_some();
+        if !selected_activation {
+            if self.store.pack_digest() != REVIEW_PACK_DIGEST {
+                return Err(HostError::Acceptance(
+                    "alternate review pack requires selected activation".into(),
+                ));
+            }
+            if let Some(result) = self.store.load_review_result(&key)? {
+                return Ok(result);
+            }
+            let resolved_attempt = self.store.resolved_attempt(&order, attempt)?;
+            if !resolved_attempt {
+                self.executor.ensure_available()?;
+            }
         }
         let snap = load_pack(&self.pack_path).map_err(|e| HostError::Persistence(e.to_string()))?;
         if snap.digest() != self.store.pack_digest() {
             return Err(HostError::Persistence("review pack digest changed".into()));
         }
         let digest = snap.digest().to_owned();
-        let binary = provenance(&digest, self.source_commit.as_deref())?;
-        let engine =
-            GraphEngine::from_snapshot(&snap).map_err(|e| HostError::Persistence(e.to_string()))?;
-        let admitted = self.store.admit_review_activation(ReviewAdmissionRequest {
+        let admission_request = ReviewAdmissionRequest {
             intent: intent.clone(),
             base_commit: base.clone(),
             result_commit: result.clone(),
-            pack_digest: digest,
+            pack_digest: digest.clone(),
             product_work,
-        })?;
+        };
+        let admitted = match selected_request {
+            Some((binding, request_key)) => {
+                self.store
+                    .admit_selected_review_activation(SelectedReviewAdmissionRequest {
+                        review: admission_request,
+                        binding,
+                        request_key,
+                    })?
+            }
+            None => self.store.admit_review_activation(admission_request)?,
+        };
+        if selected_activation {
+            // Selected request-key replay/conflict belongs to the admission
+            // transaction and must run before a terminal-result shortcut. An
+            // exact accepted activation without a result is safe to continue
+            // after restart; a changed key/content cannot borrow its result.
+            if let Some(result) = self.store.load_review_result(&key)? {
+                return Ok(result);
+            }
+            let resolved_attempt = self.store.resolved_attempt(&order, attempt)?;
+            if !resolved_attempt {
+                self.executor.ensure_available()?;
+            }
+        }
+        let binary = provenance(&digest, self.source_commit.as_deref())?;
+        let engine =
+            GraphEngine::from_snapshot(&snap).map_err(|e| HostError::Persistence(e.to_string()))?;
         let run_id = admitted.journal_run;
         let inherited = admitted.inherited_counters;
         let inherited_result = admitted.inherited_result_json;
@@ -1530,7 +1630,7 @@ impl DispatchHost for PackReviewHost {
             .unwrap_or_else(|e| panic!("review host: {e:?}"))
     }
     fn try_dispatch(&mut self, intent: &ExecutionIntent) -> Result<HostResult, HostError> {
-        self.try_dispatch_with_product_work(intent, None)
+        self.try_dispatch_with_product_work(intent, None, None)
     }
     fn dispatch_count(&self) -> u64 {
         self.dispatches
@@ -4172,6 +4272,7 @@ mod tests {
             }),
             None,
             false,
+            false,
         )
         .unwrap()
         .with_source_commit("a".repeat(40))
@@ -4233,6 +4334,7 @@ mod tests {
                 accepted_fixture: None,
             }),
             None,
+            false,
             false,
         )
         .unwrap()

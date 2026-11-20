@@ -356,3 +356,394 @@ fn p01b_retry_is_actor_bound_and_preserves_historical_receipts() {
     );
     assert_snapshot_unchanged(&before_historical_retry, &path);
 }
+
+#[cfg(all(
+    test,
+    feature = "w1-isolated-test-support",
+    feature = "product-pack-pins"
+))]
+mod product_pin {
+    use chrono::{DateTime, TimeZone, Utc};
+    use foundry_ledger::{
+        PackRegistryConfig, ProductCapability, ProductConfig, ProductStore, RepositoryIdentity,
+        ScopeGrantManifest, ScopeSourceManifest,
+    };
+    use std::os::unix::fs::DirBuilderExt;
+    use std::{
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    struct Fixture {
+        root: PathBuf,
+        path: PathBuf,
+        store: ProductStore,
+        owner: String,
+        reviewer: String,
+        digest: String,
+        now: DateTime<Utc>,
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+    fn fixture() -> Fixture {
+        let base = PathBuf::from(std::env::var_os("TMPDIR").expect("configured scratch"));
+        assert_ne!(base, PathBuf::from("/tmp"));
+        let root = base.join(format!(
+            "b2-w1-product-pin-{}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
+        let path = root.join("product.sqlite");
+        let config = ProductConfig {
+            installation_id: "product-pin-install".into(),
+            database_id: "product-pin-database".into(),
+        };
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let source = ScopeSourceManifest {
+            connector_id: "github-primary".into(),
+            source_instance_id: "source-pin".into(),
+            generation: 1,
+            identity: RepositoryIdentity::canonicalized(
+                "acme",
+                "github",
+                "https://api.github.com",
+                "repo:1",
+            )
+            .unwrap(),
+            api_owner: Some("acme".into()),
+            api_repo: Some("project".into()),
+            legacy_repository_locator: "repo:1".into(),
+            scope_query: "open".into(),
+            enabled: true,
+        };
+        let phc =
+            foundry_ledger::product_identity::ProductPasswordKdf::hash("owner-password").unwrap();
+        let mut store = ProductStore::create_product_pin_store(&path, &config).unwrap();
+        store
+            .bootstrap_owner_scoped(
+                "owner",
+                &phc,
+                std::slice::from_ref(&source),
+                &[ScopeGrantManifest {
+                    actor_id: "owner".into(),
+                    source_instance_id: "source-pin".into(),
+                    capabilities: vec![ProductCapability::ReadOrder],
+                }],
+            )
+            .unwrap();
+        let owner = store
+            .login("owner", "owner-password", now)
+            .unwrap()
+            .digest()
+            .to_owned();
+        let reviewer_phc =
+            foundry_ledger::product_identity::ProductPasswordKdf::hash("reviewer-password")
+                .unwrap();
+        store
+            .create_account(&owner, "reviewer", "approver", &reviewer_phc, now)
+            .unwrap();
+        store
+            .change_product_scope(
+                &owner,
+                "reviewer",
+                "source-pin",
+                ProductCapability::ReadOrder,
+                foundry_ledger::ScopeMutation::Grant,
+                0,
+                "reviewer-grant",
+                now,
+            )
+            .unwrap();
+        let reviewer = store
+            .login("reviewer", "reviewer-password", now)
+            .unwrap()
+            .digest()
+            .to_owned();
+        for (order, issue) in [("order-one", "issue:1"), ("order-two", "issue:2")] {
+            store
+                .admit_order(
+                    order,
+                    "github-primary",
+                    "repo:1",
+                    issue,
+                    "dep-bump",
+                    "fixture payload",
+                    now,
+                )
+                .unwrap();
+        }
+        let pack = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../skills/bmad-review-full/v1")
+            .canonicalize()
+            .unwrap();
+        let digest = foundry_pack::load_pack(&pack).unwrap().digest().to_owned();
+        store = store.with_product_registry(PackRegistryConfig {
+            snapshots: [(digest.clone(), pack)].into_iter().collect(),
+        });
+        Fixture {
+            root,
+            path,
+            store,
+            owner,
+            reviewer,
+            digest,
+            now,
+        }
+    }
+
+    #[test]
+    fn p01_pin_store_selection_control_cas_and_receipt() {
+        let mut f = fixture();
+        let digest = f.digest.clone();
+        f.store
+            .change_pack_approval(&f.owner, "source-pin", &digest, 0, true, "approve", f.now)
+            .unwrap();
+        let r = f
+            .store
+            .select_order_pack(
+                &f.owner,
+                "order-one",
+                1,
+                "source-pin",
+                &digest,
+                0,
+                "select",
+                f.now,
+            )
+            .unwrap();
+        assert_eq!((r.expected_revision, r.result_revision), (0, 1));
+        assert_eq!(r.operation, foundry_ledger::product::W1Operation::Select);
+    }
+    #[test]
+    fn p01_pin_store_non_owner_and_binding_rejected() {
+        let mut f = fixture();
+        let digest = f.digest.clone();
+        assert!(
+            f.store
+                .change_pack_approval(
+                    &f.reviewer,
+                    "source-pin",
+                    &digest,
+                    0,
+                    true,
+                    "reviewer-approve",
+                    f.now
+                )
+                .is_err()
+        );
+        f.store
+            .change_pack_approval(&f.owner, "source-pin", &digest, 0, true, "approve", f.now)
+            .unwrap();
+        assert!(
+            f.store
+                .select_order_pack(
+                    &f.owner,
+                    "order-one",
+                    1,
+                    "other-source",
+                    &digest,
+                    0,
+                    "bad-binding",
+                    f.now
+                )
+                .is_err()
+        );
+        assert!(
+            f.store
+                .select_order_pack(
+                    &f.owner,
+                    "order-two",
+                    2,
+                    "source-pin",
+                    &digest,
+                    0,
+                    "bad-life",
+                    f.now
+                )
+                .is_err()
+        );
+    }
+    #[test]
+    fn p01_pin_store_stale_revision_and_inactive_rejected() {
+        let mut f = fixture();
+        let digest = f.digest.clone();
+        f.store
+            .change_pack_approval(&f.owner, "source-pin", &digest, 0, true, "approve", f.now)
+            .unwrap();
+        f.store
+            .select_order_pack(
+                &f.owner,
+                "order-one",
+                1,
+                "source-pin",
+                &digest,
+                0,
+                "select",
+                f.now,
+            )
+            .unwrap();
+        assert!(
+            f.store
+                .select_order_pack(
+                    &f.owner,
+                    "order-two",
+                    1,
+                    "source-pin",
+                    &digest,
+                    1,
+                    "stale",
+                    f.now
+                )
+                .is_err()
+        );
+        f.store
+            .change_pack_approval(&f.owner, "source-pin", &digest, 1, false, "revoke", f.now)
+            .unwrap();
+        assert!(
+            f.store
+                .select_order_pack(
+                    &f.owner,
+                    "order-two",
+                    1,
+                    "source-pin",
+                    &digest,
+                    0,
+                    "inactive",
+                    f.now
+                )
+                .is_err()
+        );
+    }
+    #[test]
+    fn p01_pin_store_retry_returns_original_receipt() {
+        let mut f = fixture();
+        let digest = f.digest.clone();
+        f.store
+            .change_pack_approval(&f.owner, "source-pin", &digest, 0, true, "approve", f.now)
+            .unwrap();
+        let first = f
+            .store
+            .select_order_pack(
+                &f.owner,
+                "order-one",
+                1,
+                "source-pin",
+                &digest,
+                0,
+                "select",
+                f.now,
+            )
+            .unwrap();
+        let retry = f
+            .store
+            .select_order_pack(
+                &f.owner,
+                "order-one",
+                1,
+                "source-pin",
+                &digest,
+                0,
+                "select",
+                f.now,
+            )
+            .unwrap();
+        assert_eq!(first, retry);
+    }
+    #[test]
+    fn p01_unauthenticated_selection_cannot_probe_registry_availability() {
+        let mut f = fixture();
+        let unavailable_digest = "f".repeat(64);
+        let denied = f
+            .store
+            .select_order_pack(
+                &"0".repeat(64),
+                "order-one",
+                1,
+                "source-pin",
+                &unavailable_digest,
+                0,
+                "unauthenticated-select",
+                f.now,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            denied,
+            foundry_ledger::ProductError::Invariant("w1 authorization or binding unavailable")
+        ));
+        let unavailable = f
+            .store
+            .select_order_pack(
+                &f.owner,
+                "order-one",
+                1,
+                "source-pin",
+                &unavailable_digest,
+                0,
+                "authenticated-select",
+                f.now,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            unavailable,
+            foundry_ledger::ProductError::Invariant("w1 selection unavailable")
+        ));
+    }
+    #[test]
+    fn p01_pin_store_db_snapshot_unchanged_on_rejection() {
+        use rusqlite::{Connection, types::Value};
+        let mut f = fixture();
+        let digest = f.digest.clone();
+        let snapshot = || {
+            let c = Connection::open(&f.path).unwrap();
+            let mut s=c.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").unwrap();
+            let names = s
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>();
+            names
+                .into_iter()
+                .map(|name| {
+                    let mut q = c
+                        .prepare(&format!("SELECT * FROM \"{}\"", name.replace('"', "\"\"")))
+                        .unwrap();
+                    let n = q.column_count();
+                    let rows: Vec<Vec<Value>> = q
+                        .query_map([], |r| (0..n).map(|i| r.get::<_, Value>(i)).collect())
+                        .unwrap()
+                        .map(Result::unwrap)
+                        .collect::<Vec<_>>();
+                    (name, rows)
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = snapshot();
+        assert!(
+            f.store
+                .select_order_pack(
+                    &f.owner,
+                    "order-one",
+                    1,
+                    "source-pin",
+                    &digest,
+                    0,
+                    "unapproved",
+                    f.now
+                )
+                .is_err()
+        );
+        assert_eq!(before, snapshot());
+    }
+}

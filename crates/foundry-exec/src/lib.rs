@@ -28,8 +28,9 @@ pub use inject::{CrashPoint, FaultInjector};
 pub use lifecycle::{DispatchResult, Executor, LifecycleError, ResumeAction, RunStep};
 pub use ports::{
     AttemptLedger, CounterLog, CounterRecord, DispatchHost, EpochGate, HoldStore, IntentLog,
-    OutcomeStore, PortError, Recorded, ReviewAdmissionStore, ReviewDispatchStore, ReviewHostStore,
-    TupleStore,
+    OutcomeStore, PinReceipt, PolicyRejection, PortError, ProductSelectionBinding, Recorded,
+    ReviewAdmissionStore, ReviewDispatchStore, ReviewHostStore, SelectedAdmission,
+    SelectedReviewAdmissionRequest, TupleStore,
 };
 pub use review_run::{
     DurableReviewRun, HeldOutcome, ReviewAcceptedHold, ReviewAdmission, ReviewAdmissionRequest,

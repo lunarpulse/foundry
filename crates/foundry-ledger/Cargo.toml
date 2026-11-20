@@ -9,11 +9,13 @@ default = []
 p2-test-support = []
 w1-isolated-test-support = []
 a01-harness-support = []
+product-pack-pins = ["dep:foundry-pack"]
 
 [dependencies]
 foundry-domain = { path = "../foundry-domain" }
 foundry-approval = { path = "../foundry-approval" }
 foundry-exec = { path = "../foundry-exec" }
+foundry-pack = { path = "../foundry-pack", optional = true }
 argon2 = "=0.5.3"
 rand_core = { version = "=0.6.4", features = ["getrandom"] }
 rusqlite.workspace = true

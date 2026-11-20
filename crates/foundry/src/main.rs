@@ -710,16 +710,37 @@ fn product_review_host(
         product_config(installation_id, database_id),
     )
     .map_err(|_| "product review database rejected".to_owned())?;
-    PackReviewHost::with_product_store(
+    #[cfg(feature = "product-pack-pins")]
+    let store = {
+        let pack_path = std::path::PathBuf::from(&pack);
+        let snapshot = foundry_pack::load_pack(&pack_path)
+            .map_err(|_| "product review pack registry rejected".to_owned())?;
+        store.with_product_registry(foundry_ledger::PackRegistryConfig {
+            snapshots: [(snapshot.digest().to_owned(), pack_path)]
+                .into_iter()
+                .collect(),
+        })
+    };
+    #[cfg(feature = "product-pack-pins")]
+    let host = PackReviewHost::with_selected_product_pack(
         &pack,
         executor,
         store,
         artifact_root,
         session_root,
         claim_root,
-    )
-    .map(Some)
-    .map_err(|_| "product review runtime configuration rejected".to_owned())
+    );
+    #[cfg(not(feature = "product-pack-pins"))]
+    let host = PackReviewHost::with_product_store(
+        &pack,
+        executor,
+        store,
+        artifact_root,
+        session_root,
+        claim_root,
+    );
+    host.map(Some)
+        .map_err(|_| "product review runtime configuration rejected".to_owned())
 }
 
 fn product_login_cmd(
@@ -2805,6 +2826,35 @@ fn dispatch_product_tick(
 }
 
 
+/// Product review dispatch front door. A normal v4 store resolves the current
+/// selected coordinates and the host atomically binds them with the caller's
+/// service request key. Legacy/A01 stores have no v4 marker and retain the
+/// established fixed-pack admission path.
+pub(crate) mod product_coordinator {
+    use foundry_ledger::{ProductStore, ProductWorkClaim};
+    use foundry_line::PackReviewHost;
+
+    pub(crate) fn dispatch_review(
+        store: &ProductStore,
+        host: &mut PackReviewHost,
+        intent: &foundry_exec::ExecutionIntent,
+        claim: &ProductWorkClaim,
+        request_key: &str,
+    ) -> Result<foundry_exec::HostResult, String> {
+        #[cfg(feature = "product-pack-pins")]
+        if let Some(binding) = store
+            .selected_review_binding(intent, claim)
+            .map_err(|_| "product selected-pack binding rejected")?
+        {
+            return host
+                .try_dispatch_selected_product_work(intent, claim, binding, request_key)
+                .map_err(|error| format!("product selected host rejected: {error:?}"));
+        }
+        host.try_dispatch_product_work(intent, claim)
+            .map_err(|_| "product host rejected".into())
+    }
+}
+
 /// Bounded A01 assembly. Its DTOs, producer and fake selection share one feature.
 #[cfg(feature = "a01-harness-support")]
 pub(crate) mod a01_coordinator {
@@ -2839,8 +2889,14 @@ pub(crate) mod a01_coordinator {
         if accepted.output!=output || accepted.reservation!=reservation {
             return Err("A01 output read-back mismatch".into());
         }
-        let result=host.try_dispatch_product_work(&accepted.intent,claim)
-            .map_err(|_|"A01 host rejected")?;
+        let result = super::product_coordinator::dispatch_review(
+            store,
+            host,
+            &accepted.intent,
+            claim,
+            request_key,
+        )
+        .map_err(|_| "A01 host rejected")?;
         Ok(AcceptedDispatch{output:accepted,host:result})
     }
 }

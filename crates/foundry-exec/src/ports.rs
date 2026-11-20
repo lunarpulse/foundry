@@ -105,6 +105,72 @@ pub trait ReviewAdmissionStore: Send {
         &mut self,
         request: crate::review_run::ReviewAdmissionRequest,
     ) -> Result<crate::review_run::ReviewAdmission, crate::host::HostError>;
+
+    /// Atomically admits the exact selected pack and the review activation.
+    /// The service-scoped request key is durable: exact retries replay the
+    /// original admission and changed content conflicts without mutation.
+    fn admit_selected_review_activation(
+        &mut self,
+        _request: SelectedReviewAdmissionRequest,
+    ) -> Result<crate::review_run::ReviewAdmission, crate::host::HostError> {
+        Err(crate::host::HostError::Acceptance(
+            "selected review activation unsupported".into(),
+        ))
+    }
+
+    fn selected_admission(
+        &mut self,
+        _claim: &crate::review_run::ReviewWorkClaim,
+        _binding: &ProductSelectionBinding,
+        _request_key: &str,
+    ) -> Result<SelectedAdmission, crate::host::HostError> {
+        Err(crate::host::HostError::Acceptance(
+            "selected admission unsupported".into(),
+        ))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProductSelectionBinding {
+    pub order_id: String,
+    pub lifecycle: i64,
+    pub source_instance_id: String,
+    pub pack_digest: String,
+    pub selection_revision: i64,
+    pub referenced_approval_revision: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedReviewAdmissionRequest {
+    pub review: crate::review_run::ReviewAdmissionRequest,
+    pub binding: ProductSelectionBinding,
+    pub request_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinReceipt {
+    pub order_id: String,
+    pub lifecycle: i64,
+    pub selection_revision: i64,
+    pub receipt_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectedAdmission {
+    Selected(PinReceipt),
+    PolicyRejected {
+        reason: PolicyRejection,
+        original: Option<Vec<u8>>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyRejection {
+    ApprovalInactive,
+    StaleRevision,
+    BlockedByReview,
+    AuthorizationBinding,
+    RequestKeyConflict,
 }
 
 /// Typed persistence boundary used by the existing staged review algorithm.

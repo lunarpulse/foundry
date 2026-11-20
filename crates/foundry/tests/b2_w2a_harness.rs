@@ -807,11 +807,111 @@ fn a01_g21_failed_backend_terminal_keeps_real_accepted_evidence() {
     let after:BTreeMap<_,_>=snapshot(f.store.path()).into_iter().filter(|(k,_)|matches!(k.as_str(),"product_review_stages_v1"|"product_review_sessions_v1"|"product_artifacts_v1")).collect();assert_snapshots_equal(&before,&after);
     assert!(terminal_state(&f)==("failed".into(),"completed".into(),"completed".into()) && bridge_count(f.store.path())==0,"A01 Failed behavior changed");assert_no_result(&f);drop(f.checked());
 }
+fn accepted_hold_expectation(f: &A01Fixture) -> foundry_ledger::ProductHoldExpectation {
+    must(a01_db(f.store.path()).query_row(
+        "SELECT lifecycle,attempt,originating_run,activation,host_epoch,hold_revision,source_revision,expected_predecessor,snapshot_digest FROM product_review_holds_v1",
+        [],
+        |row| Ok(foundry_ledger::ProductHoldExpectation {
+            lifecycle: row.get(0)?,
+            attempt: row.get(1)?,
+            originating_run: row.get(2)?,
+            activation: row.get(3)?,
+            host_epoch: row.get(4)?,
+            hold_revision: row.get(5)?,
+            source_revision: row.get(6)?,
+            predecessor_seq: row.get(7)?,
+            snapshot_digest: row.get(8)?,
+        }),
+    ))
+}
+
+#[cfg(feature = "product-pack-pins")]
+#[test]
+fn a01_pin_enabled_accepted_hold_preserves_fixed_pack_authority() {
+    use foundry_exec::{HostError, ReviewHostStore};
+
+    let mut f = A01Fixture::new();
+    let mut stages = A01Stages::new();
+    stages.held = true;
+    let (_, dispatch, _) = f.dispatch(stages);
+    let hold = dispatch.host.held.unwrap();
+    let db = a01_db(f.store.path());
+    let version: i64 = must(db.query_row(
+        "SELECT schema_version FROM product_meta_v1 WHERE singleton=1",
+        [],
+        |r| r.get(0),
+    ));
+    assert_eq!(version, 0x0A01);
+    let pins: i64 = must(db.query_row(
+        "SELECT count(*) FROM sqlite_schema WHERE name='product_w1_lifecycle_pins_v1'",
+        [],
+        |r| r.get(0),
+    ));
+    assert_eq!(pins, 0);
+    let now = f.clock.now();
+    let receipt = must(f.backend().accept_product_review_hold(
+        &f.session,
+        &dispatch.output.intent.order.0,
+        &hold.hold_instance_id,
+        &accepted_hold_expectation(&f),
+        "pin-enabled-a01-resume",
+        foundry_ledger::ProductHoldDecision::Resume(hold.resume_targets[0].clone()),
+        now,
+    ));
+    let accepted = snapshot(f.store.path());
+    for (session, digest, reason) in [
+        (
+            "invalid-session",
+            A01_PACK_DIGEST,
+            "current review authority is unavailable",
+        ),
+        (
+            f.session.as_str(),
+            &"b".repeat(64),
+            "accepted evolving snapshot does not match immutable origin evidence",
+        ),
+    ] {
+        let mut store = f.checked();
+        must(
+            store.configure_review_backend(foundry_ledger::ProductReviewConfig {
+                artifact_root: f.dir.0.join("artifacts"),
+                session_root: f.dir.0.join("sessions"),
+                claim_root: f.dir.0.join("claims"),
+                pack_digest: digest.into(),
+            }),
+        );
+        let error = store
+            .claim_accepted_hold(session, &receipt.operation_id, now, &mut |_, _| {
+                panic!("rejected A01 claim reached preflight")
+            })
+            .unwrap_err();
+        assert!(
+            matches!(error, HostError::Acceptance(ref message) if message == reason),
+            "{error:?}"
+        );
+        assert_snapshots_equal(&accepted, &snapshot(f.store.path()));
+    }
+    let stages = A01Stages::new();
+    let calls = stages.calls.clone();
+    must(
+        f.host(stages)
+            .continue_accepted_product_hold(&f.session, &receipt.operation_id, now),
+    );
+    assert!(calls.load(Ordering::SeqCst) > 0);
+    let progress = must(f.backend().product_review_progress(
+        &f.session,
+        &receipt.operation_id,
+        now,
+    ));
+    assert!(progress.receipt == receipt);
+    assert_eq!(progress.phase, "completed");
+}
+
 #[test]
 fn a01_g22_continuation_and_human_pass_bind_resolved_claimed_results() {
     for human_pass in [true,false] {
         let mut f=A01Fixture::new();let mut stages=A01Stages::new();stages.held=true;let (_,d,_)=f.dispatch(stages);let hold=d.host.held.as_ref().unwrap();
-        let expected=must(a01_db(f.store.path()).query_row("SELECT lifecycle,attempt,originating_run,activation,host_epoch,hold_revision,source_revision,expected_predecessor,snapshot_digest FROM product_review_holds_v1",[],|r|Ok(foundry_ledger::ProductHoldExpectation{lifecycle:r.get(0)?,attempt:r.get(1)?,originating_run:r.get(2)?,activation:r.get(3)?,host_epoch:r.get(4)?,hold_revision:r.get(5)?,source_revision:r.get(6)?,predecessor_seq:r.get(7)?,snapshot_digest:r.get(8)?})));
+        let expected = accepted_hold_expectation(&f);
         let decision=if human_pass {foundry_ledger::ProductHoldDecision::CommitPass} else {foundry_ledger::ProductHoldDecision::Resume(must(hold.resume_targets.first().cloned().ok_or(())))};
         let receipt=must(f.backend().accept_product_review_hold(&f.session,&d.output.intent.order.0,&hold.hold_instance_id,&expected,"human-accept",decision,f.clock.now()));
         let receipt_before=snapshot(f.store.path())["product_review_hold_acceptances_v1"].clone();

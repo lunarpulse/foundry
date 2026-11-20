@@ -513,6 +513,103 @@ fn validate_admitted_in(
 }
 
 impl ReviewAdmissionStore for ProductStore {
+    #[cfg(feature = "product-pack-pins")]
+    fn selected_admission(
+        &mut self,
+        claim: &ReviewWorkClaim,
+        binding: &foundry_exec::ProductSelectionBinding,
+        request_key: &str,
+    ) -> Result<foundry_exec::SelectedAdmission, HostError> {
+        use foundry_exec::{PolicyRejection, SelectedAdmission};
+        let reject = |reason| {
+            Ok(SelectedAdmission::PolicyRejected {
+                reason,
+                original: None,
+            })
+        };
+        if claim.order_id != binding.order_id
+            || claim.lifecycle != binding.lifecycle
+            || claim.epoch <= 0
+            || claim.fence <= 0
+            || !super::w1_text(request_key)
+        {
+            return reject(PolicyRejection::AuthorizationBinding);
+        }
+        let service = claim.service_binding.as_ref();
+        let source = service.map(|s| s.source_instance_id.as_str());
+        if source != Some(binding.source_instance_id.as_str()) {
+            return reject(PolicyRejection::AuthorizationBinding);
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        super::require_product_pin_version(&tx).map_err(db_error)?;
+        let now = self.clock.now();
+        if claim.lease_until <= now
+            || super::service::validate_review_work_claim_in(&tx, claim, now).is_err()
+        {
+            return reject(PolicyRejection::AuthorizationBinding);
+        }
+        let sidecar: Option<(String,i64,i64)> = tx.query_row(
+            "SELECT selector_subject_id,scope_revision,grant_revision FROM product_w1_grant_sidecar_v1 WHERE order_id=?1 AND lifecycle=?2 AND selection_revision=?3",
+            params![binding.order_id,binding.lifecycle,binding.selection_revision], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).optional().map_err(db_error)?;
+        let Some((selector_subject_id, scope_revision, grant_revision)) = sidecar else {
+            return reject(PolicyRejection::AuthorizationBinding);
+        };
+        let authorized: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM product_scope_subject_revisions_v1 r JOIN product_scope_grants_v1 g ON g.subject_id=r.subject_id AND g.source_instance_id=r.source_instance_id WHERE r.subject_id=?1 AND r.source_instance_id=?2 AND r.revision=?3 AND g.grant_revision=?4 AND g.enabled=1 AND g.capability=?5)",
+            params![selector_subject_id,binding.source_instance_id,scope_revision,grant_revision,super::ProductCapability::ReadOrder.as_str()], |r| r.get(0),
+        ).map_err(db_error)?;
+        if !authorized {
+            return reject(PolicyRejection::AuthorizationBinding);
+        }
+        let exact_claim: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM product_work_claims_v1 WHERE order_id=?1 AND lifecycle=?2 AND owner_id=?3 AND epoch=?4 AND fence=?5 AND state='claimed' AND payload_digest=?6)",
+            params![claim.order_id,claim.lifecycle,claim.worker_id,claim.epoch,claim.fence,claim.payload_digest], |r| r.get(0),
+        ).map_err(db_error)?;
+        if !exact_claim {
+            return reject(PolicyRejection::AuthorizationBinding);
+        }
+        let _original: Vec<u8> = tx.query_row(
+            "SELECT receipt FROM product_w1_operations_v1 WHERE operation='select' AND order_id=?1 AND lifecycle=?2 AND selection_result_revision=?3 AND source_instance_id=?4 AND digest=?5 AND referenced_approval_revision=?6 AND actor_id=?7",
+            params![binding.order_id,binding.lifecycle,binding.selection_revision,binding.source_instance_id,binding.pack_digest,binding.referenced_approval_revision,selector_subject_id], |r| r.get(0),
+        ).optional().map_err(db_error)?.ok_or_else(|| HostError::Acceptance("selected product pack binding is unavailable".into()))?;
+        let blocked: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM product_review_runs_v1 WHERE order_id=?1 AND product_lifecycle=?2 AND status IN ('running','held','resuming')) OR EXISTS(SELECT 1 FROM product_review_holds_v1 WHERE order_id=?1 AND lifecycle=?2 AND state='active') OR EXISTS(SELECT 1 FROM product_review_active_v1 WHERE order_id=?1)",
+            params![binding.order_id,binding.lifecycle], |r| r.get(0),
+        ).map_err(db_error)?;
+        if blocked {
+            return reject(PolicyRejection::BlockedByReview);
+        }
+        let selected = super::w1_selection_state_in(
+            &tx,
+            &self.installation_id,
+            &self.database_id,
+            &binding.order_id,
+            binding.lifecycle,
+            &binding.source_instance_id,
+        )
+        .map_err(|_| HostError::Acceptance("selected product pack is unavailable".into()))?;
+        if selected.selection_revision != binding.selection_revision
+            || selected.pack_digest != binding.pack_digest
+            || selected.referenced_approval_revision != binding.referenced_approval_revision
+        {
+            return reject(PolicyRejection::StaleRevision);
+        }
+        if !selected.active {
+            return reject(PolicyRejection::ApprovalInactive);
+        }
+        // The durable lifecycle pin belongs to `admit_review_activation`'s
+        // transaction. A public standalone call cannot provide that atomicity;
+        // fail closed after validating the proposed binding and leave no pin or
+        // request-key state that could strand a later claim reassignment.
+        Err(HostError::Acceptance(
+            "standalone selected admission requires atomic review activation".into(),
+        ))
+    }
+
     fn validate_product_work_claim(
         &self,
         claim: &ReviewWorkClaim,
@@ -582,6 +679,109 @@ impl ReviewAdmissionStore for ProductStore {
         &mut self,
         request: ReviewAdmissionRequest,
     ) -> Result<ReviewAdmission, HostError> {
+        self.admit_review_activation_impl(request, None)
+    }
+
+    fn admit_selected_review_activation(
+        &mut self,
+        request: foundry_exec::SelectedReviewAdmissionRequest,
+    ) -> Result<ReviewAdmission, HostError> {
+        let foundry_exec::SelectedReviewAdmissionRequest {
+            review,
+            binding,
+            request_key,
+        } = request;
+        self.admit_review_activation_impl(review, Some((binding, request_key)))
+    }
+}
+
+impl ProductStore {
+    /// Resolve the currently selected pack coordinates for the exact live work
+    /// claim. This is a coordinator read, not execution authority: selected
+    /// activation repeats every check under its own writer transaction.
+    #[cfg(feature = "product-pack-pins")]
+    pub fn selected_review_binding(
+        &self,
+        intent: &ExecutionIntent,
+        claim: &super::ProductWorkClaim,
+    ) -> Result<Option<foundry_exec::ProductSelectionBinding>, HostError> {
+        let version = self
+            .conn
+            .query_row(
+                "SELECT schema_version FROM product_meta_v1 WHERE singleton=1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        if version != Some(4) {
+            return Ok(None);
+        }
+        <Self as ReviewAdmissionStore>::validate_product_work_claim(
+            self,
+            &claim.review_binding(),
+            intent,
+            self.clock.now(),
+        )?;
+        let source = claim
+            .service_binding
+            .as_ref()
+            .map(|binding| binding.source_instance_id.as_str())
+            .ok_or_else(|| {
+                HostError::Acceptance("selected product pack authority is unavailable".into())
+            })?;
+        let tx = self.conn.unchecked_transaction().map_err(db_error)?;
+        super::require_product_pin_version(&tx).map_err(db_error)?;
+        let selected = super::w1_selection_state_in(
+            &tx,
+            &self.installation_id,
+            &self.database_id,
+            &claim.order_id,
+            claim.lifecycle,
+            source,
+        )
+        .map_err(|_| HostError::Acceptance("selected product pack is unavailable".into()))?;
+        let sidecar: Option<(String, i64, i64)> = tx
+            .query_row(
+                "SELECT selector_subject_id,scope_revision,grant_revision FROM product_w1_grant_sidecar_v1 WHERE order_id=?1 AND lifecycle=?2 AND selection_revision=?3",
+                params![claim.order_id, claim.lifecycle, selected.selection_revision],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(db_error)?;
+        let Some((selector_subject_id, scope_revision, grant_revision)) = sidecar else {
+            return Err(HostError::Acceptance(
+                "selected product pack authority is unavailable".into(),
+            ));
+        };
+        let authorized: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM product_scope_subject_revisions_v1 r JOIN product_scope_grants_v1 g ON g.subject_id=r.subject_id AND g.source_instance_id=r.source_instance_id WHERE r.subject_id=?1 AND r.source_instance_id=?2 AND r.revision=?3 AND g.grant_revision=?4 AND g.enabled=1 AND g.capability=?5)",
+                params![selector_subject_id, source, scope_revision, grant_revision, super::ProductCapability::ReadOrder.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        if !authorized || !selected.active {
+            return Err(HostError::Acceptance(
+                "selected product pack authority is unavailable".into(),
+            ));
+        }
+        tx.commit().map_err(db_error)?;
+        Ok(Some(foundry_exec::ProductSelectionBinding {
+            order_id: selected.order,
+            lifecycle: selected.lifecycle,
+            source_instance_id: selected.source,
+            pack_digest: selected.pack_digest,
+            selection_revision: selected.selection_revision,
+            referenced_approval_revision: selected.referenced_approval_revision,
+        }))
+    }
+
+    fn admit_review_activation_impl(
+        &mut self,
+        request: ReviewAdmissionRequest,
+        selected_request: Option<(foundry_exec::ProductSelectionBinding, String)>,
+    ) -> Result<ReviewAdmission, HostError> {
         #[cfg(feature = "a01-harness-support")]
         if self.open_mode.is_a01() && !self.open_mode.is_a01_task() {
             return Err(HostError::Acceptance("A01 isolated store review admission is disabled".into()));
@@ -611,6 +811,22 @@ impl ReviewAdmissionStore for ProductStore {
                 "unsupported product review activation".into(),
             ));
         }
+        #[cfg(not(feature = "product-pack-pins"))]
+        if selected_request.is_some() {
+            return Err(HostError::Acceptance(
+                "selected review activation unsupported".into(),
+            ));
+        }
+        #[cfg(feature = "product-pack-pins")]
+        if let Some((binding, request_key)) = selected_request.as_ref()
+            && (binding.order_id != intent.order.0
+                || binding.pack_digest != request.pack_digest
+                || !super::w1_text(request_key))
+        {
+            return Err(HostError::Acceptance(
+                "selected review activation binding is invalid".into(),
+            ));
+        }
         let expected_ref = format!(
             "review:{}:{}:{}..{}",
             intent.order.0, intent.attempt.0, request.base_commit, request.result_commit
@@ -622,6 +838,8 @@ impl ReviewAdmissionStore for ProductStore {
         }
         let key = key_json(intent)?;
         let clock = self.clock.clone();
+        #[cfg(all(feature = "product-pack-pins", feature = "p2-test-support"))]
+        let commit_hook = self.product_pin_commit_hook.take();
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -658,6 +876,227 @@ impl ReviewAdmissionStore for ProductStore {
             HostError::Acceptance("product review requires a durable work claim".into())
         })?;
         validate_work_claim_in(&tx, work, intent, lifecycle, source_revision, now)?;
+        #[cfg(feature = "product-pack-pins")]
+        let selected_authority = if let Some((binding, request_key)) = selected_request.as_ref() {
+            super::require_product_pin_version(&tx).map_err(db_error)?;
+            let source = work
+                .service_binding
+                .as_ref()
+                .map(|service| service.source_instance_id.as_str())
+                .ok_or_else(|| {
+                    HostError::Acceptance("selected product pack authority is unavailable".into())
+                })?;
+            let sidecar: Option<(String, i64, i64)> = tx
+                .query_row(
+                    "SELECT selector_subject_id,scope_revision,grant_revision FROM product_w1_grant_sidecar_v1 WHERE order_id=?1 AND lifecycle=?2 AND selection_revision=?3",
+                    params![intent.order.0, lifecycle, binding.selection_revision],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .map_err(db_error)?;
+            let Some((selector_subject_id, scope_revision, grant_revision)) = sidecar else {
+                return Err(HostError::Acceptance(
+                    "selected product pack authority is unavailable".into(),
+                ));
+            };
+            let still_authorized: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM product_scope_subject_revisions_v1 r JOIN product_scope_grants_v1 g ON g.subject_id=r.subject_id AND g.source_instance_id=r.source_instance_id WHERE r.subject_id=?1 AND r.source_instance_id=?2 AND r.revision=?3 AND g.grant_revision=?4 AND g.enabled=1 AND g.capability=?5)",
+                    params![selector_subject_id, source, scope_revision, grant_revision, super::ProductCapability::ReadOrder.as_str()],
+                    |row| row.get(0),
+                )
+                .map_err(db_error)?;
+            if !still_authorized
+                || binding.lifecycle != lifecycle
+                || binding.source_instance_id != source
+            {
+                return Err(HostError::Acceptance(
+                    "selected product pack authority is unavailable".into(),
+                ));
+            }
+            let service_id = work
+                .service_binding
+                .as_ref()
+                .expect("validated service binding")
+                .service_id
+                .clone();
+            Some((source.to_owned(), service_id, request_key.clone()))
+        } else {
+            None
+        };
+        #[cfg(feature = "product-pack-pins")]
+        if let Some((binding, request_key)) = selected_request.as_ref() {
+            let service_id = work
+                .service_binding
+                .as_ref()
+                .expect("validated service binding")
+                .service_id
+                .as_str();
+            let keyed: Option<(String,i64,String,String,i64,i64,i64,i64,String)> = tx.query_row(
+                "SELECT order_id,lifecycle,source_instance_id,pack_digest,selection_revision,referenced_approval_revision,claim_epoch,claim_fence,payload_digest FROM product_w1_lifecycle_pins_v1 WHERE service_id=?1 AND request_key=?2",
+                params![service_id,request_key],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?)),
+            ).optional().map_err(db_error)?;
+            if let Some((
+                order,
+                lifecycle_row,
+                source,
+                digest,
+                selection_revision,
+                approval_revision,
+                claim_epoch,
+                claim_fence,
+                payload_digest,
+            )) = keyed
+            {
+                let journal_run = format!(
+                    "{}:{}:{}:{}",
+                    intent.order.0, intent.attempt.0, intent.run.0, intent.activation
+                );
+                let service = work
+                    .service_binding
+                    .as_ref()
+                    .expect("validated service binding");
+                let exact_rows: bool = tx.query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM product_review_runs_v1 r
+                        JOIN product_review_work_bindings_v1 w ON w.order_id=r.order_id AND w.run_id=r.run_id
+                        JOIN product_review_host_accept_v1 h ON h.order_id=r.order_id AND h.attempt=r.attempt
+                        JOIN product_review_bindings_v1 b ON b.key_json=?1
+                        JOIN product_review_active_v1 a ON a.order_id=r.order_id AND a.journal_run=r.run_id
+                        JOIN product_review_authority_v1 au ON au.order_id=r.order_id AND au.journal_run=r.run_id
+                        WHERE r.order_id=?2 AND r.attempt=?3 AND r.run_id=?4
+                          AND r.base_commit=?5 AND r.result_commit=?6 AND r.pack_digest=?7
+                          AND h.run_id=?8 AND h.activation=?9
+                          AND w.lifecycle=?10 AND w.delivery_id=?11 AND w.worker_id=?12
+                          AND w.claim_epoch=?13 AND w.claim_fence=?14 AND w.source_revision=?15
+                          AND w.payload_digest=?16 AND w.task_kind=?17 AND w.payload_snapshot=?18
+                          AND b.intent_json=?19
+                          AND au.service_id=?20 AND au.service_revision=?21
+                          AND au.credential_revision=?22 AND au.source_instance_id=?23
+                    )",
+                    params![
+                        key,
+                        intent.order.0,
+                        intent.attempt.0 as i64,
+                        journal_run,
+                        request.base_commit,
+                        request.result_commit,
+                        request.pack_digest,
+                        intent.run.0 as i64,
+                        intent.activation as i64,
+                        work.lifecycle,
+                        work.delivery_id,
+                        work.worker_id,
+                        work.epoch,
+                        work.fence,
+                        work.source_revision,
+                        work.payload_digest,
+                        work.task_kind,
+                        work.payload_snapshot,
+                        json(intent)?,
+                        service.service_id,
+                        service.service_revision,
+                        service.credential_revision,
+                        service.source_instance_id,
+                    ],
+                    |row| row.get(0),
+                ).map_err(db_error)?;
+                let exact = order == binding.order_id
+                    && lifecycle_row == binding.lifecycle
+                    && source == binding.source_instance_id
+                    && digest == binding.pack_digest
+                    && selection_revision == binding.selection_revision
+                    && approval_revision == binding.referenced_approval_revision
+                    && claim_epoch == work.epoch
+                    && claim_fence == work.fence
+                    && payload_digest == work.payload_digest
+                    && exact_rows;
+                if exact {
+                    tx.commit().map_err(db_error)?;
+                    return Ok(ReviewAdmission {
+                        journal_run,
+                        inherited_counters: Default::default(),
+                        inherited_result_json: None,
+                    });
+                }
+                let has_run: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM product_review_runs_v1 WHERE order_id=?1 AND product_lifecycle=?2)",
+                    params![order,lifecycle_row],
+                    |row| row.get(0),
+                ).map_err(db_error)?;
+                if !has_run {
+                    return Err(HostError::Acceptance(
+                        "selected product pack pin exists outside atomic activation".into(),
+                    ));
+                }
+                return Err(HostError::Acceptance(
+                    "selected review activation request key conflict".into(),
+                ));
+            }
+        }
+        #[cfg(feature = "product-pack-pins")]
+        let product_pin = if let Some((binding, _)) = selected_request.as_ref() {
+            if !super::registered_pack_snapshot(self.product_registry.as_ref(), &cfg.pack_digest) {
+                return Err(HostError::Acceptance(
+                    "selected product pack is unavailable".into(),
+                ));
+            }
+            let (source, service_id, request_key) = selected_authority
+                .as_ref()
+                .expect("selected authority was validated");
+            let selected = super::w1_selection_state_in(
+                &tx,
+                &self.installation_id,
+                &self.database_id,
+                &intent.order.0,
+                lifecycle,
+                source,
+            )
+            .map_err(|_| HostError::Acceptance("selected product pack is unavailable".into()))?;
+            if binding.selection_revision != selected.selection_revision
+                || binding.referenced_approval_revision != selected.referenced_approval_revision
+                || binding.pack_digest != selected.pack_digest
+            {
+                return Err(HostError::Acceptance(
+                    "selected review activation binding is stale".into(),
+                ));
+            }
+            if selected.pack_digest != cfg.pack_digest
+                || selected.source != *source
+                || !selected.active
+            {
+                return Err(HostError::Acceptance(
+                    "selected product pack is unavailable".into(),
+                ));
+            }
+            Some((
+                selected,
+                source.clone(),
+                service_id.clone(),
+                request_key.clone(),
+            ))
+        } else {
+            None
+        };
+        #[cfg(feature = "product-pack-pins")]
+        if selected_request.is_some() {
+            // Exact service/key replay returned above. Any remaining lifecycle
+            // pin names another request and must conflict before generic host
+            // recovery checks can obscure the selected request-key contract.
+            let pinned: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM product_w1_lifecycle_pins_v1 p JOIN product_review_runs_v1 r ON r.order_id=p.order_id AND r.product_lifecycle=p.lifecycle WHERE p.order_id=?1 AND p.lifecycle=?2)",
+                    params![intent.order.0, lifecycle],
+                    |row| row.get(0),
+                )
+                .map_err(db_error)?;
+            if pinned {
+                return Err(HostError::Acceptance(
+                    "selected review activation request key conflict".into(),
+                ));
+            }
+        }
         let existing: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM product_review_host_accept_v1 WHERE order_id=?1 AND attempt=?2 AND run_id=?3 AND activation=?4)",params![intent.order.0,intent.attempt.0 as i64,intent.run.0 as i64,intent.activation as i64],|r|r.get(0)).map_err(db_error)?;
         if existing {
             return Err(HostError::Persistence(
@@ -691,6 +1130,35 @@ impl ReviewAdmissionStore for ProductStore {
                 "stale or unresolved product review run".into(),
             ));
         }
+        #[cfg(feature = "product-pack-pins")]
+        {
+            let pin_schema: Option<i64> = tx
+                .query_row(
+                    "SELECT schema_version FROM product_meta_v1 WHERE singleton=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(db_error)?;
+            if pin_schema == Some(4) {
+                // Lifecycle pins are created only as part of this activation write
+                // set. Finding one before the run exists is an orphan from a split
+                // admission and must never be adopted, even when its old claim
+                // coordinates happen to match.
+                let persisted: bool = tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM product_w1_lifecycle_pins_v1 WHERE order_id=?1 AND lifecycle=?2)",
+                        params![intent.order.0, lifecycle],
+                        |row| row.get(0),
+                    )
+                    .map_err(db_error)?;
+                if persisted {
+                    return Err(HostError::Acceptance(
+                        "selected product pack pin exists outside atomic activation".into(),
+                    ));
+                }
+            }
+        }
         tx.execute("INSERT INTO product_review_epochs_v1(order_id,epoch) VALUES(?1,?2) ON CONFLICT(order_id) DO UPDATE SET epoch=excluded.epoch WHERE excluded.epoch>=product_review_epochs_v1.epoch",params![intent.order.0,intent.epoch.0 as i64]).map_err(db_error)?;
         let run_id = format!(
             "{}:{}:{}:{}",
@@ -699,6 +1167,10 @@ impl ReviewAdmissionStore for ProductStore {
         tx.execute("INSERT INTO product_review_runs_v1(order_id,attempt,run_id,base_commit,result_commit,pack_digest,status,counters_json,product_lifecycle,source_revision,admission_seq,admission_hash,created_at) VALUES(?1,?2,?3,?4,?5,?6,'running','{}',?7,?8,?9,?10,unixepoch())",params![intent.order.0,intent.attempt.0 as i64,run_id,request.base_commit,request.result_commit,cfg.pack_digest,lifecycle,source_revision,admission_seq,admission_hash]).map_err(db_error)?;
         tx.execute("INSERT INTO product_review_work_bindings_v1(order_id,attempt,run_id,lifecycle,delivery_id,worker_id,claim_epoch,claim_fence,source_revision,payload_digest,task_kind,payload_snapshot) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",params![intent.order.0,intent.attempt.0 as i64,run_id,lifecycle,work.delivery_id,work.worker_id,work.epoch,work.fence,work.source_revision,work.payload_digest,work.task_kind,work.payload_snapshot]).map_err(db_error)?;
         tx.execute("INSERT INTO product_review_host_accept_v1(order_id,attempt,run_id,activation) VALUES(?1,?2,?3,?4)",params![intent.order.0,intent.attempt.0 as i64,intent.run.0 as i64,intent.activation as i64]).map_err(db_error)?;
+        #[cfg(feature = "product-pack-pins")]
+        if let Some(product_pin) = product_pin {
+            tx.execute("INSERT INTO product_w1_lifecycle_pins_v1(order_id,lifecycle,installation_id,database_id,source_instance_id,pack_digest,selection_revision,referenced_approval_revision,service_id,request_key,claim_epoch,claim_fence,payload_digest,admission_seq,admission_hash) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)", params![intent.order.0,lifecycle,self.installation_id,self.database_id,product_pin.1,product_pin.0.pack_digest,product_pin.0.selection_revision,product_pin.0.referenced_approval_revision,product_pin.2,product_pin.3,work.epoch,work.fence,work.payload_digest,admission_seq,admission_hash]).map_err(db_error)?;
+        }
         tx.execute(
             "INSERT INTO product_review_bindings_v1(key_json,intent_json) VALUES(?1,?2)",
             params![key, json(intent)?],
@@ -739,6 +1211,25 @@ impl ReviewAdmissionStore for ProductStore {
             tx.execute("INSERT INTO product_review_authority_v1(key_json,order_id,lifecycle,attempt,run_id,activation,journal_run,host_epoch,service_id,service_revision,credential_revision,drive_review_grant_revision,source_instance_id,source_generation,source_instance_revision,connector_revision) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",params![key,intent.order.0,lifecycle,intent.attempt.0 as i64,intent.run.0 as i64,intent.activation as i64,run_id,intent.epoch.0 as i64,service.service_id,service.service_revision,service.credential_revision,grant_revision,service.source_instance_id,source_generation,source_instance_revision,connector_revision]).map_err(db_error)?;
         }
         tx.execute("INSERT INTO product_review_active_v1(order_id,key_json,epoch,journal_run) VALUES(?1,?2,?3,?4) ON CONFLICT(order_id) DO UPDATE SET key_json=excluded.key_json,epoch=excluded.epoch,journal_run=excluded.journal_run",params![intent.order.0,key,intent.epoch.0 as i64,run_id]).map_err(db_error)?;
+        #[cfg(all(feature = "product-pack-pins", feature = "p2-test-support"))]
+        if let Some((reached, release)) = commit_hook {
+            reached.send(()).map_err(|_| {
+                HostError::Persistence("product pin commit hook notification unavailable".into())
+            })?;
+            match release.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(()) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(HostError::Persistence(
+                        "product pin commit hook release timed out".into(),
+                    ));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(HostError::Persistence(
+                        "product pin commit hook release disconnected".into(),
+                    ));
+                }
+            }
+        }
         tx.commit().map_err(db_error)?;
         Ok(ReviewAdmission {
             journal_run: run_id,
@@ -1376,6 +1867,8 @@ impl ReviewHostStore for ProductStore {
             &request.journal_run,
         )?;
         let binding = ensure_resuming_fence(&tx, &request.intent, &request.journal_run, pack)?;
+        #[cfg(feature = "product-pack-pins")]
+        ensure_pinned_product_authority(&tx, &request.intent.order.0, &binding, pack)?;
         ensure_product_source_for_new_stage(
             &tx,
             &request.intent.order.0,
@@ -1679,6 +2172,65 @@ impl ReviewHostStore for ProductStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db_error)?;
+        // Only normal v4 stores carry lifecycle pins. Every profile still checks
+        // the session, work authority and immutable origin below.
+        #[cfg(feature = "product-pack-pins")]
+        let normal_v4 = self.open_mode == super::StoreOpenMode::Normal
+            && tx
+                .query_row(
+                    "SELECT schema_version=4 FROM product_meta_v1 WHERE singleton=1",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(db_error)?;
+        #[cfg(feature = "product-pack-pins")]
+        if normal_v4 {
+            let pin: Option<(String,String,String,i64,i64)> = tx.query_row(
+                "SELECT installation_id,database_id,source_instance_id,selection_revision,referenced_approval_revision FROM product_w1_lifecycle_pins_v1 WHERE order_id=?1 AND lifecycle=?2",
+                params![preliminary.order_id,preliminary.lifecycle], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
+            ).optional().map_err(db_error)?;
+            if let Some((installation, database, source, selection_revision, approval_revision)) =
+                pin
+            {
+                let selected = super::w1_selection_state_in(
+                    &tx,
+                    &installation,
+                    &database,
+                    &preliminary.order_id,
+                    preliminary.lifecycle,
+                    &source,
+                )
+                .map_err(|_| {
+                    HostError::Acceptance("selected product pack authority was revoked".into())
+                })?;
+                if !selected.active
+                    || selected.selection_revision != selection_revision
+                    || selected.referenced_approval_revision != approval_revision
+                {
+                    return Err(HostError::Acceptance(
+                        "selected product pack authority was revoked".into(),
+                    ));
+                }
+                let sidecar:Option<(String,i64,i64)>=tx.query_row("SELECT selector_subject_id,scope_revision,grant_revision FROM product_w1_grant_sidecar_v1 WHERE order_id=?1 AND lifecycle=?2 AND selection_revision=?3",params![preliminary.order_id,preliminary.lifecycle,selection_revision],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(db_error)?;
+                let live = if let Some((selector_subject_id, scope_revision, grant_revision)) =
+                    sidecar
+                {
+                    tx.query_row("SELECT EXISTS(SELECT 1 FROM product_scope_subject_revisions_v1 r JOIN product_scope_grants_v1 g ON g.subject_id=r.subject_id AND g.source_instance_id=r.source_instance_id WHERE r.subject_id=?1 AND r.source_instance_id=?2 AND r.revision=?3 AND g.grant_revision=?4 AND g.enabled=1 AND g.capability=?5)",params![selector_subject_id,source,scope_revision,grant_revision,super::ProductCapability::ReadOrder.as_str()],|r|r.get::<_,bool>(0)).map_err(db_error)?
+                } else {
+                    false
+                };
+                if !live {
+                    return Err(HostError::Acceptance(
+                        "selected product pack authority was revoked".into(),
+                    ));
+                }
+                if selected.pack_digest != configured_pack {
+                    return Err(HostError::Acceptance(
+                        "selected product pack binding changed".into(),
+                    ));
+                }
+            }
+        }
         // This is a new-work authorization transaction as well as a human
         // decision claim. Use one fresh transaction instant for both checks;
         // the caller's HTTP/CLI timestamp must not extend service authority.
@@ -2482,6 +3034,8 @@ fn ensure_new_work(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), HostError> {
     let binding = ensure_active_fence(tx, intent, run, pack)?;
+    #[cfg(feature = "product-pack-pins")]
+    ensure_pinned_product_authority(tx, &intent.order.0, &binding, pack)?;
     let order: Option<(i64,i64,i64,String,String,i64)> = tx.query_row(
         "SELECT o.lifecycle,o.source_revision,o.admission_seq,o.admission_hash,o.repository_id,s.revision FROM product_orders_v1 o JOIN product_sources_v1 s ON s.connector_id=o.connector_id WHERE o.order_id=?1 AND s.enabled=1",
         [&intent.order.0], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)),
@@ -2938,6 +3492,89 @@ struct ProductArtifactRegistration<'a> {
     stage_id: &'a str,
     evidence: &'a ReviewStageEvidence,
     now: chrono::DateTime<chrono::Utc>,
+}
+
+#[cfg(feature = "product-pack-pins")]
+fn ensure_pinned_product_authority(
+    tx: &rusqlite::Transaction<'_>,
+    order: &str,
+    binding: &ActiveRunBinding,
+    pack: &str,
+) -> Result<(), HostError> {
+    let schema_version: Option<i64> = tx
+        .query_row(
+            "SELECT schema_version FROM product_meta_v1 WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(db_error)?;
+    if schema_version != Some(4) {
+        return Ok(());
+    }
+    let pin: Option<(String,String,String,String,i64,i64,i64,i64,String)> = tx.query_row(
+        "SELECT installation_id,database_id,source_instance_id,pack_digest,selection_revision,referenced_approval_revision,admission_seq,claim_fence,admission_hash FROM product_w1_lifecycle_pins_v1 WHERE order_id=?1 AND lifecycle=?2",
+        params![order,binding.lifecycle], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?)),
+    ).optional().map_err(db_error)?;
+    let Some((
+        installation,
+        database,
+        source,
+        digest,
+        selection_revision,
+        approval_revision,
+        seq,
+        fence,
+        hash,
+    )) = pin
+    else {
+        // Feature-enabled binaries still serve legacy fixed-pack runs. Only
+        // selected activations carry a lifecycle pin and require live W1
+        // authority at later stage boundaries.
+        return Ok(());
+    };
+    if digest != pack || seq != binding.admission_seq || hash != binding.admission_hash {
+        return Err(HostError::Acceptance(
+            "selected product pack binding changed".into(),
+        ));
+    }
+    let sidecar: Option<(String,i64,i64)> = tx.query_row(
+        "SELECT selector_subject_id,scope_revision,grant_revision FROM product_w1_grant_sidecar_v1 WHERE order_id=?1 AND lifecycle=?2 AND selection_revision=?3",
+        params![order,binding.lifecycle,selection_revision], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+    ).optional().map_err(db_error)?;
+    let Some((selector_subject_id, scope_revision, grant_revision)) = sidecar else {
+        return Err(HostError::Acceptance(
+            "selected product pack authority is unavailable".into(),
+        ));
+    };
+    let live: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM product_scope_subject_revisions_v1 r JOIN product_scope_grants_v1 g ON g.subject_id=r.subject_id AND g.source_instance_id=r.source_instance_id JOIN product_scope_source_instances_v1 i ON i.source_instance_id=r.source_instance_id WHERE r.subject_id=?1 AND r.source_instance_id=?2 AND r.revision=?3 AND g.grant_revision=?4 AND g.enabled=1 AND g.capability=?5 AND i.enabled=1)",
+        params![selector_subject_id,source,scope_revision,grant_revision,super::ProductCapability::ReadOrder.as_str()], |r|r.get(0),
+    ).map_err(db_error)?;
+    if !live || approval_revision <= 0 || fence <= 0 {
+        return Err(HostError::Acceptance(
+            "selected product pack authority was revoked".into(),
+        ));
+    }
+    let current = super::w1_selection_state_in(
+        tx,
+        &installation,
+        &database,
+        order,
+        binding.lifecycle,
+        &source,
+    )
+    .map_err(|_| HostError::Acceptance("selected product pack authority was revoked".into()))?;
+    if current.pack_digest != digest
+        || current.selection_revision != selection_revision
+        || current.referenced_approval_revision != approval_revision
+        || !current.active
+    {
+        return Err(HostError::Acceptance(
+            "selected product pack authority was revoked".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn register_product_artifact_in(

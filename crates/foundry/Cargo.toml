@@ -8,6 +8,7 @@ license.workspace = true
 default = []
 a01-harness-support = ["foundry-ledger/a01-harness-support", "foundry-line/a01-harness-support"]
 p2-test-support = ["foundry-ledger/p2-test-support", "foundry-line/p2-test-support", "foundry-serve/p2-test-support"]
+product-pack-pins = ["foundry-ledger/product-pack-pins", "foundry-line/product-pack-pins"]
 
 [[bin]]
 name = "foundry"
@@ -37,6 +38,7 @@ foundry-approval = { path = "../foundry-approval" }
 foundry-workflow = { path = "../foundry-workflow" }
 foundry-line = { path = "../foundry-line" }
 foundry-exec = { path = "../foundry-exec" }
+foundry-pack = { path = "../foundry-pack" }
 foundry-blueprint = { path = "../foundry-blueprint" }
 foundry-ledger = { path = "../foundry-ledger" }
 foundry-harness-cli = { path = "../foundry-harness-cli" }

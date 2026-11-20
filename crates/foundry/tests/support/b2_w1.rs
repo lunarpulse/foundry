@@ -5,6 +5,8 @@
 
 use chrono::{Duration, Utc};
 use foundry_exec::{Attempt, Epoch, ExecutionIntent, Generation, OrderId, RunId};
+#[cfg(feature = "product-pack-pins")]
+use foundry_ledger::PackRegistryConfig;
 use foundry_ledger::{
     AdmissionReceipt, P2ReviewPreparation, ProductCapability, ProductConfig, ProductDelivery,
     ProductHoldAcceptance, ProductHoldDecision, ProductHoldExpectation, ProductPollCursor,
@@ -29,11 +31,12 @@ use std::{
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
 pub type Snapshot = BTreeMap<String, Vec<Vec<Value>>>;
+pub type SchemaSnapshot = Vec<(String, String, String, Option<String>)>;
 
-pub struct PrivateRoot(pub PathBuf);
+pub struct PrivateRoot(pub PathBuf, bool);
 
 impl PrivateRoot {
-    fn new() -> Self {
+    pub fn new() -> Self {
         let base = std::env::var_os("TMPDIR")
             .map(PathBuf::from)
             .expect("TMPDIR must name configured private scratch");
@@ -55,13 +58,27 @@ impl PrivateRoot {
             .mode(0o700)
             .create(&path)
             .expect("create private runtime fixture root");
-        Self(path)
+        Self(path, false)
+    }
+
+    pub fn arm_failure_preservation(&mut self) -> PathBuf {
+        self.1 = true;
+        self.0.clone()
+    }
+
+    pub fn cleanup_on_success(&mut self) {
+        fs::remove_dir_all(&self.0).expect("remove successful W1-b fixture root");
+        self.1 = false;
     }
 }
 
 impl Drop for PrivateRoot {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        if self.1 {
+            eprintln!("retained W1-b failure root: {}", self.0.display());
+        } else {
+            let _ = fs::remove_dir_all(&self.0);
+        }
     }
 }
 
@@ -94,16 +111,29 @@ pub struct RuntimeFixture {
     pub service_token: String,
     pub service: ProductServiceContext,
     pub items: Vec<WorkItem>,
+    #[cfg(feature = "product-pack-pins")]
+    selected_pack: bool,
 }
 
 impl RuntimeFixture {
     pub fn new(order_ids: &[&str]) -> Self {
+        Self::with_preimage(order_ids, None)
+    }
+
+    pub fn with_preimage(order_ids: &[&str], preimage: Option<(&Path, ProductConfig)>) -> Self {
         assert!(!order_ids.is_empty());
         let root = PrivateRoot::new();
         let db_path = root.0.join("product.sqlite");
-        let config = ProductConfig {
-            installation_id: "b2-w1-runtime-install".into(),
-            database_id: "b2-w1-runtime-database".into(),
+        #[cfg(feature = "product-pack-pins")]
+        let selected_pack = preimage.is_none();
+        let config = if let Some((path, config)) = preimage {
+            fs::copy(path, &db_path).expect("copy closed feature-off preimage to private fixture");
+            config
+        } else {
+            ProductConfig {
+                installation_id: "b2-w1-runtime-install".into(),
+                database_id: "b2-w1-runtime-database".into(),
+            }
         };
         let now = Utc::now();
         let source = ScopeSourceManifest {
@@ -126,6 +156,14 @@ impl RuntimeFixture {
         let owner_phc =
             foundry_ledger::product_identity::ProductPasswordKdf::hash("b2-w1-test-owner-password")
                 .expect("hash test-only password");
+        #[cfg(feature = "product-pack-pins")]
+        let mut store = if selected_pack {
+            ProductStore::create_product_pin_store(&db_path, &config)
+        } else {
+            ProductStore::open(&db_path, config.clone())
+        }
+        .expect("open runtime store");
+        #[cfg(not(feature = "product-pack-pins"))]
         let mut store = ProductStore::open(&db_path, config.clone()).expect("open runtime store");
         store
             .bootstrap_owner_scoped(
@@ -138,6 +176,7 @@ impl RuntimeFixture {
                     capabilities: vec![
                         ProductCapability::ReadReview,
                         ProductCapability::ResolveReviewHold,
+                        ProductCapability::ReadOrder,
                     ],
                 }],
             )
@@ -279,6 +318,38 @@ impl RuntimeFixture {
             .join("../../skills/bmad-review-full/v1")
             .canonicalize()
             .expect("resolve frozen review pack");
+        #[cfg(feature = "product-pack-pins")]
+        if selected_pack {
+            let digest = manifest_digest(&pack);
+            store = store.with_product_registry(PackRegistryConfig {
+                snapshots: [(digest.clone(), pack.clone())].into_iter().collect(),
+            });
+            store
+                .change_pack_approval(
+                    &owner_session,
+                    "b2-w1-source",
+                    &digest,
+                    0,
+                    true,
+                    "b2-w1-pack-approval",
+                    now,
+                )
+                .expect("approve fixture review pack");
+            for item in &items {
+                store
+                    .select_order_pack(
+                        &owner_session,
+                        &item.order_id,
+                        item.admission.lifecycle,
+                        "b2-w1-source",
+                        &digest,
+                        0,
+                        &format!("b2-w1-select-{}", item.order_id),
+                        now,
+                    )
+                    .expect("select fixture review pack");
+            }
+        }
         Self {
             root,
             db_path,
@@ -290,6 +361,8 @@ impl RuntimeFixture {
             service_token,
             service,
             items,
+            #[cfg(feature = "product-pack-pins")]
+            selected_pack,
         }
     }
 
@@ -313,7 +386,17 @@ impl RuntimeFixture {
     }
 
     pub fn store(&self) -> ProductStore {
-        ProductStore::open(&self.db_path, self.config.clone()).expect("open fixture ProductStore")
+        let store = ProductStore::open(&self.db_path, self.config.clone())
+            .expect("open fixture ProductStore");
+        #[cfg(feature = "product-pack-pins")]
+        {
+            let digest = manifest_digest(&self.pack);
+            return store.with_product_registry(PackRegistryConfig {
+                snapshots: [(digest, self.pack.clone())].into_iter().collect(),
+            });
+        }
+        #[cfg(not(feature = "product-pack-pins"))]
+        store
     }
 
     pub fn host<E: StageExecutor + 'static>(&self, executor: E) -> PackReviewHost {
@@ -343,8 +426,27 @@ impl RuntimeFixture {
             external_ref: format!("review:{order_id}:1:base..result"),
             recorded_at: self.now,
         };
-        let held = host
-            .try_dispatch_product_work(&intent, &item.claim)
+        #[cfg(feature = "product-pack-pins")]
+        let dispatch = if self.selected_pack {
+            host.try_dispatch_selected_product_work(
+                &intent,
+                &item.claim,
+                foundry_exec::ProductSelectionBinding {
+                    order_id: order_id.to_owned(),
+                    lifecycle: item.admission.lifecycle,
+                    source_instance_id: "b2-w1-source".into(),
+                    pack_digest: manifest_digest(&self.pack),
+                    selection_revision: 1,
+                    referenced_approval_revision: 1,
+                },
+                format!("fixture-selected-{order_id}"),
+            )
+        } else {
+            host.try_dispatch_product_work(&intent, &item.claim)
+        };
+        #[cfg(not(feature = "product-pack-pins"))]
+        let dispatch = host.try_dispatch_product_work(&intent, &item.claim);
+        let held = dispatch
             .expect("dispatch prepared fixture work")
             .held
             .expect("fake stage failure should persist a hold");
@@ -462,6 +564,34 @@ pub fn assert_snapshot_unchanged(before: &Snapshot, db: &Path) {
     assert!(before == &after, "logical ProductStore snapshot changed");
 }
 
+pub fn schema_snapshot(db: &Path) -> SchemaSnapshot {
+    let conn = Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("open ProductStore schema observer");
+    let mut statement = conn
+        .prepare("SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name,tbl_name,sql")
+        .expect("prepare ProductStore schema snapshot");
+    statement
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .expect("query ProductStore schema snapshot")
+        .map(Result::unwrap)
+        .collect()
+}
+
+pub fn assert_state_and_schema_unchanged(
+    state_before: &Snapshot,
+    schema_before: &SchemaSnapshot,
+    db: &Path,
+) {
+    assert_snapshot_unchanged(state_before, db);
+    assert_eq!(
+        schema_before,
+        &schema_snapshot(db),
+        "ProductStore schema changed"
+    );
+}
+
 pub fn count(db: &Path, table: &str) -> i64 {
     Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
         .expect("open ProductStore count observer")
@@ -490,6 +620,7 @@ pub struct SuccessExecutor {
     pub calls: Arc<AtomicUsize>,
     pub lens_bytes: Option<Arc<std::sync::Mutex<Vec<Vec<u8>>>>>,
     pub after_preflight: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub after_execute: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl StageExecutor for SuccessExecutor {
@@ -502,6 +633,9 @@ impl StageExecutor for SuccessExecutor {
 
     fn execute(&mut self, task: &StageTask) -> Result<StageOutput, String> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(callback) = &self.after_execute {
+            callback();
+        }
         if let Some(lenses) = &self.lens_bytes {
             lenses
                 .lock()

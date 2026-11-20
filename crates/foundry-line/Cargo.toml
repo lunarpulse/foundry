@@ -8,6 +8,7 @@ license.workspace = true
 default = []
 a01-harness-support = ["foundry-ledger/a01-harness-support"]
 p2-test-support = ["foundry-ledger/p2-test-support"]
+product-pack-pins = ["foundry-ledger/product-pack-pins"]
 
 [dependencies]
 foundry-domain = { path = "../foundry-domain" }

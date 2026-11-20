@@ -154,11 +154,7 @@ fn a01_fresh_create_preserves_product_review_and_result_contracts() {
     drop(store);
     drop(reopen(&dir));
     // Exactly two replacements and one additional trigger distinguish marked schema.
-    let normal = PrivateDir::new();
-    drop(require(ProductStore::open(&normal.0.join("store.db"), config())));
-    let a = logical(&dir.0.join("store.db"));
-    let b = logical(&normal.0.join("store.db"));
-    foundation_schema_delta(&a, &b);
+    foundation_schema_delta(&logical(&dir.0.join("store.db")), &ordinary_v3_snapshot());
 }
 
 #[test]
@@ -691,6 +687,26 @@ fn a01_failure_diagnostics_are_sanitized() {
 }
 
 
+fn ordinary_v3_snapshot() -> BTreeMap<String, Vec<Vec<Value>>> {
+    let dir = PrivateDir::new();
+    let path = dir.0.join("ordinary.sqlite");
+    #[cfg(not(feature = "product-pack-pins"))]
+    drop(require(ProductStore::open(&path, config())));
+    // With pins a fresh normal store is v4. Use the feature-off producer's v3 DB.
+    #[cfg(feature = "product-pack-pins")]
+    {
+        let preimage = std::env::var_os("W1_V3_PREIMAGE").expect("A01 requires the v3 preimage");
+        require(std::fs::copy(preimage, &path));
+    }
+    let version: i64 = require(read_db(&path).query_row(
+        "SELECT schema_version FROM product_meta_v1 WHERE singleton=1",
+        [],
+        |row| row.get(0),
+    ));
+    assert!(version == 3, "A01 requires an ordinary v3 baseline");
+    logical(&path)
+}
+
 fn foundation_schema_delta(
     marked: &BTreeMap<String, Vec<Vec<Value>>>,
     ordinary: &BTreeMap<String, Vec<Vec<Value>>>,
@@ -838,9 +854,7 @@ fn a01_binding_foundation_create_and_reopen_are_equivalent() {
         && store.database_id() == config().database_id, "A01 foundation create identity differs");
     drop(store);
     let before = preserved(&dir);
-    let normal = PrivateDir::new();
-    drop(require(ProductStore::open(&normal.0.join("ordinary.sqlite"), config())));
-    foundation_schema_delta(&before.0, &logical(&normal.0.join("ordinary.sqlite")));
+    foundation_schema_delta(&before.0, &ordinary_v3_snapshot());
     let store = reopen(&dir);
     foundation_binding_census(&store);
     assert!(store.installation_id() == config().installation_id
@@ -1246,6 +1260,10 @@ fn task_w1_cross_open(f: &TaskClaimFixture) {
             3=>require(ProductStore::create_w1_capture_test_store(&dir.0,"store.db",config(),clock())),
             _=>require(ProductStore::create_w1_pin_test_store(&dir.0,"store.db",config())),
         };
+        require(std::fs::set_permissions(
+            dir.0.join("store.db"),
+            std::fs::Permissions::from_mode(0o600),
+        ));
         let before=preserved(&dir);
         let diagnostic_case = match version { 2 => "w1-v2-to-task", 3 => "w1-v3-to-task", _ => "w1-v4-to-task" };
         task_matrix_preconditions(diagnostic_case, &dir);
