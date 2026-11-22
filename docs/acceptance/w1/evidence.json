@@ -1,0 +1,687 @@
+{
+  "version": "W1 scoped oracle, 2026-11-22",
+  "profile": "one admission per order ID; controlled single-digest migration copies",
+  "decision": {
+    "authority": "User, attributed to Discord message 1573876269811240971",
+    "roadmap": "/home/cosmo/foundry/.hermes/plans/2026-11-22_102736-w1-revised-roadmap.md",
+    "roadmap_sha256": "3286c9559861c897ea2c06fa6ba08a3b545990f4873511c4dc5640a2363ca58a",
+    "freeze_time": "2026-11-22T11:45:08+10:00",
+    "oracle_sha256": "7414118c376925e78d796a41b80e39ed9abd05a171e9ea6f8ac46bad2a03cd4b"
+  },
+  "parent": "508fca10d67016b53e73174c8a01f597f1f2da1f",
+  "patch_sha256": "d20ea8aa22a546a9d340e0c96c912a62a7f28eca994af3e90decb55b5d90f118",
+  "product_paths_sha256": {
+    "crates/foundry-ledger/Cargo.toml": "cba7b014ffa0b693edfadf723124393c4a3d5bdd37ccbd758312ddb6ce195804",
+    "crates/foundry-ledger/src/product.rs": "6d9bb441138850d995000eb7b8681185426b08662d9904c08a248e75e9511bfd",
+    "crates/foundry-ledger/src/product/commit_review.rs": "f2272d33d1723a866c7db850f67555b95a2c5ef50df1799a7f7534a75771a0a1",
+    "crates/foundry-ledger/src/product/pack_migration.rs": "eff5955beae0d0e94b2cb34ec2484b69128a213a375c007a991e9bcd601a41f4",
+    "crates/foundry-ledger/src/product/review.rs": "096a88fd63504fb22d6ccda7511d01211846609a3b7f2d5c3bc1d1aeef2828f9",
+    "crates/foundry-line/src/die_executor.rs": "918566e387cc4f4ed1f62db5e10cd46f505d85f7f7f4cac8773e067c7e3dea06",
+    "crates/foundry-line/src/review_host.rs": "f5bea78a7455a4d586c21fee46c1ca8bc7beed4058c60d2d41d4467ff00f3fb0",
+    "crates/foundry/src/main.rs": "5ae63e253b040a64a6b86354d836fa595a2b6a0d4624921770909e819db18a1a",
+    "crates/foundry/src/selected_review.rs": "51e3d06208e782afdd352b7acde89e356d0fff39c6a031071c6ef215560ef9c8",
+    "crates/foundry/tests/b2_w1_runtime.rs": "ccd654ebd9ae4ff44ffe09a829441c68c6c73726f0e00b88d7b4e6981f7fcbd2",
+    "crates/foundry/tests/fixtures/commit-review-inspector.py": "d824c0249aef6cbaad351d12963639306ace40be5e332c09e3288f6cd73102ca",
+    "crates/foundry/tests/fixtures/selected-review-cli.py": "7abc5ce6b152d81fee7f9f8792e63dd06f1f7ec33608fb314c82eb9d489dad5e",
+    "crates/foundry/tests/fixtures/selected_review_races.py": "1e90a09dcef4e1e9130d36ba19ef1afec838f73cf8c4248a42db06da48aa2534",
+    "crates/foundry/tests/product_pin/legacy.rs": "0a0717d22b0ac258b8b8f0ffe9c6ab16b06e5282015516ec0f6311513c0055d1",
+    "crates/foundry/tests/selected_review_cli.rs": "67e0007902ade7c4ef987655cdb4fa45ea34d479c391f3288c0037a84c201331",
+    "crates/foundry/tests/selected_review_races.rs": "8030356ff4c34068165499ebd2926c168a03e7348ef63eb4ef6f7699f60a259f",
+    "crates/foundry/tests/support/b2_w1.rs": "68757f2498fa626f33b16655c0971daf0a27d8f074554dc95291c5743ceff966",
+    "docs/usage.md": "d72eca586b26b3c599909ec0af3416b79b938b6132ca24c40d478a32c373b3f5"
+  },
+  "normal_cli_sha256": "da03f158bc8661b292871452be8fb6cca888f28a3a661bbc5feb5906011bef9b",
+  "boundary": {
+    "original_P07_none_verified": [
+      "BLOCKED, complete original service binding",
+      "BLOCKED, incomplete original service binding"
+    ],
+    "original_P07_same_ID_successor": "BLOCKED",
+    "deferred": [
+      "same-ID successor positive",
+      "cross-lifecycle stale replay against that successor"
+    ],
+    "original_P08_continuing": "FAIL",
+    "A01_nonowned_directory": "IGNORED, not constructed",
+    "installation_migration": "CLOSED",
+    "W2": "NOT STARTED"
+  },
+  "evidence_root": "/home/cosmo/.hermes/cache/scratch",
+  "source_keys": {
+    "first": "w11-evidence-avr7fyMq",
+    "continuation": "w1-continuation-lhuM4C5g",
+    "authority": "w1-authority-YREvzVh5",
+    "adjudication": "w1-adjudication-BwmALODw",
+    "recovery": "w1-p08-fRfHAeqz",
+    "close": "w1-close-FOHeMsA2"
+  },
+  "observations": {
+    "archived_held": {
+      "operation": "c5cb1ce677dc3f4b26091aed77e60064da60acd2189ac131973e7ffced94ba83",
+      "receipt_sha256": "05b27f631f8c1e99f8ad0502ed454c3751c07699f37c5564c32391be6fc022b4",
+      "actor": "owner",
+      "admission": "06b6742ea14f309232772c8615fd52e12dfac7717c42a9b20ca79ee9fe0ff5c4",
+      "source": "b2-w1-source",
+      "reservation": 8,
+      "run": "historical:1:8:1",
+      "stage": "fixdie-g1",
+      "sequence": 1,
+      "owner": "c5cb1ce677dc3f4b26091aed77e60064da60acd2189ac131973e7ffced94ba83:0:4",
+      "epoch": 0,
+      "fence": 4,
+      "worker": "b2-w1-worker-historical",
+      "worker_epoch": 1,
+      "worker_fence": 1,
+      "revision": [
+        2,
+        3
+      ],
+      "output_sha256": "8f5643748ef4b3f13e861b23ce210d9d9b1969943e7cc732c012a5501b776e5e",
+      "changed": [
+        "product_artifacts_v1",
+        "product_review_hold_progress_v1",
+        "product_review_runs_v1",
+        "product_review_sessions_v1",
+        "product_review_stages_v1"
+      ],
+      "schema_objects": 249,
+      "tables_including_sequence": 79
+    },
+    "fresh_held": {
+      "operation": "13e75e85207e8f0ed45d871b5280285ac4ef1261410d420757eb794ef1d9ea31",
+      "receipt_sha256": "27258c5749e18baa091b143256d184e80c643463d6e1d55c84dd0e07dbc0e72b",
+      "actor": "owner",
+      "admission": "a141e8b83985e91bf627935c6308c7f705dd599218973b6576db17d04a5f4cc8",
+      "source": "b2-w1-source",
+      "reservation": 8,
+      "run": "legacy-cli:1:8:1",
+      "stage": "fixdie-g1",
+      "sequence": 1,
+      "owner": "13e75e85207e8f0ed45d871b5280285ac4ef1261410d420757eb794ef1d9ea31:0:11",
+      "epoch": 0,
+      "fence": 11,
+      "worker": "b2-w1-worker-legacy-cli",
+      "worker_epoch": 1,
+      "worker_fence": 5,
+      "revision": [
+        2,
+        3
+      ],
+      "output_sha256": "79a187f642d689182a0dbb1db280a586ba9424e4b98789cfd0adf27fbe3ee24f",
+      "changed": [
+        "product_artifacts_v1",
+        "product_review_hold_progress_v1",
+        "product_review_runs_v1",
+        "product_review_sessions_v1",
+        "product_review_stages_v1"
+      ],
+      "schema_objects": 249,
+      "tables_including_sequence": 79
+    },
+    "matrix": [
+      {
+        "history": "single",
+        "authority": true,
+        "snapshot": "verified",
+        "exact_receipt": "c6bc7a21da1363632c32db29dcd63ac093672c9c4b6549fdb2589ba9eec0274b",
+        "reserved_output": true,
+        "phase": "completed",
+        "executor_calls": 15
+      },
+      {
+        "history": "single",
+        "authority": true,
+        "snapshot": "absent",
+        "exact_receipt": "c6bc7a21da1363632c32db29dcd63ac093672c9c4b6549fdb2589ba9eec0274b",
+        "reserved_output": true,
+        "phase": "accepted",
+        "executor_calls": 0
+      },
+      {
+        "history": "single",
+        "authority": true,
+        "snapshot": "tampered",
+        "exact_receipt": "c6bc7a21da1363632c32db29dcd63ac093672c9c4b6549fdb2589ba9eec0274b",
+        "reserved_output": true,
+        "phase": "accepted",
+        "executor_calls": 0
+      },
+      {
+        "history": "single",
+        "authority": false,
+        "snapshot": "verified",
+        "exact_receipt": "c6bc7a21da1363632c32db29dcd63ac093672c9c4b6549fdb2589ba9eec0274b",
+        "reserved_output": true,
+        "phase": "accepted",
+        "executor_calls": 0
+      },
+      {
+        "history": "single",
+        "authority": false,
+        "snapshot": "absent",
+        "exact_receipt": "c6bc7a21da1363632c32db29dcd63ac093672c9c4b6549fdb2589ba9eec0274b",
+        "reserved_output": true,
+        "phase": "accepted",
+        "executor_calls": 0
+      },
+      {
+        "history": "single",
+        "authority": false,
+        "snapshot": "tampered",
+        "exact_receipt": "c6bc7a21da1363632c32db29dcd63ac093672c9c4b6549fdb2589ba9eec0274b",
+        "reserved_output": true,
+        "phase": "accepted",
+        "executor_calls": 0
+      },
+      {
+        "history": "mixed",
+        "authority": true,
+        "snapshot": "verified",
+        "exact_receipt": "c6bc7a21da1363632c32db29dcd63ac093672c9c4b6549fdb2589ba9eec0274b",
+        "reserved_output": true,
+        "phase": "completed",
+        "executor_calls": 15
+      },
+      {
+        "history": "mixed",
+        "authority": true,
+        "snapshot": "absent",
+        "exact_receipt": "c6bc7a21da1363632c32db29dcd63ac093672c9c4b6549fdb2589ba9eec0274b",
+        "reserved_output": true,
+        "phase": "accepted",
+        "executor_calls": 0
+      },
+      {
+        "history": "mixed",
+        "authority": true,
+        "snapshot": "tampered",
+        "exact_receipt": "c6bc7a21da1363632c32db29dcd63ac093672c9c4b6549fdb2589ba9eec0274b",
+        "reserved_output": true,
+        "phase": "accepted",
+        "executor_calls": 0
+      },
+      {
+        "history": "mixed",
+        "authority": false,
+        "snapshot": "verified",
+        "exact_receipt": "c6bc7a21da1363632c32db29dcd63ac093672c9c4b6549fdb2589ba9eec0274b",
+        "reserved_output": true,
+        "phase": "accepted",
+        "executor_calls": 0
+      },
+      {
+        "history": "mixed",
+        "authority": false,
+        "snapshot": "absent",
+        "exact_receipt": "c6bc7a21da1363632c32db29dcd63ac093672c9c4b6549fdb2589ba9eec0274b",
+        "reserved_output": true,
+        "phase": "accepted",
+        "executor_calls": 0
+      },
+      {
+        "history": "mixed",
+        "authority": false,
+        "snapshot": "tampered",
+        "exact_receipt": "c6bc7a21da1363632c32db29dcd63ac093672c9c4b6549fdb2589ba9eec0274b",
+        "reserved_output": true,
+        "phase": "accepted",
+        "executor_calls": 0
+      },
+      {
+        "history": "none",
+        "authority": true,
+        "snapshot": "verified",
+        "exact_receipt": "c6bc7a21da1363632c32db29dcd63ac093672c9c4b6549fdb2589ba9eec0274b",
+        "reserved_output": false,
+        "phase": "accepted",
+        "executor_calls": 0
+      },
+      {
+        "history": "none",
+        "authority": true,
+        "snapshot": "absent",
+        "exact_receipt": "c6bc7a21da1363632c32db29dcd63ac093672c9c4b6549fdb2589ba9eec0274b",
+        "reserved_output": false,
+        "phase": "accepted",
+        "executor_calls": 0
+      },
+      {
+        "history": "none",
+        "authority": true,
+        "snapshot": "tampered",
+        "exact_receipt": "c6bc7a21da1363632c32db29dcd63ac093672c9c4b6549fdb2589ba9eec0274b",
+        "reserved_output": false,
+        "phase": "accepted",
+        "executor_calls": 0
+      },
+      {
+        "history": "none",
+        "authority": false,
+        "snapshot": "verified",
+        "exact_receipt": "c6bc7a21da1363632c32db29dcd63ac093672c9c4b6549fdb2589ba9eec0274b",
+        "reserved_output": false,
+        "phase": "accepted",
+        "executor_calls": 0
+      },
+      {
+        "history": "none",
+        "authority": false,
+        "snapshot": "absent",
+        "exact_receipt": "c6bc7a21da1363632c32db29dcd63ac093672c9c4b6549fdb2589ba9eec0274b",
+        "reserved_output": false,
+        "phase": "accepted",
+        "executor_calls": 0
+      },
+      {
+        "history": "none",
+        "authority": false,
+        "snapshot": "tampered",
+        "exact_receipt": "c6bc7a21da1363632c32db29dcd63ac093672c9c4b6549fdb2589ba9eec0274b",
+        "reserved_output": false,
+        "phase": "accepted",
+        "executor_calls": 0
+      }
+    ],
+    "reserved-run-column": {
+      "operation": "81b05383b425259f62be9f87e313edf459938e16d2c3550783a37dbb1f6f7d3b",
+      "receipt": "e55ea06b06a8148ede3c10c89fdef074344d87f6e04d14e01e5a5abe01fdfda5",
+      "registered": 0,
+      "additional_calls": 0
+    },
+    "reserved-run-column-and-authority": {
+      "operation": "81b05383b425259f62be9f87e313edf459938e16d2c3550783a37dbb1f6f7d3b",
+      "receipt": "fcea6682be36b9b30297c9d70a0983358278d9349c006cc23248e3ac3c70419c",
+      "registered": 0,
+      "additional_calls": 0
+    },
+    "reserved-live-revoke": {
+      "operation": "81b05383b425259f62be9f87e313edf459938e16d2c3550783a37dbb1f6f7d3b",
+      "receipt": "1c28b19feef3e877bf235baebcfc4d48eb95bed393d6f1dd965ac1ac8a559eaa",
+      "registered": 1,
+      "additional_calls": 0
+    }
+  },
+  "fresh_P07": {
+    "complete": {
+      "db_before_sha256": "7bacc972055717f8ddc9066bcbf484e5fc12bbb778fbdfd7b9f5cda3b9613535",
+      "pack": "e925fd014d367c4c7f3d83fe92d03cd4bc4d3b7cbc1ecdf0d4e77320acab1db8",
+      "held_receipt_sha256": "0b3b4b915371ec201def231c32816fbd57af9392a1ca2b163135be6b47a6aaad",
+      "stage": "review",
+      "effect_free": true
+    },
+    "partial": {
+      "db_before_sha256": "1a22f9a0597b577a054b50e75ec9c75faf12bd1aa4292b92b7ae90eee17cdc8f",
+      "pack": "e925fd014d367c4c7f3d83fe92d03cd4bc4d3b7cbc1ecdf0d4e77320acab1db8",
+      "held_receipt_sha256": "304d8aa432be8f4a9efb79596d09c7a81044b6be3b5c5728b61e2f3929c6eb9a",
+      "stage": "review",
+      "effect_free": true
+    }
+  },
+  "fresh_P08": {
+    "adapter_calls": [
+      "fix:fixdie-g1"
+    ],
+    "artifacts": 1,
+    "exact_status": 202,
+    "operation": "13e75e85207e8f0ed45d871b5280285ac4ef1261410d420757eb794ef1d9ea31",
+    "order": "legacy-cli",
+    "receipt_sha256": "27258c5749e18baa091b143256d184e80c643463d6e1d55c84dd0e07dbc0e72b",
+    "repeat_unchanged": true,
+    "reserved_run": 8,
+    "revision": 3,
+    "root": "/home/cosmo/.hermes/cache/scratch/w1-close-FOHeMsA2/tmp/b2-w1-runtime-12-0-1795312000863820625",
+    "wal_bytes": 140112,
+    "writer_exit": 1
+  },
+  "builds": {
+    "current_features": "cargo build --locked --offline -j1 -p foundry --no-default-features --features product-pack-pins --bin foundry",
+    "historical_commit": "7abcfd80c9db51ad1511662debc28a591e837991",
+    "historic_operands": {
+      "/home/cosmo/.hermes/cache/scratch/w1-adjudication-BwmALODw/target-archive/debug/deps/w1_origin_proof-da81e6c831f32da3": "3287955ac159834caf2d578c7551ad2c6069132d36cb4af448fb1d9ecfa0ff5b",
+      "/home/cosmo/.hermes/cache/scratch/w1-authority-YREvzVh5/historical-adapter": "d8bfeca357f44e65885c203338b53cfca33726aa291083bfbf23d298b4eba133",
+      "/home/cosmo/.hermes/cache/scratch/w1-p08-fRfHAeqz/stage-entry": "eb12476636d5f3cd218da72ebe9e801a6efd29e07323b46629aa1961ee41e6ef",
+      "/home/cosmo/.hermes/cache/scratch/w1-p08-fRfHAeqz/target/debug/deps/p08_custody-81b2df97f973e64b": "261341b9914ce04f2b3a1b676ee7ab0d3f2fa393dfba9d4fe5460e26f0e267ab",
+      "/home/cosmo/.hermes/cache/scratch/w1-p08-fRfHAeqz/target/debug/deps/p08_route-0a5d1e156171ac9c": "b58fe7060f9cbded036ae74da0ba6d0c8942838bc6cd6d3794cd174e6406d5d3",
+      "/home/cosmo/.hermes/cache/scratch/w11-evidence-avr7fyMq/historical/foundry-7abcfd80": "102964d4bbc2204753c78d558ed4100827fe7ce332cb2ada7b588ce95ecac258"
+    },
+    "close_driver_first": "c37248f94556ab31813a7d09bea44d335475f26194f374fd136a49f63dad64df",
+    "close_driver_second": "b1fc84f6838f53326685484a346da7864fae1182a4ec7fb9cf08c066efe4cd59",
+    "cargo_environment": {
+      "CARGO_INCREMENTAL": "0",
+      "CARGO_BUILD_JOBS": "1",
+      "CARGO_NET_OFFLINE": "true",
+      "TMPDIR": "/home/cosmo/.hermes/cache/scratch/w1-close-FOHeMsA2/tmp",
+      "CARGO_TARGET_DIR": "/home/cosmo/.hermes/cache/scratch/w1-close-FOHeMsA2/target"
+    }
+  },
+  "current_tests": {
+    "focused-cli": {
+      "argv": "cargo test --locked --offline -j1 -p foundry --no-default-features --features product-pack-pins --test selected_review_cli -- two_orders_consume_their_selected_packs --exact --test-threads=1",
+      "exit": 0,
+      "results": [
+        {
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered": 0
+        }
+      ]
+    },
+    "old-axes": {
+      "argv": "cargo test --locked --offline -j1 -p foundry --no-default-features --features p2-test-support\\,product-pack-pins --test b2_w1_runtime -- product_pin::legacy::held_old_connection_pin_combinations --exact --ignored --nocapture --test-threads=1",
+      "exit": 0,
+      "results": [
+        {
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered": 54
+        }
+      ]
+    },
+    "p07-missing": {
+      "argv": "cargo test --locked --offline -j1 -p foundry --no-default-features --features p2-test-support\\,product-pack-pins --test b2_w1_runtime -- product_pin::legacy::missing_digest_history --exact --nocapture --test-threads=1",
+      "exit": 0,
+      "results": [
+        {
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered": 54
+        }
+      ]
+    },
+    "runtime-on-confirmed": {
+      "argv": "cargo test --locked --offline -j1 -p foundry --no-default-features --features p2-test-support\\,product-pack-pins --test b2_w1_runtime -- --test-threads=1",
+      "exit": 0,
+      "results": [
+        {
+          "passed": 52,
+          "failed": 0,
+          "ignored": 3,
+          "measured": 0,
+          "filtered": 0
+        }
+      ]
+    },
+    "runtime-off": {
+      "argv": "cargo test --locked --offline -j1 -p foundry --no-default-features --features p2-test-support --test b2_w1_runtime -- --test-threads=1",
+      "exit": 0,
+      "results": [
+        {
+          "passed": 18,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered": 0
+        }
+      ]
+    },
+    "restore": {
+      "argv": "cargo test --locked --offline -j1 -p foundry-line --no-default-features --features p2-test-support\\,product-pack-pins --test b1_product_restore --test b1_service_review -- --test-threads=1",
+      "exit": 0,
+      "results": [
+        {
+          "passed": 14,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered": 0
+        },
+        {
+          "passed": 9,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered": 0
+        }
+      ]
+    },
+    "human": {
+      "argv": "cargo test --locked --offline -j1 -p foundry-ledger --no-default-features --test b1_product_atomic -- --test-threads=1",
+      "exit": 0,
+      "results": [
+        {
+          "passed": 15,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered": 0
+        }
+      ]
+    },
+    "open-select": {
+      "argv": "cargo test --locked --offline -j1 -p foundry-ledger --no-default-features --features w1-isolated-test-support\\,product-pack-pins --test b2_w1_product_open --test b2_w1_selection -- --test-threads=1",
+      "exit": 0,
+      "results": [
+        {
+          "passed": 6,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered": 0
+        },
+        {
+          "passed": 8,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered": 0
+        }
+      ]
+    },
+    "a01": {
+      "argv": "cargo test --locked --offline -j1 -p foundry-ledger --no-default-features --features a01-harness-support\\,product-pack-pins --test a01_isolated_store -- --test-threads=1",
+      "exit": 0,
+      "results": [
+        {
+          "passed": 21,
+          "failed": 0,
+          "ignored": 1,
+          "measured": 0,
+          "filtered": 0
+        }
+      ]
+    },
+    "intact": {
+      "argv": "cargo test --locked --offline -j1 -p foundry --no-default-features --features p2-test-support\\,product-pack-pins --test b2_w1_runtime -- product_pin::legacy::historical_writer_fixture --exact --ignored --nocapture --test-threads=1",
+      "exit": 0,
+      "results": [
+        {
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered": 54
+        }
+      ]
+    },
+    "lost-binding": {
+      "argv": "cargo test --locked --offline -j1 -p foundry --no-default-features --features p2-test-support\\,product-pack-pins --test b2_w1_runtime -- product_pin::legacy::historical_writer_fixture --exact --ignored --nocapture --test-threads=1",
+      "exit": 0,
+      "results": [
+        {
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered": 54
+        }
+      ]
+    },
+    "cutover": {
+      "argv": "cargo test --locked --offline -j1 -p foundry --no-default-features --features p2-test-support\\,product-pack-pins --test b2_w1_runtime -- product_pin::legacy::historical_writer_fixture --exact --ignored --nocapture --test-threads=1",
+      "exit": 0,
+      "results": [
+        {
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered": 54
+        }
+      ]
+    },
+    "a01-hold": {
+      "argv": "cargo test --locked --offline -j1 -p foundry --no-default-features --features a01-harness-support\\,product-pack-pins --test b2_w2a_harness -- a01_pin_enabled_accepted_hold_preserves_fixed_pack_authority --exact --test-threads=1",
+      "exit": 0,
+      "results": [
+        {
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered": 37
+        }
+      ]
+    }
+  },
+  "new_tests": {
+    "held_old_connection_pin_combinations": {
+      "argv": "cargo test --locked --offline -j1 -p foundry --no-default-features --features p2-test-support\\,product-pack-pins --test b2_w1_runtime -- product_pin::legacy::held_old_connection_pin_combinations --exact --ignored --nocapture --test-threads=1",
+      "exit": 0,
+      "result": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 55 filtered out; finished in 9.42s"
+    },
+    "unbound_existing_order_cannot_take_first_pin": {
+      "argv": "cargo test --locked --offline -j1 -p foundry --no-default-features --features p2-test-support\\,product-pack-pins --test b2_w1_runtime -- product_pin::legacy::unbound_existing_order_cannot_take_first_pin --exact --nocapture --test-threads=1",
+      "exit": 0,
+      "result": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 55 filtered out; finished in 6.09s"
+    },
+    "intact": {
+      "argv": "cargo test --locked --offline -j1 -p foundry --no-default-features --features p2-test-support\\,product-pack-pins --test b2_w1_runtime -- product_pin::legacy::intact_unassigned_bytes --exact --nocapture --test-threads=1",
+      "exit": 0,
+      "result": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 56 filtered out; finished in 15.36s"
+    }
+  },
+  "primary_sources_sha256": {
+    "first": {
+      "ROWS.md": "185f8caa2d7b2b9180288d763d506290216a554526eb349d13d40eecf7f23edf",
+      "verification.json": "d329c29613fdf44bf33ea715751feea6a8b3f9dbac3607b97de55d8554e5e993",
+      "aba-freeze.md": "75efc3e8932c2c8425798ebdb5f5bdc1d051f95c17ed82b350facf5cf9be1dcd",
+      "races-complete/races.json": "513575be2f941086105cf1d448b6825feb76d756a66512af489c81554e16f88c",
+      "races-complete/alias-control.json": "0b6fc71d0361d1ec2406e6e92db44d64130d55c0b9537e6ee2206ec9f272c628",
+      "cli-5/results.json": "cf69f4586682a1661425862be1711c11c8ffa0ea0bfdbf3e36d75a2a1294e9de",
+      "cli-5/continuation.json": "82da6868775e1d0c18a40787d8f21f52052cf2a1fd99f09db2dd70bc471e27f0",
+      "cli-5/swapped.json": "6c6c36051329aa7b0b53e9fa2b2a0a2bdac893433ebecaa586ae8a890aba0bf8",
+      "cli-5/denials.jsonl": "a25f4c1f9cd65ae822116a12b65588af726af129281084d814e1f7aa44ca1a49",
+      "cli-5/commands.json": "999332a664ff83009b5442f740bf51294f624fad5d13dc3790c9dda8951462e3",
+      "cli-5/process-loss.json": "1d9f97f71460a4c57c1e4d1a579aa81f7683dd5ce8c3893ab5ae86ce30bf53cd",
+      "preaccept/result.json": "ef2c718bc3c9b236f765aaa2484936a652e7cfbef83506ae7ffa2b0d3c63e9cb"
+    },
+    "continuation": {
+      "P07.json": "4b982a306c42933f2d589a7afd0b5654e2900b030c01579f86d6c71da7cc747d",
+      "MIGRATION-FREEZE.md": "43c907236f366022baf6d89d4acf2ddd6077965705cb8f0139b4c34c1f354d34",
+      "HISTORICAL-DISCREPANCY.md": "ce68247c2b35eacbbed3fac1429fc2c740d9699c4efb75ca894c23153b10039b",
+      "hist-cutover-1.log": "8b4808ace9aee2afb846e0dcb8b351f2d375481af9154cc22780309b96005875",
+      "matrix-2.log": "519dcb5ee922f834e974e3d130557bd30d1014db0cb67ff9ddd9645cd805afa1",
+      "missing-history.log": "6f7e930ecbe288d0be27bb317939efb8814b24e6ecf05f198cd3de94ab83f6c5",
+      "actor-1.log": "3bfbda5c548af684cbcdf7882c482bc6fcd144d64604fafc5efe864fbf7192c9",
+      "epoch-positive.log": "f00b3d5df445a0a9fddf962e24cf2690611cb5b826acaf846464cecfb781391b",
+      "lifecycle-1.log": "801b7bcc4f548ed08edb0c9f40dfc9c98f4414d5ca291748ef8f42d84a269946",
+      "operand.sha256": "81e418ff93ef3f31cdfa1ad603e80abd0d5da137d8040493aba9e5173cce27d8",
+      "aba-bound/aba.json": "afcd9393341e13ee03e1e35652860dcf43a7fa14667ca4ed73c1c13c935aedf3"
+    },
+    "authority": {
+      "candidate.json": "0a07beb04e69646871821124bdfda3ca5e9b4882acbc36c37a6e967dfe1eff29",
+      "verification.json": "2b60bea1cde2b65f18847b513165e20ee48af57056a34686b3836b1f6ba381a6",
+      "CONTRACT.md": "e0ec4d28f7e1dfcc1a4e8a3900448a4b8f503758fbe73478793d77c10414d98a",
+      "P07.md": "8a2f24d1df666d0af21ed5283d12c1b578e4d41fd8bf45c6fa4563fcb539a53c",
+      "P08.md": "fdb615ebdbfc1f40485789587e9814df7e4df45032cf61ffb80a952f8b175c10",
+      "cutover/report.json": "0c1f47253a3e86f07362bcb7921430be3558853752442740b2799a8a94f0c610",
+      "cutover/migrated.sqlite": "6849f423b263bc710600e3bcf15a2a0429d40d0014150de50014586cf221f123",
+      "cutover/completed.sqlite": "f7d1fc5e1f0ea2aba9e5c23345cc2f74e349f95d59f8a666da51187074cbd1d7",
+      "cutover/reserved-stage-output": "8f5643748ef4b3f13e861b23ce210d9d9b1969943e7cc732c012a5501b776e5e",
+      "cutover/verified-output.json": "de3cae359e39b6ef156418c8b831ddc97941004ae235e81d41d12780123b05d0",
+      "cutover/normal-writer.json": "d5e42dc827c840f885e4f5532de4bda8563b0d2e8e70f3a60bb1186158a03203",
+      "aba/aba.json": "c09ee03a4854029d3fbd2195fef04f73fff7c7245723f9b5e2e37922f2305467",
+      "guards/guards.json": "62e8b255ef75fbd28708f008844684c183511a8be189ffa6771e1f13062bc713",
+      "archive-match.json": "d611ec59e822427b1e6dd24fc91e389462cafeedd170940fe50b5a264357ae81",
+      "receipt-lifecycle.json": "283c496678bb9cf63824e8c4fbedef68bb76fbbdfd9c5ea3a97364179f8b1990",
+      "stale-fence.json": "4ab77cac71e142f0e99640149704f3df3e2105e2fc406ff4cc9ecbe36d7cb035",
+      "focused-cli.log": "0b20ba32a2987598227f337a5d0d6915e3be62eb0257600906753b8174ef20e4",
+      "old-axes.log": "f9e2f44ed870aa554b122e423a25648cbf23debc10aa95083fa6c229975c45b5",
+      "p07-missing.log": "44938d86de76e0883b16a0da5913614d1cdd8ae80ecc1b44ea5be388e6142861",
+      "runtime-on-confirmed.log": "aae2bfa8ec39702124e51a9b4e1e6cf5a97d380fa348e750b4b5b26938f5c612",
+      "runtime-off.log": "c05f53088903bb3270d3c85dc6e471af0c54a204b8a97c716e16fea4a1cc5e91",
+      "restore.log": "c6ae3a05aa4a2f187b1121749d189f42c405704874d557c8274fa6c4a4384adf",
+      "human.log": "e7349c0b48b1bc3e12b96c70a7f2ca515747d6d6ed425f065ec9cc13600089d9",
+      "open-select.log": "991a099905fa756267a7d21e59eec55078dc6cfee8e786b2ea35127af1e406c4",
+      "a01.log": "176d5b73eb9053ac9f4f8573acec6d471bef2f5095aadc1ffdcaf706dd30eca8",
+      "intact.log": "d9a44eee03b35a9a1c9756a64b5afeb96391c71e3d373396b7a320c510530b71",
+      "lost-binding.log": "4dc2590cd2ee163c2ceaa97fe01371558d24691739efec55df9c3c02468eabf2",
+      "cutover.log": "df0858cfb8ae47f90099c9f9b3b3a57c4ed14ab51f44170bf66f24c41063de46",
+      "a01-hold.log": "3553091c9c0b50340cda92562d0a412b062df1d0ef05263132d697add56d0e2a"
+    },
+    "adjudication": {
+      "ROWS.md": "93410bb317b1ffce4717dbaae4c682dec651868d353060292f0c781f1c926b0f",
+      "DECISION.md": "3b55a7c2a2de466e1b9f9cfce03ef137f48e83efca49b717557a47f0e9e6b584",
+      "authority.sha256": "902d83e9efdf3ddd7890190124bf9780537ee3c4ee8c7d6795086a66d119fa3e",
+      "verification.json": "502ee38f45ee947b2c30e9829017756568ca54a37b168815fb1a425aa0f1967a",
+      "witnesses.json": "abc1c87a7de89b6f0f6b7ee19b3342e276af76c8dbea8cf80d483c1ea91d7b92",
+      "identity-confirmed/identity.json": "f1f72ee7dc8675acd202077294931dca9da927ccdf059fc43da5fd7394791338",
+      "entries/trace.json": "46c12bf9bb3894cff4d0fa079653f9695684ce610df340c934265ba583da3d30",
+      "route-1/summary.json": "5d1283a3a42572814395df7268f94350b57ebfc345e2eaaf77e7a5fb3db2ba5f",
+      "p09/result.json": "5796aab364f6ffadfac83a2a4b18f296063c10214db57c786145109e5e14d77a",
+      "trial-2/upgrade.json": "0a34dd1903915665a27b7163b179a7184afc472b005ed6e858cb603a9904f424",
+      "route-1/incomplete-column/upgrade.json": "4d2d230a22931f57b0cbe4dd31e0214dc40b0953f01f78571be9009cd46c6605",
+      "reserved-run-column/report.json": "62e4eee2c33c75db14654234f2e4c5a396bb8f395246a79b275b544e129f619f",
+      "reserved-run-column-and-authority/report.json": "3261d4b06c2f40a25e843f2fa8eeaf8532feeaf1b205c38c05623c1886d9e48b",
+      "reserved-live-revoke/report.json": "33d46fdafccb25aa71572e00ef7131117fba4586957b6cfd1e2e49780996680e",
+      "clean-custody/custody.json": "39108aca58dbc07fe7f74b650f545ded11cf785b2916eb5c398e8a47ef16f68f"
+    },
+    "recovery": {
+      "P08.md": "24717e7e78d6845884a6311c7c25bd5513ef25cadf227ee84b592dc427c2b406",
+      "FREEZE.md": "a44b8c49e7cbabee052cf154c130ec0ac4f307b30d1136d964069ac52c69f01a",
+      "verification.json": "21885a89c253eb60f68e6eeba1ad13739289ff3d5d74a0c6c2b9ee7a2e5d21eb",
+      "old-connection.log": "1d97b66b2e20e5c758021b167009ccd910d09040742fe1a52eaa0dcb079b045c",
+      "trial-2/postwrite-delta.json": "d16727dc91de086218b65fb0e05d1443850d44a3772035b9a8c81be5aac2f48f",
+      "trial-2/migration-delta.json": "904cd14d038b3cf2bb959a75e2abc963f8ec8f8fadba8e3ac2eba0fb3cd2e538",
+      "trial-2/result.json": "b4c2bb792a02d4aca657adac8c99845b54680b9b07e22c00637ce99f8dffaf70",
+      "interrupted-2/result.json": "7a28e54caadda4453db40a21662de1cecd57c5ac959e76e5ca25f00af7508b02",
+      "interrupted-2/interrupted.json": "9e864ce0dd6aa3f8fa42b751b07d6185141859312d6d4f304ca3f61c67d62239",
+      "interrupted-2/recovery-delta.json": "a671484ce12fd4340ac0199db78882d022390a4a8893baaed5e51d481a7b86bb",
+      "progress-1/reads.json": "401fc985b98f0d7a128698f4c021675d8b1ff3231ae3ff20f9e638591ac20e7a"
+    },
+    "close": {
+      "env.sh": "08070c314f8e0d7aed49f79311a4dcc6b1a73a435cbecaa7e630cfb3575ea28f",
+      "bind.py": "85e59eb2230092b40f3f61aa4724edb79408339cf283c48fb48ce72f81628c1e",
+      "bind.log": "4ac1e2dbbaee0b5366ec2afb1d325a2fd4cbfa99a19cca23d28d9cfa2f3c2e49",
+      "compare.py": "2201410284503dddf5a641e31f398c512f3c553f611fe6bf5f1d305a75e1f4bc",
+      "adjudicate.py": "ae96f31dbe65b4ae6f6543f4578fdb7f45e4bc757944092e63872bdc5697ef8d",
+      "disposition.json": "cf984799d6c8594d602fd07c47c38abe051e084e5383139a7abe25dfaf128dd5",
+      "held.py": "0e604b9370bcacdcb5d74c4b120c662c2566cc6d34c50851e6ce1ee0484a1221",
+      "focused.sh": "7d6439061b07901ab9c895a21d34275a3a3e747fce87a56b8b06ff8a35222004",
+      "observer.patch": "78491188349d98639fd2fc54212c8700fd867351cc2a741a31d48f2ea6f02fb3",
+      "observer-2.patch": "f84fd4ffe0b2bbdcfdb2524876df65e950884f92b988f9136dd57909014cfe65",
+      "freeze.sha256": "38a3480f069cc8f1be1620c84579e4df149a3821186400a52a8ba360a370024a",
+      "freeze.time": "af68081ee548add2691eb6ba4357c84184fbcc3cc62c656ab2d6bbb600498639",
+      "build.log": "862145b1940d4b63784af977c85db52869d04dc1da9514f99e88167b45ac437d",
+      "list.log": "872ea334787642ab4c59651ace5ea50276ab7386b3b4dfb750575d96626b0660",
+      "list-2.log": "053d5457d4324f4a9bd88247cda5ac42ab67776709aafdaf6ede6967b41cfde9",
+      "intact.log": "6452898cba4e79083c13f6a642d15b19968552ab862bfbf9fbabaa594ae29077",
+      "held_old_connection_pin_combinations.log": "6148f12ba156548ed5f038cbf13f47bc7c5acd1c864e42d4e9a9b81fd9e60052",
+      "unbound_existing_order_cannot_take_first_pin.log": "7ddfbf084b5218f306220191a300529366d688d6712503d3208f0711be2f4152",
+      "held-1/summary.json": "0f5bd408a06777450813e012966cc7414e2e5b623b6112a91a6bf673af9bf683",
+      "held-1/writer.log": "5001d8e12e1dcfc1d8ee4c68e662beffbaa59ebda944301ca06111c7242bcc18",
+      "held-1/exact.command.json": "089355c3ee3b5108ad931be9a7b1ab7b1b757bb557717b1789872721b887486a",
+      "held-1/migrate.command.json": "60956a945471ae2884656c97fa9f99499e7a066997dcdae75ac4c1676e4348ea",
+      "held-1/origin.command.json": "f2fa0ffcb555e4ec91947d012af0bd7b927cdfb9d53cf4311a06a14c67436573",
+      "held-1/repeat.command.json": "089355c3ee3b5108ad931be9a7b1ab7b1b757bb557717b1789872721b887486a",
+      "held-1/writer.command.json": "c0268bc1a3574274ceb7fab2fd20f931eda1f455a5d955197e367a2bdff52ebe",
+      "held-1/completed.sqlite": "744ac991fd3ad84a55c5e6cd09038d697265e94432df1ae4acc8286f5ae39b67",
+      "held-1/exact.sqlite": "744ac991fd3ad84a55c5e6cd09038d697265e94432df1ae4acc8286f5ae39b67",
+      "held-1/migrated.sqlite": "a3e2985160b20670d98875e85b90c5b312f9465de095e902acf9ad872af70efe",
+      "held-1/repeat.sqlite": "744ac991fd3ad84a55c5e6cd09038d697265e94432df1ae4acc8286f5ae39b67",
+      "held-1/reserved.sqlite": "aa802736e20bc05f98e108deb17546c23f6f3727dab4cd6120579a47bf9f5772",
+      "held-1/exact.json": "dcfe4cc696fd806de75fb661c982acb95ffb457b63e159d8ae8303d51e62e7f5",
+      "held-1/repeat.json": "dcfe4cc696fd806de75fb661c982acb95ffb457b63e159d8ae8303d51e62e7f5",
+      "unassigned/complete/after.sqlite": "7bacc972055717f8ddc9066bcbf484e5fc12bbb778fbdfd7b9f5cda3b9613535",
+      "unassigned/complete/before.sqlite": "7bacc972055717f8ddc9066bcbf484e5fc12bbb778fbdfd7b9f5cda3b9613535",
+      "unassigned/partial/after.sqlite": "1a22f9a0597b577a054b50e75ec9c75faf12bd1aa4292b92b7ae90eee17cdc8f",
+      "unassigned/partial/before.sqlite": "1a22f9a0597b577a054b50e75ec9c75faf12bd1aa4292b92b7ae90eee17cdc8f"
+    }
+  }
+}

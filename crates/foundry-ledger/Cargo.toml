@@ -9,7 +9,7 @@ default = []
 p2-test-support = []
 w1-isolated-test-support = []
 a01-harness-support = []
-product-pack-pins = ["dep:foundry-pack"]
+product-pack-pins = ["dep:foundry-pack", "rusqlite/functions"]
 
 [dependencies]
 foundry-domain = { path = "../foundry-domain" }

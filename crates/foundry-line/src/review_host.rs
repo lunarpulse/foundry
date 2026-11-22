@@ -819,6 +819,14 @@ impl PackReviewHost {
         }
         self.executor.ensure_available().map_err(HostError::Worker)
     }
+    #[cfg(feature = "product-pack-pins")]
+    pub fn ensure_commit_review_available(&self) -> Result<(), HostError> {
+        self.ensure_product_executor_available()?;
+        let source = self.source_commit.as_deref().ok_or_else(|| {
+            HostError::Persistence("commit review requires build provenance".into())
+        })?;
+        validate_source_commit(source).map_err(HostError::Persistence)
+    }
     pub fn resume(
         &mut self,
         order: &str,
@@ -1031,6 +1039,10 @@ impl PackReviewHost {
         }
         validate_intent(intent)?;
         self.check_binding(intent)?;
+        #[cfg(feature = "product-pack-pins")]
+        let needs_inspection_output = product_work
+            .as_ref()
+            .is_some_and(|claim| claim.task_kind == foundry_ledger::product::COMMIT_REVIEW_KIND);
         let selected_activation = selected_request.is_some();
         if !selected_activation {
             if self.store.pack_digest() != REVIEW_PACK_DIGEST {
@@ -1510,6 +1522,16 @@ impl PackReviewHost {
                 })
             },
         );
+        #[cfg(feature = "product-pack-pins")]
+        let outcome = outcome.and_then(|outcome| {
+            if needs_inspection_output && accepted_logs.is_empty() {
+                return Err(foundry_pack::PackError {
+                    code: "E_EXEC_ALL_ERROR",
+                    message: "commit review has no retained inspection output".into(),
+                });
+            }
+            Ok(outcome)
+        });
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(error) => {

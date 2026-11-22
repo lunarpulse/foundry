@@ -877,6 +877,41 @@ impl ProductStore {
         })?;
         validate_work_claim_in(&tx, work, intent, lifecycle, source_revision, now)?;
         #[cfg(feature = "product-pack-pins")]
+        if work.task_kind == super::COMMIT_REVIEW_KIND
+            && self.open_mode == super::StoreOpenMode::Normal
+            && tx
+                .query_row(
+                    "SELECT schema_version=4 FROM product_meta_v1 WHERE singleton=1",
+                    [],
+                    |r| r.get::<_, bool>(0),
+                )
+                .map_err(db_error)?
+        {
+            let denied = || HostError::Acceptance("commit review authorization rejected".into());
+            let (binding, key) = selected_request.as_ref().ok_or_else(denied)?;
+            let service = work.service_binding.as_ref().ok_or_else(denied)?;
+            let owner = super::commit_review::authorized_worker(
+                &tx,
+                binding,
+                key,
+                &admission_hash,
+                &service.service_id,
+                service.service_revision,
+                service.credential_revision,
+            )
+            .map_err(|_| denied())?;
+            if owner != work.worker_id
+                || request.base_commit != work.payload_snapshot
+                || request.result_commit != work.payload_snapshot
+                || intent.attempt.0 != 1
+                || intent.run.0 != 1
+                || intent.activation != 1
+                || intent.epoch.0 != work.fence as u64
+            {
+                return Err(denied());
+            }
+        }
+        #[cfg(feature = "product-pack-pins")]
         let selected_authority = if let Some((binding, request_key)) = selected_request.as_ref() {
             super::require_product_pin_version(&tx).map_err(db_error)?;
             let source = work
@@ -1301,6 +1336,20 @@ impl ReviewDispatchStore for ProductStore {
         }
         tx.execute("INSERT INTO product_review_budget_v1(order_id,used) VALUES(?1,1) ON CONFLICT(order_id) DO UPDATE SET used=used+1",[&request.intent.order.0]).map_err(db_error)?;
         tx.execute("INSERT INTO product_review_stages_v1(order_id,run_id,sequence,stage_id,status) VALUES(?1,?2,?3,?4,'accepted')",params![request.intent.order.0,request.journal_run,request.sequence as i64,request.stage_id]).map_err(db_error)?;
+        #[cfg(feature = "product-pack-pins")]
+        if request.sequence == 1
+            && self.open_mode == super::StoreOpenMode::Normal
+            && is_commit_review_work(&tx, &request.intent.order.0, &request.journal_run)?
+        {
+            super::commit_review::record_inspection_transition(
+                &tx,
+                &request.intent.order.0,
+                &request.journal_run,
+                None,
+                now,
+            )
+            .map_err(db_error)?;
+        }
         tx.commit().map_err(db_error)
     }
     fn finish_review_stage(&mut self, request: ReviewStageFinishRequest) -> Result<(), HostError> {
@@ -1385,6 +1434,18 @@ impl ReviewDispatchStore for ProductStore {
             params![request.intent.order.0, request.journal_run, request.error],
         )
         .map_err(db_error)?;
+        #[cfg(feature = "product-pack-pins")]
+        if self.open_mode == super::StoreOpenMode::Normal
+            && is_commit_review_work(&tx, &request.intent.order.0, &request.journal_run)?
+        {
+            super::commit_review::record_failed_inspection(
+                &tx,
+                &request.intent.order.0,
+                &request.journal_run,
+                self.clock.now(),
+            )
+            .map_err(db_error)?;
+        }
         tx.commit().map_err(db_error)
     }
     fn complete_review_dispatch(
@@ -1443,6 +1504,19 @@ impl ReviewDispatchStore for ProductStore {
         #[cfg(feature = "a01-harness-support")]
         if self.open_mode.is_a01_task() && status == "passed" {
             super::a01_task::complete_bridge_in(&tx,&request.intent,&request.result,now).map_err(db_error)?;
+        }
+        #[cfg(feature = "product-pack-pins")]
+        if self.open_mode == super::StoreOpenMode::Normal
+            && is_commit_review_work(&tx, &request.intent.order.0, &request.journal_run)?
+        {
+            super::commit_review::record_inspection_transition(
+                &tx,
+                &request.intent.order.0,
+                &request.journal_run,
+                Some(&request),
+                now,
+            )
+            .map_err(db_error)?;
         }
         if let (Some(snapshot), Some(saved), Some(hold_id)) =
             (request.held_snapshot.as_ref(), hold_json, hold_id)
@@ -2172,6 +2246,23 @@ impl ReviewHostStore for ProductStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db_error)?;
+        let receipt_json: String = tx
+            .query_row(
+                "SELECT receipt_json FROM product_review_hold_acceptances_v1 WHERE operation_id=?1",
+                [operation_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_error)?
+            .ok_or_else(|| {
+                HostError::Acceptance("accepted product hold receipt is unavailable".into())
+            })?;
+        let receipt: ProductHoldAcceptance = decode(&receipt_json)?;
+        if receipt != preliminary {
+            return Err(HostError::Acceptance(
+                "accepted product hold changed before claim".into(),
+            ));
+        }
         // Only normal v4 stores carry lifecycle pins. Every profile still checks
         // the session, work authority and immutable origin below.
         #[cfg(feature = "product-pack-pins")]
@@ -2203,7 +2294,9 @@ impl ReviewHostStore for ProductStore {
                 .map_err(|_| {
                     HostError::Acceptance("selected product pack authority was revoked".into())
                 })?;
-                if !selected.active
+                // Abort closes the original held run without starting work. Its
+                // original selection and selector must still match the pin.
+                if (!selected.active && receipt.decision != ProductHoldDecision::Abort)
                     || selected.selection_revision != selection_revision
                     || selected.referenced_approval_revision != approval_revision
                 {
@@ -2256,18 +2349,6 @@ impl ReviewHostStore for ProductStore {
         } else {
             None
         };
-        let receipt_json: String = tx
-            .query_row(
-                "SELECT receipt_json FROM product_review_hold_acceptances_v1 WHERE operation_id=?1",
-                [operation_id],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(db_error)?
-            .ok_or_else(|| {
-                HostError::Acceptance("accepted product hold receipt is unavailable".into())
-            })?;
-        let receipt: ProductHoldAcceptance = decode(&receipt_json)?;
         let run_id = format!(
             "{}:{}:{}:{}",
             receipt.order_id, receipt.attempt, receipt.originating_run, receipt.activation
@@ -2402,6 +2483,10 @@ impl ReviewHostStore for ProductStore {
             ProductHoldDecision::Abort => foundry_exec::ReviewHoldAction::Abort,
         };
         if matches!(action, foundry_exec::ReviewHoldAction::Resume { .. }) {
+            #[cfg(feature = "product-pack-pins")]
+            if self.open_mode == super::StoreOpenMode::Normal {
+                check_commit_review_resume(&tx, &receipt.order_id, receipt.attempt, &run_id, now)?;
+            }
             let service_valid = super::service::review_work_service_valid_in(
                 &tx,
                 &receipt.order_id,
@@ -3495,6 +3580,49 @@ struct ProductArtifactRegistration<'a> {
 }
 
 #[cfg(feature = "product-pack-pins")]
+fn is_commit_review_work(
+    tx: &rusqlite::Transaction<'_>,
+    order: &str,
+    run: &str,
+) -> Result<bool, HostError> {
+    tx.query_row("SELECT EXISTS(SELECT 1 FROM product_review_work_bindings_v1 WHERE order_id=?1 AND run_id=?2 AND task_kind=?3) AND (SELECT schema_version FROM product_meta_v1 WHERE singleton=1)=4",
+        params![order,run,super::COMMIT_REVIEW_KIND],|r|r.get(0)).map_err(db_error)
+}
+
+/// A receipt may survive revocation. A fresh Resume of this explicitly
+/// authorized task also needs the originating pin and live execution rights.
+#[cfg(feature = "product-pack-pins")]
+pub(super) fn check_commit_review_resume(
+    tx: &rusqlite::Transaction<'_>,
+    order: &str,
+    attempt: i64,
+    run: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), HostError> {
+    let selected: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM product_orders_v1 WHERE order_id=?1 AND task_kind=?2) AND (SELECT schema_version FROM product_meta_v1 WHERE singleton=1)=4",
+        params![order,super::COMMIT_REVIEW_KIND],|row|row.get(0),
+    ).map_err(db_error)?;
+    if !selected {
+        return Ok(());
+    }
+    let (binding, pack) = tx.query_row(
+        "SELECT r.product_lifecycle,r.source_revision,r.admission_seq,r.admission_hash,o.repository_id,r.base_commit,r.pack_digest
+         FROM product_review_runs_v1 r JOIN product_orders_v1 o ON o.order_id=r.order_id AND o.lifecycle=r.product_lifecycle
+         JOIN product_review_work_bindings_v1 w ON w.order_id=r.order_id AND w.attempt=r.attempt AND w.run_id=r.run_id AND w.task_kind=o.task_kind
+         JOIN product_w1_lifecycle_pins_v1 p ON p.order_id=w.order_id AND p.lifecycle=w.lifecycle AND p.claim_epoch=w.claim_epoch
+            AND p.claim_fence=w.claim_fence AND p.pack_digest=r.pack_digest AND p.payload_digest=w.payload_digest
+         WHERE r.order_id=?1 AND r.attempt=?2 AND r.run_id=?3",
+        params![order,attempt,run],|row|Ok((ActiveRunBinding {
+            lifecycle:row.get(0)?, source_revision:row.get(1)?, admission_seq:row.get(2)?, admission_hash:row.get(3)?,
+            repository_id:row.get(4)?, base_commit:row.get(5)?,
+        },row.get::<_,String>(6)?)),
+    ).map_err(db_error)?;
+    ensure_pinned_product_authority(tx, order, &binding, &pack)?;
+    ensure_product_source_for_new_stage(tx, order, attempt, run, &binding, now)
+}
+
+#[cfg(feature = "product-pack-pins")]
 fn ensure_pinned_product_authority(
     tx: &rusqlite::Transaction<'_>,
     order: &str,
@@ -3555,6 +3683,51 @@ fn ensure_pinned_product_authority(
         return Err(HostError::Acceptance(
             "selected product pack authority was revoked".into(),
         ));
+    }
+    let commit_review: Option<(String, String, String, i64, i64)> = tx
+        .query_row(
+            "SELECT w.worker_id,p.request_key,a.service_id,a.service_revision,a.credential_revision
+         FROM product_w1_lifecycle_pins_v1 p JOIN product_review_work_bindings_v1 w
+           ON w.order_id=p.order_id AND w.lifecycle=p.lifecycle AND w.claim_fence=p.claim_fence
+         JOIN product_review_authority_v1 a ON a.order_id=w.order_id AND a.journal_run=w.run_id
+         WHERE p.order_id=?1 AND p.lifecycle=?2 AND w.task_kind=?3 LIMIT 1",
+            params![order, binding.lifecycle, super::COMMIT_REVIEW_KIND],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(db_error)?;
+    if let Some((worker, key, service, service_revision, credential_revision)) = commit_review {
+        let selected = foundry_exec::ProductSelectionBinding {
+            order_id: order.into(),
+            lifecycle: binding.lifecycle,
+            source_instance_id: source.clone(),
+            pack_digest: digest.clone(),
+            selection_revision,
+            referenced_approval_revision: approval_revision,
+        };
+        let expected = super::commit_review::authorized_worker(
+            tx,
+            &selected,
+            &key,
+            &hash,
+            &service,
+            service_revision,
+            credential_revision,
+        )
+        .map_err(|_| HostError::Acceptance("commit review authority changed".into()))?;
+        if expected != worker {
+            return Err(HostError::Acceptance(
+                "commit review authority changed".into(),
+            ));
+        }
     }
     let current = super::w1_selection_state_in(
         tx,

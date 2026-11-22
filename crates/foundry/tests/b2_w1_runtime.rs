@@ -57,6 +57,7 @@ fn w1_failure_root_custody_preserves_armed_panic_and_default_cleanup() {
 
 #[cfg(feature = "product-pack-pins")]
 mod product_pin {
+    mod legacy;
     use super::*;
     use foundry_exec::{
         Attempt, Epoch, ExecutionIntent, Generation, OrderId, PolicyRejection,
@@ -1924,6 +1925,136 @@ mod product_pin {
         assert_eq!(count(&fixture.db_path, "product_w1_lifecycle_pins_v1"), 1);
         assert_eq!(count(&fixture.db_path, "product_review_host_results_v1"), 1);
         reject_unselected(&mut host);
+    }
+
+    #[test]
+    fn reserved_followup_alias_across_processes() {
+        use foundry_ledger::{ProductConfig, ProductStore};
+        use std::process::Command;
+        const ORDER: &str = "alias-order";
+        const KEY: &str = "accept-resume";
+        if let Some(root) = std::env::var_os("W1_ALIAS_CHILD") {
+            let root = Path::new(&root);
+            let db = root.join("product.sqlite");
+            let mut store = ProductStore::open(
+                &db,
+                ProductConfig {
+                    installation_id: "b2-w1-runtime-install".into(),
+                    database_id: "b2-w1-runtime-database".into(),
+                },
+            )
+            .unwrap();
+            let session = fs::read_to_string(root.join("owner.digest")).unwrap();
+            let now = chrono::Utc::now();
+            let holds = store.list_product_review_holds(&session, now).unwrap();
+            assert_eq!(holds.len(), 1);
+            let held = &holds[0];
+            assert_eq!(held.order_id, ORDER);
+            let receipt = store
+                .accept_product_review_hold(
+                    &session,
+                    ORDER,
+                    &held.hold_instance_id,
+                    &held.expectation,
+                    KEY,
+                    ProductHoldDecision::Resume(held.allowed_targets[0].clone()),
+                    now,
+                )
+                .unwrap();
+            fs::write(
+                root.join("receipt.json"),
+                serde_json::to_vec(&receipt).unwrap(),
+            )
+            .unwrap();
+            return;
+        }
+        let fixture = RuntimeFixture::new(&[ORDER]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let held = fixture.make_hold(
+            ORDER,
+            FailingExecutor {
+                calls: calls.clone(),
+            },
+        );
+        fs::write(fixture.root.0.join("owner.digest"), &fixture.owner_session).unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "product_pin::reserved_followup_alias_across_processes",
+            ])
+            .env("W1_ALIAS_CHILD", &fixture.root.0)
+            .spawn()
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+        let receipt = fixture.accept_resume(&held, KEY);
+        assert_eq!(
+            serde_json::to_vec(&receipt).unwrap(),
+            fs::read(fixture.root.0.join("receipt.json")).unwrap()
+        );
+        assert_eq!(count(&fixture.db_path, "product_review_runs_v1"), 1);
+        assert_eq!(
+            count(&fixture.db_path, "product_review_run_reservations_v1"),
+            1
+        );
+        assert_eq!(
+            fixture
+                .store()
+                .product_review_progress(&fixture.owner_session, &receipt.operation_id, fixture.now)
+                .unwrap()
+                .phase,
+            "accepted"
+        );
+        let mut store = fixture.configured_review_store(manifest_digest(&fixture.pack));
+        let before = snapshot(&fixture.db_path);
+        let schema = schema_snapshot(&fixture.db_path);
+        let mut request = selected_request(
+            &fixture,
+            ORDER,
+            selection_binding(&fixture, ORDER),
+            "another-key",
+        );
+        request.review.intent.run = RunId(receipt.reserved_run_id.try_into().unwrap());
+        let regular = request.review.clone();
+        let selected_error = store.admit_selected_review_activation(request).unwrap_err();
+        assert!(
+            matches!(selected_error, foundry_exec::HostError::Acceptance(ref m) if m=="selected review activation request key conflict")
+        );
+        assert_state_and_schema_unchanged(&before, &schema, &fixture.db_path);
+        let alias_error = store.admit_review_activation(regular).unwrap_err();
+        assert!(
+            matches!(alias_error, foundry_exec::HostError::Acceptance(ref m) if m=="product review numeric run aliases an existing activation or reservation")
+        );
+        assert_state_and_schema_unchanged(&before, &schema, &fixture.db_path);
+        let resume_calls = Arc::new(AtomicUsize::new(0));
+        fixture
+            .host(SuccessExecutor {
+                calls: resume_calls.clone(),
+                lens_bytes: None,
+                after_execute: None,
+                after_preflight: None,
+            })
+            .continue_accepted_product_hold(
+                &fixture.owner_session,
+                &receipt.operation_id,
+                fixture.now,
+            )
+            .unwrap();
+        let progress = fixture
+            .store()
+            .product_review_progress(&fixture.owner_session, &receipt.operation_id, fixture.now)
+            .unwrap();
+        assert_eq!(progress.receipt, receipt);
+        assert_eq!(progress.phase, "completed");
+        assert!(resume_calls.load(Ordering::SeqCst) > 0);
+        println!(
+            "winner_pid={} contender_pid={} reserved_run={} operation={} compared_tables={} selected={selected_error:?} fixed={alias_error:?} original_phase={}",
+            child.id(),
+            std::process::id(),
+            receipt.reserved_run_id,
+            receipt.operation_id,
+            before.len(),
+            progress.phase
+        );
     }
 
     #[test]

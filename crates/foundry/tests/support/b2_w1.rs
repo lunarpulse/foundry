@@ -414,6 +414,16 @@ impl RuntimeFixture {
     }
 
     pub fn make_hold<E: StageExecutor + 'static>(&self, order_id: &str, executor: E) -> Held {
+        self.make_hold_for_commits(order_id, executor, "base", "result")
+    }
+
+    pub fn make_hold_for_commits<E: StageExecutor + 'static>(
+        &self,
+        order_id: &str,
+        executor: E,
+        base: &str,
+        result: &str,
+    ) -> Held {
         let item = self.item(order_id);
         let mut host = self.host(executor);
         let intent = ExecutionIntent {
@@ -423,7 +433,7 @@ impl RuntimeFixture {
             activation: 1,
             generation: Generation(0),
             epoch: Epoch(1),
-            external_ref: format!("review:{order_id}:1:base..result"),
+            external_ref: format!("review:{order_id}:1:{base}..{result}"),
             recorded_at: self.now,
         };
         #[cfg(feature = "product-pack-pins")]

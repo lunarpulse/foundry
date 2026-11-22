@@ -37,6 +37,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex as TMutex;
 
+#[cfg(feature = "product-pack-pins")]
+mod selected_review;
+
 #[derive(Parser)]
 #[command(name = "foundry", version, about = "personal software factory")]
 struct Cli {
@@ -329,6 +332,10 @@ enum Cmd {
         session_file: String,
         #[arg(long, value_parser = ["holds", "progress", "resume", "commit-pass", "commit-fail", "abort"])]
         action: String,
+        /// Record a selected hold decision and leave continuation for the exact retry.
+        #[cfg(feature = "product-pack-pins")]
+        #[arg(long)]
+        accept_only: bool,
         #[arg(long)]
         order: Option<String>,
         #[arg(long)]
@@ -392,6 +399,15 @@ enum Cmd {
         #[arg(long)]
         manifest: String,
     },
+    /// Admit an immutable local Git commit for review.
+    #[cfg(feature = "product-pack-pins")]
+    ProductIntake(selected_review::IntakeArgs),
+    /// Approve, revoke or select a review pack by digest.
+    #[cfg(feature = "product-pack-pins")]
+    ProductPack(selected_review::PackArgs),
+    /// Review an existing commit using its order's selected pack.
+    #[cfg(feature = "product-pack-pins")]
+    ProductReviewDispatch(selected_review::DispatchArgs),
     /// Owner-managed source/action scoped service authority.
     ProductService {
         #[arg(long, value_parser = ["configure", "revoke", "query", "issue", "rotate"])]
@@ -675,6 +691,30 @@ fn product_review_host(
     let Ok(pack) = std::env::var("FOUNDRY_REVIEW_PACK") else {
         return Ok(None);
     };
+    let store = foundry_ledger::ProductStore::open(
+        std::path::Path::new(db),
+        product_config(installation_id, database_id),
+    )
+    .map_err(|_| "product review database rejected".to_owned())?;
+    #[cfg(feature = "product-pack-pins")]
+    let store = {
+        let pack_path = std::path::PathBuf::from(&pack);
+        let snapshot = foundry_pack::load_pack(&pack_path)
+            .map_err(|_| "product review pack registry rejected".to_owned())?;
+        store.with_product_registry(foundry_ledger::PackRegistryConfig {
+            snapshots: [(snapshot.digest().to_owned(), pack_path)]
+                .into_iter()
+                .collect(),
+        })
+    };
+    build_product_review_host(std::path::Path::new(&pack), store, false).map(Some)
+}
+
+fn build_product_review_host(
+    pack: &std::path::Path,
+    store: foundry_ledger::ProductStore,
+    _commit_review: bool,
+) -> Result<PackReviewHost, String> {
     let get_root = |name: &str| -> Result<std::path::PathBuf, String> {
         std::env::var(name)
             .ok()
@@ -695,35 +735,22 @@ fn product_review_host(
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(600);
-            Box::new(DieStageExecutor::new(
+            let executor = DieStageExecutor::new(
                 std::path::PathBuf::from(binary),
                 profile,
                 timeout,
                 std::path::PathBuf::from(repo),
                 session_root.clone(),
-            ))
+            );
+            #[cfg(feature = "product-pack-pins")]
+            let executor = executor.with_commit_review(_commit_review);
+            Box::new(executor)
         }
         _ => Box::new(UnavailableStageExecutor),
     };
-    let store = foundry_ledger::ProductStore::open(
-        std::path::Path::new(db),
-        product_config(installation_id, database_id),
-    )
-    .map_err(|_| "product review database rejected".to_owned())?;
-    #[cfg(feature = "product-pack-pins")]
-    let store = {
-        let pack_path = std::path::PathBuf::from(&pack);
-        let snapshot = foundry_pack::load_pack(&pack_path)
-            .map_err(|_| "product review pack registry rejected".to_owned())?;
-        store.with_product_registry(foundry_ledger::PackRegistryConfig {
-            snapshots: [(snapshot.digest().to_owned(), pack_path)]
-                .into_iter()
-                .collect(),
-        })
-    };
     #[cfg(feature = "product-pack-pins")]
     let host = PackReviewHost::with_selected_product_pack(
-        &pack,
+        pack,
         executor,
         store,
         artifact_root,
@@ -732,15 +759,14 @@ fn product_review_host(
     );
     #[cfg(not(feature = "product-pack-pins"))]
     let host = PackReviewHost::with_product_store(
-        &pack,
+        pack,
         executor,
         store,
         artifact_root,
         session_root,
         claim_root,
     );
-    host.map(Some)
-        .map_err(|_| "product review runtime configuration rejected".to_owned())
+    host.map_err(|_| "product review runtime configuration rejected".to_owned())
 }
 
 fn product_login_cmd(
@@ -1357,6 +1383,7 @@ fn product_review_cmd(
     operation_id: Option<&str>,
     target: Option<&str>,
     request_key: Option<&str>,
+    #[cfg(feature = "product-pack-pins")] accept_only: bool,
 ) -> i32 {
     let bearer = match read_private(session_file) {
         Ok(value) if value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()) => value,
@@ -1443,6 +1470,34 @@ fn product_review_cmd(
                 "commit-fail" => foundry_ledger::ProductHoldDecision::CommitFail,
                 _ => foundry_ledger::ProductHoldDecision::Abort,
             };
+            #[cfg(feature = "product-pack-pins")]
+            {
+                match store.selected_hold_pack(&session, order, hold_id) {
+                    Ok(held)
+                        if held.commit_review
+                            || accept_only
+                            || std::env::var_os("FOUNDRY_REVIEW_PACK_REGISTRY").is_some() =>
+                    {
+                        return selected_review::decide_hold(
+                            &mut store,
+                            &session,
+                            order,
+                            hold_id,
+                            request_key,
+                            decision,
+                            held,
+                            accept_only,
+                        );
+                    }
+                    _ if accept_only
+                        || std::env::var_os("FOUNDRY_REVIEW_PACK_REGISTRY").is_some() =>
+                    {
+                        eprintln!("product review request rejected");
+                        return 1;
+                    }
+                    _ => {}
+                }
+            }
             let holds = match store.list_product_review_holds(&session, chrono::Utc::now()) {
                 Ok(holds) => holds,
                 Err(_) => {
@@ -2368,6 +2423,8 @@ async fn main() {
             operation_id,
             target,
             idempotency_key,
+            #[cfg(feature = "product-pack-pins")]
+            accept_only,
         } => product_review_cmd(
             &expand(&db),
             &installation_id,
@@ -2379,6 +2436,8 @@ async fn main() {
             operation_id.as_deref(),
             target.as_deref(),
             idempotency_key.as_deref(),
+            #[cfg(feature = "product-pack-pins")]
+            accept_only,
         ),
         Cmd::ProductScope {
             action,
@@ -2432,6 +2491,12 @@ async fn main() {
             &database_id,
             &expand(&manifest),
         ),
+        #[cfg(feature = "product-pack-pins")]
+        Cmd::ProductIntake(args) => selected_review::intake(args),
+        #[cfg(feature = "product-pack-pins")]
+        Cmd::ProductPack(args) => selected_review::pack(args),
+        #[cfg(feature = "product-pack-pins")]
+        Cmd::ProductReviewDispatch(args) => selected_review::dispatch(args),
         Cmd::ProductService {
             action,
             db,

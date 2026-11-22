@@ -374,6 +374,15 @@ pub struct ProductConfig {
 }
 
 #[cfg(feature = "product-pack-pins")]
+mod commit_review;
+#[cfg(feature = "product-pack-pins")]
+mod pack_migration;
+#[cfg(feature = "product-pack-pins")]
+pub use commit_review::{
+    COMMIT_REVIEW_KIND, CommitReviewRequest, CommitReviewWork, SelectedReviewHold,
+};
+
+#[cfg(feature = "product-pack-pins")]
 #[derive(Debug, Clone, Default)]
 pub struct PackRegistryConfig {
     /// Pack snapshots keyed by their canonical digest.
@@ -1769,6 +1778,7 @@ fn open_internal_with_checkpoint(
                 )
                 .map_err(v4_schema_error)?;
                 validate_product_pack_pin_schema(&conn)?;
+                pack_migration::configure_migrated_writer(&conn)?;
             } else {
                 result::validate_v3_connection(
                     &conn,
@@ -3883,6 +3893,12 @@ fn open_internal_with_checkpoint(
             }
         }
         if let ProductHoldDecision::Resume(target) = &decision {
+            #[cfg(feature = "product-pack-pins")]
+            if self.open_mode == StoreOpenMode::Normal {
+                let run = format!("{order_id}:{attempt}:{originating_run}:{activation}");
+                review::check_commit_review_resume(&tx, order_id, attempt, &run, self.clock.now())
+                    .map_err(|_| ProductError::Invariant("commit review authority unavailable"))?;
+            }
             let allowed: Vec<String> = serde_json::from_str(&allowed_targets_json)
                 .map_err(|_| ProductError::Invariant("product review target list is corrupt"))?;
             if !allowed.iter().any(|item| item == target) {
@@ -4534,6 +4550,8 @@ fn open_internal_with_checkpoint(
             // connection and inspect the authoritative operation on a fresh
             // handle; never rerun the approval blindly.
             let reopened = Connection::open(&self.path)?;
+            #[cfg(feature = "product-pack-pins")]
+            pack_migration::configure_migrated_writer(&reopened)?;
             reopened.busy_timeout(std::time::Duration::from_secs(5))?;
             let stored: Option<String> = reopened
                 .query_row(
@@ -5511,10 +5529,23 @@ fn open_internal_with_checkpoint(
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        service::require_service_context_in(&tx, context, ProductServiceAction::DriveReview, now)?;
+        let result = Self::claim_scoped_work_in(&tx, context, worker_id, None, now, lease)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    fn claim_scoped_work_in(
+        tx: &rusqlite::Transaction<'_>,
+        context: &ProductServiceContext,
+        worker_id: &str,
+        requested_order: Option<&str>,
+        now: DateTime<Utc>,
+        lease: chrono::Duration,
+    ) -> Result<ProductWorkClaimResult, ProductError> {
+        service::require_service_context_in(tx, context, ProductServiceAction::DriveReview, now)?;
         let candidate: Option<(String,i64,String,String,String,i64,i64,String,i64,i64,i64,Option<String>)> = tx.query_row(
-            "SELECT o.order_id,o.lifecycle,b.delivery_id,o.task_kind,o.payload_snapshot,o.source_revision,o.admission_seq,o.admission_hash,s.revision,s.enabled,COALESCE(c.epoch,0),c.lease_until FROM product_work_backlog_v1 b JOIN product_orders_v1 o ON o.order_id=b.order_id AND o.lifecycle=b.lifecycle JOIN product_sources_v1 s ON s.connector_id=o.connector_id JOIN product_scope_order_provenance_v1 p ON p.order_id=o.order_id AND p.lifecycle=o.lifecycle AND p.verified=1 AND p.source_instance_id=?2 LEFT JOIN product_work_claims_v1 c ON c.order_id=b.order_id AND c.lifecycle=b.lifecycle WHERE o.connector_id=?3 AND o.repository_id=?4 AND (b.state IN ('ready','retryable') OR (b.state IN ('claimed','completed') AND (c.lease_until IS NULL OR c.lease_until<=?1))) AND b.available_at<=?1 ORDER BY b.available_at,o.order_id LIMIT 1",
-            params![now.to_rfc3339(),context.source_instance_id,context.connector_id,context.repository_id], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?,r.get(11)?)),
+            "SELECT o.order_id,o.lifecycle,b.delivery_id,o.task_kind,o.payload_snapshot,o.source_revision,o.admission_seq,o.admission_hash,s.revision,s.enabled,COALESCE(c.epoch,0),c.lease_until FROM product_work_backlog_v1 b JOIN product_orders_v1 o ON o.order_id=b.order_id AND o.lifecycle=b.lifecycle JOIN product_sources_v1 s ON s.connector_id=o.connector_id JOIN product_scope_order_provenance_v1 p ON p.order_id=o.order_id AND p.lifecycle=o.lifecycle AND p.verified=1 AND p.source_instance_id=?2 LEFT JOIN product_work_claims_v1 c ON c.order_id=b.order_id AND c.lifecycle=b.lifecycle WHERE o.connector_id=?3 AND o.repository_id=?4 AND (b.state IN ('ready','retryable') OR (b.state IN ('claimed','completed') AND (c.lease_until IS NULL OR c.lease_until<=?1))) AND ((?5 IS NULL AND (?6 IS NULL OR o.task_kind!=?6 OR c.owner_id IS NULL OR c.owner_id NOT GLOB 'commit-review-*' OR (SELECT schema_version FROM product_meta_v1 WHERE singleton=1)!=4)) OR o.order_id=?5) AND b.available_at<=?1 ORDER BY b.available_at,o.order_id LIMIT 1",
+            params![now.to_rfc3339(),context.source_instance_id,context.connector_id,context.repository_id,requested_order,if cfg!(feature="product-pack-pins"){Some("local-commit-review-v1")}else{None}], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?,r.get(11)?)),
         ).optional()?;
         let Some((
             order_id,
@@ -5531,7 +5562,6 @@ fn open_internal_with_checkpoint(
             old_lease,
         )) = candidate
         else {
-            tx.commit()?;
             return Ok(ProductWorkClaimResult::Empty);
         };
         if enabled != 1
@@ -5553,7 +5583,6 @@ fn open_internal_with_checkpoint(
                 .map(|v| v.with_timezone(&Utc) > now)
                 .unwrap_or(true)
         }) {
-            tx.commit()?;
             return Ok(ProductWorkClaimResult::Empty);
         }
         let epoch = old_epoch
@@ -5573,7 +5602,6 @@ fn open_internal_with_checkpoint(
         tx.execute("INSERT INTO product_work_claims_v1(order_id,lifecycle,owner_id,epoch,fence,state,lease_until,source_revision,payload_digest) VALUES(?1,?2,?3,?4,?5,'claimed',?6,?7,?8) ON CONFLICT(order_id,lifecycle) DO UPDATE SET owner_id=excluded.owner_id,epoch=excluded.epoch,fence=excluded.fence,state='claimed',lease_until=excluded.lease_until,source_revision=excluded.source_revision,payload_digest=excluded.payload_digest",params![order_id,lifecycle,worker_id,epoch,fence,lease_until.to_rfc3339(),source_revision,digest])?;
         tx.execute("UPDATE product_work_backlog_v1 SET state='claimed',attempts=attempts+1 WHERE order_id=?1 AND lifecycle=?2 AND state IN ('ready','retryable','claimed','completed')",params![order_id,lifecycle])?;
         tx.execute("INSERT INTO product_service_work_bindings_v1(order_id,lifecycle,service_id,service_revision,credential_revision,source_instance_id) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(order_id,lifecycle) DO UPDATE SET service_id=excluded.service_id,service_revision=excluded.service_revision,credential_revision=excluded.credential_revision,source_instance_id=excluded.source_instance_id",params![order_id,lifecycle,context.service_id,context.service_revision,context.credential_revision,context.source_instance_id])?;
-        tx.commit()?;
         Ok(ProductWorkClaimResult::Claimed(ProductWorkClaim {
             order_id,
             lifecycle,

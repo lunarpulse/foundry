@@ -19,6 +19,8 @@ pub struct DieStageExecutor {
     timeout_secs: u64,
     repo_path: PathBuf,
     session_root: PathBuf,
+    #[cfg(feature = "product-pack-pins")]
+    commit_review: bool,
     restored: BTreeMap<String, RestoredSession>,
 }
 
@@ -45,7 +47,29 @@ struct DieOutputFile {
     inspected_commit: Option<String>,
 }
 
+#[cfg(feature = "product-pack-pins")]
+/// Complete, immutable stage input for external Die adapters. The legacy
+/// input manifest remains the harness wire contract; this sidecar carries the
+/// review lens and structured inputs without flattening or shell quoting.
+#[derive(Serialize)]
+struct StageInputFile<'a> {
+    version: u32,
+    role: &'a str,
+    stage_id: &'a str,
+    artifact_commit: &'a str,
+    lens_bytes: &'a [u8],
+    inputs: &'a BTreeMap<String, String>,
+}
+
 impl DieStageExecutor {
+    #[cfg(feature = "product-pack-pins")]
+    /// Review an existing immutable commit: transmit the selected lens and
+    /// accept inspection stages only.
+    pub fn with_commit_review(mut self, enabled: bool) -> Self {
+        self.commit_review = enabled;
+        self
+    }
+
     pub fn new(
         binary: PathBuf,
         profile: String,
@@ -59,6 +83,8 @@ impl DieStageExecutor {
             timeout_secs,
             repo_path,
             session_root,
+            #[cfg(feature = "product-pack-pins")]
+            commit_review: false,
             restored: BTreeMap::new(),
         }
     }
@@ -122,6 +148,10 @@ impl StageExecutor for DieStageExecutor {
     }
 
     fn execute(&mut self, task: &StageTask) -> Result<StageOutput, String> {
+        #[cfg(feature = "product-pack-pins")]
+        if self.commit_review && !matches!(task.role.as_str(), "lens" | "verify") {
+            return Err("commit review requires an inspection stage".into());
+        }
         self.ensure_available()?;
         let record_path = self.session_path(&task.session_id)?;
         if record_path.exists() && !self.restored.contains_key(&task.session_id) {
@@ -133,6 +163,23 @@ impl StageExecutor for DieStageExecutor {
             &task.base_commit,
             &self.session_root,
         )?;
+        #[cfg(feature = "product-pack-pins")]
+        let stage_input = if self.commit_review {
+            let stage_input_path = task.workdir.join("stage-input.json");
+            let stage_input_bytes = serde_json::to_vec(&StageInputFile {
+                version: 1,
+                role: &task.role,
+                stage_id: &task.stage_id,
+                artifact_commit: &task.artifact_commit,
+                lens_bytes: &task.lens_bytes,
+                inputs: &task.inputs,
+            })
+            .map_err(|e| format!("serialize stage input: {e}"))?;
+            let file = write_stage_input(&stage_input_path, &stage_input_bytes)?;
+            Some((stage_input_path, file, stage_input_bytes))
+        } else {
+            None
+        };
         let output_path = task.workdir.join("die-output.json");
         match fs::remove_file(&output_path) {
             Ok(()) => {}
@@ -235,6 +282,10 @@ impl StageExecutor for DieStageExecutor {
         if manifest != expected_manifest {
             return Err("Die modified the input manifest (BindingMismatch)".into());
         }
+        #[cfg(feature = "product-pack-pins")]
+        if let Some((path, file, expected)) = stage_input {
+            verify_stage_input(&path, file, &expected)?;
+        }
         if let Some(commit) = output.produced_commit.as_deref() {
             cache_commit(&self.session_root, &task.workdir, commit)?;
         }
@@ -273,6 +324,54 @@ impl StageExecutor for DieStageExecutor {
         );
         Ok(())
     }
+}
+
+#[cfg(feature = "product-pack-pins")]
+fn write_stage_input(path: &Path, bytes: &[u8]) -> Result<fs::File, String> {
+    use std::io::Write;
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|e| format!("create stage input: {e}"))?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|e| format!("write stage input: {e}"))?;
+    Ok(file)
+}
+
+#[cfg(feature = "product-pack-pins")]
+fn verify_stage_input(path: &Path, mut file: fs::File, expected: &[u8]) -> Result<(), String> {
+    use std::io::{Read, Seek};
+    let mismatch = || "Die modified the stage input (BindingMismatch)".to_owned();
+    let named = fs::symlink_metadata(path).map_err(|_| mismatch())?;
+    if !named.is_file() || named.len() != expected.len() as u64 {
+        return Err(mismatch());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let pinned = file.metadata().map_err(|_| mismatch())?;
+        if (named.dev(), named.ino()) != (pinned.dev(), pinned.ino()) {
+            return Err(mismatch());
+        }
+    }
+    // Read the original descriptor with a hard bound, even if the child
+    // replaces the directory entry with a pipe or grows the file.
+    file.rewind().map_err(|_| mismatch())?;
+    let mut actual = Vec::with_capacity(expected.len());
+    file.take(expected.len() as u64 + 1)
+        .read_to_end(&mut actual)
+        .map_err(|_| mismatch())?;
+    if actual != expected {
+        return Err(mismatch());
+    }
+    Ok(())
 }
 
 fn prepare_workdir(

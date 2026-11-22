@@ -180,3 +180,24 @@ The examples use placeholder IDs and dates; choose future finite timestamps for 
 ## 검증되지 않은 실행 경로
 
 이번 배치에서는 Docker 배포·컨테이너 경로, 외부 GitHub 실연결 및 실제 publish, `watch --once`의 온라인 intake, `serve`를 통한 실제 Die review 실행을 실행하지 않았다. 승인 및 serve의 변경 API도 실사용자 데이터에 실행하지 않았다. `cargo doc`는 Rust API 문서만 다루므로 이 Markdown의 링크·앵커·코드 예제 검증을 대신하지 않는다.
+
+## Per-order review of a local commit
+
+A build with `product-pack-pins` can review an immutable Git commit in a fresh product pin store. Configure the Owner's source grants and the intake and review service as described above. Set `FOUNDRY_REPO_PATH` to the local repository and `FOUNDRY_PRODUCT_REVIEW_SOURCE` to its configured source instance. Set the artifact, session and claim roots and the trusted Die executable. Supply the full build source commit in `FOUNDRY_SOURCE_COMMIT` at build time or at launch so the host can record executable provenance. The executable receives a private `stage-input.json` in its working directory with the selected lens text for each inspection stage.
+
+Set `FOUNDRY_REVIEW_PACK_REGISTRY` to a JSON file containing an array of absolute pack directory paths. Each pack must pass manifest validation and have a distinct digest. The registry and the single-pack setting `FOUNDRY_REVIEW_PACK` are mutually exclusive on this CLI path.
+
+1. Use `product-intake` with the source service credential, issue ID, order ID, observed update timestamp and full lowercase Git commit ID. Keep the acknowledged lifecycle and admission hash.
+2. Use `product-pack --action approve` for each permitted digest, then `product-pack --action select` with the order and lifecycle. Both actions require the Owner session, the source instance, an expected revision and a request key. The initial expected revision is zero. Keep the selection receipt.
+3. Use `product-review-dispatch` with the Owner session, review service credential, source coordinates, original order, lifecycle, admission hash, commit, selection revision and a new request key. The command resolves the selected digest. Give both orders the same operator configuration. An exact retry of a recorded request remains subject to its authority and binding checks.
+4. On a hold, use `product-review --action resume` with the hold ID, allowed target and idempotency key. Use `--accept-only` to stop after durable acceptance. Retry the same action to continue from the original pack. A returned receipt identifies the accepted decision. The phase reports whether continuation has completed. Preserve the database, roots and original pack across restart.
+
+These commands inspect an existing commit. The Owner's pack approval authorizes pack use. Human approval of the order's result remains a separate operation.
+
+The offline CLI regression uses Git and Python 3.11 or newer. Run it with the same feature profile as the product binary.
+
+```sh
+cargo test --locked --offline -j 1 -p foundry --no-default-features \
+  --features product-pack-pins --test selected_review_cli -- \
+  two_orders_consume_their_selected_packs --exact --test-threads=1
+```
