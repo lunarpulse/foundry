@@ -62,6 +62,19 @@ struct StageInputFile<'a> {
 }
 
 impl DieStageExecutor {
+    /// Operator timeout shared by serve and the product review coordinator.
+    pub fn configured_timeout() -> Result<u64, String> {
+        match std::env::var("FOUNDRY_DIE_TIMEOUT") {
+            Ok(value) => value
+                .parse::<u64>()
+                .ok()
+                .filter(|v| (1..=3600).contains(v))
+                .ok_or_else(|| "invalid FOUNDRY_DIE_TIMEOUT".to_owned()),
+            Err(std::env::VarError::NotPresent) => Ok(600),
+            Err(_) => Err("invalid FOUNDRY_DIE_TIMEOUT".into()),
+        }
+    }
+
     #[cfg(feature = "product-pack-pins")]
     /// Review an existing immutable commit: transmit the selected lens and
     /// accept inspection stages only.

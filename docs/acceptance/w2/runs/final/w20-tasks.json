@@ -1,0 +1,32 @@
+[
+  {
+    "canonical_utf8": "{\"kind\":\"code-change-v1\",\"request\":\"Add a line\",\"acceptance\":[\"README updated\"],\"base_commit\":\"90029a88498594e527dcbc5df5a193df08f975ba\",\"pack_digest\":\"5f28e6c41d834462a93c1d77541b4d122baf58ac9c85c7674c9753d23436d8fc\",\"allowed_paths\":[\"A\",\"README\"],\"checks\":[{\"argv\":[\"git\",\"diff\",\"--check\"],\"timeout_secs\":5}],\"total_timeout_secs\":120,\"model\":\"none\",\"max_model_calls\":0,\"max_cost_microusd\":0,\"max_fix_generations\":0}",
+    "receipt": {
+      "actor": "owner",
+      "admission_hash": "905c9002da65687e0f3f745fa7834000a39e5552d0c698dcbc32aeb13085c5e4",
+      "admission_sequence": 1,
+      "approval_revision": 1,
+      "authority_revision": 1,
+      "base_commit": "90029a88498594e527dcbc5df5a193df08f975ba",
+      "connector": "github-primary",
+      "database": "b2-w1-runtime-database",
+      "delivery_id": "cd27f0e69235c5feb2ef32da5965d2ea2e57589200886d0f02a13b0cf79d406b",
+      "generation": 1,
+      "grant_revision": 1,
+      "installation": "b2-w1-runtime-install",
+      "instance_revision": 1,
+      "issue": "w20",
+      "lifecycle": 1,
+      "order_id": "w20",
+      "pack_digest": "5f28e6c41d834462a93c1d77541b4d122baf58ac9c85c7674c9753d23436d8fc",
+      "repository": "repo:1",
+      "request_key": "approve-w20",
+      "scope_revision": 4,
+      "selection_revision": 1,
+      "snapshot_sha256": "9429afd22658fdd174864e4d150eb3611b3a14614890233d5d18c3b56830620e",
+      "source": "b2-w1-source",
+      "source_revision": 1,
+      "task_sha256": "4eb996e3139dba2adc6cf294ecce3cc5013706892fe9edf2046af359bca9437a"
+    }
+  }
+]

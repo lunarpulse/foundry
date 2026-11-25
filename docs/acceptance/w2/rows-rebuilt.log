@@ -1,0 +1,89 @@
++ cargo test --locked --offline -j1 -p foundry --features p2-test-support,product-pack-pins --test w2 -- --test-threads=1 --nocapture
+   Compiling foundry-ledger v0.1.0 (/home/cosmo/worktrees/foundry-w2-integration/crates/foundry-ledger)
+warning: function `nothing` is never used
+ --> crates/foundry-furnace/src/lib.rs:2:4
+  |
+2 | fn nothing() {}
+  |    ^^^^^^^
+  |
+  = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `foundry-furnace` (lib) generated 1 warning
+   Compiling foundry-line v0.1.0 (/home/cosmo/worktrees/foundry-w2-integration/crates/foundry-line)
+   Compiling foundry-watch v0.1.0 (/home/cosmo/worktrees/foundry-w2-integration/crates/foundry-watch)
+warning: unused import: `CostFields`
+  --> crates/foundry-watch/src/benchmark.rs:22:37
+   |
+22 | use crate::corpus::{CorpusManifest, CostFields};
+   |                                     ^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `foundry_domain::OrderState`
+  --> crates/foundry-watch/src/corpus_emit.rs:15:5
+   |
+15 | use foundry_domain::OrderState;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `Sha256`
+   --> crates/foundry-watch/src/dry_die.rs:101:28
+    |
+101 |         use sha2::{Digest, Sha256};
+    |                            ^^^^^^
+
+warning: unused import: `Sha256`
+   --> crates/foundry-watch/src/dry_die.rs:145:24
+    |
+145 |     use sha2::{Digest, Sha256};
+    |                        ^^^^^^
+
+warning: unused import: `std::os::unix::ffi::OsStrExt`
+  --> crates/foundry-watch/src/gc.rs:58:9
+   |
+58 |     use std::os::unix::ffi::OsStrExt;
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `foundry-watch` (lib) generated 5 warnings (run `cargo fix --lib -p foundry-watch` to apply 4 suggestions)
+   Compiling foundry-workflow v0.1.0 (/home/cosmo/worktrees/foundry-w2-integration/crates/foundry-workflow)
+   Compiling foundry-serve v0.1.0 (/home/cosmo/worktrees/foundry-w2-integration/crates/foundry-serve)
+warning: unused imports: `IdentityError` and `Role`
+  --> crates/foundry-serve/src/scope.rs:16:54
+   |
+16 | use crate::identity::{AuthenticatedUser, Capability, IdentityError, Role};
+   |                                                      ^^^^^^^^^^^^^  ^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `foundry-serve` (lib) generated 1 warning (run `cargo fix --lib -p foundry-serve` to apply 1 suggestion)
+   Compiling foundry-orch v0.1.0 (/home/cosmo/worktrees/foundry-w2-integration/crates/foundry-orch)
+warning: unused import: `foundry_domain::order as _`
+ --> crates/foundry-blueprint/src/lib.rs:3:5
+  |
+3 | use foundry_domain::order as _; // reserve: line→Order factory comes in T7
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `foundry-blueprint` (lib) generated 1 warning (run `cargo fix --lib -p foundry-blueprint` to apply 1 suggestion)
+   Compiling foundry v0.1.0 (/home/cosmo/worktrees/foundry-w2-integration/crates/foundry)
+    Finished `test` profile [unoptimized] target(s) in 34.90s
+     Running tests/w2.rs (/home/cosmo/.hermes/cache/scratch/w2-rebuild/target/debug/deps/w2-6c3992339f29af01)
+
+running 2 tests
+test w21_intake::disallowed_and_edited_observations ... E02b valid-first receipt={"actor":"owner","admission_hash":"c36e9bb0bd78b8a3b6391b4d20bab3f11e5b7122c3d40392fcb5f2c7768479d6","admission_sequence":10,"approval_revision":1,"authority_revision":1,"base_commit":"ab1602d5bc93d919bb2e2c1361268b1ae3c0ef4e","connector":"github-primary","database":"b2-w1-runtime-database","delivery_id":"5474627a0fcf9feb5449fd3f323450778a9fb36fc87fb87cc9d45d1d7fc1da1b","generation":1,"grant_revision":1,"installation":"b2-w1-runtime-install","instance_revision":1,"issue":"valid-first","lifecycle":1,"order_id":"p-05632b07fe3b8d46bfd93e970a77c06c616b36b4ca0bf472c4a62e277279c200","pack_digest":"5f28e6c41d834462a93c1d77541b4d122baf58ac9c85c7674c9753d23436d8fc","repository":"repo:1","request_key":"owner-p-05632b07fe3b8d46bfd93e970a77c06c616b36b4ca0bf472c4a62e277279c200","scope_revision":4,"selection_revision":1,"snapshot_sha256":"bb2f44b6bd62f8d41c5512288c54269c54839df9f97b102d0461686831e4c18d","source":"b2-w1-source","source_revision":1,"task_sha256":"4c2c40a67821ed502c83f324770dcabfc23fbe2b71a7580b195671ae15e0b16d"}
+E02b valid-first deliveries=["5474627a0fcf9feb5449fd3f323450778a9fb36fc87fb87cc9d45d1d7fc1da1b", "134c96b415b5af38194b169008d03ea6fd3f72ef42d1650e322c89005b0b7332"] admission=c36e9bb0bd78b8a3b6391b4d20bab3f11e5b7122c3d40392fcb5f2c7768479d6 order=p-05632b07fe3b8d46bfd93e970a77c06c616b36b4ca0bf472c4a62e277279c200
+E02b unsupported-first deliveries=["2483bf21674928f9601389aa58b91d0255f9f2388d18babf6c0baefa22d225ec", "1bc6a0d116ddaf7c032557bccce3af03d4a0156361e83ee3f9a010f5511527a4"] admission=e8102d243daaf21b8ba34eef3191707a4491a185ad6d51215359d9b5e0495e18 order=p-28c842e3f49eb2eb9c2bdf0c51fbec45696f00c001c88f2f3ea6139b31aec1c4
+E02 disallowed=9 claims=0 producer=0 review=0 grant=0 approval=0 canary_absent=true
+ok
+test w22_code_change::fenced_producer_and_loss_boundaries ... E04 six missing/partial config denials, three serve timeout denials, valid reserve, injected pre-seal loss; Die entries=0
+E03 independent reader base=82c05945da7cef4e58ee062cd943841a116fd07b head=9450bbc0326bf0e693cd44e7ba844f7bcf98d580 pack=5f28e6c41d834462a93c1d77541b4d122baf58ac9c85c7674c9753d23436d8fc epoch=1 fence=2 admission=e8bfb25eafe07eea41a0a5141d36721b72519ea4fda1f595f0555950672d34ae sealed_patch_bytes=180 sealed_sha256=0f814fe1d98112eddcecef676c8202038c2b45564dede044fe5921e1bf093217 finalized={"result_id":"c149d3072b0a47a011414126cf6575e066f9fdf16f04d3b6cf27cfc108b7df1b","order_id":"good","lifecycle":1,"attempt":1,"run_id":1,"activation":1,"generation":0,"base_commit":"82c05945da7cef4e58ee062cd943841a116fd07b","result_commit":"9450bbc0326bf0e693cd44e7ba844f7bcf98d580","host_result_digest":"bc11cf2e64293339306df217a55b83735dc79fa2f0d31042bf175a59e65fe502","tuple_digest":"2b4f574bc0a0e964b4dc14884330eca5570f8a298eb04613c72f546c3025c574","binding_digest":"01bc9b3b2272d1fca654ce663035fb3a7cc7ff628757a395202bcf10d2e4a02f","final_artifact_id":"bca941f0cb851177dac22fdf9ef9006660e19e79aa7da88988110d41e27f3009","artifact_ids":["bca941f0cb851177dac22fdf9ef9006660e19e79aa7da88988110d41e27f3009"],"finalized_at":"2026-11-25T06:12:44.959577392+00:00"}
+
+running 1 test
+E04 retry=1 tables_equal=82 git_object_files_equal=6 host_files_equal=5 producer_file_equal=1 schema_equal=true
+E04 retry=2 tables_equal=82 git_object_files_equal=6 host_files_equal=5 producer_file_equal=1 schema_equal=true
+E04 owned_child_signal=9 changed=["product_producer_events_v1", "product_producers_v1"] operation={"order_id":"loss","lifecycle":1,"operation_key":"lost-producer","state":"uncertain","worker":"code-change-598cbe934c86f855a3c4d05428c69b572c725ed0a533b267e400b631ea322014","epoch":1,"fence":3,"deadline":"2026-11-25T06:14:45.178233707+00:00","result_commit":"38150a10da8ae4eb7ac45e63d7e1061100593eac","artifact_sha256":"8c9a7e107e4b9767d034624c1b7aeecfa2a78c5e0aef8443fbbf4eaad7856a21"}
+E03 service revoke/ABA, lease expiry, reassignment and owner revoke/ABA rejected; retained finalized result=1 approval=0
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 36.97s
+

@@ -76,7 +76,13 @@ pub(super) struct IntakeArgs {
     #[arg(long)]
     order: String,
     #[arg(long)]
-    commit: String,
+    #[arg(
+        required_unless_present = "issue_snapshot",
+        conflicts_with = "issue_snapshot"
+    )]
+    commit: Option<String>,
+    #[arg(long)]
+    issue_snapshot: Option<PathBuf>,
     #[arg(long)]
     observed_updated_at: chrono::DateTime<Utc>,
 }
@@ -175,14 +181,33 @@ pub(super) fn intake(args: IntakeArgs) -> i32 {
                 .order
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-            || args.commit.len() != 40
-            || !args
-                .commit
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         {
             return Err(());
         }
+        let (kind, payload) = match (args.commit, args.issue_snapshot) {
+            (Some(commit), None)
+                if commit.len() == 40
+                    && commit
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) =>
+            {
+                (COMMIT_REVIEW_KIND, commit)
+            }
+            (None, Some(path)) => {
+                use std::io::Read;
+                let mut bytes = Vec::new();
+                std::fs::File::open(path)
+                    .map_err(|_| ())?
+                    .take(1_000_001)
+                    .read_to_end(&mut bytes)
+                    .map_err(|_| ())?;
+                if bytes.len() > 1_000_000 {
+                    return Err(());
+                }
+                ("github-issue", String::from_utf8(bytes).map_err(|_| ())?)
+            }
+            _ => return Err(()),
+        };
         let mut store = args.database.open()?;
         let service = args
             .source
@@ -200,8 +225,8 @@ pub(super) fn intake(args: IntakeArgs) -> i32 {
         let version = foundry_ledger::product::delivery_version_digest(
             &args.issue_id,
             &updated,
-            COMMIT_REVIEW_KIND,
-            &args.commit,
+            kind,
+            &payload,
         );
         let delivery_id = foundry_ledger::product::github_delivery_id(
             store.installation_id(),
@@ -218,8 +243,8 @@ pub(super) fn intake(args: IntakeArgs) -> i32 {
             issue_id: args.issue_id,
             observed_updated_at: updated.clone(),
             version_digest: version,
-            task_kind: COMMIT_REVIEW_KIND.into(),
-            payload: args.commit,
+            task_kind: kind.into(),
+            payload,
         };
         let cursor = foundry_ledger::ProductPollCursor {
             connector_id: args.source.connector,
@@ -475,4 +500,132 @@ pub(super) fn decide_hold(
     } else {
         1
     }
+}
+
+#[derive(Args)]
+pub(super) struct TaskArgs {
+    #[command(flatten)]
+    database: Database,
+    #[arg(long)]
+    session_file: String,
+    #[arg(long)]
+    order: String,
+    #[arg(long)]
+    lifecycle: i64,
+    #[arg(long)]
+    admission_hash: String,
+    #[arg(long)]
+    task_sha256: String,
+    #[arg(long)]
+    request_key: String,
+}
+
+pub(super) fn task(args: TaskArgs) -> i32 {
+    report((|| {
+        let session = sha256_hex(read_private(&args.session_file).map_err(|_| ())?.as_bytes());
+        let receipt = args
+            .database
+            .open()?
+            .authorize_code_change(
+                &session,
+                &args.order,
+                args.lifecycle,
+                &args.admission_hash,
+                &args.task_sha256,
+                &args.request_key,
+            )
+            .map_err(|_| ())?;
+        serde_json::to_value(receipt).map_err(|_| ())
+    })())
+}
+
+#[derive(Args)]
+pub(super) struct ProducerArgs {
+    #[command(flatten)]
+    database: Database,
+    #[command(flatten)]
+    source: Source,
+    #[arg(long,value_parser=["reserve","seal","collect","status","recover"])]
+    action: String,
+    #[arg(long)]
+    order: String,
+    #[arg(long)]
+    request_key: String,
+    #[arg(long, required_if_eq("action", "seal"))]
+    commit: Option<String>,
+}
+
+/// An operator can inspect and reconcile a reservation after restart. The
+/// offline producer interface never invokes a Die or starts a model.
+pub(super) fn producer(args: ProducerArgs) -> i32 {
+    report((|| {
+        let mut store = args.database.open()?;
+        let service = args.source.authenticate(
+            &mut store,
+            foundry_ledger::ProductServiceAction::DriveReview,
+        )?;
+        if args.action != "seal" && args.commit.is_some() {
+            return Err(());
+        }
+        let order = &args.order;
+        let key = &args.request_key;
+        match args.action.as_str() {
+            "reserve" => {
+                use foundry_line::StageExecutor;
+                let r = store
+                    .code_change_for_producer(&service, order)
+                    .map_err(|_| ())?;
+                let config = registry()?;
+                if !config.snapshots.contains_key(&r.pack_digest) {
+                    return Err(());
+                }
+                let repo = std::env::var_os("FOUNDRY_REPO_PATH").ok_or(())?;
+                let binary = std::env::var_os("FOUNDRY_DIE_BINARY").ok_or(())?;
+                foundry_line::DieStageExecutor::new(
+                    binary.into(),
+                    "coding".into(),
+                    foundry_line::DieStageExecutor::configured_timeout().map_err(|_| ())?,
+                    repo.into(),
+                    PathBuf::new(),
+                )
+                .ensure_available()
+                .map_err(|_| ())?;
+                require_local_commit(&r.base_commit)?;
+                store = store.with_product_registry(config);
+                store
+                    .reserve_code_change(&service, order, key)
+                    .map_err(|_| ())?;
+            }
+            "seal" => {
+                let repo = PathBuf::from(std::env::var_os("FOUNDRY_REPO_PATH").ok_or(())?);
+                store
+                    .seal_code_change(
+                        &service,
+                        order,
+                        key,
+                        &repo,
+                        args.commit.as_deref().ok_or(())?,
+                    )
+                    .map_err(|_| ())?;
+            }
+            "collect" => {
+                store
+                    .collect_code_change(&service, order, key)
+                    .map_err(|_| ())?;
+            }
+            "recover" => {
+                store
+                    .mark_code_change_uncertain(&service, order, key)
+                    .map_err(|_| ())?;
+            }
+            "status" => {}
+            _ => return Err(()),
+        }
+        serde_json::to_value(
+            store
+                .code_change_status(&service, order, key)
+                .map_err(|_| ())?,
+        )
+        .map_err(|_| ())
+    })())
 }

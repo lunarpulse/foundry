@@ -1,0 +1,16 @@
+Intake verified from saved rows: 13 first observations, 15 acknowledgements, one owner task, zero downstream effects.
+{
+  "tables": 82,
+  "changed": [
+    "product_producer_events_v1",
+    "product_producers_v1"
+  ],
+  "retries_equal": 2,
+  "retained_review_and_producer_files": 6,
+  "bundles_verified": 2,
+  "finalized_head": "8fc5516e0f225e71de8e9bffe9f9addff333632d",
+  "tuple_sha256": "a40a1f42c11d06458620e306521cf2474a843a49f2dba63eb744afd270f8a7a5",
+  "sealed_patch_sha256": "0f814fe1d98112eddcecef676c8202038c2b45564dede044fe5921e1bf093217",
+  "original_collection_missing_denial": "see exact Cargo test",
+  "owner_withdrawal_database_and_files_equal": true
+}

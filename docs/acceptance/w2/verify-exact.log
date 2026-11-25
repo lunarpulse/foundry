@@ -1,0 +1,15 @@
+{
+  "tables": 82,
+  "changed": [
+    "product_producer_events_v1",
+    "product_producers_v1"
+  ],
+  "retries_equal": 2,
+  "retained_review_and_producer_files": 6,
+  "bundles_verified": 2,
+  "finalized_head": "59951eef0813f7af50483dd050496cf4c818edca",
+  "tuple_sha256": "067dba8debd9678bbb5e57c6f0d3db16d1c7370573451ca0f7efb3019446f155",
+  "sealed_patch_sha256": "0f814fe1d98112eddcecef676c8202038c2b45564dede044fe5921e1bf093217",
+  "original_collection_missing_denial": "see exact Cargo test",
+  "owner_withdrawal_database_and_files_equal": true
+}

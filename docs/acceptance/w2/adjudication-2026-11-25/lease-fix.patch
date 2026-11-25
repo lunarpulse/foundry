@@ -1,0 +1,143 @@
+diff --git a/crates/foundry-ledger/src/product/code_change.rs b/crates/foundry-ledger/src/product/code_change.rs
+index a9e1b59b2bd5c556e0e050cfe9c11995c369b98a..084bc84c945db42004e65690876df4d101da831e 100644
+--- a/crates/foundry-ledger/src/product/code_change.rs
++++ b/crates/foundry-ledger/src/product/code_change.rs
+@@ -478,7 +478,7 @@ fn claim_in(
+         JOIN product_orders_v1 o USING(order_id) JOIN product_work_claims_v1 c ON c.order_id=p.order_id AND c.lifecycle=o.lifecycle
+         JOIN product_work_backlog_v1 b ON b.order_id=c.order_id AND b.lifecycle=c.lifecycle AND b.state=c.state
+         WHERE p.order_id=?1 AND p.service_revision=?2 AND p.credential_revision=?3 AND c.owner_id=p.worker AND c.epoch=p.epoch AND c.fence=p.fence
+-        AND c.state='claimed' AND c.source_revision=?4 AND b.delivery_id=?5",
++        AND c.state='claimed' AND c.lease_until=p.deadline AND c.source_revision=?4 AND b.delivery_id=?5",
+         params![p.order_id,service.service_revision,service.credential_revision,r.source_revision,r.delivery_id],|row|Ok((row.get(0)?,row.get(1)?)))?;
+     let claim = ProductWorkClaim {
+         order_id: p.order_id.clone(),
+@@ -758,7 +758,15 @@ pub(super) fn check_adapter_claim(
+     now: DateTime<Utc>,
+ ) -> Result<(), ProductError> {
+     load_task(tx, &claim.order_id)?;
+-    let exact:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM product_producers_v1 WHERE order_id=?1 AND worker=?2 AND epoch=?3 AND fence=?4 AND deadline>?5 AND state='reserved')",params![claim.order_id,claim.worker_id,claim.epoch,claim.fence,now.to_rfc3339()],|r|r.get(0))?;
++    let exact: bool = tx.query_row(
++        "SELECT EXISTS(SELECT 1 FROM product_producers_v1 p
++         JOIN product_work_claims_v1 c ON c.order_id=p.order_id AND c.lifecycle=?2
++         WHERE p.order_id=?1 AND p.worker=?3 AND p.epoch=?4 AND p.fence=?5
++           AND p.state='reserved' AND p.deadline=?6 AND c.lease_until=p.deadline AND p.deadline>?7)",
++        params![claim.order_id, claim.lifecycle, claim.worker_id, claim.epoch, claim.fence,
++                claim.lease_until.to_rfc3339(), now.to_rfc3339()],
++        |row| row.get(0),
++    )?;
+     if !exact {
+         return Err(denied());
+     }
+diff --git a/crates/foundry/tests/w2.rs b/crates/foundry/tests/w2.rs
+index c8216bc3d2056b598a27671aa9d0fb4f76729015..4ef5f2d38005b7d627477fff2e2ea0b24ec79c20 100644
+--- a/crates/foundry/tests/w2.rs
++++ b/crates/foundry/tests/w2.rs
+@@ -864,6 +864,7 @@ mod w22_code_change {
+         let sealed = store
+             .seal_code_change(service, "good", "produce-good", &f.repo, &f.head)
+             .unwrap();
++        assert_stale_operations_refused(&mut at_deadline(&f, &claim), &f, "good", "produce-good");
+         let (intent, claim, binding) = store
+             .collect_code_change(service, "good", "produce-good")
+             .unwrap();
+@@ -1057,6 +1058,41 @@ mod w22_code_change {
+             .execute("VACUUM INTO ?1", [dst.to_str().unwrap()])
+             .unwrap();
+     }
++
++    fn assert_stale_operations_refused(
++        store: &mut ProductStore,
++        f: &Fixture,
++        order: &str,
++        key: &str,
++    ) {
++        let before = snapshot(&f.f.db_path);
++        assert!(store.reserve_code_change(&f.f.service, order, key).is_err());
++        assert!(
++            store
++                .seal_code_change(&f.f.service, order, key, &f.repo, &f.head)
++                .is_err()
++        );
++        assert!(store.collect_code_change(&f.f.service, order, key).is_err());
++        assert!(before == snapshot(&f.f.db_path));
++    }
++
++    fn at_deadline(f: &Fixture, claim: &foundry_ledger::ProductWorkClaim) -> ProductStore {
++        struct Later(chrono::DateTime<Utc>);
++        impl ProductClock for Later {
++            fn now(&self) -> chrono::DateTime<Utc> {
++                self.0
++            }
++        }
++        ProductStore::open_with_clock(
++            &f.f.db_path,
++            f.f.config.clone(),
++            Arc::new(Later(claim.lease_until())),
++        )
++        .unwrap()
++        .with_product_registry(foundry_ledger::PackRegistryConfig {
++            snapshots: [(f.pack.clone(), f.f.pack.clone())].into(),
++        })
++    }
+     fn source_boundaries(f: &Fixture, claim: &foundry_ledger::ProductWorkClaim) {
+         let db = f.f.root.0.join("source-control.db");
+         private_copy(&f.f.db_path, &db);
+@@ -1127,20 +1163,29 @@ mod w22_code_change {
+                 .validate_product_work_claim(&claim, claim.lease_until())
+                 .is_err()
+         );
+-        struct Later(chrono::DateTime<Utc>);
+-        impl ProductClock for Later {
+-            fn now(&self) -> chrono::DateTime<Utc> {
+-                self.0
+-            }
+-        }
+-        let mut later = ProductStore::open_with_clock(
+-            &f.f.db_path,
+-            f.f.config.clone(),
+-            Arc::new(Later(claim.lease_until())),
+-        )
+-        .unwrap();
++        assert_stale_operations_refused(&mut at_deadline(f, &claim), f, "stale", "stale-producer");
++        let copy = f.f.root.0.join("lease-control.db");
++        private_copy(&f.f.db_path, &copy);
++        let mut copy_store = ProductStore::open(&copy, f.f.config.clone()).unwrap();
++        let now = Utc::now();
++        copy_store.validate_product_work_claim(&claim, now).unwrap();
++        let extended = claim.lease_until() + Duration::seconds(1);
++        assert_eq!(
++            Connection::open(&copy)
++                .unwrap()
++                .execute(
++                    "UPDATE product_work_claims_v1 SET lease_until=?1 WHERE order_id='stale'",
++                    [extended.to_rfc3339()],
++                )
++                .unwrap(),
++            1
++        );
++        assert!(
++            copy_store.validate_product_work_claim(&claim, now).is_err(),
++            "a live but different lease passed the adapter check"
++        );
+         assert!(
+-            later
++            copy_store
+                 .seal_code_change(service, "stale", "stale-producer", &f.repo, &f.head)
+                 .is_err()
+         );
+@@ -1153,11 +1198,15 @@ mod w22_code_change {
+             )
+             .unwrap();
+         assert!(matches!(next, ProductWorkClaimResult::Claimed(ref c) if c.order_id()=="stale"));
++        assert_stale_operations_refused(&mut store, f, "stale", "stale-producer");
+         assert!(
+             store
+                 .validate_product_work_claim(&claim, Utc::now())
+                 .is_err()
+         );
++        println!(
++            "E03 exact live lease mismatch refused; expired and reassigned reserve/seal/collect refused with equal database snapshots"
++        );
+         f.approved("service-revoke");
+         let worker = store
+             .reserve_code_change(service, "service-revoke", "service-producer")

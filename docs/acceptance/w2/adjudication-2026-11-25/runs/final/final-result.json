@@ -1,0 +1,108 @@
+{
+  "accepted_holds": [],
+  "admission_hash": "ba70149cdc89ba975af70413257ed4b22dc49cb4c14fc904a664da397192a915",
+  "admission_seq": 3,
+  "artifacts": [
+    {
+      "admission_hash": "ba70149cdc89ba975af70413257ed4b22dc49cb4c14fc904a664da397192a915",
+      "admission_seq": 3,
+      "artifact_id": "9f9cc0f4b794c0ed708f2134cac9707352131d582aa724bb151008f9b8a67cd4",
+      "artifact_sha256": "6c59b7f00d8430a82d45d226a6925d0c70cd00866ff8a4975a4ce8a1d6157a23",
+      "attempt": 1,
+      "generation": 0,
+      "journal_run": "good:1:1:1",
+      "lifecycle": 1,
+      "order_id": "good",
+      "output_json": "{\"deferred\":false,\"findings\":false,\"input_manifest\":null,\"inspected_commit\":\"8fc5516e0f225e71de8e9bffe9f9addff333632d\",\"log_path\":\"/home/cosmo/.hermes/cache/scratch/w2-rebuild/tmp/b2-w1-runtime-228-2-1795588008682055396/artifacts/60569750b787fcde7801c1b6f70a8e577b343f563b4b6fe46fbcc5634547f67e/exec/1-1/0/accepted-output\",\"produced_commit\":null,\"role\":\"verify\",\"sha256\":\"6c59b7f00d8430a82d45d226a6925d0c70cd00866ff8a4975a4ce8a1d6157a23\",\"verdicts\":[]}",
+      "pack_digest": "5f28e6c41d834462a93c1d77541b4d122baf58ac9c85c7674c9753d23436d8fc",
+      "provenance_digest": "b34481d56f665ad26ec6b25a715bc21dd16849755d767435fdd9868861bb725d",
+      "relative_path": "60569750b787fcde7801c1b6f70a8e577b343f563b4b6fe46fbcc5634547f67e/exec/1-1/0/accepted-output",
+      "repository_key": "95a9c99cec2a60af370bc1a74e6f8292154f0f63db248554191a392aa1147b8c",
+      "source_instance_id": "b2-w1-source",
+      "stage_id": "lens-a",
+      "stage_sequence": 1
+    }
+  ],
+  "binary_provenance": {
+    "executable": "/home/cosmo/.hermes/cache/scratch/w2-rebuild/target/debug/deps/w2-6c3992339f29af01",
+    "pack_digest": "5f28e6c41d834462a93c1d77541b4d122baf58ac9c85c7674c9753d23436d8fc",
+    "sha256": "2922e1bab224b93e8eaac1f5687b5bde05e19eef275dda4cef17b7b2999d2531",
+    "source_commit": "e3631b1ba40511159b58ff7b2c2c0817a44d2cc5"
+  },
+  "database_id": "b2-w1-runtime-database",
+  "final_artifact_id": "9f9cc0f4b794c0ed708f2134cac9707352131d582aa724bb151008f9b8a67cd4",
+  "finalized_at": "2026-11-25T06:27:03.417180755+00:00",
+  "host_result": {
+    "base_commit": "a85d19ff6bc1f7a70602584bf88a0ceca44cc57d",
+    "exit_code": 0,
+    "generations": [
+      {
+        "commit": "8fc5516e0f225e71de8e9bffe9f9addff333632d",
+        "fix_log_path": "",
+        "generation": 0
+      }
+    ],
+    "held": null,
+    "log_path": "/home/cosmo/.hermes/cache/scratch/w2-rebuild/tmp/b2-w1-runtime-228-2-1795588008682055396/artifacts/60569750b787fcde7801c1b6f70a8e577b343f563b4b6fe46fbcc5634547f67e/exec/1-1/0/accepted-output",
+    "result_commit": "8fc5516e0f225e71de8e9bffe9f9addff333632d"
+  },
+  "host_result_digest": "9dc404b469004174fa508e7c55296ea77572872807c5d9758c1b397f051c504d",
+  "installation_id": "b2-w1-runtime-install",
+  "intent": {
+    "activation": 1,
+    "attempt": 1,
+    "epoch": 2,
+    "external_ref": "review:good:1:a85d19ff6bc1f7a70602584bf88a0ceca44cc57d..8fc5516e0f225e71de8e9bffe9f9addff333632d",
+    "generation": 0,
+    "order": "good",
+    "recorded_at": "2026-11-25T06:27:02.009607650Z",
+    "run": 1
+  },
+  "journal_run": "good:1:1:1",
+  "lifecycle": 1,
+  "order_id": "good",
+  "repository_key": "95a9c99cec2a60af370bc1a74e6f8292154f0f63db248554191a392aa1147b8c",
+  "s1_event_hash": "f79fd375fda5d06870cb61c06a3ead3e3d7ea59032c9af71836b70a0fc1fe9c9",
+  "s1_sequence": 6,
+  "source_generation": 1,
+  "source_instance_id": "b2-w1-source",
+  "source_instance_revision": 1,
+  "source_revision": 1,
+  "tuple": {
+    "artifact_location": "/home/cosmo/.hermes/cache/scratch/w2-rebuild/tmp/b2-w1-runtime-228-2-1795588008682055396/artifacts/60569750b787fcde7801c1b6f70a8e577b343f563b4b6fe46fbcc5634547f67e/exec/1-1/0/accepted-output",
+    "attempt": 1,
+    "generation": 0,
+    "generations": [
+      {
+        "commit": "8fc5516e0f225e71de8e9bffe9f9addff333632d",
+        "fix_log_path": "",
+        "generation": 0
+      }
+    ],
+    "immutable_commit": "8fc5516e0f225e71de8e9bffe9f9addff333632d",
+    "order": "good",
+    "run": 1
+  },
+  "tuple_digest": "a40a1f42c11d06458620e306521cf2474a843a49f2dba63eb744afd270f8a7a5",
+  "version": 1,
+  "work": {
+    "authority": {
+      "connector_revision": 1,
+      "credential_revision": 1,
+      "drive_review_grant_revision": 1,
+      "service_id": "b2-w1-service",
+      "service_revision": 1,
+      "source_generation": 1,
+      "source_instance_id": "b2-w1-source",
+      "source_instance_revision": 1
+    },
+    "claim_epoch": 1,
+    "claim_fence": 2,
+    "delivery_id": "805bad2ebfa7a6f5b42ba76d5256295f442e7422ecb83162afbc55c250b91b9f",
+    "payload_digest": "05306398f2361e104cd0e97cf161d5521850564b47e906d4299166cc02ca4a83",
+    "payload_snapshot": "{\"body\":\"{\\\"kind\\\":\\\"code-change-v1\\\",\\\"request\\\":\\\"Add a line\\\",\\\"acceptance\\\":[\\\"README updated\\\"],\\\"base_commit\\\":\\\"a85d19ff6bc1f7a70602584bf88a0ceca44cc57d\\\",\\\"pack_digest\\\":\\\"5f28e6c41d834462a93c1d77541b4d122baf58ac9c85c7674c9753d23436d8fc\\\",\\\"allowed_paths\\\":[\\\"README\\\"],\\\"checks\\\":[{\\\"argv\\\":[\\\"git\\\",\\\"diff\\\",\\\"--check\\\"],\\\"timeout_secs\\\":5}],\\\"total_timeout_secs\\\":120,\\\"model\\\":\\\"none\\\",\\\"max_model_calls\\\":0,\\\"max_cost_microusd\\\":0,\\\"max_fix_generations\\\":0}\",\"issue_number\":17,\"title\":\"first\"}",
+    "source_revision": 1,
+    "task_kind": "github-issue",
+    "worker_id": "code-change-f77ff3c9b553e57085cf430096f3672a9f5d4415c0429e4784b16207342371fa"
+  }
+}

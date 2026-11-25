@@ -848,6 +848,17 @@ impl ProductStore {
         if state != "waiting" {
             return Err(ProductResultError::StaleBinding);
         }
+        #[cfg(feature = "product-pack-pins")]
+        if super::code_change::enabled_for(&tx, &order_id).map_err(service_result_error)? {
+            let (task, producer) = super::code_change::collected(&tx, &order_id)
+                .map_err(|_| ProductResultError::StaleBinding)?;
+            if task.base_commit != host.base_commit
+                || producer.result_commit.as_ref() != Some(&host.result_commit)
+                || producer.fence != own_active_epoch
+            {
+                return Err(ProductResultError::InvalidEvidence);
+            }
+        }
         let work: Option<(String,String,i64,i64,i64,String,String,String)> = tx.query_row(
             "SELECT delivery_id,worker_id,claim_epoch,claim_fence,source_revision,payload_digest,task_kind,payload_snapshot FROM product_review_work_bindings_v1 WHERE order_id=?1 AND attempt=?2 AND run_id=?3",
             params![order_id,attempt,journal_run],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?)),

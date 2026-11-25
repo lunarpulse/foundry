@@ -1,0 +1,6 @@
+103 SHA256SUMS
+f3c865e90ce5b2082da649d6bf3d0ef2794036cb7a80a7fb4d578fd3fe2fd03b  contract.md
+2849b2ecdaafa96e522a91f84e8f8f071cb43d56907ab87829eda8b1057e4882  oracle.md
+71187cdb3ffa8dfdcfea7fabbac79812e921d9f3fcec3979ec65a036986ea080  w2.patch
+677e051e6d56d744f2b22a57fbf53d80b402c21d04a11a83f0c1ffe1119e3ccf  SHA256SUMS
+Original manifest matched. Both original reader outputs reproduced byte-for-byte.

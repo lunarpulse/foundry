@@ -1,0 +1,3122 @@
+diff --git a/crates/foundry-ledger/src/product.rs b/crates/foundry-ledger/src/product.rs
+index 8ece055ac1aa18ca0e4e65860e572a7c265062f7..46a3c31131d418e170340d35c9b18057baafb3b3 100644
+--- a/crates/foundry-ledger/src/product.rs
++++ b/crates/foundry-ledger/src/product.rs
+@@ -373,6 +373,8 @@ pub struct ProductConfig {
+     pub database_id: String,
+ }
+ 
++#[cfg(feature = "product-pack-pins")]
++pub mod code_change;
+ #[cfg(feature = "product-pack-pins")]
+ mod commit_review;
+ #[cfg(feature = "product-pack-pins")]
+@@ -4457,6 +4459,8 @@ fn open_internal_with_checkpoint(
+         if tuple_digest != intent.tuple_digest {
+             return Err(ProductError::Invariant("strict result tuple mismatch"));
+         }
++        #[cfg(feature = "product-pack-pins")]
++        code_change::require_approval_collection(&tx, intent, self.clock.now())?;
+         let artifact_digest = intent.artifact_digest.clone();
+         let seq: i64 = tx.query_row("SELECT COALESCE(MAX(seq),0)+1 FROM ledger", [], |r| {
+             r.get(0)
+@@ -4839,6 +4843,23 @@ fn open_internal_with_checkpoint(
+                 } else {
+                     tx.execute("INSERT INTO product_intake_source_bindings_v1(delivery_id,source_instance_id,source_revision,source_instance_revision,source_generation) VALUES(?1,?2,?3,?4,?5)",params![item.delivery_id,context.source_instance_id,context.connector_revision,context.source_instance_revision,context.source_generation])?;
+                 }
++                #[cfg(feature = "product-pack-pins")]
++                if item.task_kind == "github-issue"
++                    && self.open_mode == StoreOpenMode::Normal
++                    && tx.query_row(
++                        "SELECT schema_version=4 FROM product_meta_v1 WHERE singleton=1",
++                        [],
++                        |r| r.get::<_, bool>(0),
++                    )?
++                {
++                    code_change::pin_first_observation(
++                        &tx,
++                        &context.source_instance_id,
++                        &item.connector_id,
++                        &item.repository_id,
++                        &item.issue_id,
++                    )?;
++                }
+             }
+         }
+         for digest in rejected_item_digests {
+@@ -5005,7 +5026,7 @@ fn open_internal_with_checkpoint(
+                 "intake service scope is not provisioned",
+             ));
+         }
+-        let mut stmt = self.conn.prepare("SELECT i.delivery_id,i.connector_id,i.repository_id,i.issue_id,m.observed_updated_at,i.version_digest,m.task_kind,i.payload,i.state,i.retry_at FROM product_intake_inbox_v1 i JOIN product_intake_delivery_meta_v1 m USING(delivery_id) WHERE i.state IN ('fetched','retryable','admitted') AND (i.retry_at IS NULL OR i.retry_at<=?1) ORDER BY i.delivery_id LIMIT ?2")?;
++        let mut stmt = self.conn.prepare("SELECT i.delivery_id,i.connector_id,i.repository_id,i.issue_id,m.observed_updated_at,i.version_digest,m.task_kind,i.payload,i.state,i.retry_at FROM product_intake_inbox_v1 i JOIN product_intake_delivery_meta_v1 m USING(delivery_id) WHERE i.state IN ('fetched','retryable','admitted') AND (i.retry_at IS NULL OR i.retry_at<=?1) ORDER BY i.rowid LIMIT ?2")?;
+         let rows = stmt
+             .query_map(params![now.to_rfc3339(), limit as i64], |r| {
+                 Ok(crate::product_intake::DueDelivery {
+@@ -5043,7 +5064,7 @@ fn open_internal_with_checkpoint(
+             ProductServiceAction::AdmitDelivery,
+             now,
+         )?;
+-        let mut stmt = tx.prepare("SELECT i.delivery_id,i.connector_id,i.repository_id,i.issue_id,m.observed_updated_at,i.version_digest,m.task_kind,i.payload,i.state,i.retry_at FROM product_intake_inbox_v1 i JOIN product_intake_delivery_meta_v1 m USING(delivery_id) JOIN product_intake_source_bindings_v1 b USING(delivery_id) WHERE i.connector_id=?1 AND i.repository_id=?2 AND b.source_instance_id=?3 AND b.source_revision=?4 AND b.source_instance_revision=?5 AND b.source_generation=?6 AND i.state IN ('fetched','retryable','admitted') AND (i.retry_at IS NULL OR i.retry_at<=?7) ORDER BY i.delivery_id LIMIT ?8")?;
++        let mut stmt = tx.prepare("SELECT i.delivery_id,i.connector_id,i.repository_id,i.issue_id,m.observed_updated_at,i.version_digest,m.task_kind,i.payload,i.state,i.retry_at FROM product_intake_inbox_v1 i JOIN product_intake_delivery_meta_v1 m USING(delivery_id) JOIN product_intake_source_bindings_v1 b USING(delivery_id) WHERE i.connector_id=?1 AND i.repository_id=?2 AND b.source_instance_id=?3 AND b.source_revision=?4 AND b.source_instance_revision=?5 AND b.source_generation=?6 AND i.state IN ('fetched','retryable','admitted') AND (i.retry_at IS NULL OR i.retry_at<=?7) ORDER BY i.rowid LIMIT ?8")?;
+         let rows = stmt
+             .query_map(
+                 params![
+@@ -5201,6 +5222,39 @@ fn open_internal_with_checkpoint(
+             tx.commit()?;
+             return Ok(receipt);
+         }
++        // A caller may request an edit directly before the drain sees the
++        // original. Only the first persisted observation can anchor the order.
++        let first: String = tx.query_row(
++            "SELECT i.delivery_id FROM product_intake_inbox_v1 i
++             LEFT JOIN product_intake_source_bindings_v1 b USING(delivery_id)
++             WHERE i.connector_id=?1 AND i.repository_id=?2 AND i.issue_id=?3
++               AND b.source_instance_id IS ?4 ORDER BY i.rowid LIMIT 1",
++            params![
++                connector,
++                repository_id,
++                issue_id,
++                service.map(|s| &s.source_instance_id)
++            ],
++            |r| r.get(0),
++        )?;
++        #[cfg(feature = "product-pack-pins")]
++        let first = if task_kind == "github-issue"
++            && service.is_some()
++            && tx.query_row(
++                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='product_issue_first_v1')",
++                [],
++                |r| r.get::<_, bool>(0),
++            )? {
++            tx.query_row("SELECT delivery FROM product_issue_first_v1 WHERE source=?1 AND connector=?2 AND repository=?3 AND issue=?4",
++                params![service.map(|s| &s.source_instance_id),connector,repository_id,issue_id],|r|r.get(0)).optional()?.unwrap_or(first)
++        } else {
++            first
++        };
++        if first != delivery_id {
++            return Err(ProductError::Invariant(
++                "first issue observation awaits admission",
++            ));
++        }
+         let receipt = admit_order_in(
+             &tx,
+             order_id,
+@@ -5543,8 +5597,20 @@ fn open_internal_with_checkpoint(
+         lease: chrono::Duration,
+     ) -> Result<ProductWorkClaimResult, ProductError> {
+         service::require_service_context_in(tx, context, ProductServiceAction::DriveReview, now)?;
++        // An expired lease cannot put a sealed, collected or uncertain
++        // producer back on the generic watch queue. Historical stores have
++        // no producer journal until their first explicit task authorization.
++        let has_journal: bool = tx.query_row(
++            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='product_producers_v1')",
++            [], |r| r.get(0),
++        )?;
++        let producer_filter = if has_journal {
++            "AND NOT EXISTS(SELECT 1 FROM product_producers_v1 p WHERE p.order_id=o.order_id AND p.state!='reserved')"
++        } else {
++            ""
++        };
+         let candidate: Option<(String,i64,String,String,String,i64,i64,String,i64,i64,i64,Option<String>)> = tx.query_row(
+-            "SELECT o.order_id,o.lifecycle,b.delivery_id,o.task_kind,o.payload_snapshot,o.source_revision,o.admission_seq,o.admission_hash,s.revision,s.enabled,COALESCE(c.epoch,0),c.lease_until FROM product_work_backlog_v1 b JOIN product_orders_v1 o ON o.order_id=b.order_id AND o.lifecycle=b.lifecycle JOIN product_sources_v1 s ON s.connector_id=o.connector_id JOIN product_scope_order_provenance_v1 p ON p.order_id=o.order_id AND p.lifecycle=o.lifecycle AND p.verified=1 AND p.source_instance_id=?2 LEFT JOIN product_work_claims_v1 c ON c.order_id=b.order_id AND c.lifecycle=b.lifecycle WHERE o.connector_id=?3 AND o.repository_id=?4 AND (b.state IN ('ready','retryable') OR (b.state IN ('claimed','completed') AND (c.lease_until IS NULL OR c.lease_until<=?1))) AND ((?5 IS NULL AND (?6 IS NULL OR o.task_kind!=?6 OR c.owner_id IS NULL OR c.owner_id NOT GLOB 'commit-review-*' OR (SELECT schema_version FROM product_meta_v1 WHERE singleton=1)!=4)) OR o.order_id=?5) AND b.available_at<=?1 ORDER BY b.available_at,o.order_id LIMIT 1",
++            &format!("SELECT o.order_id,o.lifecycle,b.delivery_id,o.task_kind,o.payload_snapshot,o.source_revision,o.admission_seq,o.admission_hash,s.revision,s.enabled,COALESCE(c.epoch,0),c.lease_until FROM product_work_backlog_v1 b JOIN product_orders_v1 o ON o.order_id=b.order_id AND o.lifecycle=b.lifecycle JOIN product_sources_v1 s ON s.connector_id=o.connector_id JOIN product_scope_order_provenance_v1 p ON p.order_id=o.order_id AND p.lifecycle=o.lifecycle AND p.verified=1 AND p.source_instance_id=?2 LEFT JOIN product_work_claims_v1 c ON c.order_id=b.order_id AND c.lifecycle=b.lifecycle WHERE o.connector_id=?3 AND o.repository_id=?4 AND (b.state IN ('ready','retryable') OR (b.state IN ('claimed','completed') AND (c.lease_until IS NULL OR c.lease_until<=?1))) AND ((?5 IS NULL AND (?6 IS NULL OR o.task_kind!=?6 OR c.owner_id IS NULL OR c.owner_id NOT GLOB 'commit-review-*' OR (SELECT schema_version FROM product_meta_v1 WHERE singleton=1)!=4)) OR o.order_id=?5) {producer_filter} AND b.available_at<=?1 ORDER BY b.available_at,o.order_id LIMIT 1"),
+             params![now.to_rfc3339(),context.source_instance_id,context.connector_id,context.repository_id,requested_order,if cfg!(feature="product-pack-pins"){Some("local-commit-review-v1")}else{None}], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?,r.get(11)?)),
+         ).optional()?;
+         let Some((
+@@ -5636,7 +5702,8 @@ fn open_internal_with_checkpoint(
+         }
+         #[cfg(feature = "w1-isolated-test-support")]
+         if self.open_mode.is_pin() { return Err(ProductError::ContractMismatch); }
+-        let exact: bool = self.conn.query_row(
++        let tx = self.conn.unchecked_transaction()?;
++        let exact: bool = tx.query_row(
+             "SELECT EXISTS(SELECT 1 FROM product_work_claims_v1 c JOIN product_work_backlog_v1 b ON b.order_id=c.order_id AND b.lifecycle=c.lifecycle JOIN product_orders_v1 o ON o.order_id=c.order_id AND o.lifecycle=c.lifecycle JOIN product_sources_v1 s ON s.connector_id=o.connector_id JOIN product_transition_receipts_v1 r ON r.seq=o.admission_seq AND r.event_hash=o.admission_hash WHERE c.order_id=?1 AND c.lifecycle=?2 AND c.owner_id=?3 AND c.epoch=?4 AND c.fence=?5 AND c.state='claimed' AND c.lease_until>?6 AND c.source_revision=?7 AND s.revision=?7 AND s.enabled=1 AND b.state='claimed' AND b.delivery_id=?8 AND c.payload_digest=?9 AND o.task_kind=?10 AND o.payload_snapshot=?11 AND r.operation='github-admission')",
+             params![claim.order_id,claim.lifecycle,claim.worker_id,claim.epoch,claim.fence,now.to_rfc3339(),claim.source_revision,claim.delivery_id,claim.payload_digest,claim.task_kind,claim.payload_snapshot], |r| r.get(0),
+         )?;
+@@ -5645,6 +5712,12 @@ fn open_internal_with_checkpoint(
+                 "work claim is stale, expired, or no longer authorized",
+             ));
+         }
++        #[cfg(feature = "product-pack-pins")]
++        if code_change::enabled_for(&tx, &claim.order_id)? {
++            code_change::check_adapter_claim(&tx, claim, now)?;
++        }
++        service::validate_review_work_claim_in(&tx, &claim.review_binding(), now)?;
++        tx.commit()?;
+         Ok(())
+     }
+ 
+diff --git a/crates/foundry-ledger/src/product/commit_review.rs b/crates/foundry-ledger/src/product/commit_review.rs
+index 2871957d4a3355d12d40f7155294312fdefde26c..d53bf0527f1eec20b3abec63c067bf06be7b7dbb 100644
+--- a/crates/foundry-ledger/src/product/commit_review.rs
++++ b/crates/foundry-ledger/src/product/commit_review.rs
+@@ -354,7 +354,7 @@ impl ProductStore {
+     }
+ }
+ 
+-fn append_execution_transition(
++pub(super) fn append_execution_transition(
+     tx: &rusqlite::Transaction<'_>,
+     order_id: &str,
+     lifecycle: i64,
+diff --git a/crates/foundry-ledger/src/product/result.rs b/crates/foundry-ledger/src/product/result.rs
+index 18a98289d91335ab864a93e687419fbca5c4552b..21255816edae99a22380821b606658b9c10a052b 100644
+--- a/crates/foundry-ledger/src/product/result.rs
++++ b/crates/foundry-ledger/src/product/result.rs
+@@ -848,6 +848,17 @@ impl ProductStore {
+         if state != "waiting" {
+             return Err(ProductResultError::StaleBinding);
+         }
++        #[cfg(feature = "product-pack-pins")]
++        if super::code_change::enabled_for(&tx, &order_id).map_err(service_result_error)? {
++            let (task, producer) = super::code_change::collected(&tx, &order_id)
++                .map_err(|_| ProductResultError::StaleBinding)?;
++            if task.base_commit != host.base_commit
++                || producer.result_commit.as_ref() != Some(&host.result_commit)
++                || producer.fence != own_active_epoch
++            {
++                return Err(ProductResultError::InvalidEvidence);
++            }
++        }
+         let work: Option<(String,String,i64,i64,i64,String,String,String)> = tx.query_row(
+             "SELECT delivery_id,worker_id,claim_epoch,claim_fence,source_revision,payload_digest,task_kind,payload_snapshot FROM product_review_work_bindings_v1 WHERE order_id=?1 AND attempt=?2 AND run_id=?3",
+             params![order_id,attempt,journal_run],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?)),
+diff --git a/crates/foundry-ledger/src/product/review.rs b/crates/foundry-ledger/src/product/review.rs
+index 668d8634adfc3538bdce20cefc0b952d0d6c40cf..0a7bb49911f336742a956a98c1853ee60c7d03c9 100644
+--- a/crates/foundry-ledger/src/product/review.rs
++++ b/crates/foundry-ledger/src/product/review.rs
+@@ -160,7 +160,12 @@ fn append_hold_outcome_in(
+         .ok_or_else(|| HostError::Acceptance("hold outcome has no verified S1 lifecycle".into()))?;
+     if current.lifecycle as i64 + 1 != receipt.lifecycle
+         || current.order.attempt() as i64 != receipt.attempt
+-        || (current.order.state().to_string() != "waiting" && !a01_review_state_in(tx,&receipt.order_id,&current.order.state().to_string())?)
++        || (current.order.state().to_string() != "waiting"
++            && !producer_review_state_in(
++                tx,
++                &receipt.order_id,
++                &current.order.state().to_string(),
++            )?)
+         || current.last_seq != receipt.predecessor_seq
+     {
+         return Err(HostError::Acceptance(
+@@ -235,7 +240,15 @@ fn append_hold_outcome_in(
+     Ok(())
+ }
+ 
+-fn a01_review_state_in(tx: &rusqlite::Transaction<'_>, order: &str, state: &str) -> Result<bool,HostError> {
++fn producer_review_state_in(
++    tx: &rusqlite::Transaction<'_>,
++    order: &str,
++    state: &str,
++) -> Result<bool, HostError> {
++    #[cfg(feature = "product-pack-pins")]
++    if state == "review" && super::code_change::enabled_for(tx, order).map_err(db_error)? {
++        return Ok(super::code_change::collected(tx, order).is_ok());
++    }
+     #[cfg(feature = "a01-harness-support")]
+     if state == "review" { return super::a01_task::canonical_review_in(tx,order).map_err(db_error); }
+     let _ = (tx,order,state);
+@@ -439,7 +452,7 @@ fn validate_admitted(
+         || !matches!(
+             state.as_str(),
+             "queued" | "working" | "held" | "waiting" | "inspecting"
+-        ) && !a01_review_state_in(&tx,order,&state)?
++        ) && !producer_review_state_in(&tx, order, &state)?
+     {
+         return Err(HostError::Acceptance(
+             "product lifecycle does not admit review work".into(),
+@@ -486,7 +499,7 @@ fn validate_admitted_in(
+     let allowed = match latest {
+         Some((seq,state)) => seq >= admission_seq && (
+             matches!(state.as_str(),"queued"|"working"|"held"|"waiting"|"inspecting")
+-            || a01_review_state_in(tx,order,&state)?),
++            || producer_review_state_in(tx,order,&state)?),
+         None => false,
+     };
+     if !allowed {
+@@ -846,7 +859,7 @@ impl ProductStore {
+             .map_err(db_error)?;
+         #[cfg(feature = "a01-harness-support")]
+         super::a01_task::validate_host_intent_in(&tx,intent).map_err(db_error)?;
+-        if self.open_mode != super::StoreOpenMode::Normal && !a01_review_state_in(&tx,&intent.order.0,"review")? {
++        if self.open_mode != super::StoreOpenMode::Normal && !producer_review_state_in(&tx,&intent.order.0,"review")? {
+             // Check the marker on this connection while holding the writer lock.
+             // Missing, malformed, or mismatched markers all fail closed as well.
+             let marker = tx.query_row(
+@@ -877,6 +890,35 @@ impl ProductStore {
+         })?;
+         validate_work_claim_in(&tx, work, intent, lifecycle, source_revision, now)?;
+         #[cfg(feature = "product-pack-pins")]
++        if super::code_change::enabled_for(&tx, &intent.order.0).map_err(db_error)? {
++            let (task, producer) =
++                super::code_change::collected(&tx, &intent.order.0).map_err(db_error)?;
++            let recorded: String = tx.query_row("SELECT at FROM product_producer_events_v1 WHERE order_id=?1 AND state='collected'", [&intent.order.0], |r| r.get(0)).map_err(db_error)?;
++            if selected_request.as_ref().is_none_or(|(binding, key)| {
++                *binding != task.selection() || *key != producer.operation_key
++            }) || producer.result_commit.as_ref() != Some(&request.result_commit)
++                || request.base_commit != task.base_commit
++                || work.worker_id != producer.worker
++                || work.fence != producer.fence
++                || work.epoch != producer.epoch
++                || intent.attempt.0 != 1
++                || intent.run.0 != 1
++                || intent.activation != 1
++                || intent.generation.0 != 0
++                || intent.epoch.0 != producer.fence as u64
++                || intent.recorded_at.to_rfc3339() != recorded
++                || intent.external_ref
++                    != format!(
++                        "review:{}:1:{}..{}",
++                        intent.order.0, task.base_commit, request.result_commit
++                    )
++            {
++                return Err(HostError::Acceptance(
++                    "collected producer binding changed".into(),
++                ));
++            }
++        }
++        #[cfg(feature = "product-pack-pins")]
+         if work.task_kind == super::COMMIT_REVIEW_KIND
+             && self.open_mode == super::StoreOpenMode::Normal
+             && tx
+@@ -1501,6 +1543,39 @@ impl ReviewDispatchStore for ProductStore {
+             ));
+         }
+         tx.execute("INSERT INTO product_review_host_results_v1(order_id,attempt,run_id,activation,result_json) VALUES(?1,?2,?3,?4,?5)",params![request.intent.order.0,request.intent.attempt.0 as i64,request.intent.run.0 as i64,request.intent.activation as i64,result]).map_err(db_error)?;
++        #[cfg(feature = "product-pack-pins")]
++        if super::code_change::enabled_for(&tx, &request.intent.order.0).map_err(db_error)? {
++            let (task, producer) =
++                super::code_change::collected(&tx, &request.intent.order.0).map_err(db_error)?;
++            if request.result.base_commit != task.base_commit
++                || Some(&request.result.result_commit) != producer.result_commit.as_ref()
++                || request.result.generations.len() != 1
++            {
++                return Err(HostError::Acceptance(
++                    "review differs from collected commit".into(),
++                ));
++            }
++            let event = match request.status {
++                ReviewTerminalStatus::Passed => super::OrderEvent::InspectionPassed,
++                ReviewTerminalStatus::Failed => super::OrderEvent::InspectionFailed {
++                    reason: "code-change review failed".into(),
++                },
++                ReviewTerminalStatus::Held => super::OrderEvent::ReviewHeld {
++                    reason: "code-change review held".into(),
++                },
++            };
++            super::commit_review::append_execution_transition(
++                &tx,
++                &task.order_id,
++                task.lifecycle,
++                event,
++                "code-change-review",
++                "Service/product-review",
++                &json(&producer)?,
++                now,
++            )
++            .map_err(db_error)?;
++        }
+         #[cfg(feature = "a01-harness-support")]
+         if self.open_mode.is_a01_task() && status == "passed" {
+             super::a01_task::complete_bridge_in(&tx,&request.intent,&request.result,now).map_err(db_error)?;
+@@ -3184,7 +3259,7 @@ fn ensure_new_work(
+     if !state
+         .as_deref()
+         .is_some_and(|s| matches!(s, "queued" | "working" | "held" | "waiting" | "inspecting"))
+-        && !a01_review_state_in(tx,&intent.order.0,state.as_deref().unwrap_or(""))?
++        && !producer_review_state_in(tx, &intent.order.0, state.as_deref().unwrap_or(""))?
+     {
+         return Err(HostError::Acceptance(
+             "product lifecycle no longer admits review work".into(),
+@@ -3363,7 +3438,7 @@ fn ensure_product_source_for_new_stage(
+         || !matches!(
+             state.as_str(),
+             "queued" | "working" | "held" | "waiting" | "inspecting"
+-        ) && !a01_review_state_in(tx,order,&state)?
++        ) && !producer_review_state_in(tx, order, &state)?
+     {
+         return Err(HostError::Acceptance(
+             "product lifecycle no longer admits continuation work".into(),
+@@ -3599,6 +3674,11 @@ pub(super) fn check_commit_review_resume(
+     run: &str,
+     now: chrono::DateTime<chrono::Utc>,
+ ) -> Result<(), HostError> {
++    if super::code_change::enabled_for(tx, order).map_err(db_error)? {
++        return Err(HostError::Acceptance(
++            "offline task cannot launch a continuation".into(),
++        ));
++    }
+     let selected: bool = tx.query_row(
+         "SELECT EXISTS(SELECT 1 FROM product_orders_v1 WHERE order_id=?1 AND task_kind=?2) AND (SELECT schema_version FROM product_meta_v1 WHERE singleton=1)=4",
+         params![order,super::COMMIT_REVIEW_KIND],|row|row.get(0),
+diff --git a/crates/foundry-ledger/src/product_scope.rs b/crates/foundry-ledger/src/product_scope.rs
+index cc25cdcd821731bfdf66f1be2b6f69512697bc73..6f9e0f91001ba4b64ba369ed8514d834b8ff8356 100644
+--- a/crates/foundry-ledger/src/product_scope.rs
++++ b/crates/foundry-ledger/src/product_scope.rs
+@@ -147,6 +147,7 @@ pub enum ProductCapability {
+     ExportEvidence,
+     ReadOperationalAudit,
+     PublishApproved,
++    AuthorizeTask,
+     A01BridgePassed,
+ }
+ 
+@@ -161,6 +162,7 @@ impl ProductCapability {
+             Self::ExportEvidence => "export_evidence",
+             Self::ReadOperationalAudit => "read_operational_audit",
+             Self::PublishApproved => "publish_approved",
++            Self::AuthorizeTask => "authorize_task",
+             Self::A01BridgePassed => "a01_bridge_passed",
+         }
+     }
+@@ -175,13 +177,16 @@ impl ProductCapability {
+             "export_evidence" => Ok(Self::ExportEvidence),
+             "read_operational_audit" => Ok(Self::ReadOperationalAudit),
+             "publish_approved" => Ok(Self::PublishApproved),
++            "authorize_task" => Ok(Self::AuthorizeTask),
+             "a01_bridge_passed" => Ok(Self::A01BridgePassed),
+             _ => Err(ScopeInputError),
+         }
+     }
+ 
+     pub fn allowed_for_role(self, role: &str) -> bool {
+-        if self == Self::A01BridgePassed { return role == "owner"; }
++        if matches!(self, Self::A01BridgePassed | Self::AuthorizeTask) {
++            return role == "owner";
++        }
+         match role {
+             "viewer" | "operator" => self == Self::ReadOrder,
+             "approver" | "owner" => true,
+diff --git a/crates/foundry-line/src/die_executor.rs b/crates/foundry-line/src/die_executor.rs
+index b8e5b09d2fc2c699f50de64f97f4ef96eed59eda..c6be07156f94986e11467f8bac062ead65adea08 100644
+--- a/crates/foundry-line/src/die_executor.rs
++++ b/crates/foundry-line/src/die_executor.rs
+@@ -62,6 +62,19 @@ struct StageInputFile<'a> {
+ }
+ 
+ impl DieStageExecutor {
++    /// Operator timeout shared by serve and the product review coordinator.
++    pub fn configured_timeout() -> Result<u64, String> {
++        match std::env::var("FOUNDRY_DIE_TIMEOUT") {
++            Ok(value) => value
++                .parse::<u64>()
++                .ok()
++                .filter(|v| (1..=3600).contains(v))
++                .ok_or_else(|| "invalid FOUNDRY_DIE_TIMEOUT".to_owned()),
++            Err(std::env::VarError::NotPresent) => Ok(600),
++            Err(_) => Err("invalid FOUNDRY_DIE_TIMEOUT".into()),
++        }
++    }
++
+     #[cfg(feature = "product-pack-pins")]
+     /// Review an existing immutable commit: transmit the selected lens and
+     /// accept inspection stages only.
+diff --git a/crates/foundry-line/src/review_host.rs b/crates/foundry-line/src/review_host.rs
+index 4a28fbe19e3ee70ba8dcb5fc757993e9f7917aa1..e36096d281d6859c8c2be5c1dd28193df57c0889 100644
+--- a/crates/foundry-line/src/review_host.rs
++++ b/crates/foundry-line/src/review_host.rs
+@@ -48,6 +48,12 @@ pub trait StageExecutor: Send {
+     fn ensure_available(&self) -> Result<(), String> {
+         Ok(())
+     }
++    /// Opt in only for a trusted local reader that never launches a Die or model.
++    #[cfg(feature = "product-pack-pins")]
++    fn offline_inspector(&self) -> bool {
++        false
++    }
++
+     /// Observation boundary after durable stage acceptance and before the
+     /// terminal transaction. Implementations may stop before completion.
+     #[cfg(feature = "a01-harness-support")]
+@@ -59,6 +65,11 @@ pub trait StageExecutor: Send {
+     }
+ }
+ impl<T: StageExecutor + ?Sized> StageExecutor for Box<T> {
++    #[cfg(feature = "product-pack-pins")]
++    fn offline_inspector(&self) -> bool {
++        (**self).offline_inspector()
++    }
++
+     #[cfg(feature = "a01-harness-support")]
+     fn before_terminal_commit(&mut self, completion: &foundry_exec::ReviewDispatchCompletion) -> Result<(),String> {
+         (**self).before_terminal_commit(completion)
+@@ -1031,6 +1042,16 @@ impl PackReviewHost {
+             self.store
+                 .validate_product_work_claim(claim, intent, chrono::Utc::now())?;
+         }
++        #[cfg(feature = "product-pack-pins")]
++        let offline_task = product_work.as_ref().is_some_and(|c| {
++            c.task_kind == "github-issue" && c.worker_id.starts_with("code-change-")
++        });
++        #[cfg(feature = "product-pack-pins")]
++        if offline_task && !self.executor.offline_inspector() {
++            return Err(HostError::Acceptance(
++                "code-change profile requires an offline inspector".into(),
++            ));
++        }
+         let key = host_key(intent);
+         let (order, attempt, base, result) = parse_external_ref(&intent.external_ref)
+             .ok_or_else(|| HostError::Worker("invalid review external_ref".into()))?;
+@@ -1062,6 +1083,28 @@ impl PackReviewHost {
+         if snap.digest() != self.store.pack_digest() {
+             return Err(HostError::Persistence("review pack digest changed".into()));
+         }
++        #[cfg(feature = "product-pack-pins")]
++        if offline_task
++            && snap.nodes().iter().any(|node| {
++                node.value.get("kind").and_then(toml::Value::as_str) == Some("redrive")
++                    || node
++                        .value
++                        .get("stages")
++                        .and_then(toml::Value::as_array)
++                        .is_some_and(|stages| {
++                            stages.iter().any(|stage| {
++                                !matches!(
++                                    stage.get("role").and_then(toml::Value::as_str),
++                                    Some("verify" | "lens")
++                                )
++                            })
++                        })
++            })
++        {
++            return Err(HostError::Acceptance(
++                "offline task pack contains a mutating stage".into(),
++            ));
++        }
+         let digest = snap.digest().to_owned();
+         let admission_request = ReviewAdmissionRequest {
+             intent: intent.clone(),
+diff --git a/crates/foundry-serve/src/lib.rs b/crates/foundry-serve/src/lib.rs
+index 11a69af8c8d78fb9dd1531ea0a12607115360b6b..32a9f96782c025a67f723abd26b4e358481164ea 100644
+--- a/crates/foundry-serve/src/lib.rs
++++ b/crates/foundry-serve/src/lib.rs
+@@ -162,6 +162,14 @@ pub struct ServeState {
+ 
+ impl ServeState {
+     pub fn new(ledger_path: impl Into<PathBuf>) -> Result<Self, String> {
++        let timeout_secs = DieStageExecutor::configured_timeout()?;
++        let binary = std::env::var_os("FOUNDRY_DIE_BINARY");
++        let repo = std::env::var_os("FOUNDRY_REPO_PATH");
++        if binary.is_some() != repo.is_some()
++            || binary.is_some() && std::env::var_os("FOUNDRY_REVIEW_PACK").is_none()
++        {
++            return Err("incomplete review executor configuration".into());
++        }
+         let path: PathBuf = ledger_path.into();
+         let ledger = SqliteLedger::open(&path).map_err(|e| format!("open ledger: {e:?}"))?;
+         let ledger2 = SqliteLedger::open(&path).map_err(|e| format!("open ledger: {e:?}"))?;
+@@ -196,10 +204,6 @@ impl ServeState {
+                 (Ok(binary), Ok(repo)) => {
+                     let profile =
+                         std::env::var("FOUNDRY_DIE_PROFILE").unwrap_or_else(|_| "coding".into());
+-                    let timeout_secs = std::env::var("FOUNDRY_DIE_TIMEOUT")
+-                        .ok()
+-                        .and_then(|v| v.parse().ok())
+-                        .unwrap_or(600);
+                     let default_sessions = host_db
+                         .parent()
+                         .unwrap_or(std::path::Path::new("."))
+diff --git a/crates/foundry/src/main.rs b/crates/foundry/src/main.rs
+index 1a7200950142771dfa885280dbd452eccf292097..487f7e8c2082e0c78a4e321b0736fd267c2eef4d 100644
+--- a/crates/foundry/src/main.rs
++++ b/crates/foundry/src/main.rs
+@@ -405,6 +405,12 @@ enum Cmd {
+     /// Approve, revoke or select a review pack by digest.
+     #[cfg(feature = "product-pack-pins")]
+     ProductPack(selected_review::PackArgs),
++    /// Authorize the first acknowledged code-change task.
++    #[cfg(feature = "product-pack-pins")]
++    ProductTask(selected_review::TaskArgs),
++    /// Inspect or advance an explicit offline producer reservation.
++    #[cfg(feature = "product-pack-pins")]
++    ProductProducer(selected_review::ProducerArgs),
+     /// Review an existing commit using its order's selected pack.
+     #[cfg(feature = "product-pack-pins")]
+     ProductReviewDispatch(selected_review::DispatchArgs),
+@@ -731,10 +737,7 @@ fn build_product_review_host(
+     ) {
+         (Ok(binary), Ok(repo)) if !binary.is_empty() && !repo.is_empty() => {
+             let profile = std::env::var("FOUNDRY_DIE_PROFILE").unwrap_or_else(|_| "coding".into());
+-            let timeout = std::env::var("FOUNDRY_DIE_TIMEOUT")
+-                .ok()
+-                .and_then(|value| value.parse().ok())
+-                .unwrap_or(600);
++            let timeout = DieStageExecutor::configured_timeout()?;
+             let executor = DieStageExecutor::new(
+                 std::path::PathBuf::from(binary),
+                 profile,
+@@ -2494,6 +2497,10 @@ async fn main() {
+         #[cfg(feature = "product-pack-pins")]
+         Cmd::ProductIntake(args) => selected_review::intake(args),
+         #[cfg(feature = "product-pack-pins")]
++        Cmd::ProductProducer(args) => selected_review::producer(args),
++        #[cfg(feature = "product-pack-pins")]
++        Cmd::ProductTask(args) => selected_review::task(args),
++        #[cfg(feature = "product-pack-pins")]
+         Cmd::ProductPack(args) => selected_review::pack(args),
+         #[cfg(feature = "product-pack-pins")]
+         Cmd::ProductReviewDispatch(args) => selected_review::dispatch(args),
+diff --git a/crates/foundry/src/selected_review.rs b/crates/foundry/src/selected_review.rs
+index 6e63dc7c2183a9659fb96114a02beeda85993e72..af530b4af7314ccab1b5aaf5b61cc45a97d296eb 100644
+--- a/crates/foundry/src/selected_review.rs
++++ b/crates/foundry/src/selected_review.rs
+@@ -76,7 +76,13 @@ pub(super) struct IntakeArgs {
+     #[arg(long)]
+     order: String,
+     #[arg(long)]
+-    commit: String,
++    #[arg(
++        required_unless_present = "issue_snapshot",
++        conflicts_with = "issue_snapshot"
++    )]
++    commit: Option<String>,
++    #[arg(long)]
++    issue_snapshot: Option<PathBuf>,
+     #[arg(long)]
+     observed_updated_at: chrono::DateTime<Utc>,
+ }
+@@ -175,14 +181,33 @@ pub(super) fn intake(args: IntakeArgs) -> i32 {
+                 .order
+                 .bytes()
+                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+-            || args.commit.len() != 40
+-            || !args
+-                .commit
+-                .bytes()
+-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+         {
+             return Err(());
+         }
++        let (kind, payload) = match (args.commit, args.issue_snapshot) {
++            (Some(commit), None)
++                if commit.len() == 40
++                    && commit
++                        .bytes()
++                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) =>
++            {
++                (COMMIT_REVIEW_KIND, commit)
++            }
++            (None, Some(path)) => {
++                use std::io::Read;
++                let mut bytes = Vec::new();
++                std::fs::File::open(path)
++                    .map_err(|_| ())?
++                    .take(1_000_001)
++                    .read_to_end(&mut bytes)
++                    .map_err(|_| ())?;
++                if bytes.len() > 1_000_000 {
++                    return Err(());
++                }
++                ("github-issue", String::from_utf8(bytes).map_err(|_| ())?)
++            }
++            _ => return Err(()),
++        };
+         let mut store = args.database.open()?;
+         let service = args
+             .source
+@@ -200,8 +225,8 @@ pub(super) fn intake(args: IntakeArgs) -> i32 {
+         let version = foundry_ledger::product::delivery_version_digest(
+             &args.issue_id,
+             &updated,
+-            COMMIT_REVIEW_KIND,
+-            &args.commit,
++            kind,
++            &payload,
+         );
+         let delivery_id = foundry_ledger::product::github_delivery_id(
+             store.installation_id(),
+@@ -218,8 +243,8 @@ pub(super) fn intake(args: IntakeArgs) -> i32 {
+             issue_id: args.issue_id,
+             observed_updated_at: updated.clone(),
+             version_digest: version,
+-            task_kind: COMMIT_REVIEW_KIND.into(),
+-            payload: args.commit,
++            task_kind: kind.into(),
++            payload,
+         };
+         let cursor = foundry_ledger::ProductPollCursor {
+             connector_id: args.source.connector,
+@@ -476,3 +501,131 @@ pub(super) fn decide_hold(
+         1
+     }
+ }
++
++#[derive(Args)]
++pub(super) struct TaskArgs {
++    #[command(flatten)]
++    database: Database,
++    #[arg(long)]
++    session_file: String,
++    #[arg(long)]
++    order: String,
++    #[arg(long)]
++    lifecycle: i64,
++    #[arg(long)]
++    admission_hash: String,
++    #[arg(long)]
++    task_sha256: String,
++    #[arg(long)]
++    request_key: String,
++}
++
++pub(super) fn task(args: TaskArgs) -> i32 {
++    report((|| {
++        let session = sha256_hex(read_private(&args.session_file).map_err(|_| ())?.as_bytes());
++        let receipt = args
++            .database
++            .open()?
++            .authorize_code_change(
++                &session,
++                &args.order,
++                args.lifecycle,
++                &args.admission_hash,
++                &args.task_sha256,
++                &args.request_key,
++            )
++            .map_err(|_| ())?;
++        serde_json::to_value(receipt).map_err(|_| ())
++    })())
++}
++
++#[derive(Args)]
++pub(super) struct ProducerArgs {
++    #[command(flatten)]
++    database: Database,
++    #[command(flatten)]
++    source: Source,
++    #[arg(long,value_parser=["reserve","seal","collect","status","recover"])]
++    action: String,
++    #[arg(long)]
++    order: String,
++    #[arg(long)]
++    request_key: String,
++    #[arg(long, required_if_eq("action", "seal"))]
++    commit: Option<String>,
++}
++
++/// An operator can inspect and reconcile a reservation after restart. The
++/// offline producer interface never invokes a Die or starts a model.
++pub(super) fn producer(args: ProducerArgs) -> i32 {
++    report((|| {
++        let mut store = args.database.open()?;
++        let service = args.source.authenticate(
++            &mut store,
++            foundry_ledger::ProductServiceAction::DriveReview,
++        )?;
++        if args.action != "seal" && args.commit.is_some() {
++            return Err(());
++        }
++        let order = &args.order;
++        let key = &args.request_key;
++        match args.action.as_str() {
++            "reserve" => {
++                use foundry_line::StageExecutor;
++                let r = store
++                    .code_change_for_producer(&service, order)
++                    .map_err(|_| ())?;
++                let config = registry()?;
++                if !config.snapshots.contains_key(&r.pack_digest) {
++                    return Err(());
++                }
++                let repo = std::env::var_os("FOUNDRY_REPO_PATH").ok_or(())?;
++                let binary = std::env::var_os("FOUNDRY_DIE_BINARY").ok_or(())?;
++                foundry_line::DieStageExecutor::new(
++                    binary.into(),
++                    "coding".into(),
++                    foundry_line::DieStageExecutor::configured_timeout().map_err(|_| ())?,
++                    repo.into(),
++                    PathBuf::new(),
++                )
++                .ensure_available()
++                .map_err(|_| ())?;
++                require_local_commit(&r.base_commit)?;
++                store = store.with_product_registry(config);
++                store
++                    .reserve_code_change(&service, order, key)
++                    .map_err(|_| ())?;
++            }
++            "seal" => {
++                let repo = PathBuf::from(std::env::var_os("FOUNDRY_REPO_PATH").ok_or(())?);
++                store
++                    .seal_code_change(
++                        &service,
++                        order,
++                        key,
++                        &repo,
++                        args.commit.as_deref().ok_or(())?,
++                    )
++                    .map_err(|_| ())?;
++            }
++            "collect" => {
++                store
++                    .collect_code_change(&service, order, key)
++                    .map_err(|_| ())?;
++            }
++            "recover" => {
++                store
++                    .mark_code_change_uncertain(&service, order, key)
++                    .map_err(|_| ())?;
++            }
++            "status" => {}
++            _ => return Err(()),
++        }
++        serde_json::to_value(
++            store
++                .code_change_status(&service, order, key)
++                .map_err(|_| ())?,
++        )
++        .map_err(|_| ())
++    })())
++}
+diff --git a/crates/foundry/tests/support/b2_w1.rs b/crates/foundry/tests/support/b2_w1.rs
+index b8bced40353cf4b86a5096e64236119c0a9d86a8..7ac496c4f376bdbbc3108698d5a49d7346ebda92 100644
+--- a/crates/foundry/tests/support/b2_w1.rs
++++ b/crates/foundry/tests/support/b2_w1.rs
+@@ -121,7 +121,7 @@ impl RuntimeFixture {
+     }
+ 
+     pub fn with_preimage(order_ids: &[&str], preimage: Option<(&Path, ProductConfig)>) -> Self {
+-        assert!(!order_ids.is_empty());
++        // An empty slice provisions identities and the registry only.
+         let root = PrivateRoot::new();
+         let db_path = root.0.join("product.sqlite");
+         #[cfg(feature = "product-pack-pins")]
+@@ -686,6 +686,11 @@ pub fn y_pack_with_changed_lenses(source: &Path, destination: &Path) -> (PathBuf
+             fs::write(entry.path(), bytes).expect("change Y pack lens bytes");
+         }
+     }
++    let digest = refresh_fixture_manifest(destination);
++    (destination.to_owned(), digest)
++}
++
++pub fn refresh_fixture_manifest(destination: &Path) -> String {
+     let manifest_path = destination.join("manifest.toml");
+     let manifest = fs::read_to_string(&manifest_path).expect("read copied manifest");
+     let files_line = manifest
+@@ -745,7 +750,7 @@ pub fn y_pack_with_changed_lenses(source: &Path, destination: &Path) -> (PathBuf
+         manifest_digest(destination) == digest,
+         "recomputed pack manifest digest differs"
+     );
+-    (destination.to_owned(), digest)
++    digest
+ }
+ 
+ pub fn manifest_digest(pack_dir: &Path) -> String {
+diff --git a/crates/foundry-ledger/src/product/code_change.rs b/crates/foundry-ledger/src/product/code_change.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..a9e1b59b2bd5c556e0e050cfe9c11995c369b98a
+--- /dev/null
++++ b/crates/foundry-ledger/src/product/code_change.rs
+@@ -0,0 +1,808 @@
++//! Explicit, offline code-change authorization and producer journal on v4.
++use super::*;
++use foundry_exec::{ExecutionIntent, ProductSelectionBinding};
++use rusqlite::Transaction;
++use serde::{Deserialize, Serialize};
++use sha2::{Digest, Sha256};
++
++mod retained_git;
++
++#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
++#[serde(deny_unknown_fields)]
++struct TaskCheck {
++    argv: Vec<String>,
++    timeout_secs: u32,
++}
++
++#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
++#[serde(deny_unknown_fields)]
++struct CodeChangeTask {
++    kind: String,
++    request: String,
++    acceptance: Vec<String>,
++    base_commit: String,
++    pack_digest: String,
++    allowed_paths: Vec<String>,
++    checks: Vec<TaskCheck>,
++    total_timeout_secs: u32,
++    model: String,
++    max_model_calls: u32,
++    max_cost_microusd: u64,
++    max_fix_generations: u32,
++}
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Issue {
++    issue_number: u64,
++    title: String,
++    body: String,
++}
++
++fn denied() -> ProductError {
++    ProductError::Invariant("code-change authority or evidence unavailable")
++}
++
++fn sha(bytes: &[u8]) -> String {
++    hex::encode(Sha256::digest(bytes))
++}
++
++fn full_hex(s: &str, n: usize) -> bool {
++    s.len() == n
++        && s.bytes()
++            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
++}
++
++fn normalize(snapshot: &str) -> Result<CodeChangeTask, ProductError> {
++    let issue: Issue = serde_json::from_str(snapshot).map_err(|_| denied())?;
++    if issue.issue_number == 0 || issue.title.len() > 16384 || issue.body.len() > 256 * 1024 {
++        return Err(denied());
++    }
++    let mut t: CodeChangeTask = serde_json::from_str(&issue.body).map_err(|_| denied())?;
++    let text = |s: &str, limit| !s.trim().is_empty() && s.len() <= limit && !s.contains('\0');
++    if t.kind != "code-change-v1"
++        || !text(&t.request, 16384)
++        || !(1..=64).contains(&t.acceptance.len())
++        || t.acceptance.iter().any(|s| !text(s, 4096))
++        || !full_hex(&t.base_commit, 40)
++        || !full_hex(&t.pack_digest, 64)
++        || !(1..=256).contains(&t.allowed_paths.len())
++        || t.allowed_paths.iter().any(|p| {
++            !text(p, 4096)
++                || p.split('/').any(|c| {
++                    matches!(c, "" | "." | "..")
++                        || c.eq_ignore_ascii_case(".git")
++                        || !c
++                            .bytes()
++                            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
++                })
++        })
++        || !(1..=3600).contains(&t.total_timeout_secs)
++        || t.checks.len() != 1
++        || t.checks[0].argv != ["git", "diff", "--check"]
++        || !(1..=t.total_timeout_secs).contains(&t.checks[0].timeout_secs)
++        || t.model != "none"
++        || t.max_model_calls != 0
++        || t.max_cost_microusd != 0
++        || t.max_fix_generations != 0
++    {
++        return Err(denied());
++    }
++    t.allowed_paths.sort();
++    if t.allowed_paths.windows(2).any(|p| p[0] == p[1]) {
++        return Err(denied());
++    }
++    Ok(t)
++}
++
++/// Pin the first persisted issue, including unsupported bodies, before the
++/// drain can see an edit. On a pre-W2 store the existing inbox supplies the
++/// observation history. An existing admission must still match that anchor.
++pub(super) fn pin_first_observation(
++    tx: &Transaction<'_>,
++    source: &str,
++    connector: &str,
++    repository: &str,
++    issue: &str,
++) -> Result<(), ProductError> {
++    tx.execute_batch("
++        CREATE TABLE IF NOT EXISTS product_issue_first_v1(
++         source TEXT NOT NULL, connector TEXT NOT NULL, repository TEXT NOT NULL, issue TEXT NOT NULL,
++         delivery TEXT NOT NULL UNIQUE REFERENCES product_intake_inbox_v1(delivery_id),
++         snapshot BLOB NOT NULL, snapshot_sha256 TEXT NOT NULL, PRIMARY KEY(source,connector,repository,issue));
++        CREATE TRIGGER IF NOT EXISTS product_issue_first_no_replace BEFORE INSERT ON product_issue_first_v1
++         WHEN EXISTS(SELECT 1 FROM product_issue_first_v1 WHERE delivery=NEW.delivery OR
++          (source=NEW.source AND connector=NEW.connector AND repository=NEW.repository AND issue=NEW.issue))
++         BEGIN SELECT RAISE(ABORT,'immutable first issue'); END;
++        CREATE TRIGGER IF NOT EXISTS product_issue_first_preserve BEFORE UPDATE ON product_issue_first_v1
++         BEGIN SELECT RAISE(ABORT,'immutable first issue'); END;
++        CREATE TRIGGER IF NOT EXISTS product_issue_first_retain BEFORE DELETE ON product_issue_first_v1
++         BEGIN SELECT RAISE(ABORT,'retained first issue'); END;")?;
++    let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM product_issue_first_v1 WHERE source=?1 AND connector=?2 AND repository=?3 AND issue=?4)",
++        params![source,connector,repository,issue],|r|r.get(0))?;
++    if exists {
++        return Ok(());
++    }
++    let (id,snapshot):(String,String)=tx.query_row(
++        "SELECT i.delivery_id,i.payload FROM product_intake_inbox_v1 i JOIN product_intake_source_bindings_v1 b USING(delivery_id)
++         WHERE b.source_instance_id=?1 AND i.connector_id=?2 AND i.repository_id=?3 AND i.issue_id=?4 ORDER BY i.rowid LIMIT 1",
++        params![source,connector,repository,issue],|r|Ok((r.get(0)?,r.get(1)?)))?;
++    tx.execute(
++        "INSERT INTO product_issue_first_v1 VALUES(?1,?2,?3,?4,?5,?6,?7)",
++        params![
++            source,
++            connector,
++            repository,
++            issue,
++            id,
++            snapshot.as_bytes(),
++            sha(snapshot.as_bytes())
++        ],
++    )?;
++    Ok(())
++}
++
++const SCHEMA: &str = "
++CREATE TABLE IF NOT EXISTS product_code_tasks_v1(
++ order_id TEXT PRIMARY KEY, lifecycle INTEGER NOT NULL, actor TEXT NOT NULL, request_key TEXT NOT NULL,
++ task_bytes BLOB NOT NULL, receipt TEXT NOT NULL, UNIQUE(actor,request_key));
++CREATE TABLE IF NOT EXISTS product_producers_v1(
++ order_id TEXT PRIMARY KEY REFERENCES product_code_tasks_v1(order_id), operation_key TEXT NOT NULL,
++ service TEXT NOT NULL, service_revision INTEGER NOT NULL, credential_revision INTEGER NOT NULL,
++ worker TEXT NOT NULL, epoch INTEGER NOT NULL, fence INTEGER NOT NULL, deadline TEXT NOT NULL,
++ state TEXT NOT NULL CHECK(state IN ('reserved','sealed','collected','uncertain')),
++ result_commit TEXT, artifact BLOB, artifact_sha256 TEXT, UNIQUE(service,operation_key));
++CREATE TABLE IF NOT EXISTS product_producer_events_v1(
++ order_id TEXT NOT NULL REFERENCES product_producers_v1(order_id), state TEXT NOT NULL, at TEXT NOT NULL,
++ PRIMARY KEY(order_id,state));
++CREATE TRIGGER IF NOT EXISTS product_task_no_replace BEFORE INSERT ON product_code_tasks_v1
++ WHEN EXISTS(SELECT 1 FROM product_code_tasks_v1 WHERE order_id=NEW.order_id OR (actor=NEW.actor AND request_key=NEW.request_key))
++ BEGIN SELECT RAISE(ABORT,'immutable task'); END;
++CREATE TRIGGER IF NOT EXISTS product_producer_no_replace BEFORE INSERT ON product_producers_v1
++ WHEN EXISTS(SELECT 1 FROM product_producers_v1 WHERE order_id=NEW.order_id OR (service=NEW.service AND operation_key=NEW.operation_key))
++ BEGIN SELECT RAISE(ABORT,'retained producer'); END;
++CREATE TRIGGER IF NOT EXISTS product_producer_no_delete BEFORE DELETE ON product_producers_v1
++ BEGIN SELECT RAISE(ABORT,'retained producer'); END;
++CREATE TRIGGER IF NOT EXISTS product_producer_event_no_replace BEFORE INSERT ON product_producer_events_v1
++ WHEN EXISTS(SELECT 1 FROM product_producer_events_v1 WHERE order_id=NEW.order_id AND state=NEW.state)
++ BEGIN SELECT RAISE(ABORT,'retained producer event'); END;
++CREATE TRIGGER IF NOT EXISTS product_producer_event_no_update BEFORE UPDATE ON product_producer_events_v1
++ BEGIN SELECT RAISE(ABORT,'retained producer event'); END;
++CREATE TRIGGER IF NOT EXISTS product_producer_event_no_delete BEFORE DELETE ON product_producer_events_v1
++ BEGIN SELECT RAISE(ABORT,'retained producer event'); END;
++CREATE TRIGGER IF NOT EXISTS product_task_immutable BEFORE UPDATE ON product_code_tasks_v1
++ BEGIN SELECT RAISE(ABORT,'immutable task'); END;
++CREATE TRIGGER IF NOT EXISTS product_task_retained BEFORE DELETE ON product_code_tasks_v1
++ BEGIN SELECT RAISE(ABORT,'retained task'); END;
++CREATE TRIGGER IF NOT EXISTS product_producer_terminal BEFORE UPDATE ON product_producers_v1
++ WHEN OLD.state IN ('collected','uncertain') OR
++ (OLD.state='sealed' AND (OLD.artifact IS NOT NEW.artifact OR OLD.result_commit IS NOT NEW.result_commit OR OLD.artifact_sha256 IS NOT NEW.artifact_sha256))
++ BEGIN SELECT RAISE(ABORT,'sealed producer'); END;";
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct TaskReceipt {
++    pub order_id: String,
++    pub lifecycle: i64,
++    pub source: String,
++    pub installation: String,
++    pub database: String,
++    pub connector: String,
++    pub repository: String,
++    pub issue: String,
++    pub generation: i64,
++    pub source_revision: i64,
++    pub instance_revision: i64,
++    pub delivery_id: String,
++    pub admission_sequence: i64,
++    pub admission_hash: String,
++    pub snapshot_sha256: String,
++    pub task_sha256: String,
++    pub base_commit: String,
++    pub pack_digest: String,
++    pub actor: String,
++    pub authority_revision: i64,
++    pub scope_revision: i64,
++    pub grant_revision: i64,
++    pub selection_revision: i64,
++    pub approval_revision: i64,
++    pub request_key: String,
++}
++
++impl TaskReceipt {
++    pub fn selection(&self) -> ProductSelectionBinding {
++        ProductSelectionBinding {
++            order_id: self.order_id.clone(),
++            lifecycle: self.lifecycle,
++            source_instance_id: self.source.clone(),
++            pack_digest: self.pack_digest.clone(),
++            selection_revision: self.selection_revision,
++            referenced_approval_revision: self.approval_revision,
++        }
++    }
++}
++
++fn selected(tx: &Transaction<'_>, r: &TaskReceipt) -> Result<(), ProductError> {
++    let (installation, database): (String, String) = tx.query_row(
++        "SELECT installation_id,database_id FROM product_meta_v1 WHERE singleton=1",
++        [],
++        |row| Ok((row.get(0)?, row.get(1)?)),
++    )?;
++    let state = w1_selection_state_in(
++        tx,
++        &installation,
++        &database,
++        &r.order_id,
++        r.lifecycle,
++        &r.source,
++    )?;
++    if !state.active
++        || state.pack_digest != r.pack_digest
++        || state.selection_revision != r.selection_revision
++        || state.referenced_approval_revision != r.approval_revision
++    {
++        return Err(denied());
++    }
++    Ok(())
++}
++
++fn load_task(
++    tx: &Transaction<'_>,
++    order: &str,
++) -> Result<(TaskReceipt, CodeChangeTask), ProductError> {
++    let (bytes,receipt,snapshot):(Vec<u8>,String,String)=tx.query_row(
++        "SELECT t.task_bytes,t.receipt,i.payload FROM product_code_tasks_v1 t
++         JOIN product_orders_v1 o ON o.order_id=t.order_id AND o.lifecycle=t.lifecycle
++         JOIN product_work_backlog_v1 b ON b.order_id=t.order_id AND b.lifecycle=t.lifecycle
++         JOIN product_intake_inbox_v1 i ON i.delivery_id=b.delivery_id AND i.payload=o.payload_snapshot
++         JOIN product_issue_first_v1 first ON first.delivery=i.delivery_id AND first.snapshot=CAST(i.payload AS BLOB) AND first.snapshot_sha256=json_extract(t.receipt,'$.snapshot_sha256')
++         WHERE t.order_id=?1 AND i.state='acked' AND o.task_kind='github-issue'
++         AND o.admission_hash=json_extract(t.receipt,'$.admission_hash')
++         AND first.connector=json_extract(t.receipt,'$.connector') AND first.repository=json_extract(t.receipt,'$.repository')
++         AND first.issue=json_extract(t.receipt,'$.issue') AND first.source=json_extract(t.receipt,'$.source')
++         AND EXISTS(SELECT 1 FROM product_meta_v1 m WHERE m.singleton=1 AND m.installation_id=json_extract(t.receipt,'$.installation') AND m.database_id=json_extract(t.receipt,'$.database'))
++         AND o.admission_seq=json_extract(t.receipt,'$.admission_sequence')
++         AND i.delivery_id=json_extract(t.receipt,'$.delivery_id')",[order],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
++    let r: TaskReceipt = serde_json::from_str(&receipt).map_err(|_| denied())?;
++    let t = normalize(&snapshot)?;
++    if r.order_id != order
++        || r.snapshot_sha256 != sha(snapshot.as_bytes())
++        || r.task_sha256 != sha(&bytes)
++        || bytes != serde_json::to_vec(&t).map_err(|_| denied())?
++        || r.base_commit != t.base_commit
++        || r.pack_digest != t.pack_digest
++    {
++        return Err(denied());
++    }
++    let owner = ProductPrincipal {
++        actor_id: r.actor.clone(),
++        role: "owner".into(),
++        authority_revision: r.authority_revision,
++    };
++    let current:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM product_accounts_v1 WHERE actor_id=?1 AND enabled=1 AND role='owner' AND revision=?2)",params![r.actor,r.authority_revision],|row|row.get(0))?;
++    let view =
++        require_order_capability_in(tx, &owner, order, ProductCapability::AuthorizeTask, true)?;
++    if !current
++        || view.scope_revision != r.scope_revision
++        || view.grant_revision != r.grant_revision
++        || view.source_instance_id != r.source
++        || view.lifecycle != r.lifecycle
++    {
++        return Err(denied());
++    }
++    selected(tx, &r)?;
++    Ok((r, t))
++}
++
++impl ProductStore {
++    pub fn authorize_code_change(
++        &mut self,
++        session: &str,
++        order: &str,
++        lifecycle: i64,
++        admission: &str,
++        task_sha256: &str,
++        key: &str,
++    ) -> Result<TaskReceipt, ProductError> {
++        if self.open_mode != StoreOpenMode::Normal || !w1_text(key) {
++            return Err(denied());
++        }
++        let tx = self
++            .conn
++            .transaction_with_behavior(TransactionBehavior::Immediate)?;
++        require_product_pin_version(&tx)?;
++        let owner = resolve_session_in(&tx, session, self.clock.now())?;
++        if owner.role != "owner" {
++            return Err(denied());
++        }
++        let view = require_order_capability_in(
++            &tx,
++            &owner,
++            order,
++            ProductCapability::AuthorizeTask,
++            true,
++        )?;
++        let (connector,repository,issue):(String,String,String)=tx.query_row(
++            "SELECT connector_id,repository_id,issue_id FROM product_orders_v1 WHERE order_id=?1 AND lifecycle=?2 AND admission_hash=?3 AND task_kind='github-issue'",
++            params![order,lifecycle,admission],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
++        pin_first_observation(
++            &tx,
++            &view.source_instance_id,
++            &connector,
++            &repository,
++            &issue,
++        )?;
++        let (snapshot,delivery_id,generation,instance_revision,source_revision):(String,String,i64,i64,i64)=tx.query_row(
++            "SELECT i.payload,i.delivery_id,b.source_generation,b.source_instance_revision,b.source_revision FROM product_orders_v1 o
++             JOIN product_work_backlog_v1 w ON w.order_id=o.order_id AND w.lifecycle=o.lifecycle
++             JOIN product_intake_inbox_v1 i ON i.delivery_id=w.delivery_id AND i.payload=o.payload_snapshot AND i.state='acked'
++             JOIN product_intake_source_bindings_v1 b USING(delivery_id)
++             JOIN product_issue_first_v1 first ON first.delivery=i.delivery_id AND first.source=b.source_instance_id AND first.snapshot=CAST(i.payload AS BLOB)
++             JOIN product_sources_v1 s ON s.connector_id=o.connector_id AND s.enabled=1 AND s.revision=o.source_revision
++             JOIN product_scope_source_instances_v1 si ON si.source_instance_id=b.source_instance_id AND si.enabled=1
++             WHERE o.order_id=?1 AND o.lifecycle=?2 AND o.admission_hash=?3 AND o.task_kind='github-issue'
++             AND b.source_instance_id=?4 AND si.revision=b.source_instance_revision AND si.generation=b.source_generation
++             AND b.source_revision=o.source_revision",params![order,lifecycle,admission,view.source_instance_id],
++            |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
++        let t = normalize(&snapshot)?;
++        let bytes = serde_json::to_vec(&t).map_err(|_| denied())?;
++        let sel = w1_selection_state_in(
++            &tx,
++            &self.installation_id,
++            &self.database_id,
++            order,
++            lifecycle,
++            &view.source_instance_id,
++        )?;
++        if sha(&bytes) != task_sha256 || !sel.active || sel.pack_digest != t.pack_digest {
++            return Err(denied());
++        }
++        let r = TaskReceipt {
++            order_id: order.into(),
++            lifecycle,
++            source: view.source_instance_id,
++            installation: self.installation_id.clone(),
++            database: self.database_id.clone(),
++            connector,
++            repository,
++            issue,
++            generation,
++            source_revision,
++            instance_revision,
++            delivery_id,
++            admission_sequence: view.admission_sequence,
++            admission_hash: admission.into(),
++            snapshot_sha256: sha(snapshot.as_bytes()),
++            task_sha256: task_sha256.into(),
++            base_commit: t.base_commit,
++            pack_digest: t.pack_digest,
++            actor: owner.actor_id,
++            authority_revision: owner.authority_revision,
++            scope_revision: view.scope_revision,
++            grant_revision: view.grant_revision,
++            selection_revision: sel.selection_revision,
++            approval_revision: sel.referenced_approval_revision,
++            request_key: key.into(),
++        };
++        tx.execute_batch(SCHEMA)?;
++        let encoded = serde_json::to_string(&r).map_err(|_| denied())?;
++        if let Some(existing) = tx
++            .query_row(
++                "SELECT receipt FROM product_code_tasks_v1 WHERE order_id=?1",
++                [order],
++                |r| r.get::<_, String>(0),
++            )
++            .optional()?
++        {
++            if existing != encoded {
++                return Err(denied());
++            }
++        } else {
++            tx.execute(
++                "INSERT INTO product_code_tasks_v1 VALUES(?1,?2,?3,?4,?5,?6)",
++                params![order, lifecycle, r.actor, key, bytes, encoded],
++            )?;
++        }
++        tx.commit()?;
++        Ok(r)
++    }
++}
++
++#[derive(Debug, Serialize, PartialEq, Eq)]
++pub struct ProducerStatus {
++    pub order_id: String,
++    pub lifecycle: i64,
++    pub operation_key: String,
++    pub state: String,
++    pub worker: String,
++    pub epoch: i64,
++    pub fence: i64,
++    pub deadline: String,
++    pub result_commit: Option<String>,
++    pub artifact_sha256: Option<String>,
++}
++
++impl ProducerStatus {
++    fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
++        Ok(Self {
++            order_id: r.get(0)?,
++            lifecycle: r.get(1)?,
++            operation_key: r.get(2)?,
++            state: r.get(3)?,
++            worker: r.get(4)?,
++            epoch: r.get(5)?,
++            fence: r.get(6)?,
++            deadline: r.get(7)?,
++            result_commit: r.get(8)?,
++            artifact_sha256: r.get(9)?,
++        })
++    }
++}
++
++fn status_in(
++    tx: &Transaction<'_>,
++    service: &ProductServiceContext,
++    order: &str,
++    key: &str,
++    now: DateTime<Utc>,
++) -> Result<ProducerStatus, ProductError> {
++    service::require_service_context_in(tx, service, ProductServiceAction::DriveReview, now)?;
++    tx.query_row("SELECT p.order_id,t.lifecycle,p.operation_key,p.state,p.worker,p.epoch,p.fence,p.deadline,p.result_commit,p.artifact_sha256
++        FROM product_producers_v1 p JOIN product_code_tasks_v1 t USING(order_id)
++        WHERE p.order_id=?1 AND p.operation_key=?2 AND p.service=?3 AND json_extract(t.receipt,'$.source')=?4",
++        params![order,key,service.service_id,service.source_instance_id],ProducerStatus::from_row).map_err(Into::into)
++}
++
++fn claim_in(
++    tx: &Transaction<'_>,
++    service: &ProductServiceContext,
++    p: &ProducerStatus,
++    now: DateTime<Utc>,
++) -> Result<ProductWorkClaim, ProductError> {
++    let (r, _) = load_task(tx, &p.order_id)?;
++    if (
++        r.source.as_str(),
++        r.generation,
++        r.instance_revision,
++        r.source_revision,
++    ) != (
++        service.source_instance_id.as_str(),
++        service.source_generation,
++        service.source_instance_revision,
++        service.connector_revision,
++    ) || now >= p.deadline.parse::<DateTime<Utc>>().map_err(|_| denied())?
++    {
++        return Err(denied());
++    }
++    let (payload,lease):(String,String)=tx.query_row("SELECT o.payload_snapshot,c.lease_until FROM product_producers_v1 p
++        JOIN product_orders_v1 o USING(order_id) JOIN product_work_claims_v1 c ON c.order_id=p.order_id AND c.lifecycle=o.lifecycle
++        JOIN product_work_backlog_v1 b ON b.order_id=c.order_id AND b.lifecycle=c.lifecycle AND b.state=c.state
++        WHERE p.order_id=?1 AND p.service_revision=?2 AND p.credential_revision=?3 AND c.owner_id=p.worker AND c.epoch=p.epoch AND c.fence=p.fence
++        AND c.state='claimed' AND c.source_revision=?4 AND b.delivery_id=?5",
++        params![p.order_id,service.service_revision,service.credential_revision,r.source_revision,r.delivery_id],|row|Ok((row.get(0)?,row.get(1)?)))?;
++    let claim = ProductWorkClaim {
++        order_id: p.order_id.clone(),
++        lifecycle: r.lifecycle,
++        delivery_id: r.delivery_id,
++        worker_id: p.worker.clone(),
++        epoch: p.epoch,
++        fence: p.fence,
++        source_revision: r.source_revision,
++        payload_digest: payload_digest("github-issue", &payload),
++        task_kind: "github-issue".into(),
++        payload_snapshot: payload,
++        lease_until: lease.parse().map_err(|_| denied())?,
++        service_binding: Some(foundry_exec::ReviewServiceBinding {
++            service_id: service.service_id.clone(),
++            service_revision: service.service_revision,
++            credential_revision: service.credential_revision,
++            source_instance_id: r.source,
++        }),
++    };
++    service::validate_review_work_claim_in(tx, &claim.review_binding(), now)?;
++    Ok(claim)
++}
++
++fn event(
++    tx: &Transaction<'_>,
++    order: &str,
++    state: &str,
++    now: DateTime<Utc>,
++) -> Result<(), ProductError> {
++    tx.execute(
++        "INSERT INTO product_producer_events_v1(order_id,state,at) VALUES(?1,?2,?3)",
++        params![order, state, now.to_rfc3339()],
++    )?;
++    Ok(())
++}
++
++impl ProductStore {
++    /// A successful return is the sole permission to start one producer. A
++    /// lost reply must go to inspection/recovery, never a second reservation.
++    pub fn reserve_code_change(
++        &mut self,
++        service: &ProductServiceContext,
++        order: &str,
++        key: &str,
++    ) -> Result<ProductWorkClaim, ProductError> {
++        if !w1_text(key) {
++            return Err(denied());
++        }
++        let tx = self
++            .conn
++            .transaction_with_behavior(TransactionBehavior::Immediate)?;
++        require_product_pin_version(&tx)?;
++        let now = self.clock.now();
++        service::require_service_context_in(&tx, service, ProductServiceAction::DriveReview, now)?;
++        let (r, t) = load_task(&tx, order)?;
++        if r.source != service.source_instance_id
++            || !registered_pack_snapshot(self.product_registry.as_ref(), &r.pack_digest)
++        {
++            return Err(denied());
++        }
++        let n=tx.execute("UPDATE product_work_backlog_v1 SET state='ready' WHERE order_id=?1 AND lifecycle=?2 AND delivery_id=?3 AND state='waiting_unsupported' AND attempts=0",params![order,r.lifecycle,r.delivery_id])?;
++        if n != 1 {
++            return Err(denied());
++        }
++        let lease = chrono::Duration::seconds(i64::from(t.total_timeout_secs));
++        let worker = format!("code-change-{}", sha(key.as_bytes()));
++        let ProductWorkClaimResult::Claimed(claim) =
++            Self::claim_scoped_work_in(&tx, service, &worker, Some(order), now, lease)?
++        else {
++            return Err(denied());
++        };
++        tx.execute("INSERT INTO product_producers_v1(order_id,operation_key,service,service_revision,credential_revision,worker,epoch,fence,deadline,state) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'reserved')",params![order,key,service.service_id,service.service_revision,service.credential_revision,worker,claim.epoch,claim.fence,claim.lease_until.to_rfc3339()])?;
++        let p = status_in(&tx, service, order, key, now)?;
++        claim_in(&tx, service, &p, now)?;
++        event(&tx, order, "reserved", now)?;
++        commit_review::append_execution_transition(
++            &tx,
++            order,
++            r.lifecycle,
++            OrderEvent::DieStarted,
++            "code-change-reserved",
++            &format!("Service/{}", service.service_id),
++            &serde_json::to_string(&p).map_err(|_| denied())?,
++            now,
++        )?;
++        tx.commit()?;
++        Ok(claim)
++    }
++
++    pub fn code_change_status(
++        &self,
++        service: &ProductServiceContext,
++        order: &str,
++        key: &str,
++    ) -> Result<ProducerStatus, ProductError> {
++        let tx = self.conn.unchecked_transaction()?;
++        status_in(&tx, service, order, key, self.clock.now())
++    }
++
++    pub fn seal_code_change(
++        &mut self,
++        service: &ProductServiceContext,
++        order: &str,
++        key: &str,
++        repo: &Path,
++        head: &str,
++    ) -> Result<ProducerStatus, ProductError> {
++        let (t, remaining) = {
++            let tx = self.conn.unchecked_transaction()?;
++            let now = self.clock.now();
++            let p = status_in(&tx, service, order, key, now)?;
++            if p.state != "reserved" {
++                return Err(denied());
++            }
++            claim_in(&tx, service, &p, now)?;
++            let deadline = p.deadline.parse::<DateTime<Utc>>().map_err(|_| denied())?;
++            (
++                load_task(&tx, order)?.1,
++                (deadline - now).to_std().map_err(|_| denied())?,
++            )
++        };
++        let artifact = retained_git::verify(repo, &t, head, remaining)?;
++        let tx = self
++            .conn
++            .transaction_with_behavior(TransactionBehavior::Immediate)?;
++        let now = self.clock.now();
++        let p = status_in(&tx, service, order, key, now)?;
++        claim_in(&tx, service, &p, now)?;
++        if tx.execute("UPDATE product_producers_v1 SET state='sealed',result_commit=?2,artifact=?3,artifact_sha256=?4 WHERE order_id=?1 AND state='reserved'",params![order,head,&artifact,sha(&artifact)])?!=1{return Err(denied())}
++        event(&tx, order, "sealed", now)?;
++        let status = status_in(&tx, service, order, key, now)?;
++        tx.commit()?;
++        Ok(status)
++    }
++
++    pub fn collect_code_change(
++        &mut self,
++        service: &ProductServiceContext,
++        order: &str,
++        key: &str,
++    ) -> Result<(ExecutionIntent, ProductWorkClaim, ProductSelectionBinding), ProductError> {
++        let tx = self
++            .conn
++            .transaction_with_behavior(TransactionBehavior::Immediate)?;
++        let now = self.clock.now();
++        let p = status_in(&tx, service, order, key, now)?;
++        let claim = claim_in(&tx, service, &p, now)?;
++        let (r, _) = load_task(&tx, order)?;
++        let head = p.result_commit.as_deref().ok_or_else(denied)?;
++        let artifact: Vec<u8> = tx.query_row(
++            "SELECT artifact FROM product_producers_v1 WHERE order_id=?1",
++            [order],
++            |row| row.get(0),
++        )?;
++        if p.artifact_sha256 != Some(sha(&artifact)) {
++            return Err(denied());
++        }
++        if p.state == "sealed" {
++            tx.execute(
++                "UPDATE product_producers_v1 SET state='collected' WHERE order_id=?1",
++                [order],
++            )?;
++            event(&tx, order, "collected", now)?;
++            commit_review::append_execution_transition(
++                &tx,
++                order,
++                r.lifecycle,
++                OrderEvent::DieSucceeded { attempt: 1 },
++                "code-change-collected",
++                &format!("Service/{}", service.service_id),
++                &serde_json::to_string(&p).map_err(|_| denied())?,
++                now,
++            )?;
++        } else if p.state != "collected" {
++            return Err(denied());
++        }
++        let recorded: String = tx.query_row(
++            "SELECT at FROM product_producer_events_v1 WHERE order_id=?1 AND state='collected'",
++            [order],
++            |row| row.get(0),
++        )?;
++        let intent = ExecutionIntent {
++            order: foundry_exec::OrderId(order.into()),
++            attempt: foundry_exec::Attempt(1),
++            run: foundry_exec::RunId(1),
++            activation: 1,
++            generation: foundry_exec::Generation(0),
++            epoch: foundry_exec::Epoch(claim.fence as u64),
++            recorded_at: recorded.parse().map_err(|_| denied())?,
++            external_ref: format!("review:{order}:1:{}..{head}", r.base_commit),
++        };
++        tx.commit()?;
++        Ok((intent, claim, r.selection()))
++    }
++
++    /// Reconcile a lost producer. A sealed artifact remains available for
++    /// investigation. A concurrent collection and recovery serialize here.
++    pub fn mark_code_change_uncertain(
++        &mut self,
++        service: &ProductServiceContext,
++        order: &str,
++        key: &str,
++    ) -> Result<ProducerStatus, ProductError> {
++        let tx = self
++            .conn
++            .transaction_with_behavior(TransactionBehavior::Immediate)?;
++        let now = self.clock.now();
++        let p = status_in(&tx, service, order, key, now)?;
++        if matches!(p.state.as_str(), "reserved" | "sealed") {
++            tx.execute(
++                "UPDATE product_producers_v1 SET state='uncertain' WHERE order_id=?1",
++                [order],
++            )?;
++            event(&tx, order, "uncertain", now)?;
++        } else if p.state != "uncertain" {
++            return Err(denied());
++        }
++        let p = status_in(&tx, service, order, key, now)?;
++        tx.commit()?;
++        Ok(p)
++    }
++}
++
++pub(super) fn enabled_for(tx: &Transaction<'_>, order: &str) -> Result<bool, ProductError> {
++    // The immutable admission kind and body identify the profile even if
++    // someone removes the task sidecar. Missing collection then fails closed.
++    let item:Option<String>=tx.query_row("SELECT payload_snapshot FROM product_orders_v1 WHERE order_id=?1 AND task_kind='github-issue' AND (SELECT schema_version FROM product_meta_v1 WHERE singleton=1)=4",[order],|r|r.get(0)).optional()?;
++    Ok(item.is_some_and(|snapshot| normalize(&snapshot).is_ok()))
++}
++
++pub(super) fn collected(
++    tx: &Transaction<'_>,
++    order: &str,
++) -> Result<(TaskReceipt, ProducerStatus), ProductError> {
++    let (r, _) = load_task(tx, order)?;
++    let p=tx.query_row("SELECT p.order_id,t.lifecycle,p.operation_key,p.state,p.worker,p.epoch,p.fence,p.deadline,p.result_commit,p.artifact_sha256,p.artifact
++        FROM product_producers_v1 p JOIN product_code_tasks_v1 t USING(order_id)
++        JOIN product_producer_events_v1 e ON e.order_id=p.order_id AND e.state='collected'
++        JOIN product_work_claims_v1 c ON c.order_id=p.order_id AND c.lifecycle=t.lifecycle AND c.owner_id=p.worker AND c.epoch=p.epoch AND c.fence=p.fence
++        JOIN product_service_work_bindings_v1 sb ON sb.order_id=c.order_id AND sb.lifecycle=c.lifecycle AND sb.service_id=p.service AND sb.service_revision=p.service_revision AND sb.credential_revision=p.credential_revision
++        WHERE p.order_id=?1 AND p.state='collected' AND EXISTS(SELECT 1 FROM ledger l JOIN product_transition_receipts_v1 tr ON tr.seq=l.seq AND tr.event_hash=l.hash
++         WHERE tr.order_id=p.order_id AND tr.lifecycle=t.lifecycle AND tr.operation='code-change-collected'
++           AND json_extract(l.intent,'$.operation_key')=p.operation_key AND json_extract(l.intent,'$.fence')=p.fence
++           AND json_extract(l.intent,'$.result_commit')=p.result_commit AND json_extract(l.intent,'$.artifact_sha256')=p.artifact_sha256)",[order],
++        |row|Ok((ProducerStatus::from_row(row)?,row.get::<_,Vec<u8>>(10)?)))?;
++    if p.0.artifact_sha256 != Some(sha(&p.1)) {
++        return Err(denied());
++    }
++    Ok((r, p.0))
++}
++
++impl ProductStore {
++    pub fn code_change_for_producer(
++        &self,
++        service: &ProductServiceContext,
++        order: &str,
++    ) -> Result<TaskReceipt, ProductError> {
++        let tx = self.conn.unchecked_transaction()?;
++        service::require_service_context_in(
++            &tx,
++            service,
++            ProductServiceAction::DriveReview,
++            self.clock.now(),
++        )?;
++        let (r, _) = load_task(&tx, order)?;
++        if r.source != service.source_instance_id {
++            return Err(denied());
++        }
++        Ok(r)
++    }
++}
++
++pub(super) fn check_adapter_claim(
++    tx: &Transaction<'_>,
++    claim: &ProductWorkClaim,
++    now: DateTime<Utc>,
++) -> Result<(), ProductError> {
++    load_task(tx, &claim.order_id)?;
++    let exact:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM product_producers_v1 WHERE order_id=?1 AND worker=?2 AND epoch=?3 AND fence=?4 AND deadline>?5 AND state='reserved')",params![claim.order_id,claim.worker_id,claim.epoch,claim.fence,now.to_rfc3339()],|r|r.get(0))?;
++    if !exact {
++        return Err(denied());
++    }
++    Ok(())
++}
++
++/// Only fresh v4 approvals require a current originating task and producer.
++/// Historical receipts are verified by the existing replay path.
++pub(super) fn require_approval_collection(
++    tx: &Transaction<'_>,
++    intent: &ProductApprovalIntent,
++    now: DateTime<Utc>,
++) -> Result<(), ProductError> {
++    let version: i64 = tx.query_row(
++        "SELECT schema_version FROM product_meta_v1 WHERE singleton=1",
++        [],
++        |row| row.get(0),
++    )?;
++    if version != 4 {
++        return Ok(());
++    }
++    let (task, producer) = collected(tx, &intent.order_id)?;
++    if producer.result_commit.as_ref() != Some(&intent.artifact_digest) {
++        return Err(denied());
++    }
++    let journal = format!(
++        "{}:{}:{}:1",
++        task.order_id, intent.expected_attempt, intent.run_id
++    );
++    let exact:bool=tx.query_row(
++        "SELECT EXISTS(SELECT 1 FROM product_w1_lifecycle_pins_v1 p
++         JOIN product_review_runs_v1 r ON r.order_id=p.order_id AND r.product_lifecycle=p.lifecycle AND r.pack_digest=p.pack_digest
++         JOIN product_review_authority_v1 a ON a.order_id=r.order_id AND a.journal_run=r.run_id AND a.service_id=p.service_id
++         JOIN product_services_v1 s ON s.service_id=a.service_id AND s.revision=a.service_revision AND s.enabled=1
++         JOIN product_service_credentials_v1 c ON c.service_id=s.service_id AND c.credential_revision=a.credential_revision
++         JOIN product_service_grants_v1 g ON g.service_id=s.service_id AND g.source_instance_id=p.source_instance_id
++             AND g.action='drive_review' AND g.enabled=1 AND g.grant_revision=a.drive_review_grant_revision
++         WHERE p.order_id=?1 AND p.lifecycle=?2 AND p.request_key=?3 AND p.claim_epoch=?4 AND p.claim_fence=?5
++           AND p.admission_hash=?6 AND p.selection_revision=?7 AND r.base_commit=?8 AND r.result_commit=?9
++           AND r.attempt=?10 AND r.run_id=?11 AND r.status='passed' AND s.lease_until>?12 AND c.expires_at>?12)",
++        params![task.order_id,task.lifecycle,producer.operation_key,producer.epoch,producer.fence,task.admission_hash,
++            task.selection_revision,task.base_commit,intent.artifact_digest,intent.expected_attempt,journal,now.to_rfc3339()],|r|r.get(0))?;
++    if !exact {
++        return Err(denied());
++    }
++    Ok(())
++}
+diff --git a/crates/foundry-ledger/src/product/code_change/retained_git.rs b/crates/foundry-ledger/src/product/code_change/retained_git.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..b9a9025cf2481713c8285cc1355071b92018ead8
+--- /dev/null
++++ b/crates/foundry-ledger/src/product/code_change/retained_git.rs
+@@ -0,0 +1,121 @@
++//! Controller-owned read-only comparison of immutable Git objects.
++use super::{CodeChangeTask, ProductError, denied, full_hex};
++use std::{
++    io::Read,
++    path::Path,
++    process::{Command, Stdio},
++    time::{Duration, Instant},
++};
++
++fn git(repo: &Path, args: &[&str], until: Instant) -> Result<Vec<u8>, ProductError> {
++    if Instant::now() >= until {
++        return Err(denied());
++    }
++    let mut child = Command::new("/usr/bin/git")
++        .current_dir(repo)
++        .env_clear()
++        .env("GIT_CONFIG_NOSYSTEM", "1")
++        .env("GIT_CONFIG_GLOBAL", "/dev/null")
++        .env("GIT_ALLOW_PROTOCOL", "")
++        .env("GIT_NO_LAZY_FETCH", "1")
++        .env("GIT_NO_REPLACE_OBJECTS", "1")
++        .args(args)
++        .stdin(Stdio::null())
++        .stdout(Stdio::piped())
++        .stderr(Stdio::null())
++        .spawn()
++        .map_err(|_| denied())?;
++    let mut stdout = child.stdout.take().ok_or_else(denied)?;
++    let output = std::thread::spawn(move || {
++        let mut bytes = Vec::new();
++        stdout
++            .by_ref()
++            .take(4 * 1024 * 1024 + 1)
++            .read_to_end(&mut bytes)?;
++        Ok::<_, std::io::Error>(bytes)
++    });
++    let status = loop {
++        match child.try_wait() {
++            Ok(Some(status)) => break Some(status),
++            Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(5)),
++            _ => {
++                let _ = child.kill();
++                let _ = child.wait();
++                break None;
++            }
++        }
++    };
++    let bytes = output.join().map_err(|_| denied())?.map_err(|_| denied())?;
++    if !status.is_some_and(|s| s.success()) || bytes.len() > 4 * 1024 * 1024 {
++        return Err(denied());
++    }
++    Ok(bytes)
++}
++
++pub(super) fn verify(
++    repo: &Path,
++    t: &CodeChangeTask,
++    head: &str,
++    remaining: Duration,
++) -> Result<Vec<u8>, ProductError> {
++    if !full_hex(head, 40) {
++        return Err(denied());
++    }
++    let until =
++        Instant::now() + remaining.min(Duration::from_secs(t.checks[0].timeout_secs.into()));
++    let parents = git(repo, &["rev-list", "--parents", "-n", "1", head], until)?;
++    if parents != format!("{} {}\n", head, t.base_commit).as_bytes() {
++        return Err(denied());
++    }
++    let paths = git(
++        repo,
++        &[
++            "diff-tree",
++            "--no-renames",
++            "--no-commit-id",
++            "--name-only",
++            "-z",
++            "-r",
++            &t.base_commit,
++            head,
++            "--",
++        ],
++        until,
++    )?;
++    let files = paths.strip_suffix(&[0]).ok_or_else(denied)?;
++    if files.is_empty()
++        || files
++            .split(|b| *b == 0)
++            .any(|p| !t.allowed_paths.iter().any(|a| a.as_bytes() == p))
++    {
++        return Err(denied());
++    }
++    git(
++        repo,
++        &[
++            "diff",
++            "--no-ext-diff",
++            "--no-textconv",
++            "--check",
++            &t.base_commit,
++            head,
++            "--",
++        ],
++        until,
++    )?;
++    git(
++        repo,
++        &[
++            "diff",
++            "--no-ext-diff",
++            "--no-textconv",
++            "--no-renames",
++            "--binary",
++            "--full-index",
++            &t.base_commit,
++            head,
++            "--",
++        ],
++        until,
++    )
++}
+diff --git a/crates/foundry/tests/w2.rs b/crates/foundry/tests/w2.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..c8216bc3d2056b598a27671aa9d0fb4f76729015
+--- /dev/null
++++ b/crates/foundry/tests/w2.rs
+@@ -0,0 +1,1370 @@
++//! Offline W20–22 acceptance. No connector transport or real Die is installed.
++#![cfg(all(feature = "p2-test-support", feature = "product-pack-pins", unix))]
++#[allow(dead_code)]
++#[path = "support/b2_w1.rs"]
++mod support;
++use chrono::{Duration, Utc};
++use foundry_ledger::{
++    ProductCapability, ProductDelivery, ProductPollCursor, ProductServiceAction, ProductStore,
++    ProductWorkClaimResult, ScopeMutation,
++};
++use rusqlite::{Connection, OpenFlags, params};
++use serde_json::{Value, json};
++use sha2::{Digest, Sha256};
++use std::{
++    fs,
++    os::unix::fs::PermissionsExt,
++    path::{Path, PathBuf},
++    process::Command,
++};
++use support::{RuntimeFixture, count, schema_snapshot, snapshot};
++
++const SOURCE: &str = "b2-w1-source";
++const SERVICE: &str = "b2-w1-service";
++fn sha(b: &[u8]) -> String {
++    hex::encode(Sha256::digest(b))
++}
++fn reader(path: &Path) -> Connection {
++    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap()
++}
++fn git(repo: &Path, args: &[&str]) -> Vec<u8> {
++    let out = Command::new("/usr/bin/git")
++        .current_dir(repo)
++        .env_clear()
++        .env("PATH", "/usr/bin:/bin")
++        .env("GIT_CONFIG_NOSYSTEM", "1")
++        .env("GIT_CONFIG_GLOBAL", "/dev/null")
++        .env("GIT_ALLOW_PROTOCOL", "file")
++        .args(args)
++        .output()
++        .unwrap();
++    assert!(out.status.success(), "git {args:?}");
++    out.stdout
++}
++fn oid(repo: &Path) -> String {
++    String::from_utf8(git(repo, &["rev-parse", "HEAD"]))
++        .unwrap()
++        .trim()
++        .into()
++}
++
++fn capture(f: &Fixture, phase: &str) {
++    if let Some(out) = std::env::var_os("W2_EVIDENCE_DIR") {
++        let script =
++            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/acceptance/w2/observe.py");
++        let run = Command::new("python3")
++            .arg(script)
++            .arg(&f.f.root.0)
++            .arg(out)
++            .arg(phase)
++            .status()
++            .unwrap();
++        assert!(run.success());
++    }
++}
++
++struct Fixture {
++    f: RuntimeFixture,
++    repo: PathBuf,
++    base: String,
++    head: String,
++    pack: String,
++}
++impl Fixture {
++    fn new() -> Self {
++        let mut f = RuntimeFixture::new(&[]);
++        let repo = f.root.0.join("repo");
++        fs::create_dir(&repo).unwrap();
++        git(&repo, &["init", "-q"]);
++        git(&repo, &["config", "user.name", "Test"]);
++        git(&repo, &["config", "user.email", "local@example.invalid"]);
++        fs::write(repo.join("README"), "first\n").unwrap();
++        git(&repo, &["add", "README"]);
++        git(&repo, &["commit", "-qm", "base"]);
++        let base = oid(&repo);
++        fs::write(repo.join("README"), "first\nsecond\n").unwrap();
++        git(&repo, &["add", "README"]);
++        git(&repo, &["commit", "-qm", "candidate"]);
++        let head = oid(&repo);
++        f.pack = Path::new(env!("CARGO_MANIFEST_DIR"))
++            .join("../../skills/fixture-min/v1")
++            .canonicalize()
++            .unwrap();
++        let verify_pack = f.root.0.join("verify-pack");
++        fs::create_dir(&verify_pack).unwrap();
++        for name in ["manifest.toml", "lens-a.md", "policy.toml"] {
++            fs::copy(f.pack.join(name), verify_pack.join(name)).unwrap();
++        }
++        let policy = verify_pack.join("policy.toml");
++        fs::write(
++            &policy,
++            fs::read_to_string(&policy)
++                .unwrap()
++                .replace("role = \"lens\"", "role = \"verify\""),
++        )
++        .unwrap();
++        f.pack = verify_pack;
++        let pack = support::refresh_fixture_manifest(&f.pack);
++        let mut bootstrap = f.store();
++        let phc =
++            foundry_ledger::product_identity::ProductPasswordKdf::hash("fixture-admin-password")
++                .unwrap();
++        bootstrap
++            .create_account(&f.owner_session, "scope-admin", "owner", &phc, Utc::now())
++            .unwrap();
++        let admin = bootstrap
++            .login("scope-admin", "fixture-admin-password", Utc::now())
++            .unwrap();
++        fs::write(f.root.0.join("admin-verifier"), admin.digest()).unwrap();
++        scope(
++            &f,
++            "owner",
++            ProductCapability::AuthorizeTask,
++            ScopeMutation::Grant,
++            "task-authority",
++        );
++        f.store()
++            .change_pack_approval(
++                &f.owner_session,
++                SOURCE,
++                &pack,
++                0,
++                true,
++                "offline-pack",
++                Utc::now(),
++            )
++            .unwrap();
++        for (file, bytes) in [("owner", &f.owner_bearer), ("service", &f.service_token)] {
++            let path = f.root.0.join(file);
++            fs::write(&path, bytes).unwrap();
++            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
++        }
++        Self {
++            f,
++            repo,
++            base,
++            head,
++            pack,
++        }
++    }
++    fn task(&self) -> String {
++        // Canonical struct field order, independently spelled out by the reader.
++        format!(
++            r#"{{"kind":"code-change-v1","request":"Add a line","acceptance":["README updated"],"base_commit":"{}","pack_digest":"{}","allowed_paths":["README"],"checks":[{{"argv":["git","diff","--check"],"timeout_secs":5}}],"total_timeout_secs":120,"model":"none","max_model_calls":0,"max_cost_microusd":0,"max_fix_generations":0}}"#,
++            self.base, self.pack
++        )
++    }
++    fn cli(&self, cmd: &str, args: &[&str]) -> std::process::Output {
++        self.cli_command(cmd, args).output().unwrap()
++    }
++    fn cli_command(&self, cmd: &str, args: &[&str]) -> Command {
++        let mut command = Command::new(env!("CARGO_BIN_EXE_foundry"));
++        command
++            .env_clear()
++            .env("PATH", "/usr/bin:/bin")
++            .env("HOME", &self.f.root.0)
++            .env("TMPDIR", &self.f.root.0)
++            .args([
++                cmd,
++                "--db",
++                self.f.db_path.to_str().unwrap(),
++                "--installation-id",
++                &self.f.config.installation_id,
++                "--database-id",
++                &self.f.config.database_id,
++            ])
++            .args(args);
++        command
++    }
++    fn delivery(&self, issue: &str, title: &str, body: &str) -> ProductDelivery {
++        let payload = json!({"issue_number":17,"title":title,"body":body}).to_string();
++        let updated = self.f.now.to_rfc3339();
++        let version = foundry_ledger::product::delivery_version_digest(
++            issue,
++            &updated,
++            "github-issue",
++            &payload,
++        );
++        ProductDelivery {
++            delivery_id: foundry_ledger::product::github_delivery_id(
++                &self.f.config.installation_id,
++                "github-primary",
++                "https://api.github.com",
++                "repo:1",
++                issue,
++                &version,
++            ),
++            connector_id: "github-primary".into(),
++            repository_id: "repo:1".into(),
++            issue_id: issue.into(),
++            observed_updated_at: updated,
++            version_digest: version,
++            task_kind: "github-issue".into(),
++            payload,
++        }
++    }
++    fn persist(&self, items: &[ProductDelivery]) {
++        let cursor = ProductPollCursor {
++            connector_id: "github-primary".into(),
++            query_fingerprint: "offline".into(),
++            sweep_id: "offline".into(),
++            next_page: 1,
++            page_ceiling: 1,
++            updated_at: self.f.now.to_rfc3339(),
++        };
++        self.f
++            .store()
++            .persist_intake_page_for_service(&self.f.service, &cursor, items, &[], Utc::now())
++            .unwrap();
++    }
++    fn intake(&self, order: &str, d: &ProductDelivery) -> Value {
++        let path = self.f.root.0.join("input");
++        fs::write(&path, &d.payload).unwrap();
++        let out = self.cli(
++            "product-intake",
++            &[
++                "--connector",
++                "github-primary",
++                "--repository-id",
++                "repo:1",
++                "--service-file",
++                self.f.root.0.join("service").to_str().unwrap(),
++                "--order",
++                order,
++                "--issue-id",
++                &d.issue_id,
++                "--issue-snapshot",
++                path.to_str().unwrap(),
++                "--observed-updated-at",
++                &d.observed_updated_at,
++            ],
++        );
++        assert!(
++            out.status.success(),
++            "{}",
++            String::from_utf8_lossy(&out.stderr)
++        );
++        serde_json::from_slice(&out.stdout).unwrap()
++    }
++    fn select(&self, order: &str) {
++        self.f
++            .store()
++            .select_order_pack(
++                &self.f.owner_session,
++                order,
++                1,
++                SOURCE,
++                &self.pack,
++                0,
++                &format!("select-{order}"),
++                Utc::now(),
++            )
++            .unwrap();
++    }
++    fn authorize(&self, order: &str, admission: &str) -> std::process::Output {
++        self.authorize_digest(order, admission, &sha(self.task().as_bytes()))
++    }
++    fn authorize_digest(&self, order: &str, admission: &str, digest: &str) -> std::process::Output {
++        self.cli(
++            "product-task",
++            &[
++                "--session-file",
++                self.f.root.0.join("owner").to_str().unwrap(),
++                "--order",
++                order,
++                "--lifecycle",
++                "1",
++                "--admission-hash",
++                admission,
++                "--task-sha256",
++                digest,
++                "--request-key",
++                &format!("owner-{order}"),
++            ],
++        )
++    }
++    fn approved(&self, order: &str) {
++        let admission = self.intake(order, &self.delivery(order, "first", &self.task()));
++        self.select(order);
++        let out = self.authorize(order, admission["admission_hash"].as_str().unwrap());
++        assert!(
++            out.status.success(),
++            "{}",
++            String::from_utf8_lossy(&out.stderr)
++        );
++    }
++}
++fn scope(f: &RuntimeFixture, actor: &str, cap: ProductCapability, op: ScopeMutation, key: &str) {
++    let revision:i64=reader(&f.db_path).query_row("SELECT coalesce((SELECT revision FROM product_scope_subject_revisions_v1 WHERE subject_id=?1 AND source_instance_id=?2),0)",params![actor,SOURCE],|r|r.get(0)).unwrap();
++    f.store()
++        .change_product_scope(
++            &fs::read_to_string(f.root.0.join("admin-verifier")).unwrap(),
++            actor,
++            SOURCE,
++            cap,
++            op,
++            revision,
++            key,
++            Utc::now(),
++        )
++        .unwrap();
++}
++
++mod w20_contract {
++    use super::*;
++    #[test]
++    fn canonical_bytes_and_owner_coordinates() {
++        let f = Fixture::new();
++        let canonical = f.task().replace(r#"["README"]"#, r#"["A","README"]"#);
++        let mut value: Value = serde_json::from_str(&canonical).unwrap();
++        value["allowed_paths"] = json!(["README", "A"]);
++        let body = serde_json::to_string_pretty(&value).unwrap();
++        let d = f.delivery("w20", "original", &body);
++        let receipt = f.intake("w20", &d);
++        let hash = receipt["admission_hash"].as_str().unwrap();
++        f.select("w20");
++        let mut store = f.f.store();
++        let before = snapshot(&f.f.db_path);
++        let normalized = sha(canonical.as_bytes());
++        for (session, lifecycle, anchor, digest) in [
++            (f.f.service_token.as_str(), 1, hash, normalized.as_str()),
++            (f.f.owner_session.as_str(), 2, hash, normalized.as_str()),
++            (f.f.owner_session.as_str(), 1, "wrong", normalized.as_str()),
++            (f.f.owner_session.as_str(), 1, hash, "wrong"),
++        ] {
++            assert!(
++                store
++                    .authorize_code_change(session, "w20", lifecycle, anchor, digest, "approve-w20")
++                    .is_err()
++            );
++        }
++        assert!(before == snapshot(&f.f.db_path));
++        let r = store
++            .authorize_code_change(
++                &f.f.owner_session,
++                "w20",
++                1,
++                hash,
++                &normalized,
++                "approve-w20",
++            )
++            .unwrap();
++        let bytes: Vec<u8> = reader(&f.f.db_path)
++            .query_row(
++                "SELECT task_bytes FROM product_code_tasks_v1 WHERE order_id='w20'",
++                [],
++                |r| r.get(0),
++            )
++            .unwrap();
++        assert_eq!(bytes, canonical.as_bytes());
++        assert_eq!(sha(&bytes), r.task_sha256);
++        assert_eq!(sha(d.payload.as_bytes()), r.snapshot_sha256);
++        assert_eq!(r.delivery_id, d.delivery_id);
++        assert_ne!(sha(body.as_bytes()), r.task_sha256);
++        let before = snapshot(&f.f.db_path);
++        assert_eq!(
++            r,
++            store
++                .authorize_code_change(
++                    &f.f.owner_session,
++                    "w20",
++                    1,
++                    hash,
++                    &normalized,
++                    "approve-w20"
++                )
++                .unwrap()
++        );
++        assert!(
++            store
++                .authorize_code_change(
++                    &f.f.owner_session,
++                    "w20",
++                    1,
++                    hash,
++                    &normalized,
++                    "another-key"
++                )
++                .is_err()
++        );
++        assert!(before == snapshot(&f.f.db_path));
++        println!(
++            "W20 canonical_bytes={} raw_body_bytes={} receipt={}",
++            bytes.len(),
++            body.len(),
++            serde_json::to_string(&r).unwrap()
++        );
++        capture(&f, "w20");
++    }
++}
++
++mod w21_intake {
++    use super::*;
++    struct Ack(Vec<String>);
++    impl foundry_watch::intake_worker::DeliveryAcknowledger for Ack {
++        fn acknowledge(
++            &mut self,
++            d: &ProductDelivery,
++        ) -> Result<(), foundry_watch::intake_worker::AckError> {
++            self.0.push(d.delivery_id.clone());
++            Ok(())
++        }
++    }
++    #[test]
++    fn disallowed_and_edited_observations() {
++        let f = Fixture::new();
++        let canary = f.f.root.0.join("shell-entered");
++        let malicious = format!("$(touch {})", canary.display());
++        let valid = f.task();
++        let invalids = vec![
++            "free text".to_owned(),
++            malicious.clone(),
++            valid.replace("\"README\"", "\"../README\""),
++            valid.replace("\"git\",\"diff\",\"--check\"", "\"sh\",\"-c\",\"true\""),
++            valid.replace("timeout_secs\":5", "timeout_secs\":121"),
++            valid.replace("timeout_secs\":5", "timeout_secs\":0"),
++            valid.replace("max_model_calls\":0", "max_model_calls\":1"),
++            valid.replace("total_timeout_secs\":120", "total_timeout_secs\":0"),
++            valid.replace("total_timeout_secs\":120", "total_timeout_secs\":3601"),
++            valid.replace("\"none\"", "\"other\""),
++            valid.replace("max_cost_microusd\":0", "max_cost_microusd\":1"),
++        ];
++        for (n, body) in invalids.iter().enumerate() {
++            let order = format!("unsupported-{n}");
++            let a = f.intake(&order, &f.delivery(&order, "invalid", body));
++            f.select(&order);
++            let before = snapshot(&f.f.db_path);
++            assert!(
++                !f.authorize_digest(
++                    &order,
++                    a["admission_hash"].as_str().unwrap(),
++                    &sha(body.as_bytes())
++                )
++                .status
++                .success()
++            );
++            assert!(before == snapshot(&f.f.db_path));
++            assert!(!canary.exists());
++        }
++        for (issue, first, edit, supported) in [
++            (
++                "valid-first",
++                valid.clone(),
++                valid.replace("Add a line", "Replace the task"),
++                true,
++            ),
++            ("unsupported-first", "later edit".into(), valid, false),
++        ] {
++            let a = f.delivery(issue, "A", &first);
++            let mut b = f.delivery(issue, "B", &edit);
++            // Make the edit sort before A under the old digest-ordered drain.
++            for n in 0..10000 {
++                b = f.delivery(issue, &format!("B{n}"), &edit);
++                if b.delivery_id < a.delivery_id {
++                    break;
++                }
++            }
++            assert!(b.delivery_id < a.delivery_id);
++            f.persist(&[a.clone(), b.clone()]);
++            let mut store = f.f.store();
++            assert!(
++                store
++                    .admit_intake_delivery_for_service(
++                        &f.f.service,
++                        &b.delivery_id,
++                        issue,
++                        Utc::now()
++                    )
++                    .is_err()
++            );
++            let mut ack = Ack(vec![]);
++            let drain = foundry_watch::intake_worker::drain_admissions_for_service(
++                &mut store,
++                &mut ack,
++                &f.f.service,
++                Utc::now(),
++                10,
++            )
++            .unwrap();
++            assert_eq!(ack.0, [a.delivery_id.clone(), b.delivery_id.clone()]);
++            assert_eq!(drain.receipts.len(), 2);
++            assert_eq!(drain.receipts[0], drain.receipts[1]);
++            let r = &drain.receipts[0];
++            f.select(&r.order_id);
++            let receipt = f.authorize(&r.order_id, &r.event_hash);
++            assert_eq!(receipt.status.success(), supported);
++            let stored:(String,String)=reader(&f.f.db_path).query_row("SELECT payload_snapshot,delivery_id FROM product_orders_v1 JOIN product_work_backlog_v1 USING(order_id,lifecycle) WHERE order_id=?1",[&r.order_id],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
++            assert_eq!(stored, (a.payload.clone(), a.delivery_id.clone()));
++            if supported {
++                let before = snapshot(&f.f.db_path);
++                assert!(
++                    !f.authorize_digest(&r.order_id, &r.event_hash, &sha(edit.as_bytes()))
++                        .status
++                        .success()
++                );
++                assert!(before == snapshot(&f.f.db_path));
++            }
++            let retry = f.intake(&r.order_id, &b);
++            assert_eq!(retry["admission_hash"], r.event_hash);
++            assert_eq!(
++                receipt.stdout,
++                f.authorize(&r.order_id, &r.event_hash).stdout
++            );
++            if supported {
++                let receipt: Value = serde_json::from_slice(&receipt.stdout).unwrap();
++                assert_eq!(receipt["snapshot_sha256"], sha(a.payload.as_bytes()));
++                assert_eq!(receipt["task_sha256"], sha(first.as_bytes()));
++                assert_eq!(receipt["delivery_id"], a.delivery_id);
++                assert_eq!(receipt["actor"], "owner");
++                println!("E02b {issue} receipt={receipt}");
++            }
++            println!(
++                "E02b {issue} deliveries={:?} admission={} order={}",
++                ack.0, r.event_hash, r.order_id
++            );
++        }
++        let mut store = f.f.store();
++        assert!(!matches!(
++            store
++                .claim_product_work_for_service(
++                    &f.f.service,
++                    "watch",
++                    Utc::now(),
++                    Duration::minutes(1)
++                )
++                .unwrap(),
++            ProductWorkClaimResult::Claimed(_)
++        ));
++        for table in [
++            "product_producers_v1",
++            "product_producer_events_v1",
++            "product_work_claims_v1",
++            "product_review_runs_v1",
++            "product_result_bindings_v1",
++            "product_approval_result_bindings_v1",
++            "product_grants_v1",
++            "product_publish_outcomes_v1",
++        ] {
++            assert_eq!(count(&f.f.db_path, table), 0);
++        }
++        assert_eq!(count(&f.f.db_path, "product_code_tasks_v1"), 1);
++        assert!(!canary.exists());
++        assert!(!f.f.artifact_root().exists());
++        capture(&f, "w21");
++        println!(
++            "E02 disallowed={} claims=0 producer=0 review=0 grant=0 approval=0 canary_absent=true",
++            invalids.len()
++        );
++    }
++}
++
++mod w22_code_change {
++    use super::*;
++    use foundry_ledger::{
++        ProductApprovalIntent, ProductClock, ProductResultExpectation, ProductServiceGrant,
++    };
++    use foundry_line::{PackReviewHost, StageExecutor, StageOutput, StageTask};
++    use std::{
++        collections::BTreeMap,
++        io::Read,
++        process::Stdio,
++        sync::Arc,
++        time::{Duration as Wait, Instant},
++    };
++    const TEST: &str = "w22_code_change::fenced_producer_and_loss_boundaries";
++    struct Inspect(PathBuf);
++    impl StageExecutor for Inspect {
++        fn offline_inspector(&self) -> bool {
++            true
++        }
++        fn execute(&mut self, stage: &StageTask) -> Result<StageOutput, String> {
++            assert!(matches!(stage.role.as_str(), "verify" | "lens"));
++            let bytes = git(
++                &self.0,
++                &["show", &format!("{}:README", stage.artifact_commit)],
++            );
++            if bytes != b"first\nsecond\n" {
++                return Err("unexpected Git blob".into());
++            }
++            let path = stage.workdir.join("inspection.json");
++            fs::write(
++                &path,
++                json!({"commit":stage.artifact_commit,"blob_sha256":sha(&bytes)}).to_string(),
++            )
++            .unwrap();
++            Ok(StageOutput {
++                log_path: path.display().to_string(),
++                inspected_commit: Some(stage.artifact_commit.clone()),
++                ..Default::default()
++            })
++        }
++    }
++    fn tree(root: &Path) -> BTreeMap<PathBuf, (u64, Vec<u8>)> {
++        use std::os::unix::fs::MetadataExt;
++        fn walk(base: &Path, dir: &Path, rows: &mut BTreeMap<PathBuf, (u64, Vec<u8>)>) {
++            for e in fs::read_dir(dir).unwrap() {
++                let p = e.unwrap().path();
++                if p.is_dir() {
++                    walk(base, &p, rows)
++                } else {
++                    rows.insert(
++                        p.strip_prefix(base).unwrap().into(),
++                        (p.metadata().unwrap().ino(), fs::read(p).unwrap()),
++                    );
++                }
++            }
++        }
++        let mut rows = BTreeMap::new();
++        walk(root, root, &mut rows);
++        rows
++    }
++    fn sequence(db: &Path) -> Vec<(String, i64)> {
++        reader(db)
++            .prepare("SELECT name,seq FROM sqlite_sequence ORDER BY name")
++            .unwrap()
++            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
++            .unwrap()
++            .collect::<Result<_, _>>()
++            .unwrap()
++    }
++    fn worker(root: &Path) {
++        let pack = root.join("verify-pack");
++        let digest = foundry_pack::load_pack(&pack).unwrap().digest().to_owned();
++        let mut store = ProductStore::open(
++            &root.join("product.sqlite"),
++            foundry_ledger::ProductConfig {
++                installation_id: "b2-w1-runtime-install".into(),
++                database_id: "b2-w1-runtime-database".into(),
++            },
++        )
++        .unwrap()
++        .with_product_registry(foundry_ledger::PackRegistryConfig {
++            snapshots: [(digest, pack)].into(),
++        });
++        let service = store
++            .authenticate_product_service_for_action(
++                &fs::read_to_string(root.join("service")).unwrap(),
++                "github-primary",
++                "https://api.github.com",
++                "repo:1",
++                ProductServiceAction::DriveReview,
++                Utc::now(),
++            )
++            .unwrap();
++        let claim = store
++            .reserve_code_change(&service, "loss", "lost-producer")
++            .unwrap();
++        store
++            .validate_product_work_claim(&claim, Utc::now())
++            .unwrap();
++        let repo = root.join("loss-repo");
++        let source = root.join("repo");
++        // Local Git only. Start the owned producer at the authorized parent.
++        git(
++            root,
++            &[
++                "clone",
++                "--local",
++                "--no-hardlinks",
++                "-q",
++                source.to_str().unwrap(),
++                repo.to_str().unwrap(),
++            ],
++        );
++        let r = store.code_change_for_producer(&service, "loss").unwrap();
++        git(&repo, &["checkout", "-q", "-B", "loss", &r.base_commit]);
++        git(&repo, &["config", "user.name", "Owned producer"]);
++        git(&repo, &["config", "user.email", "owned@example.invalid"]);
++        fs::write(repo.join("README"), "first\nfixture child output\n").unwrap();
++        git(&repo, &["add", "README"]);
++        git(&repo, &["commit", "-qm", "Owned producer output"]);
++        let head = oid(&repo);
++        let out = root.join("retained-producer");
++        fs::create_dir(&out).unwrap();
++        fs::write(
++            out.join("output.patch"),
++            git(
++                &repo,
++                &[
++                    "diff",
++                    "--full-index",
++                    "--binary",
++                    &r.base_commit,
++                    &head,
++                    "--",
++                ],
++            ),
++        )
++        .unwrap();
++        store
++            .seal_code_change(&service, "loss", "lost-producer", &repo, &oid(&repo))
++            .unwrap();
++        fs::write(root.join("sealed-barrier"), "sealed").unwrap();
++        // Parent owns this process. Stand at the real seal/collect boundary.
++        let mut token = [0u8];
++        std::io::stdin().read_exact(&mut token).unwrap();
++        store
++            .collect_code_change(&service, "loss", "lost-producer")
++            .unwrap();
++    }
++    fn lost_child(f: &Fixture) {
++        f.approved("loss");
++        let mut child = Command::new(std::env::current_exe().unwrap())
++            .args(["--exact", TEST, "--nocapture"])
++            .env_clear()
++            .env("PATH", "/usr/bin:/bin")
++            .env("W2_PRODUCER_CHILD", &f.f.root.0)
++            .stdin(Stdio::piped())
++            .spawn()
++            .unwrap();
++        let then = Instant::now();
++        while !f.f.root.0.join("sealed-barrier").exists() {
++            assert!(
++                child.try_wait().unwrap().is_none(),
++                "owned producer exited early"
++            );
++            if then.elapsed() > Wait::from_secs(30) {
++                child.kill().unwrap();
++                child.wait().unwrap();
++                panic!("producer barrier timed out")
++            }
++            std::thread::sleep(Wait::from_millis(10));
++        }
++        child.kill().unwrap();
++        use std::os::unix::process::ExitStatusExt;
++        assert_eq!(child.wait().unwrap().signal(), Some(9));
++        let db = &f.f.db_path;
++        let before = snapshot(db);
++        let schema = schema_snapshot(db);
++        let seq = sequence(db);
++        let objects = tree(&f.repo.join(".git/objects"));
++        assert_eq!(objects.len(), 6);
++        let artifacts = tree(&f.f.artifact_root());
++        let p =
++            f.f.store()
++                .code_change_status(&f.f.service, "loss", "lost-producer")
++                .unwrap();
++        assert_eq!(p.state, "sealed");
++        let loss_repo = f.f.root.0.join("loss-repo");
++        let loss_objects = tree(&loss_repo.join(".git/objects"));
++        let producer_files = tree(&f.f.root.0.join("retained-producer"));
++        assert_eq!(producer_files.len() + artifacts.len(), 6);
++        assert_eq!(p.result_commit, Some(oid(&loss_repo)));
++        assert_eq!(
++            p.artifact_sha256,
++            Some(sha(&fs::read(
++                f.f.root.0.join("retained-producer/output.patch")
++            )
++            .unwrap()))
++        );
++        assert_eq!(
++            git(&loss_repo, &["rev-parse", "HEAD^"]),
++            format!("{}\n", f.base).as_bytes()
++        );
++        capture(f, "pre-recovery");
++        let q =
++            f.f.store()
++                .mark_code_change_uncertain(&f.f.service, "loss", "lost-producer")
++                .unwrap();
++        assert_eq!(q.state, "uncertain");
++        assert_eq!(q.artifact_sha256, p.artifact_sha256);
++        assert_eq!(q.fence, p.fence);
++        capture(f, "post-recovery");
++        let after = snapshot(db);
++        let changed: Vec<_> = before
++            .keys()
++            .filter(|k| before[*k] != after[*k])
++            .map(String::as_str)
++            .collect();
++        assert_eq!(
++            changed,
++            ["product_producer_events_v1", "product_producers_v1"]
++        );
++        assert_eq!(seq, sequence(db));
++        assert_eq!(after.len() + 1, 82);
++        for retry in 1..=2 {
++            let mut store = f.f.store();
++            assert_eq!(
++                store
++                    .mark_code_change_uncertain(&f.f.service, "loss", "lost-producer")
++                    .unwrap(),
++                q
++            );
++            assert!(
++                store
++                    .reserve_code_change(&f.f.service, "loss", "lost-producer")
++                    .is_err()
++            );
++            assert!(
++                store
++                    .collect_code_change(&f.f.service, "loss", "lost-producer")
++                    .is_err()
++            );
++            assert!(
++                store
++                    .seal_code_change(&f.f.service, "loss", "lost-producer", &f.repo, &f.head)
++                    .is_err()
++            );
++            assert!(after == snapshot(db));
++            assert_eq!(seq, sequence(db));
++            assert!(schema == schema_snapshot(db));
++            assert!(artifacts == tree(&f.f.artifact_root()));
++            assert!(objects == tree(&f.repo.join(".git/objects")));
++            assert!(loss_objects == tree(&loss_repo.join(".git/objects")));
++            assert!(producer_files == tree(&f.f.root.0.join("retained-producer")));
++            capture(f, &format!("retry-{retry}"));
++            println!(
++                "E04 retry={retry} tables_equal={} git_object_files_equal={} host_files_equal={} producer_file_equal=1 schema_equal=true",
++                after.len() + 1,
++                objects.len(),
++                artifacts.len()
++            );
++        }
++        println!(
++            "E04 owned_child_signal=9 changed={changed:?} operation={}",
++            serde_json::to_string(&q).unwrap()
++        );
++    }
++
++    #[test]
++    fn fenced_producer_and_loss_boundaries() {
++        if let Some(root) = std::env::var_os("W2_SERVE_PREFLIGHT") {
++            let ledger = PathBuf::from(root).join("serve-preflight.db");
++            assert!(
++                matches!(foundry_serve::ServeState::new(&ledger),Err(e) if e=="invalid FOUNDRY_DIE_TIMEOUT")
++            );
++            assert!(!ledger.exists());
++            return;
++        }
++        if let Some(root) = std::env::var_os("W2_PRODUCER_CHILD") {
++            worker(Path::new(&root));
++            return;
++        }
++        let f = Fixture::new();
++        configuration_boundaries(&f);
++        f.approved("good");
++        let mut store = f.f.store();
++        let service = &f.f.service;
++        let claim = store
++            .reserve_code_change(service, "good", "produce-good")
++            .unwrap();
++        store
++            .validate_product_work_claim(&claim, Utc::now())
++            .unwrap();
++        assert!(
++            store
++                .collect_code_change(service, "good", "produce-good")
++                .is_err()
++        );
++        assert!(
++            store
++                .seal_code_change(service, "good", "produce-good", &f.repo, &f.base)
++                .is_err()
++        );
++        let sealed = store
++            .seal_code_change(service, "good", "produce-good", &f.repo, &f.head)
++            .unwrap();
++        let (intent, claim, binding) = store
++            .collect_code_change(service, "good", "produce-good")
++            .unwrap();
++        let mut unavailable = PackReviewHost::with_selected_product_pack(
++            &f.f.pack,
++            foundry_line::UnavailableStageExecutor,
++            f.f.store(),
++            f.f.artifact_root(),
++            f.f.session_root(),
++            f.f.claim_root(),
++        )
++        .unwrap();
++        let before = snapshot(&f.f.db_path);
++        assert!(
++            unavailable
++                .try_dispatch_selected_product_work(
++                    &intent,
++                    &claim,
++                    binding.clone(),
++                    "produce-good"
++                )
++                .is_err()
++        );
++        assert!(before == snapshot(&f.f.db_path));
++        let mut host = PackReviewHost::with_selected_product_pack(
++            &f.f.pack,
++            Inspect(f.repo.clone()),
++            f.f.store(),
++            f.f.artifact_root(),
++            f.f.session_root(),
++            f.f.claim_root(),
++        )
++        .unwrap()
++        .with_source_commit("e3631b1ba40511159b58ff7b2c2c0817a44d2cc5")
++        .unwrap();
++        let result = host
++            .try_dispatch_selected_product_work(&intent, &claim, binding, "produce-good")
++            .unwrap();
++        assert_eq!(result.exit_code, 0);
++        assert!(result.held.is_none());
++        let mut finalizer = f.f.store();
++        finalizer
++            .configure_product_artifact_root(f.f.artifact_root())
++            .unwrap();
++        let expect = ProductResultExpectation {
++            host_key: foundry_exec::HostKey {
++                order: "good".into(),
++                attempt: 1,
++                run: 1,
++                activation: 1,
++            },
++            host_result_digest: foundry_ledger::product_host_result_digest(&result).unwrap(),
++        };
++        let finalized = finalizer
++            .finalize_product_review_result(service, &expect)
++            .unwrap();
++        let db = reader(&f.f.db_path);
++        let (bytes,digest,admission,head,base,epoch,fence,pack,tuple):(Vec<u8>,String,String,String,String,i64,i64,String,String)=db.query_row(
++            "SELECT p.artifact,p.artifact_sha256,o.admission_hash,r.result_commit,r.base_commit,p.epoch,p.fence,r.pack_digest,b.tuple_digest FROM product_producers_v1 p JOIN product_orders_v1 o USING(order_id)
++             JOIN product_review_runs_v1 r ON r.order_id=p.order_id AND r.admission_hash=o.admission_hash AND r.result_commit=p.result_commit AND r.status='passed'
++             JOIN product_w1_lifecycle_pins_v1 pin ON pin.order_id=p.order_id AND pin.request_key=p.operation_key AND pin.claim_fence=p.fence AND pin.claim_epoch=p.epoch AND pin.pack_digest=r.pack_digest
++             JOIN product_result_bindings_v1 b ON b.order_id=p.order_id AND b.run_id=1 AND b.generation=0
++             WHERE p.order_id='good' AND p.state='collected'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?))).unwrap();
++        assert_eq!(
++            bytes,
++            git(
++                &f.repo,
++                &["diff", "--binary", "--full-index", &f.base, &f.head, "--"]
++            )
++        );
++        assert_eq!(sha(&bytes), digest);
++        assert_eq!(sealed.artifact_sha256.as_ref(), Some(&digest));
++        assert_eq!((&base, &head, &pack), (&f.base, &f.head, &f.pack));
++        assert_eq!(tuple, finalized.tuple_digest);
++        assert_eq!(
++            (&finalized.base_commit, &finalized.result_commit),
++            (&base, &head)
++        );
++        let expected_tuple = foundry_exec::ArtifactTuple {
++            order: intent.order.clone(),
++            attempt: intent.attempt,
++            run: intent.run,
++            generation: intent.generation,
++            immutable_commit: foundry_exec::ImmutableCommit(head.clone()),
++            artifact_location: foundry_exec::ArtifactLocation(result.log_path.clone()),
++            generations: result.generations.clone(),
++        };
++        assert_eq!(expected_tuple.digest(), tuple);
++        assert!(Path::new(&result.log_path).is_file());
++        println!(
++            "E03 independent reader base={base} head={head} pack={pack} epoch={epoch} fence={fence} admission={admission} sealed_patch_bytes={} sealed_sha256={digest} finalized={}",
++            bytes.len(),
++            serde_json::to_string(&finalized).unwrap()
++        );
++        lost_child(&f);
++        authority_boundaries(&f, &finalized);
++    }
++
++    fn configuration_boundaries(f: &Fixture) {
++        f.approved("config");
++        let fake_die = f.f.root.0.join("never-executed");
++        let canary = f.f.root.0.join("die-entered");
++        fs::write(
++            &fake_die,
++            format!("#!/bin/sh\ntouch '{}'\nexit 1\n", canary.display()),
++        )
++        .unwrap();
++        fs::set_permissions(&fake_die, fs::Permissions::from_mode(0o700)).unwrap();
++        let missing = f.f.root.0.join("absent");
++        let service_file = f.f.root.0.join("service");
++        let args = [
++            "--action",
++            "reserve",
++            "--service-file",
++            service_file.to_str().unwrap(),
++            "--connector",
++            "github-primary",
++            "--repository-id",
++            "repo:1",
++            "--order",
++            "config",
++            "--request-key",
++            "config-producer",
++        ];
++        let cmd = || {
++            let mut c = f.cli_command("product-producer", &args);
++            c.env("FOUNDRY_REPO_PATH", &f.repo)
++                .env("FOUNDRY_DIE_BINARY", &fake_die)
++                .env("FOUNDRY_REVIEW_PACK", &f.f.pack);
++            c
++        };
++        for key in [
++            "FOUNDRY_REVIEW_PACK",
++            "FOUNDRY_DIE_BINARY",
++            "FOUNDRY_REPO_PATH",
++        ] {
++            for value in [Some(&missing), None] {
++                let before = snapshot(&f.f.db_path);
++                let mut c = cmd();
++                if let Some(v) = value {
++                    c.env(key, v);
++                } else {
++                    c.env_remove(key);
++                }
++                assert!(!c.output().unwrap().status.success());
++                assert!(before == snapshot(&f.f.db_path));
++                assert!(!canary.exists());
++            }
++        }
++        for timeout in ["bad", "0", "3601"] {
++            let before = snapshot(&f.f.db_path);
++            assert!(
++                !cmd()
++                    .env("FOUNDRY_DIE_TIMEOUT", timeout)
++                    .output()
++                    .unwrap()
++                    .status
++                    .success()
++            );
++            assert!(before == snapshot(&f.f.db_path));
++            let out = Command::new(std::env::current_exe().unwrap())
++                .args(["--exact", TEST])
++                .env_clear()
++                .env("W2_SERVE_PREFLIGHT", &f.f.root.0)
++                .env("FOUNDRY_DIE_TIMEOUT", timeout)
++                .output()
++                .unwrap();
++            assert!(out.status.success(), "serve timeout {timeout}");
++        }
++        let out = cmd().env("FOUNDRY_DIE_TIMEOUT", "1").output().unwrap();
++        assert!(
++            out.status.success(),
++            "{}",
++            String::from_utf8_lossy(&out.stderr)
++        );
++        let p =
++            f.f.store()
++                .mark_code_change_uncertain(&f.f.service, "config", "config-producer")
++                .unwrap();
++        assert_eq!(p.state, "uncertain");
++        assert_eq!(p.result_commit, None);
++        assert_eq!(p.artifact_sha256, None);
++        assert!(!canary.exists());
++        println!(
++            "E04 six missing/partial config denials, three serve timeout denials, valid reserve, injected pre-seal loss; Die entries=0"
++        );
++    }
++
++    fn private_copy(db: &Path, dst: &Path) {
++        reader(db)
++            .execute("VACUUM INTO ?1", [dst.to_str().unwrap()])
++            .unwrap();
++    }
++    fn source_boundaries(f: &Fixture, claim: &foundry_ledger::ProductWorkClaim) {
++        let db = f.f.root.0.join("source-control.db");
++        private_copy(&f.f.db_path, &db);
++        let mut store = ProductStore::open(&db, f.f.config.clone()).unwrap();
++        store
++            .validate_product_work_claim(claim, Utc::now())
++            .unwrap();
++        for (enabled, key) in [(false, "disable-source"), (true, "restore-source")] {
++            let rev = reader(&db)
++                .query_row(
++                    "SELECT revision FROM product_sources_v1 WHERE connector_id='github-primary'",
++                    [],
++                    |r| r.get(0),
++                )
++                .unwrap();
++            store
++                .configure_scoped_source(
++                    &f.f.owner_session,
++                    "github-primary",
++                    foundry_ledger::RepositoryIdentity::canonicalized(
++                        "acme",
++                        "github",
++                        "https://api.github.com",
++                        "repo:1",
++                    )
++                    .unwrap(),
++                    "acme",
++                    "project",
++                    "repo:1",
++                    "open+foundry:make",
++                    enabled,
++                    rev,
++                    key,
++                    Utc::now(),
++                )
++                .unwrap();
++            assert!(
++                store
++                    .validate_product_work_claim(claim, Utc::now())
++                    .is_err()
++            );
++            assert!(
++                store
++                    .seal_code_change(
++                        &f.f.service,
++                        "service-revoke",
++                        "service-producer",
++                        &f.repo,
++                        &f.head
++                    )
++                    .is_err()
++            );
++        }
++    }
++
++    fn authority_boundaries(f: &Fixture, finalized: &foundry_ledger::ProductResultInfo) {
++        let mut store = f.f.store();
++        let service = &f.f.service;
++        f.approved("stale");
++        let claim = store
++            .reserve_code_change(service, "stale", "stale-producer")
++            .unwrap();
++        store
++            .validate_product_work_claim(&claim, Utc::now())
++            .unwrap();
++        assert!(
++            store
++                .validate_product_work_claim(&claim, claim.lease_until())
++                .is_err()
++        );
++        struct Later(chrono::DateTime<Utc>);
++        impl ProductClock for Later {
++            fn now(&self) -> chrono::DateTime<Utc> {
++                self.0
++            }
++        }
++        let mut later = ProductStore::open_with_clock(
++            &f.f.db_path,
++            f.f.config.clone(),
++            Arc::new(Later(claim.lease_until())),
++        )
++        .unwrap();
++        assert!(
++            later
++                .seal_code_change(service, "stale", "stale-producer", &f.repo, &f.head)
++                .is_err()
++        );
++        let next = store
++            .claim_product_work_for_service(
++                service,
++                "reassigned",
++                claim.lease_until() + Duration::seconds(1),
++                Duration::minutes(1),
++            )
++            .unwrap();
++        assert!(matches!(next, ProductWorkClaimResult::Claimed(ref c) if c.order_id()=="stale"));
++        assert!(
++            store
++                .validate_product_work_claim(&claim, Utc::now())
++                .is_err()
++        );
++        f.approved("service-revoke");
++        let worker = store
++            .reserve_code_change(service, "service-revoke", "service-producer")
++            .unwrap();
++        store
++            .validate_product_work_claim(&worker, Utc::now())
++            .unwrap();
++        let sr: i64 = reader(&f.f.db_path)
++            .query_row(
++                "SELECT revision FROM product_services_v1 WHERE service_id=?1",
++                [SERVICE],
++                |r| r.get(0),
++            )
++            .unwrap();
++        let service_db = f.f.root.0.join("service-control.db");
++        private_copy(&f.f.db_path, &service_db);
++        let mut service_store = ProductStore::open(&service_db, f.f.config.clone()).unwrap();
++        service_store
++            .manage_product_service(
++                &f.f.owner_session,
++                SERVICE,
++                &[],
++                false,
++                Utc::now() + Duration::hours(1),
++                sr,
++                "revoke-service",
++                Utc::now(),
++            )
++            .unwrap();
++        assert!(
++            service_store
++                .validate_product_work_claim(&worker, Utc::now())
++                .is_err()
++        );
++        let grants = [
++            ProductServiceAction::IntakeRead,
++            ProductServiceAction::AdmitDelivery,
++            ProductServiceAction::AckDelivery,
++            ProductServiceAction::DriveReview,
++        ]
++        .map(|action| ProductServiceGrant {
++            source_instance_id: SOURCE.into(),
++            action,
++        });
++        service_store
++            .manage_product_service(
++                &f.f.owner_session,
++                SERVICE,
++                &grants,
++                true,
++                Utc::now() + Duration::hours(1),
++                sr + 1,
++                "restore-service",
++                Utc::now(),
++            )
++            .unwrap();
++        assert!(
++            service_store
++                .validate_product_work_claim(&worker, Utc::now())
++                .is_err()
++        );
++        assert!(
++            service_store
++                .seal_code_change(
++                    service,
++                    "service-revoke",
++                    "service-producer",
++                    &f.repo,
++                    &f.head
++                )
++                .is_err()
++        );
++        // Distinct human approver with a live scoped grant and genuine prepared reservation.
++        let phc =
++            foundry_ledger::product_identity::ProductPasswordKdf::hash("fixture-approval-password")
++                .unwrap();
++        store
++            .create_account(&f.f.owner_session, "approver", "approver", &phc, Utc::now())
++            .unwrap();
++        scope(
++            &f.f,
++            "approver",
++            ProductCapability::ApproveOrder,
++            ScopeMutation::Grant,
++            "grant-approve",
++        );
++        let actor = store
++            .login("approver", "fixture-approval-password", Utc::now())
++            .unwrap();
++        scope(
++            &f.f,
++            "approver",
++            ProductCapability::ReadArtifact,
++            ScopeMutation::Grant,
++            "read-result",
++        );
++        let token = sha(b"fixture-one-time-approval");
++        store
++            .issue_approval_grant(actor.digest(), "grant", &token, "good", Utc::now())
++            .unwrap();
++        let intent = ProductApprovalIntent {
++            request_key: "approval".into(),
++            grant_id: "grant".into(),
++            token_digest: token,
++            order_id: "good".into(),
++            expected_source_revision: 1,
++            expected_attempt: 1,
++            run_id: 1,
++            generation: 0,
++            artifact_digest: f.head.clone(),
++            tuple_digest: finalized.tuple_digest.clone(),
++            intent: "approve local result".into(),
++            now: Utc::now(),
++        };
++        let proof = store.prepare_approval(actor.digest(), &intent).unwrap();
++        let good_copy = f.f.root.0.join("approval-positive.db");
++        private_copy(&f.f.db_path, &good_copy);
++        let receipt = ProductStore::open(&good_copy, f.f.config.clone())
++            .unwrap()
++            .approve_product(actor.digest(), &intent, &proof)
++            .unwrap();
++        assert_eq!(receipt.artifact_digest, f.head);
++        let revoked = f.f.root.0.join("approval-service-revoked.db");
++        private_copy(&f.f.db_path, &revoked);
++        let mut revoked_store = ProductStore::open(&revoked, f.f.config.clone()).unwrap();
++        revoked_store
++            .manage_product_service(
++                &f.f.owner_session,
++                SERVICE,
++                &[],
++                false,
++                Utc::now() + Duration::hours(1),
++                sr,
++                "revoke-before-approve",
++                Utc::now(),
++            )
++            .unwrap();
++        let before = snapshot(&revoked);
++        assert!(
++            revoked_store
++                .approve_product(actor.digest(), &intent, &proof)
++                .is_err()
++        );
++        assert!(before == snapshot(&revoked));
++        let missing = f.f.root.0.join("missing-collection.db");
++        private_copy(&f.f.db_path, &missing);
++        Connection::open(&missing)
++            .unwrap()
++            .execute_batch("DROP TRIGGER product_producer_event_no_delete")
++            .unwrap();
++        Connection::open(&missing).unwrap().execute("DELETE FROM product_producer_events_v1 WHERE order_id='good' AND state='collected'",[]).unwrap();
++        let prior = snapshot(&missing);
++        assert!(
++            ProductStore::open(&missing, f.f.config.clone())
++                .unwrap()
++                .approve_product(actor.digest(), &intent, &proof)
++                .is_err()
++        );
++        assert!(prior == snapshot(&missing));
++        source_boundaries(f, &worker);
++        scope(
++            &f.f,
++            "owner",
++            ProductCapability::AuthorizeTask,
++            ScopeMutation::Revoke,
++            "withdraw-task",
++        );
++        let before = snapshot(&f.f.db_path);
++        capture(f, "withdrawn-before");
++        assert!(
++            store
++                .approve_product(actor.digest(), &intent, &proof)
++                .is_err()
++        );
++        assert!(before == snapshot(&f.f.db_path));
++        capture(f, "withdrawn-after");
++        scope(
++            &f.f,
++            "owner",
++            ProductCapability::AuthorizeTask,
++            ScopeMutation::Grant,
++            "restore-task",
++        );
++        assert!(
++            store
++                .approve_product(actor.digest(), &intent, &proof)
++                .is_err()
++        );
++        store
++            .configure_product_artifact_root(f.f.artifact_root())
++            .unwrap();
++        assert_eq!(
++            store
++                .read_product_result(actor.digest(), "good", &finalized.result_id)
++                .unwrap(),
++            *finalized
++        );
++        for table in [
++            "product_outcomes_v1",
++            "product_token_consumptions_v1",
++            "product_approval_result_bindings_v1",
++        ] {
++            assert_eq!(count(&f.f.db_path, table), 0);
++        }
++        assert_eq!(count(&f.f.db_path, "product_result_bindings_v1"), 1);
++        println!(
++            "E03 service revoke/ABA, lease expiry, reassignment and owner revoke/ABA rejected; retained finalized result=1 approval=0"
++        );
++    }
++}

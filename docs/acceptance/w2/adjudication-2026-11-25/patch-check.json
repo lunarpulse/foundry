@@ -1,0 +1,22 @@
+{
+  "base": "e3631b1ba40511159b58ff7b2c2c0817a44d2cc5",
+  "input_patch_sha256": "71187cdb3ffa8dfdcfea7fabbac79812e921d9f3fcec3979ec65a036986ea080",
+  "lease_fix_patch_sha256": "15d69db9e98db01b0bbbebf66f80a7798093f4dbd30481768711893d02ca7cd8",
+  "applied_in_order_to_clean_base_index": true,
+  "matched_paths_bytes_and_executable_bits": [
+    "crates/foundry-ledger/src/product.rs",
+    "crates/foundry-ledger/src/product/code_change.rs",
+    "crates/foundry-ledger/src/product/code_change/retained_git.rs",
+    "crates/foundry-ledger/src/product/commit_review.rs",
+    "crates/foundry-ledger/src/product/result.rs",
+    "crates/foundry-ledger/src/product/review.rs",
+    "crates/foundry-ledger/src/product_scope.rs",
+    "crates/foundry-line/src/die_executor.rs",
+    "crates/foundry-line/src/review_host.rs",
+    "crates/foundry-serve/src/lib.rs",
+    "crates/foundry/src/main.rs",
+    "crates/foundry/src/selected_review.rs",
+    "crates/foundry/tests/support/b2_w1.rs",
+    "crates/foundry/tests/w2.rs"
+  ]
+}

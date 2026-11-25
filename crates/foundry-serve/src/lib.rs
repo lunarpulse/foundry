@@ -162,6 +162,14 @@ pub struct ServeState {
 
 impl ServeState {
     pub fn new(ledger_path: impl Into<PathBuf>) -> Result<Self, String> {
+        let timeout_secs = DieStageExecutor::configured_timeout()?;
+        let binary = std::env::var_os("FOUNDRY_DIE_BINARY");
+        let repo = std::env::var_os("FOUNDRY_REPO_PATH");
+        if binary.is_some() != repo.is_some()
+            || binary.is_some() && std::env::var_os("FOUNDRY_REVIEW_PACK").is_none()
+        {
+            return Err("incomplete review executor configuration".into());
+        }
         let path: PathBuf = ledger_path.into();
         let ledger = SqliteLedger::open(&path).map_err(|e| format!("open ledger: {e:?}"))?;
         let ledger2 = SqliteLedger::open(&path).map_err(|e| format!("open ledger: {e:?}"))?;
@@ -196,10 +204,6 @@ impl ServeState {
                 (Ok(binary), Ok(repo)) => {
                     let profile =
                         std::env::var("FOUNDRY_DIE_PROFILE").unwrap_or_else(|_| "coding".into());
-                    let timeout_secs = std::env::var("FOUNDRY_DIE_TIMEOUT")
-                        .ok()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(600);
                     let default_sessions = host_db
                         .parent()
                         .unwrap_or(std::path::Path::new("."))

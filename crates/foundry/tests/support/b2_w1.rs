@@ -121,7 +121,7 @@ impl RuntimeFixture {
     }
 
     pub fn with_preimage(order_ids: &[&str], preimage: Option<(&Path, ProductConfig)>) -> Self {
-        assert!(!order_ids.is_empty());
+        // An empty slice provisions identities and the registry only.
         let root = PrivateRoot::new();
         let db_path = root.0.join("product.sqlite");
         #[cfg(feature = "product-pack-pins")]
@@ -686,6 +686,11 @@ pub fn y_pack_with_changed_lenses(source: &Path, destination: &Path) -> (PathBuf
             fs::write(entry.path(), bytes).expect("change Y pack lens bytes");
         }
     }
+    let digest = refresh_fixture_manifest(destination);
+    (destination.to_owned(), digest)
+}
+
+pub fn refresh_fixture_manifest(destination: &Path) -> String {
     let manifest_path = destination.join("manifest.toml");
     let manifest = fs::read_to_string(&manifest_path).expect("read copied manifest");
     let files_line = manifest
@@ -745,7 +750,7 @@ pub fn y_pack_with_changed_lenses(source: &Path, destination: &Path) -> (PathBuf
         manifest_digest(destination) == digest,
         "recomputed pack manifest digest differs"
     );
-    (destination.to_owned(), digest)
+    digest
 }
 
 pub fn manifest_digest(pack_dir: &Path) -> String {

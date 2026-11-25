@@ -1,0 +1,12 @@
+ crates/foundry-ledger/src/product.rs               |  81 +++++++++-
+ crates/foundry-ledger/src/product/commit_review.rs |   2 +-
+ crates/foundry-ledger/src/product/result.rs        |  11 ++
+ crates/foundry-ledger/src/product/review.rs        |  94 ++++++++++-
+ crates/foundry-ledger/src/product_scope.rs         |   7 +-
+ crates/foundry-line/src/die_executor.rs            |  13 ++
+ crates/foundry-line/src/review_host.rs             |  43 +++++
+ crates/foundry-serve/src/lib.rs                    |  12 +-
+ crates/foundry/src/main.rs                         |  15 +-
+ crates/foundry/src/selected_review.rs              | 173 +++++++++++++++++++--
+ crates/foundry/tests/support/b2_w1.rs              |   9 +-
+ 11 files changed, 427 insertions(+), 33 deletions(-)

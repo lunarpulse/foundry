@@ -374,6 +374,8 @@ pub struct ProductConfig {
 }
 
 #[cfg(feature = "product-pack-pins")]
+pub mod code_change;
+#[cfg(feature = "product-pack-pins")]
 mod commit_review;
 #[cfg(feature = "product-pack-pins")]
 mod pack_migration;
@@ -4457,6 +4459,8 @@ fn open_internal_with_checkpoint(
         if tuple_digest != intent.tuple_digest {
             return Err(ProductError::Invariant("strict result tuple mismatch"));
         }
+        #[cfg(feature = "product-pack-pins")]
+        code_change::require_approval_collection(&tx, intent, self.clock.now())?;
         let artifact_digest = intent.artifact_digest.clone();
         let seq: i64 = tx.query_row("SELECT COALESCE(MAX(seq),0)+1 FROM ledger", [], |r| {
             r.get(0)
@@ -4839,6 +4843,23 @@ fn open_internal_with_checkpoint(
                 } else {
                     tx.execute("INSERT INTO product_intake_source_bindings_v1(delivery_id,source_instance_id,source_revision,source_instance_revision,source_generation) VALUES(?1,?2,?3,?4,?5)",params![item.delivery_id,context.source_instance_id,context.connector_revision,context.source_instance_revision,context.source_generation])?;
                 }
+                #[cfg(feature = "product-pack-pins")]
+                if item.task_kind == "github-issue"
+                    && self.open_mode == StoreOpenMode::Normal
+                    && tx.query_row(
+                        "SELECT schema_version=4 FROM product_meta_v1 WHERE singleton=1",
+                        [],
+                        |r| r.get::<_, bool>(0),
+                    )?
+                {
+                    code_change::pin_first_observation(
+                        &tx,
+                        &context.source_instance_id,
+                        &item.connector_id,
+                        &item.repository_id,
+                        &item.issue_id,
+                    )?;
+                }
             }
         }
         for digest in rejected_item_digests {
@@ -5005,7 +5026,7 @@ fn open_internal_with_checkpoint(
                 "intake service scope is not provisioned",
             ));
         }
-        let mut stmt = self.conn.prepare("SELECT i.delivery_id,i.connector_id,i.repository_id,i.issue_id,m.observed_updated_at,i.version_digest,m.task_kind,i.payload,i.state,i.retry_at FROM product_intake_inbox_v1 i JOIN product_intake_delivery_meta_v1 m USING(delivery_id) WHERE i.state IN ('fetched','retryable','admitted') AND (i.retry_at IS NULL OR i.retry_at<=?1) ORDER BY i.delivery_id LIMIT ?2")?;
+        let mut stmt = self.conn.prepare("SELECT i.delivery_id,i.connector_id,i.repository_id,i.issue_id,m.observed_updated_at,i.version_digest,m.task_kind,i.payload,i.state,i.retry_at FROM product_intake_inbox_v1 i JOIN product_intake_delivery_meta_v1 m USING(delivery_id) WHERE i.state IN ('fetched','retryable','admitted') AND (i.retry_at IS NULL OR i.retry_at<=?1) ORDER BY i.rowid LIMIT ?2")?;
         let rows = stmt
             .query_map(params![now.to_rfc3339(), limit as i64], |r| {
                 Ok(crate::product_intake::DueDelivery {
@@ -5043,7 +5064,7 @@ fn open_internal_with_checkpoint(
             ProductServiceAction::AdmitDelivery,
             now,
         )?;
-        let mut stmt = tx.prepare("SELECT i.delivery_id,i.connector_id,i.repository_id,i.issue_id,m.observed_updated_at,i.version_digest,m.task_kind,i.payload,i.state,i.retry_at FROM product_intake_inbox_v1 i JOIN product_intake_delivery_meta_v1 m USING(delivery_id) JOIN product_intake_source_bindings_v1 b USING(delivery_id) WHERE i.connector_id=?1 AND i.repository_id=?2 AND b.source_instance_id=?3 AND b.source_revision=?4 AND b.source_instance_revision=?5 AND b.source_generation=?6 AND i.state IN ('fetched','retryable','admitted') AND (i.retry_at IS NULL OR i.retry_at<=?7) ORDER BY i.delivery_id LIMIT ?8")?;
+        let mut stmt = tx.prepare("SELECT i.delivery_id,i.connector_id,i.repository_id,i.issue_id,m.observed_updated_at,i.version_digest,m.task_kind,i.payload,i.state,i.retry_at FROM product_intake_inbox_v1 i JOIN product_intake_delivery_meta_v1 m USING(delivery_id) JOIN product_intake_source_bindings_v1 b USING(delivery_id) WHERE i.connector_id=?1 AND i.repository_id=?2 AND b.source_instance_id=?3 AND b.source_revision=?4 AND b.source_instance_revision=?5 AND b.source_generation=?6 AND i.state IN ('fetched','retryable','admitted') AND (i.retry_at IS NULL OR i.retry_at<=?7) ORDER BY i.rowid LIMIT ?8")?;
         let rows = stmt
             .query_map(
                 params![
@@ -5200,6 +5221,39 @@ fn open_internal_with_checkpoint(
             };
             tx.commit()?;
             return Ok(receipt);
+        }
+        // A caller may request an edit directly before the drain sees the
+        // original. Only the first persisted observation can anchor the order.
+        let first: String = tx.query_row(
+            "SELECT i.delivery_id FROM product_intake_inbox_v1 i
+             LEFT JOIN product_intake_source_bindings_v1 b USING(delivery_id)
+             WHERE i.connector_id=?1 AND i.repository_id=?2 AND i.issue_id=?3
+               AND b.source_instance_id IS ?4 ORDER BY i.rowid LIMIT 1",
+            params![
+                connector,
+                repository_id,
+                issue_id,
+                service.map(|s| &s.source_instance_id)
+            ],
+            |r| r.get(0),
+        )?;
+        #[cfg(feature = "product-pack-pins")]
+        let first = if task_kind == "github-issue"
+            && service.is_some()
+            && tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='product_issue_first_v1')",
+                [],
+                |r| r.get::<_, bool>(0),
+            )? {
+            tx.query_row("SELECT delivery FROM product_issue_first_v1 WHERE source=?1 AND connector=?2 AND repository=?3 AND issue=?4",
+                params![service.map(|s| &s.source_instance_id),connector,repository_id,issue_id],|r|r.get(0)).optional()?.unwrap_or(first)
+        } else {
+            first
+        };
+        if first != delivery_id {
+            return Err(ProductError::Invariant(
+                "first issue observation awaits admission",
+            ));
         }
         let receipt = admit_order_in(
             &tx,
@@ -5543,8 +5597,20 @@ fn open_internal_with_checkpoint(
         lease: chrono::Duration,
     ) -> Result<ProductWorkClaimResult, ProductError> {
         service::require_service_context_in(tx, context, ProductServiceAction::DriveReview, now)?;
+        // An expired lease cannot put a sealed, collected or uncertain
+        // producer back on the generic watch queue. Historical stores have
+        // no producer journal until their first explicit task authorization.
+        let has_journal: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='product_producers_v1')",
+            [], |r| r.get(0),
+        )?;
+        let producer_filter = if has_journal {
+            "AND NOT EXISTS(SELECT 1 FROM product_producers_v1 p WHERE p.order_id=o.order_id AND p.state!='reserved')"
+        } else {
+            ""
+        };
         let candidate: Option<(String,i64,String,String,String,i64,i64,String,i64,i64,i64,Option<String>)> = tx.query_row(
-            "SELECT o.order_id,o.lifecycle,b.delivery_id,o.task_kind,o.payload_snapshot,o.source_revision,o.admission_seq,o.admission_hash,s.revision,s.enabled,COALESCE(c.epoch,0),c.lease_until FROM product_work_backlog_v1 b JOIN product_orders_v1 o ON o.order_id=b.order_id AND o.lifecycle=b.lifecycle JOIN product_sources_v1 s ON s.connector_id=o.connector_id JOIN product_scope_order_provenance_v1 p ON p.order_id=o.order_id AND p.lifecycle=o.lifecycle AND p.verified=1 AND p.source_instance_id=?2 LEFT JOIN product_work_claims_v1 c ON c.order_id=b.order_id AND c.lifecycle=b.lifecycle WHERE o.connector_id=?3 AND o.repository_id=?4 AND (b.state IN ('ready','retryable') OR (b.state IN ('claimed','completed') AND (c.lease_until IS NULL OR c.lease_until<=?1))) AND ((?5 IS NULL AND (?6 IS NULL OR o.task_kind!=?6 OR c.owner_id IS NULL OR c.owner_id NOT GLOB 'commit-review-*' OR (SELECT schema_version FROM product_meta_v1 WHERE singleton=1)!=4)) OR o.order_id=?5) AND b.available_at<=?1 ORDER BY b.available_at,o.order_id LIMIT 1",
+            &format!("SELECT o.order_id,o.lifecycle,b.delivery_id,o.task_kind,o.payload_snapshot,o.source_revision,o.admission_seq,o.admission_hash,s.revision,s.enabled,COALESCE(c.epoch,0),c.lease_until FROM product_work_backlog_v1 b JOIN product_orders_v1 o ON o.order_id=b.order_id AND o.lifecycle=b.lifecycle JOIN product_sources_v1 s ON s.connector_id=o.connector_id JOIN product_scope_order_provenance_v1 p ON p.order_id=o.order_id AND p.lifecycle=o.lifecycle AND p.verified=1 AND p.source_instance_id=?2 LEFT JOIN product_work_claims_v1 c ON c.order_id=b.order_id AND c.lifecycle=b.lifecycle WHERE o.connector_id=?3 AND o.repository_id=?4 AND (b.state IN ('ready','retryable') OR (b.state IN ('claimed','completed') AND (c.lease_until IS NULL OR c.lease_until<=?1))) AND ((?5 IS NULL AND (?6 IS NULL OR o.task_kind!=?6 OR c.owner_id IS NULL OR c.owner_id NOT GLOB 'commit-review-*' OR (SELECT schema_version FROM product_meta_v1 WHERE singleton=1)!=4)) OR o.order_id=?5) {producer_filter} AND b.available_at<=?1 ORDER BY b.available_at,o.order_id LIMIT 1"),
             params![now.to_rfc3339(),context.source_instance_id,context.connector_id,context.repository_id,requested_order,if cfg!(feature="product-pack-pins"){Some("local-commit-review-v1")}else{None}], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?,r.get(11)?)),
         ).optional()?;
         let Some((
@@ -5636,7 +5702,8 @@ fn open_internal_with_checkpoint(
         }
         #[cfg(feature = "w1-isolated-test-support")]
         if self.open_mode.is_pin() { return Err(ProductError::ContractMismatch); }
-        let exact: bool = self.conn.query_row(
+        let tx = self.conn.unchecked_transaction()?;
+        let exact: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM product_work_claims_v1 c JOIN product_work_backlog_v1 b ON b.order_id=c.order_id AND b.lifecycle=c.lifecycle JOIN product_orders_v1 o ON o.order_id=c.order_id AND o.lifecycle=c.lifecycle JOIN product_sources_v1 s ON s.connector_id=o.connector_id JOIN product_transition_receipts_v1 r ON r.seq=o.admission_seq AND r.event_hash=o.admission_hash WHERE c.order_id=?1 AND c.lifecycle=?2 AND c.owner_id=?3 AND c.epoch=?4 AND c.fence=?5 AND c.state='claimed' AND c.lease_until>?6 AND c.source_revision=?7 AND s.revision=?7 AND s.enabled=1 AND b.state='claimed' AND b.delivery_id=?8 AND c.payload_digest=?9 AND o.task_kind=?10 AND o.payload_snapshot=?11 AND r.operation='github-admission')",
             params![claim.order_id,claim.lifecycle,claim.worker_id,claim.epoch,claim.fence,now.to_rfc3339(),claim.source_revision,claim.delivery_id,claim.payload_digest,claim.task_kind,claim.payload_snapshot], |r| r.get(0),
         )?;
@@ -5645,6 +5712,12 @@ fn open_internal_with_checkpoint(
                 "work claim is stale, expired, or no longer authorized",
             ));
         }
+        #[cfg(feature = "product-pack-pins")]
+        if code_change::enabled_for(&tx, &claim.order_id)? {
+            code_change::check_adapter_claim(&tx, claim, now)?;
+        }
+        service::validate_review_work_claim_in(&tx, &claim.review_binding(), now)?;
+        tx.commit()?;
         Ok(())
     }
 

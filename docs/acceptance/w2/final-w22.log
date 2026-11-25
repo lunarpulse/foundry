@@ -1,0 +1,77 @@
++ cargo test --locked --offline -j1 -p foundry --features p2-test-support,product-pack-pins --test w2 -- w22_code_change::fenced_producer_and_loss_boundaries --exact --nocapture
+warning: function `nothing` is never used
+ --> crates/foundry-furnace/src/lib.rs:2:4
+  |
+2 | fn nothing() {}
+  |    ^^^^^^^
+  |
+  = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `foundry-furnace` (lib) generated 1 warning
+warning: unused import: `CostFields`
+  --> crates/foundry-watch/src/benchmark.rs:22:37
+   |
+22 | use crate::corpus::{CorpusManifest, CostFields};
+   |                                     ^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `foundry_domain::OrderState`
+  --> crates/foundry-watch/src/corpus_emit.rs:15:5
+   |
+15 | use foundry_domain::OrderState;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `Sha256`
+   --> crates/foundry-watch/src/dry_die.rs:101:28
+    |
+101 |         use sha2::{Digest, Sha256};
+    |                            ^^^^^^
+
+warning: unused import: `Sha256`
+   --> crates/foundry-watch/src/dry_die.rs:145:24
+    |
+145 |     use sha2::{Digest, Sha256};
+    |                        ^^^^^^
+
+warning: unused import: `std::os::unix::ffi::OsStrExt`
+  --> crates/foundry-watch/src/gc.rs:58:9
+   |
+58 |     use std::os::unix::ffi::OsStrExt;
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `foundry-watch` (lib) generated 5 warnings (run `cargo fix --lib -p foundry-watch` to apply 4 suggestions)
+warning: unused imports: `IdentityError` and `Role`
+  --> crates/foundry-serve/src/scope.rs:16:54
+   |
+16 | use crate::identity::{AuthenticatedUser, Capability, IdentityError, Role};
+   |                                                      ^^^^^^^^^^^^^  ^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `foundry-serve` (lib) generated 1 warning (run `cargo fix --lib -p foundry-serve` to apply 1 suggestion)
+warning: unused import: `foundry_domain::order as _`
+ --> crates/foundry-blueprint/src/lib.rs:3:5
+  |
+3 | use foundry_domain::order as _; // reserve: line→Order factory comes in T7
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `foundry-blueprint` (lib) generated 1 warning (run `cargo fix --lib -p foundry-blueprint` to apply 1 suggestion)
+    Finished `test` profile [unoptimized] target(s) in 0.31s
+     Running tests/w2.rs (/home/cosmo/.hermes/cache/scratch/w2-rebuild/target/debug/deps/w2-6c3992339f29af01)
+
+running 1 test
+E04 six missing/partial config denials, three serve timeout denials, valid reserve, injected pre-seal loss; Die entries=0
+E03 independent reader base=07216d347c03e6127741200d87db0d16eccf3e7b head=59951eef0813f7af50483dd050496cf4c818edca pack=5f28e6c41d834462a93c1d77541b4d122baf58ac9c85c7674c9753d23436d8fc epoch=1 fence=2 admission=6105ae06d0469ce0afacf508692c0f2d75cee509bb25bf95a9d9ef2a3a647275 sealed_patch_bytes=180 sealed_sha256=0f814fe1d98112eddcecef676c8202038c2b45564dede044fe5921e1bf093217 finalized={"result_id":"c149d3072b0a47a011414126cf6575e066f9fdf16f04d3b6cf27cfc108b7df1b","order_id":"good","lifecycle":1,"attempt":1,"run_id":1,"activation":1,"generation":0,"base_commit":"07216d347c03e6127741200d87db0d16eccf3e7b","result_commit":"59951eef0813f7af50483dd050496cf4c818edca","host_result_digest":"e10fc459a8b7d975dd7a0e820a3bff8f236e9743cdd32014a3ab510ed04b9ea8","tuple_digest":"067dba8debd9678bbb5e57c6f0d3db16d1c7370573451ca0f7efb3019446f155","binding_digest":"f2780fd2f1bf8f9cfd9dd8243645b311aa4faebab3cba47fa67900a1ef43cc18","final_artifact_id":"8114af6d9dbfca1715cc4f0b66b4c928fd6cf65601991c42d8b99a5126a3c4c9","artifact_ids":["8114af6d9dbfca1715cc4f0b66b4c928fd6cf65601991c42d8b99a5126a3c4c9"],"finalized_at":"2026-11-25T06:18:30.457423890+00:00"}
+
+running 1 test
+E04 retry=1 tables_equal=82 git_object_files_equal=6 host_files_equal=5 producer_file_equal=1 schema_equal=true
+E04 retry=2 tables_equal=82 git_object_files_equal=6 host_files_equal=5 producer_file_equal=1 schema_equal=true
+E04 owned_child_signal=9 changed=["product_producer_events_v1", "product_producers_v1"] operation={"order_id":"loss","lifecycle":1,"operation_key":"lost-producer","state":"uncertain","worker":"code-change-598cbe934c86f855a3c4d05428c69b572c725ed0a533b267e400b631ea322014","epoch":1,"fence":3,"deadline":"2026-11-25T06:20:30.670895742+00:00","result_commit":"87ce14604e85c19d03bbce81548c3fbe23c448e1","artifact_sha256":"8c9a7e107e4b9767d034624c1b7aeecfa2a78c5e0aef8443fbbf4eaad7856a21"}
+E03 service revoke/ABA, lease expiry, reassignment and owner revoke/ABA rejected; retained finalized result=1 approval=0
+test w22_code_change::fenced_producer_and_loss_boundaries ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 22.31s
+

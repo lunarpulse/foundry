@@ -1,0 +1,130 @@
++ cargo test --locked --offline -j1 -p foundry --features p2-test-support,product-pack-pins --test w2 -- w21_intake --nocapture
+   Compiling foundry-ledger v0.1.0 (/home/cosmo/worktrees/foundry-w2-integration/crates/foundry-ledger)
+warning: function `nothing` is never used
+ --> crates/foundry-furnace/src/lib.rs:2:4
+  |
+2 | fn nothing() {}
+  |    ^^^^^^^
+  |
+  = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `foundry-furnace` (lib) generated 1 warning
+   Compiling foundry-line v0.1.0 (/home/cosmo/worktrees/foundry-w2-integration/crates/foundry-line)
+   Compiling foundry-watch v0.1.0 (/home/cosmo/worktrees/foundry-w2-integration/crates/foundry-watch)
+warning: unused import: `CostFields`
+  --> crates/foundry-watch/src/benchmark.rs:22:37
+   |
+22 | use crate::corpus::{CorpusManifest, CostFields};
+   |                                     ^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `foundry_domain::OrderState`
+  --> crates/foundry-watch/src/corpus_emit.rs:15:5
+   |
+15 | use foundry_domain::OrderState;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `Sha256`
+   --> crates/foundry-watch/src/dry_die.rs:101:28
+    |
+101 |         use sha2::{Digest, Sha256};
+    |                            ^^^^^^
+
+warning: unused import: `Sha256`
+   --> crates/foundry-watch/src/dry_die.rs:145:24
+    |
+145 |     use sha2::{Digest, Sha256};
+    |                        ^^^^^^
+
+warning: unused import: `std::os::unix::ffi::OsStrExt`
+  --> crates/foundry-watch/src/gc.rs:58:9
+   |
+58 |     use std::os::unix::ffi::OsStrExt;
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `foundry-watch` (lib) generated 5 warnings (run `cargo fix --lib -p foundry-watch` to apply 4 suggestions)
+   Compiling foundry-workflow v0.1.0 (/home/cosmo/worktrees/foundry-w2-integration/crates/foundry-workflow)
+   Compiling foundry-serve v0.1.0 (/home/cosmo/worktrees/foundry-w2-integration/crates/foundry-serve)
+warning: unused imports: `IdentityError` and `Role`
+  --> crates/foundry-serve/src/scope.rs:16:54
+   |
+16 | use crate::identity::{AuthenticatedUser, Capability, IdentityError, Role};
+   |                                                      ^^^^^^^^^^^^^  ^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `foundry-serve` (lib) generated 1 warning (run `cargo fix --lib -p foundry-serve` to apply 1 suggestion)
+   Compiling foundry-orch v0.1.0 (/home/cosmo/worktrees/foundry-w2-integration/crates/foundry-orch)
+warning: unused import: `foundry_domain::order as _`
+ --> crates/foundry-blueprint/src/lib.rs:3:5
+  |
+3 | use foundry_domain::order as _; // reserve: line→Order factory comes in T7
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `foundry-blueprint` (lib) generated 1 warning (run `cargo fix --lib -p foundry-blueprint` to apply 1 suggestion)
+   Compiling foundry v0.1.0 (/home/cosmo/worktrees/foundry-w2-integration/crates/foundry)
+warning: unused imports: `ProductServiceAction` and `ProductStore`
+ --> crates/foundry/tests/w2.rs:8:60
+  |
+8 |     ProductCapability, ProductDelivery, ProductPollCursor, ProductServiceAction, ProductStore,
+  |                                                            ^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `schema_snapshot`
+  --> crates/foundry/tests/w2.rs:20:38
+   |
+20 | use support::{RuntimeFixture, count, schema_snapshot, snapshot};
+   |                                      ^^^^^^^^^^^^^^^
+
+warning: constant `SERVICE` is never used
+  --> crates/foundry/tests/w2.rs:23:7
+   |
+23 | const SERVICE: &str = "b2-w1-service";
+   |       ^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: fields `repo` and `head` are never read
+  --> crates/foundry/tests/w2.rs:53:5
+   |
+51 | struct Fixture {
+   |        ------- fields in this struct
+52 |     f: RuntimeFixture,
+53 |     repo: PathBuf,
+   |     ^^^^
+54 |     base: String,
+55 |     head: String,
+   |     ^^^^
+
+warning: method `approved` is never used
+   --> crates/foundry/tests/w2.rs:243:8
+    |
+ 58 | impl Fixture {
+    | ------------ method in this implementation
+...
+243 |     fn approved(&self, order: &str) {
+    |        ^^^^^^^^
+
+warning: `foundry` (test "w2") generated 5 warnings (run `cargo fix --test "w2" -p foundry` to apply 2 suggestions)
+    Finished `test` profile [unoptimized] target(s) in 34.47s
+     Running tests/w2.rs (/home/cosmo/.hermes/cache/scratch/w2-rebuild/target/debug/deps/w2-6c3992339f29af01)
+
+running 1 test
+
+thread 'w21_intake::disallowed_and_edited_observations' (220) panicked at crates/foundry/tests/w2.rs:267:10:
+called `Result::unwrap()` on an `Err` value: Invariant("remote self scope expansion is forbidden")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test w21_intake::disallowed_and_edited_observations ... FAILED
+
+failures:
+
+failures:
+    w21_intake::disallowed_and_edited_observations
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.95s
+
+error: test failed, to rerun pass `-p foundry --test w2`

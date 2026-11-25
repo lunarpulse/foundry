@@ -1,0 +1,359 @@
+{
+  "files": {
+    "repo/.git/objects/03/fa319a3bb081fd0b0e07a575e4e72d2c6b7a09": {
+      "inode": 396301,
+      "sha256": "e1a148c9207ea0b93385957a4c6e39fa911dc326ca97139f76ff0313b70c8da4"
+    },
+    "repo/.git/objects/25/2e7790dcce9d15fb6309761afeda3e2c808cea": {
+      "inode": 396274,
+      "sha256": "39f7d3bed113fa1f47e3281ae7d78aff0565ac6fde77fcc85e7f6351ed4a6818"
+    },
+    "repo/.git/objects/5e/6308cd2cb28f3b4d3c6b771bd2c5cf27b7cf99": {
+      "inode": 396278,
+      "sha256": "df4b67e67e7e7614d49f998c4fc9090279b6588ad338491ac5d842820a7e2b6a"
+    },
+    "repo/.git/objects/66/a52ee7a1d803dc57859c3e95ac9dcdc87c0164": {
+      "inode": 396295,
+      "sha256": "d3bc60038db725f4a1bd68472582af034d00ecda9770fe58f53b7132e0244aff"
+    },
+    "repo/.git/objects/9c/59e24b8393179a5d712de4f990178df5734d99": {
+      "inode": 396270,
+      "sha256": "d724be93646089d7c133c7e07f295b2448029b335dbc21ad08e4b4676b133447"
+    },
+    "repo/.git/objects/ff/01a4d64575a2a080177636926f1db3432213cd": {
+      "inode": 396299,
+      "sha256": "5b375fdbb218feafa8ebee519c6763bf51cdc324f8e1796507c5538027f9176c"
+    }
+  },
+  "schema_sha256": "f8b3712124dda30f3e3e94225b8a6e21d2106aedcfe810397db1231c27eb7f8f",
+  "tables": {
+    "artifact_tuples": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "foundry_contract": {
+      "rows": 1,
+      "sha256": "8b417832e7dd796f7bccfa5bf30e341494fb49d69acd06fdb88d3d9f20c5be1f"
+    },
+    "ledger": {
+      "rows": 13,
+      "sha256": "c33387af64b581bd37ee98f37fb8878ab73096e5e13c5613e369364a8a0918c7"
+    },
+    "product_accounts_v1": {
+      "rows": 2,
+      "sha256": "3bde276828d1415300b10639d1de68993bcbe7e9abcc843043f89efd59f9ff64"
+    },
+    "product_approval_result_bindings_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_artifact_root_identity_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_artifact_root_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_artifacts_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_code_tasks_v1": {
+      "rows": 1,
+      "sha256": "0f7a463801672d3a27acf276101ec0796f3bcdbaf42545395b9328f317c832a1"
+    },
+    "product_credentials_v1": {
+      "rows": 2,
+      "sha256": "de9208627c2fd6f6564a97c032e2f9d576f2502d63eb012edd3da08a20997993"
+    },
+    "product_fence_counter_v1": {
+      "rows": 1,
+      "sha256": "95bce4a0c3a6c362e7bc7d42df33ea98b84e4f43d1eaeb48eb3f5b2b044c8b31"
+    },
+    "product_grants_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_intake_delivery_meta_v1": {
+      "rows": 15,
+      "sha256": "5c558beb26fb12559a082ef7ef896ad7b4248655cb18308435291b1a56257b66"
+    },
+    "product_intake_inbox_v1": {
+      "rows": 15,
+      "sha256": "135b11ab6597232d297898e7889ae79ed6cb9cce14ad88bd8bce8f9b54074d74"
+    },
+    "product_intake_rejections_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_intake_source_bindings_v1": {
+      "rows": 15,
+      "sha256": "fbde7455426dd96a6183a77384703ee3d8c1aa796c5239866606cee023510fc2"
+    },
+    "product_issue_first_v1": {
+      "rows": 13,
+      "sha256": "12460542f6e4e446748141e2b3640d2bee3c39b3e392ba0148ac474c56742033"
+    },
+    "product_login_throttle_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_meta_v1": {
+      "rows": 1,
+      "sha256": "5431ef790f3aec34c04dabe8fa6ee8f9886a4dfec9453f00b7899526fffc4795"
+    },
+    "product_operations_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_order_payload_digests_v1": {
+      "rows": 13,
+      "sha256": "6b16e491186deffbab5c9438577d12fe3c41c03340305ca931cf995f2e0287eb"
+    },
+    "product_orders_v1": {
+      "rows": 13,
+      "sha256": "023c135bf03a71bd360cf4be7f93716eae59e7715b3ae36ee0062ef199c0b331"
+    },
+    "product_outcomes_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_poll_backoff_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_poll_source_bindings_v1": {
+      "rows": 2,
+      "sha256": "8f439b4eb1b1bb9d054c64bc5f185f62b7022d81017554de7254f374c1fc9707"
+    },
+    "product_poll_state_v1": {
+      "rows": 2,
+      "sha256": "9e797b8a1616acd419f28d84dba7fbb01f1ee087a76bc53c75bebe2a4f1c962b"
+    },
+    "product_producer_events_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_producers_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_publish_outcomes_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_result_bindings_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_result_legacy_hosts_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_result_legacy_tuples_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_result_meta_v1": {
+      "rows": 1,
+      "sha256": "e60310d65e1f1deef5e1251aceb977550e169a959d1eab9a68e1bc505e812101"
+    },
+    "product_review_active_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_review_authority_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_review_bindings_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_review_budget_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_review_epochs_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_review_failures_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_review_hold_acceptances_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_review_hold_progress_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_review_holds_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_review_host_accept_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_review_host_results_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_review_meta_v1": {
+      "rows": 1,
+      "sha256": "aedbb7602b8cecde807692e22457a4e1a1c3942c9ee9366131da6e650a3a8602"
+    },
+    "product_review_redrive_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_review_run_reservations_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_review_runs_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_review_sessions_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_review_stages_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_review_work_bindings_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_scope_api_locators_v1": {
+      "rows": 1,
+      "sha256": "0ffc7b7e67c1ae0545a5b6c2864596f65316f6eeabf8cc7309b47bc6a00a4542"
+    },
+    "product_scope_current_sources_v1": {
+      "rows": 1,
+      "sha256": "3b68c8c26ead01ff1ef32b146821c0c4f6826278751d9d677b89bb87ecd2a7d5"
+    },
+    "product_scope_events_v1": {
+      "rows": 4,
+      "sha256": "a142055a3444ada3dafaeae5c65baa00f3749f1653594f28d5f1b2faa76ca1b3"
+    },
+    "product_scope_grants_v1": {
+      "rows": 4,
+      "sha256": "bbe39002e7c6b53096a8ec158ed1ebe53e0a9aad1c12f996fcab26cd379301ab"
+    },
+    "product_scope_migrations_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_scope_operations_v1": {
+      "rows": 1,
+      "sha256": "9076b50813b06d385d27bc729aa198d9bbfa415b4db6759412a953177addeb97"
+    },
+    "product_scope_order_provenance_v1": {
+      "rows": 13,
+      "sha256": "d72d6e1873c04164b27a5bf9b395d7490c88d97d6dcd927d554c98ae37b62775"
+    },
+    "product_scope_policy_state_v1": {
+      "rows": 1,
+      "sha256": "fe2a0ca9065d9997a9bc3cef177928aef99d4765cbae8814148ecfec63cc439e"
+    },
+    "product_scope_quarantine_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_scope_repositories_v1": {
+      "rows": 1,
+      "sha256": "8557d18d9f82ac736cdf23892aeafa1849344eda394c7ddc4dcee12dc894c079"
+    },
+    "product_scope_source_events_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_scope_source_instances_v1": {
+      "rows": 1,
+      "sha256": "e871369f40908acb80015312ba7af6fac708700ba86d50660ea81a6fbbdfa5d4"
+    },
+    "product_scope_subject_revisions_v1": {
+      "rows": 1,
+      "sha256": "50adc8ddd9eeb56a3f079e7145c1257bb937015eddf46a585d50ce392506ffce"
+    },
+    "product_service_credentials_v1": {
+      "rows": 1,
+      "sha256": "cc10c37734abb4ff90e0cd97c446c25d1d4f31175b63c04847eb5bafd130f86b"
+    },
+    "product_service_events_v1": {
+      "rows": 2,
+      "sha256": "d886e00fa480eef6387e3e1ccbebf12fa3c77ab509b0d9ae5f22238bc45ee33c"
+    },
+    "product_service_grants_v1": {
+      "rows": 4,
+      "sha256": "18b36bad9db7b0323182d954d849858bf612b3c2618c38bb688187536c577334"
+    },
+    "product_service_operations_v1": {
+      "rows": 1,
+      "sha256": "e3d8360676748dbf0762f09e658fe160065cf90f7099cdd611951e0f7fd9ecbc"
+    },
+    "product_service_work_bindings_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_services_v1": {
+      "rows": 1,
+      "sha256": "5502737b7835bf8a0568490d7458742814102bb1e25925b70f05df82655fad0f"
+    },
+    "product_sessions_v1": {
+      "rows": 2,
+      "sha256": "ef2c508dc865faae630c9e181557ba80128eb872735e49d5d1e40294f8685e5a"
+    },
+    "product_sources_v1": {
+      "rows": 1,
+      "sha256": "d6fcea8f6cef2c65a9f17ce96c1addca9943dfbfe6dcb5fceb7d4571c98b41e9"
+    },
+    "product_token_consumptions_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_transition_intents_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_transition_receipts_v1": {
+      "rows": 13,
+      "sha256": "e8d1e375c6e7d1ad858438450b9d474515032274b6b6732a8052410bd7738519"
+    },
+    "product_w1_claim_authority_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_w1_grant_sidecar_v1": {
+      "rows": 13,
+      "sha256": "b4619bb65d8b29a9138a560e9db2155f1d50797004fff9fada14922a63c3a710"
+    },
+    "product_w1_lifecycle_pins_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "product_w1_operations_v1": {
+      "rows": 15,
+      "sha256": "bded1bff538bda01384be270ba58ab7e825fc882028676fb281c4248d18fb5e9"
+    },
+    "product_work_backlog_v1": {
+      "rows": 13,
+      "sha256": "08732a8b58200e4d74f4501eb19f2fe3ac90172e94b300cb632d6d6753561175"
+    },
+    "product_work_claims_v1": {
+      "rows": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "sqlite_sequence": {
+      "rows": 3,
+      "sha256": "4ff2adb32e5991b39c10c7dec167ad228a642e8e2851f953f02035b402fe444b"
+    }
+  }
+}

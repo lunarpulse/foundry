@@ -354,7 +354,7 @@ impl ProductStore {
     }
 }
 
-fn append_execution_transition(
+pub(super) fn append_execution_transition(
     tx: &rusqlite::Transaction<'_>,
     order_id: &str,
     lifecycle: i64,

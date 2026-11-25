@@ -1,0 +1,13 @@
+#!/bin/bash
+set -eu
+umask 077
+export CARGO_TARGET_DIR=/home/cosmo/.hermes/cache/scratch/w2-rebuild/target
+export TMPDIR=/home/cosmo/.hermes/cache/scratch/w2-rebuild/tmp
+export CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_NET_OFFLINE=true
+export CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_DEV_DEBUG=0
+mkdir -p "$CARGO_TARGET_DIR" "$TMPDIR"
+log="docs/acceptance/w2/$1.log"
+shift
+git diff --check
+set -o pipefail
+( set -x; cargo test --locked --offline -j1 "$@" ) 2>&1 | tee "$log"

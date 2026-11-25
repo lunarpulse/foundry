@@ -48,6 +48,12 @@ pub trait StageExecutor: Send {
     fn ensure_available(&self) -> Result<(), String> {
         Ok(())
     }
+    /// Opt in only for a trusted local reader that never launches a Die or model.
+    #[cfg(feature = "product-pack-pins")]
+    fn offline_inspector(&self) -> bool {
+        false
+    }
+
     /// Observation boundary after durable stage acceptance and before the
     /// terminal transaction. Implementations may stop before completion.
     #[cfg(feature = "a01-harness-support")]
@@ -59,6 +65,11 @@ pub trait StageExecutor: Send {
     }
 }
 impl<T: StageExecutor + ?Sized> StageExecutor for Box<T> {
+    #[cfg(feature = "product-pack-pins")]
+    fn offline_inspector(&self) -> bool {
+        (**self).offline_inspector()
+    }
+
     #[cfg(feature = "a01-harness-support")]
     fn before_terminal_commit(&mut self, completion: &foundry_exec::ReviewDispatchCompletion) -> Result<(),String> {
         (**self).before_terminal_commit(completion)
@@ -1031,6 +1042,16 @@ impl PackReviewHost {
             self.store
                 .validate_product_work_claim(claim, intent, chrono::Utc::now())?;
         }
+        #[cfg(feature = "product-pack-pins")]
+        let offline_task = product_work.as_ref().is_some_and(|c| {
+            c.task_kind == "github-issue" && c.worker_id.starts_with("code-change-")
+        });
+        #[cfg(feature = "product-pack-pins")]
+        if offline_task && !self.executor.offline_inspector() {
+            return Err(HostError::Acceptance(
+                "code-change profile requires an offline inspector".into(),
+            ));
+        }
         let key = host_key(intent);
         let (order, attempt, base, result) = parse_external_ref(&intent.external_ref)
             .ok_or_else(|| HostError::Worker("invalid review external_ref".into()))?;
@@ -1061,6 +1082,28 @@ impl PackReviewHost {
         let snap = load_pack(&self.pack_path).map_err(|e| HostError::Persistence(e.to_string()))?;
         if snap.digest() != self.store.pack_digest() {
             return Err(HostError::Persistence("review pack digest changed".into()));
+        }
+        #[cfg(feature = "product-pack-pins")]
+        if offline_task
+            && snap.nodes().iter().any(|node| {
+                node.value.get("kind").and_then(toml::Value::as_str) == Some("redrive")
+                    || node
+                        .value
+                        .get("stages")
+                        .and_then(toml::Value::as_array)
+                        .is_some_and(|stages| {
+                            stages.iter().any(|stage| {
+                                !matches!(
+                                    stage.get("role").and_then(toml::Value::as_str),
+                                    Some("verify" | "lens")
+                                )
+                            })
+                        })
+            })
+        {
+            return Err(HostError::Acceptance(
+                "offline task pack contains a mutating stage".into(),
+            ));
         }
         let digest = snap.digest().to_owned();
         let admission_request = ReviewAdmissionRequest {

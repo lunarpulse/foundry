@@ -1,0 +1,1598 @@
+[
+  [
+    "index",
+    "ledger_order_seq_v1",
+    "ledger",
+    "CREATE INDEX ledger_order_seq_v1 ON ledger(order_id,seq)"
+  ],
+  [
+    "index",
+    "product_orders_v1_source_identity",
+    "product_orders_v1",
+    "CREATE UNIQUE INDEX product_orders_v1_source_identity ON product_orders_v1(connector_id,repository_id,issue_id)"
+  ],
+  [
+    "index",
+    "product_review_run_coordinates_v1",
+    "product_review_run_reservations_v1",
+    "CREATE UNIQUE INDEX product_review_run_coordinates_v1 ON product_review_run_reservations_v1(order_id,followup_run_id) WHERE followup_run_id IS NOT NULL"
+  ],
+  [
+    "index",
+    "product_service_credential_issue_once",
+    "product_service_events_v1",
+    "CREATE UNIQUE INDEX product_service_credential_issue_once ON product_service_events_v1(service_id,operation,request_key) WHERE operation='credential_issue'"
+  ],
+  [
+    "index",
+    "sqlite_autoindex_artifact_tuples_1",
+    "artifact_tuples",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_accounts_v1_1",
+    "product_accounts_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_approval_result_bindings_v1_1",
+    "product_approval_result_bindings_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_approval_result_bindings_v1_2",
+    "product_approval_result_bindings_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_artifacts_v1_1",
+    "product_artifacts_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_artifacts_v1_2",
+    "product_artifacts_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_code_tasks_v1_1",
+    "product_code_tasks_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_code_tasks_v1_2",
+    "product_code_tasks_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_credentials_v1_1",
+    "product_credentials_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_grants_v1_1",
+    "product_grants_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_grants_v1_2",
+    "product_grants_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_intake_delivery_meta_v1_1",
+    "product_intake_delivery_meta_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_intake_inbox_v1_1",
+    "product_intake_inbox_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_intake_rejections_v1_1",
+    "product_intake_rejections_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_intake_source_bindings_v1_1",
+    "product_intake_source_bindings_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_issue_first_v1_1",
+    "product_issue_first_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_issue_first_v1_2",
+    "product_issue_first_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_login_throttle_v1_1",
+    "product_login_throttle_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_operations_v1_1",
+    "product_operations_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_operations_v1_2",
+    "product_operations_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_order_payload_digests_v1_1",
+    "product_order_payload_digests_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_orders_v1_1",
+    "product_orders_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_outcomes_v1_1",
+    "product_outcomes_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_outcomes_v1_2",
+    "product_outcomes_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_outcomes_v1_3",
+    "product_outcomes_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_poll_backoff_v1_1",
+    "product_poll_backoff_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_poll_source_bindings_v1_1",
+    "product_poll_source_bindings_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_poll_state_v1_1",
+    "product_poll_state_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_producer_events_v1_1",
+    "product_producer_events_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_producers_v1_1",
+    "product_producers_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_producers_v1_2",
+    "product_producers_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_publish_outcomes_v1_1",
+    "product_publish_outcomes_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_result_bindings_v1_1",
+    "product_result_bindings_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_result_bindings_v1_2",
+    "product_result_bindings_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_result_bindings_v1_3",
+    "product_result_bindings_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_result_bindings_v1_4",
+    "product_result_bindings_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_result_legacy_hosts_v1_1",
+    "product_result_legacy_hosts_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_result_legacy_tuples_v1_1",
+    "product_result_legacy_tuples_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_review_active_v1_1",
+    "product_review_active_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_review_authority_v1_1",
+    "product_review_authority_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_review_authority_v1_2",
+    "product_review_authority_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_review_authority_v1_3",
+    "product_review_authority_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_review_bindings_v1_1",
+    "product_review_bindings_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_review_budget_v1_1",
+    "product_review_budget_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_review_epochs_v1_1",
+    "product_review_epochs_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_review_hold_acceptances_v1_1",
+    "product_review_hold_acceptances_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_review_hold_acceptances_v1_2",
+    "product_review_hold_acceptances_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_review_hold_acceptances_v1_3",
+    "product_review_hold_acceptances_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_review_hold_progress_v1_1",
+    "product_review_hold_progress_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_review_holds_v1_1",
+    "product_review_holds_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_review_host_accept_v1_1",
+    "product_review_host_accept_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_review_host_results_v1_1",
+    "product_review_host_results_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_review_redrive_v1_1",
+    "product_review_redrive_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_review_run_reservations_v1_1",
+    "product_review_run_reservations_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_review_runs_v1_1",
+    "product_review_runs_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_review_sessions_v1_1",
+    "product_review_sessions_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_review_stages_v1_1",
+    "product_review_stages_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_review_work_bindings_v1_1",
+    "product_review_work_bindings_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_scope_api_locators_v1_1",
+    "product_scope_api_locators_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_scope_current_sources_v1_1",
+    "product_scope_current_sources_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_scope_current_sources_v1_2",
+    "product_scope_current_sources_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_scope_grants_v1_1",
+    "product_scope_grants_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_scope_grants_v1_2",
+    "product_scope_grants_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_scope_migrations_v1_1",
+    "product_scope_migrations_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_scope_operations_v1_1",
+    "product_scope_operations_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_scope_order_provenance_v1_1",
+    "product_scope_order_provenance_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_scope_quarantine_v1_1",
+    "product_scope_quarantine_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_scope_repositories_v1_1",
+    "product_scope_repositories_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_scope_repositories_v1_2",
+    "product_scope_repositories_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_scope_source_instances_v1_1",
+    "product_scope_source_instances_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_scope_source_instances_v1_2",
+    "product_scope_source_instances_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_scope_subject_revisions_v1_1",
+    "product_scope_subject_revisions_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_service_credentials_v1_1",
+    "product_service_credentials_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_service_credentials_v1_2",
+    "product_service_credentials_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_service_grants_v1_1",
+    "product_service_grants_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_service_operations_v1_1",
+    "product_service_operations_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_service_work_bindings_v1_1",
+    "product_service_work_bindings_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_services_v1_1",
+    "product_services_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_sessions_v1_1",
+    "product_sessions_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_sources_v1_1",
+    "product_sources_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_token_consumptions_v1_1",
+    "product_token_consumptions_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_token_consumptions_v1_2",
+    "product_token_consumptions_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_token_consumptions_v1_3",
+    "product_token_consumptions_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_transition_intents_v1_1",
+    "product_transition_intents_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_transition_receipts_v1_1",
+    "product_transition_receipts_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_w1_claim_authority_v1_1",
+    "product_w1_claim_authority_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_w1_claim_authority_v1_2",
+    "product_w1_claim_authority_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_w1_grant_sidecar_v1_1",
+    "product_w1_grant_sidecar_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_w1_lifecycle_pins_v1_1",
+    "product_w1_lifecycle_pins_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_w1_lifecycle_pins_v1_2",
+    "product_w1_lifecycle_pins_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_w1_operations_v1_1",
+    "product_w1_operations_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_w1_operations_v1_2",
+    "product_w1_operations_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_w1_operations_v1_3",
+    "product_w1_operations_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_w1_operations_v1_4",
+    "product_w1_operations_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_work_backlog_v1_1",
+    "product_work_backlog_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_work_backlog_v1_2",
+    "product_work_backlog_v1",
+    null
+  ],
+  [
+    "index",
+    "sqlite_autoindex_product_work_claims_v1_1",
+    "product_work_claims_v1",
+    null
+  ],
+  [
+    "table",
+    "artifact_tuples",
+    "artifact_tuples",
+    "CREATE TABLE artifact_tuples(order_id TEXT NOT NULL,attempt INTEGER NOT NULL,run_id INTEGER NOT NULL,generation INTEGER NOT NULL,immutable_commit TEXT NOT NULL,artifact_location TEXT NOT NULL,generations_json TEXT NOT NULL,PRIMARY KEY(order_id,attempt,run_id,generation))"
+  ],
+  [
+    "table",
+    "foundry_contract",
+    "foundry_contract",
+    "CREATE TABLE foundry_contract(singleton INTEGER PRIMARY KEY CHECK(singleton=1), contract TEXT NOT NULL)"
+  ],
+  [
+    "table",
+    "ledger",
+    "ledger",
+    "CREATE TABLE ledger(seq INTEGER PRIMARY KEY AUTOINCREMENT, order_id TEXT NOT NULL, from_state TEXT NOT NULL, to_state TEXT NOT NULL, event TEXT NOT NULL, actor TEXT NOT NULL, intent TEXT NOT NULL DEFAULT '', at TEXT NOT NULL, prev_hash TEXT NOT NULL, event_json TEXT, hash TEXT NOT NULL)"
+  ],
+  [
+    "table",
+    "product_accounts_v1",
+    "product_accounts_v1",
+    "CREATE TABLE product_accounts_v1(actor_id TEXT PRIMARY KEY, role TEXT NOT NULL, enabled INTEGER NOT NULL, revision INTEGER NOT NULL)"
+  ],
+  [
+    "table",
+    "product_approval_result_bindings_v1",
+    "product_approval_result_bindings_v1",
+    "CREATE TABLE product_approval_result_bindings_v1(\n operation_id TEXT NOT NULL PRIMARY KEY,result_id TEXT NOT NULL,binding_digest TEXT NOT NULL,tuple_digest TEXT NOT NULL,\n UNIQUE(result_id,binding_digest,tuple_digest),\n FOREIGN KEY(operation_id) REFERENCES product_outcomes_v1(operation_id),\n FOREIGN KEY(result_id,binding_digest,tuple_digest) REFERENCES product_result_bindings_v1(result_id,binding_digest,tuple_digest))"
+  ],
+  [
+    "table",
+    "product_artifact_root_identity_v1",
+    "product_artifact_root_identity_v1",
+    "CREATE TABLE product_artifact_root_identity_v1(\n            singleton INTEGER PRIMARY KEY CHECK(singleton=1), device INTEGER NOT NULL, inode INTEGER NOT NULL)"
+  ],
+  [
+    "table",
+    "product_artifact_root_v1",
+    "product_artifact_root_v1",
+    "CREATE TABLE product_artifact_root_v1(\n            singleton INTEGER PRIMARY KEY CHECK(singleton=1), root_path TEXT NOT NULL)"
+  ],
+  [
+    "table",
+    "product_artifacts_v1",
+    "product_artifacts_v1",
+    "CREATE TABLE product_artifacts_v1(\n            artifact_id TEXT PRIMARY KEY, order_id TEXT NOT NULL, lifecycle INTEGER NOT NULL,\n            source_instance_id TEXT NOT NULL, repository_key TEXT NOT NULL,\n            admission_seq INTEGER NOT NULL, admission_hash TEXT NOT NULL,\n            attempt INTEGER NOT NULL, run_id TEXT NOT NULL, generation INTEGER NOT NULL,\n            stage_sequence INTEGER NOT NULL, stage_id TEXT NOT NULL,\n            artifact_sha256 TEXT NOT NULL, provenance_digest TEXT NOT NULL,\n            relative_path TEXT NOT NULL, created_at TEXT NOT NULL,\n            UNIQUE(order_id,lifecycle,attempt,run_id,generation,stage_sequence))"
+  ],
+  [
+    "table",
+    "product_code_tasks_v1",
+    "product_code_tasks_v1",
+    "CREATE TABLE product_code_tasks_v1(\n order_id TEXT PRIMARY KEY, lifecycle INTEGER NOT NULL, actor TEXT NOT NULL, request_key TEXT NOT NULL,\n task_bytes BLOB NOT NULL, receipt TEXT NOT NULL, UNIQUE(actor,request_key))"
+  ],
+  [
+    "table",
+    "product_credentials_v1",
+    "product_credentials_v1",
+    "CREATE TABLE product_credentials_v1(actor_id TEXT PRIMARY KEY, argon2id_phc TEXT NOT NULL, revision INTEGER NOT NULL)"
+  ],
+  [
+    "table",
+    "product_fence_counter_v1",
+    "product_fence_counter_v1",
+    "CREATE TABLE product_fence_counter_v1(singleton INTEGER PRIMARY KEY CHECK(singleton=1), next INTEGER NOT NULL)"
+  ],
+  [
+    "table",
+    "product_grants_v1",
+    "product_grants_v1",
+    "CREATE TABLE product_grants_v1(grant_id TEXT PRIMARY KEY, token_digest TEXT NOT NULL UNIQUE, actor_id TEXT NOT NULL, order_id TEXT NOT NULL, state TEXT NOT NULL, fence INTEGER NOT NULL)"
+  ],
+  [
+    "table",
+    "product_intake_delivery_meta_v1",
+    "product_intake_delivery_meta_v1",
+    "CREATE TABLE product_intake_delivery_meta_v1(delivery_id TEXT PRIMARY KEY REFERENCES product_intake_inbox_v1(delivery_id), observed_updated_at TEXT NOT NULL, task_kind TEXT NOT NULL)"
+  ],
+  [
+    "table",
+    "product_intake_inbox_v1",
+    "product_intake_inbox_v1",
+    "CREATE TABLE product_intake_inbox_v1(delivery_id TEXT PRIMARY KEY, connector_id TEXT NOT NULL, repository_id TEXT NOT NULL, issue_id TEXT NOT NULL, version_digest TEXT NOT NULL, payload TEXT NOT NULL, state TEXT NOT NULL, retry_at TEXT)"
+  ],
+  [
+    "table",
+    "product_intake_rejections_v1",
+    "product_intake_rejections_v1",
+    "CREATE TABLE product_intake_rejections_v1(connector_id TEXT NOT NULL, query_fingerprint TEXT NOT NULL, sweep_id TEXT NOT NULL, item_digest TEXT NOT NULL, recorded_at TEXT NOT NULL, PRIMARY KEY(connector_id,query_fingerprint,sweep_id,item_digest))"
+  ],
+  [
+    "table",
+    "product_intake_source_bindings_v1",
+    "product_intake_source_bindings_v1",
+    "CREATE TABLE product_intake_source_bindings_v1(delivery_id TEXT PRIMARY KEY,source_instance_id TEXT NOT NULL,source_revision INTEGER NOT NULL, source_instance_revision INTEGER NOT NULL DEFAULT 0, source_generation INTEGER NOT NULL DEFAULT 0)"
+  ],
+  [
+    "table",
+    "product_issue_first_v1",
+    "product_issue_first_v1",
+    "CREATE TABLE product_issue_first_v1(\n         source TEXT NOT NULL, connector TEXT NOT NULL, repository TEXT NOT NULL, issue TEXT NOT NULL,\n         delivery TEXT NOT NULL UNIQUE REFERENCES product_intake_inbox_v1(delivery_id),\n         snapshot BLOB NOT NULL, snapshot_sha256 TEXT NOT NULL, PRIMARY KEY(source,connector,repository,issue))"
+  ],
+  [
+    "table",
+    "product_login_throttle_v1",
+    "product_login_throttle_v1",
+    "CREATE TABLE product_login_throttle_v1(actor_id TEXT PRIMARY KEY, window_started_at TEXT NOT NULL, failures INTEGER NOT NULL, blocked_until TEXT NOT NULL)"
+  ],
+  [
+    "table",
+    "product_meta_v1",
+    "product_meta_v1",
+    "CREATE TABLE product_meta_v1(singleton INTEGER PRIMARY KEY CHECK(singleton=1), installation_id TEXT NOT NULL, database_id TEXT NOT NULL, schema_version INTEGER NOT NULL, recovery_epoch INTEGER NOT NULL DEFAULT 0)"
+  ],
+  [
+    "table",
+    "product_operations_v1",
+    "product_operations_v1",
+    "CREATE TABLE product_operations_v1(operation_id TEXT PRIMARY KEY, actor_id TEXT NOT NULL, request_key TEXT NOT NULL, request_digest TEXT NOT NULL, order_id TEXT NOT NULL, grant_id TEXT, phase TEXT NOT NULL, owner_id TEXT, epoch INTEGER, fence INTEGER, prepared_at TEXT NOT NULL, expires_at TEXT NOT NULL, scope_revision INTEGER NOT NULL DEFAULT -1, UNIQUE(actor_id, request_key))"
+  ],
+  [
+    "table",
+    "product_order_payload_digests_v1",
+    "product_order_payload_digests_v1",
+    "CREATE TABLE product_order_payload_digests_v1(order_id TEXT PRIMARY KEY, payload_digest TEXT NOT NULL)"
+  ],
+  [
+    "table",
+    "product_orders_v1",
+    "product_orders_v1",
+    "CREATE TABLE product_orders_v1(order_id TEXT PRIMARY KEY, lifecycle INTEGER NOT NULL, connector_id TEXT NOT NULL, repository_id TEXT NOT NULL, issue_id TEXT NOT NULL, task_kind TEXT NOT NULL, payload_snapshot TEXT NOT NULL, source_revision INTEGER NOT NULL, admission_seq INTEGER NOT NULL, admission_hash TEXT NOT NULL)"
+  ],
+  [
+    "table",
+    "product_outcomes_v1",
+    "product_outcomes_v1",
+    "CREATE TABLE product_outcomes_v1(operation_id TEXT PRIMARY KEY, seq INTEGER NOT NULL UNIQUE, event_hash TEXT NOT NULL UNIQUE, receipt_json TEXT NOT NULL)"
+  ],
+  [
+    "table",
+    "product_poll_backoff_v1",
+    "product_poll_backoff_v1",
+    "CREATE TABLE product_poll_backoff_v1(connector_id TEXT NOT NULL, query_fingerprint TEXT NOT NULL, failures INTEGER NOT NULL, retry_at TEXT NOT NULL, PRIMARY KEY(connector_id,query_fingerprint))"
+  ],
+  [
+    "table",
+    "product_poll_source_bindings_v1",
+    "product_poll_source_bindings_v1",
+    "CREATE TABLE product_poll_source_bindings_v1(connector_id TEXT NOT NULL,query_fingerprint TEXT NOT NULL,source_instance_id TEXT NOT NULL,source_revision INTEGER NOT NULL, source_instance_revision INTEGER NOT NULL DEFAULT 0, source_generation INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(connector_id,query_fingerprint))"
+  ],
+  [
+    "table",
+    "product_poll_state_v1",
+    "product_poll_state_v1",
+    "CREATE TABLE product_poll_state_v1(connector_id TEXT NOT NULL, query_fingerprint TEXT NOT NULL, sweep_id TEXT NOT NULL, next_page INTEGER NOT NULL, page_ceiling INTEGER NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(connector_id, query_fingerprint))"
+  ],
+  [
+    "table",
+    "product_producer_events_v1",
+    "product_producer_events_v1",
+    "CREATE TABLE product_producer_events_v1(\n order_id TEXT NOT NULL REFERENCES product_producers_v1(order_id), state TEXT NOT NULL, at TEXT NOT NULL,\n PRIMARY KEY(order_id,state))"
+  ],
+  [
+    "table",
+    "product_producers_v1",
+    "product_producers_v1",
+    "CREATE TABLE product_producers_v1(\n order_id TEXT PRIMARY KEY REFERENCES product_code_tasks_v1(order_id), operation_key TEXT NOT NULL,\n service TEXT NOT NULL, service_revision INTEGER NOT NULL, credential_revision INTEGER NOT NULL,\n worker TEXT NOT NULL, epoch INTEGER NOT NULL, fence INTEGER NOT NULL, deadline TEXT NOT NULL,\n state TEXT NOT NULL CHECK(state IN ('reserved','sealed','collected','uncertain')),\n result_commit TEXT, artifact BLOB, artifact_sha256 TEXT, UNIQUE(service,operation_key))"
+  ],
+  [
+    "table",
+    "product_publish_outcomes_v1",
+    "product_publish_outcomes_v1",
+    "CREATE TABLE product_publish_outcomes_v1(\n            operation_id TEXT PRIMARY KEY REFERENCES product_outcomes_v1(operation_id),\n            receipt_json TEXT NOT NULL,\n            state TEXT NOT NULL CHECK(state IN ('pending','confirmed')),\n            pr_url TEXT,\n            started_at INTEGER NOT NULL,\n            settled_at INTEGER\n         )"
+  ],
+  [
+    "table",
+    "product_result_bindings_v1",
+    "product_result_bindings_v1",
+    "CREATE TABLE product_result_bindings_v1(\n result_id TEXT NOT NULL PRIMARY KEY,order_id TEXT NOT NULL,lifecycle INTEGER NOT NULL,attempt INTEGER NOT NULL,run_id INTEGER NOT NULL,activation INTEGER NOT NULL,generation INTEGER NOT NULL,\n host_result_digest TEXT NOT NULL,tuple_digest TEXT NOT NULL,binding_digest TEXT NOT NULL,payload_json TEXT NOT NULL,receipt_json TEXT NOT NULL,\n UNIQUE(order_id,lifecycle,attempt,run_id,activation,generation),UNIQUE(order_id,attempt,run_id,generation),UNIQUE(result_id,binding_digest,tuple_digest),\n FOREIGN KEY(order_id,attempt,run_id,generation) REFERENCES artifact_tuples(order_id,attempt,run_id,generation),\n FOREIGN KEY(order_id,attempt,run_id,activation) REFERENCES product_review_host_accept_v1(order_id,attempt,run_id,activation))"
+  ],
+  [
+    "table",
+    "product_result_legacy_hosts_v1",
+    "product_result_legacy_hosts_v1",
+    "CREATE TABLE product_result_legacy_hosts_v1(\n order_id TEXT NOT NULL,attempt INTEGER NOT NULL,run_id INTEGER NOT NULL,activation INTEGER NOT NULL,\n PRIMARY KEY(order_id,attempt,run_id,activation),\n FOREIGN KEY(order_id,attempt,run_id,activation) REFERENCES product_review_host_accept_v1(order_id,attempt,run_id,activation))"
+  ],
+  [
+    "table",
+    "product_result_legacy_tuples_v1",
+    "product_result_legacy_tuples_v1",
+    "CREATE TABLE product_result_legacy_tuples_v1(\n order_id TEXT NOT NULL,attempt INTEGER NOT NULL,run_id INTEGER NOT NULL,generation INTEGER NOT NULL,\n PRIMARY KEY(order_id,attempt,run_id,generation),\n FOREIGN KEY(order_id,attempt,run_id,generation) REFERENCES artifact_tuples(order_id,attempt,run_id,generation))"
+  ],
+  [
+    "table",
+    "product_result_meta_v1",
+    "product_result_meta_v1",
+    "CREATE TABLE product_result_meta_v1(\n singleton INTEGER NOT NULL PRIMARY KEY CHECK(singleton=1),\n installation_id TEXT NOT NULL,database_id TEXT NOT NULL,\n result_contract_version INTEGER NOT NULL CHECK(result_contract_version=1),\n legacy_approval_cutoff_seq INTEGER NOT NULL CHECK(legacy_approval_cutoff_seq>=0),\n FOREIGN KEY(singleton) REFERENCES product_meta_v1(singleton))"
+  ],
+  [
+    "table",
+    "product_review_active_v1",
+    "product_review_active_v1",
+    "CREATE TABLE product_review_active_v1(order_id TEXT PRIMARY KEY,key_json TEXT NOT NULL,epoch INTEGER NOT NULL,journal_run TEXT NOT NULL)"
+  ],
+  [
+    "table",
+    "product_review_authority_v1",
+    "product_review_authority_v1",
+    "CREATE TABLE product_review_authority_v1(\n key_json TEXT NOT NULL PRIMARY KEY,order_id TEXT NOT NULL,lifecycle INTEGER NOT NULL CHECK(lifecycle>0),\n attempt INTEGER NOT NULL CHECK(attempt>=0),run_id INTEGER NOT NULL CHECK(run_id>=0),activation INTEGER NOT NULL CHECK(activation>=0),\n journal_run TEXT NOT NULL,host_epoch INTEGER NOT NULL CHECK(host_epoch>=0),service_id TEXT NOT NULL,\n service_revision INTEGER NOT NULL CHECK(service_revision>0),credential_revision INTEGER NOT NULL CHECK(credential_revision>0),\n drive_review_grant_revision INTEGER NOT NULL CHECK(drive_review_grant_revision>0),source_instance_id TEXT NOT NULL,\n source_generation INTEGER NOT NULL CHECK(source_generation>0),source_instance_revision INTEGER NOT NULL CHECK(source_instance_revision>0),\n connector_revision INTEGER NOT NULL CHECK(connector_revision>0),\n UNIQUE(order_id,attempt,run_id,activation),UNIQUE(order_id,attempt,journal_run),\n FOREIGN KEY(key_json) REFERENCES product_review_bindings_v1(key_json),\n FOREIGN KEY(order_id,attempt,run_id,activation) REFERENCES product_review_host_accept_v1(order_id,attempt,run_id,activation),\n FOREIGN KEY(order_id,attempt,journal_run) REFERENCES product_review_work_bindings_v1(order_id,attempt,run_id))"
+  ],
+  [
+    "table",
+    "product_review_bindings_v1",
+    "product_review_bindings_v1",
+    "CREATE TABLE product_review_bindings_v1(key_json TEXT PRIMARY KEY,intent_json TEXT NOT NULL)"
+  ],
+  [
+    "table",
+    "product_review_budget_v1",
+    "product_review_budget_v1",
+    "CREATE TABLE product_review_budget_v1(order_id TEXT PRIMARY KEY,used INTEGER NOT NULL)"
+  ],
+  [
+    "table",
+    "product_review_epochs_v1",
+    "product_review_epochs_v1",
+    "CREATE TABLE product_review_epochs_v1(order_id TEXT PRIMARY KEY,epoch INTEGER NOT NULL)"
+  ],
+  [
+    "table",
+    "product_review_failures_v1",
+    "product_review_failures_v1",
+    "CREATE TABLE product_review_failures_v1(order_id TEXT NOT NULL,run_id TEXT NOT NULL,error TEXT NOT NULL)"
+  ],
+  [
+    "table",
+    "product_review_hold_acceptances_v1",
+    "product_review_hold_acceptances_v1",
+    "CREATE TABLE product_review_hold_acceptances_v1(operation_id TEXT PRIMARY KEY,actor_id TEXT NOT NULL,request_key TEXT NOT NULL,request_digest TEXT NOT NULL,receipt_json TEXT NOT NULL,order_id TEXT NOT NULL,lifecycle INTEGER NOT NULL,attempt INTEGER NOT NULL,originating_run INTEGER NOT NULL,hold_instance_id TEXT NOT NULL,UNIQUE(actor_id,request_key),UNIQUE(order_id,lifecycle,attempt,originating_run,hold_instance_id))"
+  ],
+  [
+    "table",
+    "product_review_hold_progress_v1",
+    "product_review_hold_progress_v1",
+    "CREATE TABLE product_review_hold_progress_v1(operation_id TEXT PRIMARY KEY,phase TEXT NOT NULL,progress_revision INTEGER NOT NULL,owner_id TEXT NOT NULL,epoch INTEGER NOT NULL,fence INTEGER NOT NULL,reserved_run_id INTEGER NOT NULL,recovery_reason TEXT)"
+  ],
+  [
+    "table",
+    "product_review_holds_v1",
+    "product_review_holds_v1",
+    "CREATE TABLE product_review_holds_v1(order_id TEXT NOT NULL,lifecycle INTEGER NOT NULL,attempt INTEGER NOT NULL,originating_run INTEGER NOT NULL,activation INTEGER NOT NULL,host_epoch INTEGER NOT NULL,hold_instance_id TEXT NOT NULL,hold_revision INTEGER NOT NULL,expected_predecessor INTEGER NOT NULL,snapshot_digest TEXT NOT NULL,snapshot_json TEXT NOT NULL,allowed_targets_json TEXT NOT NULL,deadline TEXT NOT NULL,source_revision INTEGER NOT NULL,admission_seq INTEGER NOT NULL,admission_hash TEXT NOT NULL,state TEXT NOT NULL,PRIMARY KEY(order_id,lifecycle,attempt,originating_run,hold_instance_id))"
+  ],
+  [
+    "table",
+    "product_review_host_accept_v1",
+    "product_review_host_accept_v1",
+    "CREATE TABLE product_review_host_accept_v1(order_id TEXT NOT NULL,attempt INTEGER NOT NULL,run_id INTEGER NOT NULL,activation INTEGER NOT NULL,PRIMARY KEY(order_id,attempt,run_id,activation))"
+  ],
+  [
+    "table",
+    "product_review_host_results_v1",
+    "product_review_host_results_v1",
+    "CREATE TABLE product_review_host_results_v1(order_id TEXT NOT NULL,attempt INTEGER NOT NULL,run_id INTEGER NOT NULL,activation INTEGER NOT NULL,result_json TEXT NOT NULL,PRIMARY KEY(order_id,attempt,run_id,activation))"
+  ],
+  [
+    "table",
+    "product_review_meta_v1",
+    "product_review_meta_v1",
+    "CREATE TABLE product_review_meta_v1(singleton INTEGER PRIMARY KEY CHECK(singleton=1), installation_id TEXT NOT NULL, database_id TEXT NOT NULL, schema_version INTEGER NOT NULL)"
+  ],
+  [
+    "table",
+    "product_review_redrive_v1",
+    "product_review_redrive_v1",
+    "CREATE TABLE product_review_redrive_v1(order_id TEXT NOT NULL,run_id TEXT NOT NULL,payload TEXT NOT NULL,artifact_json TEXT NOT NULL,PRIMARY KEY(order_id,run_id,payload))"
+  ],
+  [
+    "table",
+    "product_review_run_reservations_v1",
+    "product_review_run_reservations_v1",
+    "CREATE TABLE product_review_run_reservations_v1(reservation_id INTEGER PRIMARY KEY AUTOINCREMENT,operation_id TEXT NOT NULL UNIQUE,order_id TEXT NOT NULL,lifecycle INTEGER NOT NULL,attempt INTEGER NOT NULL,originating_run INTEGER NOT NULL,hold_instance_id TEXT NOT NULL,followup_run_id INTEGER)"
+  ],
+  [
+    "table",
+    "product_review_runs_v1",
+    "product_review_runs_v1",
+    "CREATE TABLE product_review_runs_v1(order_id TEXT NOT NULL,attempt INTEGER NOT NULL,run_id TEXT NOT NULL,base_commit TEXT NOT NULL,result_commit TEXT NOT NULL,pack_digest TEXT NOT NULL,status TEXT NOT NULL,counters_json TEXT NOT NULL,hold_json TEXT,hold_instance_id TEXT,deadline INTEGER,result_json TEXT,provenance_json TEXT,product_lifecycle INTEGER NOT NULL DEFAULT 0,source_revision INTEGER NOT NULL DEFAULT 0,admission_seq INTEGER NOT NULL DEFAULT 0,admission_hash TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,PRIMARY KEY(order_id,attempt,run_id))"
+  ],
+  [
+    "table",
+    "product_review_sessions_v1",
+    "product_review_sessions_v1",
+    "CREATE TABLE product_review_sessions_v1(order_id TEXT NOT NULL,run_id TEXT NOT NULL,session_id TEXT NOT NULL,receipt_json TEXT NOT NULL,PRIMARY KEY(order_id,run_id,session_id))"
+  ],
+  [
+    "table",
+    "product_review_stages_v1",
+    "product_review_stages_v1",
+    "CREATE TABLE product_review_stages_v1(order_id TEXT NOT NULL,run_id TEXT NOT NULL,sequence INTEGER NOT NULL,stage_id TEXT NOT NULL,status TEXT NOT NULL,output_json TEXT,PRIMARY KEY(order_id,run_id,sequence))"
+  ],
+  [
+    "table",
+    "product_review_work_bindings_v1",
+    "product_review_work_bindings_v1",
+    "CREATE TABLE product_review_work_bindings_v1(\n                order_id TEXT NOT NULL,\n                attempt INTEGER NOT NULL,\n                run_id TEXT NOT NULL,\n                lifecycle INTEGER NOT NULL,\n                delivery_id TEXT NOT NULL,\n                worker_id TEXT NOT NULL,\n                claim_epoch INTEGER NOT NULL,\n                claim_fence INTEGER NOT NULL,\n                source_revision INTEGER NOT NULL,\n                payload_digest TEXT NOT NULL,\n                task_kind TEXT NOT NULL,\n                payload_snapshot TEXT NOT NULL,\n                PRIMARY KEY(order_id,attempt,run_id)\n             )"
+  ],
+  [
+    "table",
+    "product_scope_api_locators_v1",
+    "product_scope_api_locators_v1",
+    "CREATE TABLE product_scope_api_locators_v1(\n            source_instance_id TEXT PRIMARY KEY, api_owner TEXT NOT NULL, api_repo TEXT NOT NULL)"
+  ],
+  [
+    "table",
+    "product_scope_current_sources_v1",
+    "product_scope_current_sources_v1",
+    "CREATE TABLE product_scope_current_sources_v1(\n            connector_id TEXT PRIMARY KEY, source_instance_id TEXT NOT NULL UNIQUE)"
+  ],
+  [
+    "table",
+    "product_scope_events_v1",
+    "product_scope_events_v1",
+    "CREATE TABLE product_scope_events_v1(\n            event_seq INTEGER PRIMARY KEY AUTOINCREMENT, actor_id TEXT NOT NULL, subject_id TEXT NOT NULL,\n            source_instance_id TEXT NOT NULL, capability TEXT NOT NULL, operation TEXT NOT NULL,\n            scope_revision INTEGER NOT NULL, grant_revision INTEGER NOT NULL, request_key TEXT NOT NULL,\n            request_digest TEXT NOT NULL, created_at TEXT NOT NULL)"
+  ],
+  [
+    "table",
+    "product_scope_grants_v1",
+    "product_scope_grants_v1",
+    "CREATE TABLE product_scope_grants_v1(\n            grant_id TEXT PRIMARY KEY, subject_id TEXT NOT NULL, source_instance_id TEXT NOT NULL,\n            capability TEXT NOT NULL, grant_revision INTEGER NOT NULL, enabled INTEGER NOT NULL,\n            created_by TEXT NOT NULL, request_key TEXT NOT NULL,\n            UNIQUE(subject_id,source_instance_id,capability))"
+  ],
+  [
+    "table",
+    "product_scope_migrations_v1",
+    "product_scope_migrations_v1",
+    "CREATE TABLE product_scope_migrations_v1(\n            manifest_id TEXT PRIMARY KEY, manifest_digest TEXT NOT NULL, reviewed_by TEXT NOT NULL,\n            migrated_at TEXT NOT NULL, verified_orders INTEGER NOT NULL, quarantined_orders INTEGER NOT NULL)"
+  ],
+  [
+    "table",
+    "product_scope_operations_v1",
+    "product_scope_operations_v1",
+    "CREATE TABLE product_scope_operations_v1(\n            actor_id TEXT NOT NULL, request_key TEXT NOT NULL, request_digest TEXT NOT NULL,\n            receipt_json TEXT NOT NULL, PRIMARY KEY(actor_id,request_key))"
+  ],
+  [
+    "table",
+    "product_scope_order_provenance_v1",
+    "product_scope_order_provenance_v1",
+    "CREATE TABLE product_scope_order_provenance_v1(\n            order_id TEXT NOT NULL, lifecycle INTEGER NOT NULL, source_instance_id TEXT NOT NULL,\n            admission_seq INTEGER NOT NULL, admission_hash TEXT NOT NULL, verified INTEGER NOT NULL,\n            PRIMARY KEY(order_id,lifecycle))"
+  ],
+  [
+    "table",
+    "product_scope_policy_state_v1",
+    "product_scope_policy_state_v1",
+    "CREATE TABLE product_scope_policy_state_v1(\n            singleton INTEGER PRIMARY KEY CHECK(singleton=1),\n            mode TEXT NOT NULL CHECK(mode IN ('legacy_unscoped','enforced')))"
+  ],
+  [
+    "table",
+    "product_scope_quarantine_v1",
+    "product_scope_quarantine_v1",
+    "CREATE TABLE product_scope_quarantine_v1(\n            order_id TEXT NOT NULL, lifecycle INTEGER NOT NULL, evidence_digest TEXT NOT NULL,\n            reason TEXT NOT NULL, recorded_at TEXT NOT NULL, PRIMARY KEY(order_id,lifecycle))"
+  ],
+  [
+    "table",
+    "product_scope_repositories_v1",
+    "product_scope_repositories_v1",
+    "CREATE TABLE product_scope_repositories_v1(\n            repository_key TEXT PRIMARY KEY, organization TEXT NOT NULL, provider TEXT NOT NULL,\n            api_origin TEXT NOT NULL, stable_repository_id TEXT NOT NULL,\n            UNIQUE(organization,provider,api_origin,stable_repository_id))"
+  ],
+  [
+    "table",
+    "product_scope_source_events_v1",
+    "product_scope_source_events_v1",
+    "CREATE TABLE product_scope_source_events_v1(\n            event_seq INTEGER PRIMARY KEY AUTOINCREMENT, actor_id TEXT NOT NULL,\n            connector_id TEXT NOT NULL, old_source_instance_id TEXT, new_source_instance_id TEXT NOT NULL,\n            operation TEXT NOT NULL, source_revision INTEGER NOT NULL, request_key TEXT NOT NULL,\n            request_digest TEXT NOT NULL, created_at TEXT NOT NULL)"
+  ],
+  [
+    "table",
+    "product_scope_source_instances_v1",
+    "product_scope_source_instances_v1",
+    "CREATE TABLE product_scope_source_instances_v1(\n            source_instance_id TEXT PRIMARY KEY, connector_id TEXT NOT NULL, repository_key TEXT NOT NULL,\n            generation INTEGER NOT NULL, revision INTEGER NOT NULL, legacy_repository_locator TEXT NOT NULL,\n            scope_query TEXT NOT NULL, enabled INTEGER NOT NULL, retired_at TEXT,\n            UNIQUE(connector_id,generation))"
+  ],
+  [
+    "table",
+    "product_scope_subject_revisions_v1",
+    "product_scope_subject_revisions_v1",
+    "CREATE TABLE product_scope_subject_revisions_v1(\n            subject_id TEXT NOT NULL, source_instance_id TEXT NOT NULL, revision INTEGER NOT NULL,\n            PRIMARY KEY(subject_id,source_instance_id))"
+  ],
+  [
+    "table",
+    "product_service_credentials_v1",
+    "product_service_credentials_v1",
+    "CREATE TABLE product_service_credentials_v1(service_id TEXT PRIMARY KEY,verifier TEXT NOT NULL UNIQUE,credential_revision INTEGER NOT NULL,expires_at TEXT NOT NULL,issued_by TEXT NOT NULL,request_key TEXT NOT NULL)"
+  ],
+  [
+    "table",
+    "product_service_events_v1",
+    "product_service_events_v1",
+    "CREATE TABLE product_service_events_v1(event_seq INTEGER PRIMARY KEY AUTOINCREMENT,service_id TEXT NOT NULL,actor_id TEXT NOT NULL,revision INTEGER NOT NULL,operation TEXT NOT NULL,request_key TEXT NOT NULL,request_digest TEXT NOT NULL,created_at TEXT NOT NULL)"
+  ],
+  [
+    "table",
+    "product_service_grants_v1",
+    "product_service_grants_v1",
+    "CREATE TABLE product_service_grants_v1(service_id TEXT NOT NULL,source_instance_id TEXT NOT NULL,action TEXT NOT NULL,grant_revision INTEGER NOT NULL,enabled INTEGER NOT NULL,PRIMARY KEY(service_id,source_instance_id,action))"
+  ],
+  [
+    "table",
+    "product_service_operations_v1",
+    "product_service_operations_v1",
+    "CREATE TABLE product_service_operations_v1(actor_id TEXT NOT NULL,request_key TEXT NOT NULL,request_digest TEXT NOT NULL,receipt_json TEXT NOT NULL,PRIMARY KEY(actor_id,request_key))"
+  ],
+  [
+    "table",
+    "product_service_work_bindings_v1",
+    "product_service_work_bindings_v1",
+    "CREATE TABLE product_service_work_bindings_v1(order_id TEXT NOT NULL,lifecycle INTEGER NOT NULL,service_id TEXT NOT NULL,service_revision INTEGER NOT NULL,credential_revision INTEGER NOT NULL,source_instance_id TEXT NOT NULL,PRIMARY KEY(order_id,lifecycle))"
+  ],
+  [
+    "table",
+    "product_services_v1",
+    "product_services_v1",
+    "CREATE TABLE product_services_v1(service_id TEXT PRIMARY KEY,revision INTEGER NOT NULL,enabled INTEGER NOT NULL,lease_until TEXT NOT NULL)"
+  ],
+  [
+    "table",
+    "product_sessions_v1",
+    "product_sessions_v1",
+    "CREATE TABLE product_sessions_v1(session_digest TEXT PRIMARY KEY, actor_id TEXT NOT NULL, authority_revision INTEGER NOT NULL, expires_at TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0)"
+  ],
+  [
+    "table",
+    "product_sources_v1",
+    "product_sources_v1",
+    "CREATE TABLE product_sources_v1(connector_id TEXT PRIMARY KEY, provider TEXT NOT NULL, origin TEXT NOT NULL, repository_id TEXT NOT NULL, scope TEXT NOT NULL, revision INTEGER NOT NULL, enabled INTEGER NOT NULL)"
+  ],
+  [
+    "table",
+    "product_token_consumptions_v1",
+    "product_token_consumptions_v1",
+    "CREATE TABLE product_token_consumptions_v1(token_digest TEXT PRIMARY KEY, operation_id TEXT NOT NULL UNIQUE, seq INTEGER NOT NULL UNIQUE)"
+  ],
+  [
+    "table",
+    "product_transition_intents_v1",
+    "product_transition_intents_v1",
+    "CREATE TABLE product_transition_intents_v1(order_id TEXT PRIMARY KEY, lifecycle INTEGER NOT NULL, expected_predecessor INTEGER NOT NULL, operation TEXT NOT NULL)"
+  ],
+  [
+    "table",
+    "product_transition_receipts_v1",
+    "product_transition_receipts_v1",
+    "CREATE TABLE product_transition_receipts_v1(seq INTEGER PRIMARY KEY, event_hash TEXT NOT NULL UNIQUE, order_id TEXT NOT NULL, lifecycle INTEGER NOT NULL, expected_predecessor INTEGER NOT NULL, operation TEXT NOT NULL)"
+  ],
+  [
+    "table",
+    "product_w1_claim_authority_v1",
+    "product_w1_claim_authority_v1",
+    "CREATE TABLE product_w1_claim_authority_v1(order_id TEXT NOT NULL, lifecycle INTEGER NOT NULL CHECK(lifecycle>0), epoch INTEGER NOT NULL CHECK(epoch>0), fence INTEGER NOT NULL CHECK(fence>0), installation_id TEXT NOT NULL, database_id TEXT NOT NULL, delivery_id TEXT NOT NULL, worker_id TEXT NOT NULL, claimed_at TEXT NOT NULL, claim_lease_until TEXT NOT NULL, payload_digest TEXT NOT NULL, admission_seq INTEGER NOT NULL, admission_hash TEXT NOT NULL, service_id TEXT NOT NULL, service_revision INTEGER NOT NULL, service_lease_until TEXT NOT NULL, credential_revision INTEGER NOT NULL, credential_expires_at TEXT NOT NULL, grant_action TEXT NOT NULL CHECK(grant_action='drive_review'), grant_revision INTEGER NOT NULL, source_instance_id TEXT NOT NULL, source_generation INTEGER NOT NULL, source_instance_revision INTEGER NOT NULL, connector_id TEXT NOT NULL, connector_revision INTEGER NOT NULL, api_origin TEXT NOT NULL, repository_id TEXT NOT NULL, api_owner TEXT NOT NULL, api_repo TEXT NOT NULL, PRIMARY KEY(order_id,lifecycle,epoch), UNIQUE(fence))"
+  ],
+  [
+    "table",
+    "product_w1_grant_sidecar_v1",
+    "product_w1_grant_sidecar_v1",
+    "CREATE TABLE product_w1_grant_sidecar_v1(order_id TEXT NOT NULL, lifecycle INTEGER NOT NULL CHECK(lifecycle>0), selection_revision INTEGER NOT NULL CHECK(selection_revision>0), selector_subject_id TEXT NOT NULL, scope_revision INTEGER NOT NULL, grant_revision INTEGER NOT NULL, PRIMARY KEY(order_id,lifecycle,selection_revision))"
+  ],
+  [
+    "table",
+    "product_w1_lifecycle_pins_v1",
+    "product_w1_lifecycle_pins_v1",
+    "CREATE TABLE product_w1_lifecycle_pins_v1(order_id TEXT NOT NULL, lifecycle INTEGER NOT NULL CHECK(lifecycle>0), installation_id TEXT NOT NULL, database_id TEXT NOT NULL, source_instance_id TEXT NOT NULL, pack_digest TEXT NOT NULL, selection_revision INTEGER NOT NULL CHECK(selection_revision>0), referenced_approval_revision INTEGER NOT NULL CHECK(referenced_approval_revision>0), service_id TEXT NOT NULL, request_key TEXT COLLATE BINARY NOT NULL CHECK(typeof(request_key)='text' AND length(CAST(request_key AS BLOB)) BETWEEN 1 AND 256 AND instr(CAST(request_key AS BLOB),x'00')=0), claim_epoch INTEGER NOT NULL CHECK(claim_epoch>0), claim_fence INTEGER NOT NULL CHECK(claim_fence>0), payload_digest TEXT NOT NULL, admission_seq INTEGER NOT NULL, admission_hash TEXT NOT NULL, PRIMARY KEY(order_id,lifecycle), UNIQUE(service_id,request_key))"
+  ],
+  [
+    "table",
+    "product_w1_operations_v1",
+    "product_w1_operations_v1",
+    "CREATE TABLE product_w1_operations_v1(\n actor_id TEXT COLLATE BINARY NOT NULL CHECK(typeof(actor_id)='text' AND length(CAST(actor_id AS BLOB)) BETWEEN 1 AND 256 AND instr(actor_id,char(0))=0),\n request_key TEXT COLLATE BINARY NOT NULL CHECK(typeof(request_key)='text' AND length(CAST(request_key AS BLOB)) BETWEEN 1 AND 256 AND instr(request_key,char(0))=0),\n operation TEXT COLLATE BINARY NOT NULL CHECK(operation IN ('approve','revoke','select')),\n authority_revision INTEGER NOT NULL CHECK(typeof(authority_revision)='integer' AND authority_revision>=0),\n source_instance_id TEXT COLLATE BINARY NOT NULL CHECK(typeof(source_instance_id)='text' AND length(CAST(source_instance_id AS BLOB)) BETWEEN 1 AND 256 AND instr(source_instance_id,char(0))=0),\n digest TEXT COLLATE BINARY NOT NULL CHECK(typeof(digest)='text' AND length(CAST(digest AS BLOB))=64 AND digest NOT GLOB '*[^0-9a-f]*'),\n expected_revision INTEGER NOT NULL CHECK(typeof(expected_revision)='integer' AND expected_revision>=0 AND expected_revision<9223372036854775807),\n approval_result_revision INTEGER,\n order_id TEXT COLLATE BINARY,\n lifecycle INTEGER,\n selection_result_revision INTEGER,\n referenced_approval_revision INTEGER,\n referenced_operation TEXT COLLATE BINARY,\n request BLOB NOT NULL CHECK(typeof(request)='blob' AND length(request)<=8192),\n receipt BLOB NOT NULL CHECK(typeof(receipt)='blob' AND length(receipt)<=8192),\n PRIMARY KEY(actor_id,request_key),\n UNIQUE(source_instance_id,digest,approval_result_revision),\n UNIQUE(order_id,lifecycle,selection_result_revision),\n UNIQUE(source_instance_id,digest,approval_result_revision,operation),\n FOREIGN KEY(source_instance_id,digest,referenced_approval_revision,referenced_operation)\n   REFERENCES product_w1_operations_v1(source_instance_id,digest,approval_result_revision,operation),\n CHECK((operation IN ('approve','revoke') AND typeof(approval_result_revision)='integer' AND approval_result_revision=expected_revision+1 AND order_id IS NULL AND lifecycle IS NULL AND selection_result_revision IS NULL AND referenced_approval_revision IS NULL AND referenced_operation IS NULL)\n    OR (operation='select' AND approval_result_revision IS NULL AND typeof(order_id)='text' AND length(CAST(order_id AS BLOB)) BETWEEN 1 AND 256 AND instr(order_id,char(0))=0 AND typeof(lifecycle)='integer' AND lifecycle>0 AND typeof(selection_result_revision)='integer' AND selection_result_revision=expected_revision+1 AND typeof(referenced_approval_revision)='integer' AND referenced_approval_revision>0 AND referenced_operation IS NOT NULL AND referenced_operation='approve'))\n)"
+  ],
+  [
+    "table",
+    "product_work_backlog_v1",
+    "product_work_backlog_v1",
+    "CREATE TABLE product_work_backlog_v1(order_id TEXT NOT NULL, lifecycle INTEGER NOT NULL, delivery_id TEXT NOT NULL UNIQUE, state TEXT NOT NULL, available_at TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(order_id,lifecycle))"
+  ],
+  [
+    "table",
+    "product_work_claims_v1",
+    "product_work_claims_v1",
+    "CREATE TABLE product_work_claims_v1(order_id TEXT NOT NULL, lifecycle INTEGER NOT NULL, owner_id TEXT, epoch INTEGER NOT NULL, fence INTEGER NOT NULL, state TEXT NOT NULL, lease_until TEXT, source_revision INTEGER, payload_digest TEXT, PRIMARY KEY(order_id,lifecycle))"
+  ],
+  [
+    "table",
+    "sqlite_sequence",
+    "sqlite_sequence",
+    "CREATE TABLE sqlite_sequence(name,seq)"
+  ],
+  [
+    "trigger",
+    "ledger_no_delete",
+    "ledger",
+    "CREATE TRIGGER ledger_no_delete BEFORE DELETE ON ledger BEGIN SELECT RAISE(ABORT, 'ledger is append-only'); END"
+  ],
+  [
+    "trigger",
+    "ledger_no_update",
+    "ledger",
+    "CREATE TRIGGER ledger_no_update BEFORE UPDATE ON ledger BEGIN SELECT RAISE(ABORT, 'ledger is append-only'); END"
+  ],
+  [
+    "trigger",
+    "product_approval_result_bindings_no_delete",
+    "product_approval_result_bindings_v1",
+    "CREATE TRIGGER product_approval_result_bindings_no_delete BEFORE DELETE ON product_approval_result_bindings_v1 BEGIN SELECT RAISE(ABORT,'approval result binding is immutable'); END"
+  ],
+  [
+    "trigger",
+    "product_approval_result_bindings_no_replace",
+    "product_approval_result_bindings_v1",
+    "CREATE TRIGGER product_approval_result_bindings_no_replace BEFORE INSERT ON product_approval_result_bindings_v1 WHEN EXISTS(SELECT 1 FROM product_approval_result_bindings_v1 a WHERE a.operation_id=NEW.operation_id OR (a.result_id=NEW.result_id AND a.binding_digest=NEW.binding_digest AND a.tuple_digest=NEW.tuple_digest)) BEGIN SELECT RAISE(ABORT,'approval result binding already exists'); END"
+  ],
+  [
+    "trigger",
+    "product_approval_result_bindings_no_update",
+    "product_approval_result_bindings_v1",
+    "CREATE TRIGGER product_approval_result_bindings_no_update BEFORE UPDATE ON product_approval_result_bindings_v1 BEGIN SELECT RAISE(ABORT,'approval result binding is immutable'); END"
+  ],
+  [
+    "trigger",
+    "product_artifact_no_delete",
+    "product_artifacts_v1",
+    "CREATE TRIGGER product_artifact_no_delete\n            BEFORE DELETE ON product_artifacts_v1\n            BEGIN SELECT RAISE(ABORT,'product artifact binding is immutable'); END"
+  ],
+  [
+    "trigger",
+    "product_artifact_no_update",
+    "product_artifacts_v1",
+    "CREATE TRIGGER product_artifact_no_update\n            BEFORE UPDATE ON product_artifacts_v1\n            BEGIN SELECT RAISE(ABORT,'product artifact binding is immutable'); END"
+  ],
+  [
+    "trigger",
+    "product_artifact_root_identity_no_delete",
+    "product_artifact_root_identity_v1",
+    "CREATE TRIGGER product_artifact_root_identity_no_delete\n            BEFORE DELETE ON product_artifact_root_identity_v1\n            BEGIN SELECT RAISE(ABORT,'product artifact root identity is immutable'); END"
+  ],
+  [
+    "trigger",
+    "product_artifact_root_identity_no_update",
+    "product_artifact_root_identity_v1",
+    "CREATE TRIGGER product_artifact_root_identity_no_update\n            BEFORE UPDATE ON product_artifact_root_identity_v1\n            BEGIN SELECT RAISE(ABORT,'product artifact root identity is immutable'); END"
+  ],
+  [
+    "trigger",
+    "product_artifact_root_no_delete",
+    "product_artifact_root_v1",
+    "CREATE TRIGGER product_artifact_root_no_delete\n            BEFORE DELETE ON product_artifact_root_v1\n            BEGIN SELECT RAISE(ABORT,'product artifact root is immutable'); END"
+  ],
+  [
+    "trigger",
+    "product_artifact_root_no_update",
+    "product_artifact_root_v1",
+    "CREATE TRIGGER product_artifact_root_no_update\n            BEFORE UPDATE ON product_artifact_root_v1\n            BEGIN SELECT RAISE(ABORT,'product artifact root is immutable'); END"
+  ],
+  [
+    "trigger",
+    "product_issue_first_no_replace",
+    "product_issue_first_v1",
+    "CREATE TRIGGER product_issue_first_no_replace BEFORE INSERT ON product_issue_first_v1\n         WHEN EXISTS(SELECT 1 FROM product_issue_first_v1 WHERE delivery=NEW.delivery OR\n          (source=NEW.source AND connector=NEW.connector AND repository=NEW.repository AND issue=NEW.issue))\n         BEGIN SELECT RAISE(ABORT,'immutable first issue'); END"
+  ],
+  [
+    "trigger",
+    "product_issue_first_preserve",
+    "product_issue_first_v1",
+    "CREATE TRIGGER product_issue_first_preserve BEFORE UPDATE ON product_issue_first_v1\n         BEGIN SELECT RAISE(ABORT,'immutable first issue'); END"
+  ],
+  [
+    "trigger",
+    "product_issue_first_retain",
+    "product_issue_first_v1",
+    "CREATE TRIGGER product_issue_first_retain BEFORE DELETE ON product_issue_first_v1\n         BEGIN SELECT RAISE(ABORT,'retained first issue'); END"
+  ],
+  [
+    "trigger",
+    "product_ledger_receipt",
+    "ledger",
+    "CREATE TRIGGER product_ledger_receipt AFTER INSERT ON ledger\n               WHEN (SELECT contract FROM foundry_contract WHERE singleton=1)='ProductAtomicV1'\n               BEGIN\n                 INSERT INTO product_transition_receipts_v1(seq,event_hash,order_id,lifecycle,expected_predecessor,operation)\n                   SELECT NEW.seq,NEW.hash,NEW.order_id,lifecycle,expected_predecessor,operation FROM product_transition_intents_v1 WHERE order_id=NEW.order_id;\n                 DELETE FROM product_transition_intents_v1 WHERE order_id=NEW.order_id;\n               END"
+  ],
+  [
+    "trigger",
+    "product_ledger_requires_intent",
+    "ledger",
+    "CREATE TRIGGER product_ledger_requires_intent BEFORE INSERT ON ledger\n               WHEN (SELECT contract FROM foundry_contract WHERE singleton=1)='ProductAtomicV1'\n                 AND NOT EXISTS(SELECT 1 FROM product_transition_intents_v1 WHERE order_id=NEW.order_id)\n               BEGIN SELECT RAISE(ABORT, 'product transition receipt required'); END"
+  ],
+  [
+    "trigger",
+    "product_producer_event_no_delete",
+    "product_producer_events_v1",
+    "CREATE TRIGGER product_producer_event_no_delete BEFORE DELETE ON product_producer_events_v1\n BEGIN SELECT RAISE(ABORT,'retained producer event'); END"
+  ],
+  [
+    "trigger",
+    "product_producer_event_no_replace",
+    "product_producer_events_v1",
+    "CREATE TRIGGER product_producer_event_no_replace BEFORE INSERT ON product_producer_events_v1\n WHEN EXISTS(SELECT 1 FROM product_producer_events_v1 WHERE order_id=NEW.order_id AND state=NEW.state)\n BEGIN SELECT RAISE(ABORT,'retained producer event'); END"
+  ],
+  [
+    "trigger",
+    "product_producer_event_no_update",
+    "product_producer_events_v1",
+    "CREATE TRIGGER product_producer_event_no_update BEFORE UPDATE ON product_producer_events_v1\n BEGIN SELECT RAISE(ABORT,'retained producer event'); END"
+  ],
+  [
+    "trigger",
+    "product_producer_no_delete",
+    "product_producers_v1",
+    "CREATE TRIGGER product_producer_no_delete BEFORE DELETE ON product_producers_v1\n BEGIN SELECT RAISE(ABORT,'retained producer'); END"
+  ],
+  [
+    "trigger",
+    "product_producer_no_replace",
+    "product_producers_v1",
+    "CREATE TRIGGER product_producer_no_replace BEFORE INSERT ON product_producers_v1\n WHEN EXISTS(SELECT 1 FROM product_producers_v1 WHERE order_id=NEW.order_id OR (service=NEW.service AND operation_key=NEW.operation_key))\n BEGIN SELECT RAISE(ABORT,'retained producer'); END"
+  ],
+  [
+    "trigger",
+    "product_producer_terminal",
+    "product_producers_v1",
+    "CREATE TRIGGER product_producer_terminal BEFORE UPDATE ON product_producers_v1\n WHEN OLD.state IN ('collected','uncertain') OR\n (OLD.state='sealed' AND (OLD.artifact IS NOT NEW.artifact OR OLD.result_commit IS NOT NEW.result_commit OR OLD.artifact_sha256 IS NOT NEW.artifact_sha256))\n BEGIN SELECT RAISE(ABORT,'sealed producer'); END"
+  ],
+  [
+    "trigger",
+    "product_publish_confirmed_no_delete",
+    "product_publish_outcomes_v1",
+    "CREATE TRIGGER product_publish_confirmed_no_delete\n           BEFORE DELETE ON product_publish_outcomes_v1\n           WHEN OLD.state='confirmed'\n           BEGIN SELECT RAISE(ABORT,'confirmed product publish outcome is immutable'); END"
+  ],
+  [
+    "trigger",
+    "product_publish_confirmed_no_update",
+    "product_publish_outcomes_v1",
+    "CREATE TRIGGER product_publish_confirmed_no_update\n           BEFORE UPDATE ON product_publish_outcomes_v1\n           WHEN OLD.state='confirmed'\n           BEGIN SELECT RAISE(ABORT,'confirmed product publish outcome is immutable'); END"
+  ],
+  [
+    "trigger",
+    "product_publish_outcome_no_replace",
+    "product_publish_outcomes_v1",
+    "CREATE TRIGGER product_publish_outcome_no_replace\n           BEFORE INSERT ON product_publish_outcomes_v1\n           WHEN EXISTS(SELECT 1 FROM product_publish_outcomes_v1 WHERE operation_id=NEW.operation_id)\n           BEGIN SELECT RAISE(ABORT,'product publish outcome row already exists'); END"
+  ],
+  [
+    "trigger",
+    "product_publish_pending_transition_only",
+    "product_publish_outcomes_v1",
+    "CREATE TRIGGER product_publish_pending_transition_only\n           BEFORE UPDATE ON product_publish_outcomes_v1\n           WHEN OLD.state!='pending' OR NEW.state!='confirmed'\n             OR NEW.operation_id!=OLD.operation_id\n             OR NEW.receipt_json!=OLD.receipt_json\n             OR NEW.started_at!=OLD.started_at\n             OR NEW.pr_url IS NULL OR NEW.settled_at IS NULL\n           BEGIN SELECT RAISE(ABORT,'invalid product publish settlement'); END"
+  ],
+  [
+    "trigger",
+    "product_result_bindings_no_delete",
+    "product_result_bindings_v1",
+    "CREATE TRIGGER product_result_bindings_no_delete BEFORE DELETE ON product_result_bindings_v1 BEGIN SELECT RAISE(ABORT,'product result is immutable'); END"
+  ],
+  [
+    "trigger",
+    "product_result_bindings_no_legacy_tuple",
+    "product_result_bindings_v1",
+    "CREATE TRIGGER product_result_bindings_no_legacy_tuple BEFORE INSERT ON product_result_bindings_v1 WHEN EXISTS(SELECT 1 FROM product_result_legacy_tuples_v1 t WHERE t.order_id=NEW.order_id AND t.attempt=NEW.attempt AND t.run_id=NEW.run_id AND t.generation=NEW.generation) BEGIN SELECT RAISE(ABORT,'legacy tuple cannot be adopted'); END"
+  ],
+  [
+    "trigger",
+    "product_result_bindings_no_replace",
+    "product_result_bindings_v1",
+    "CREATE TRIGGER product_result_bindings_no_replace BEFORE INSERT ON product_result_bindings_v1 WHEN EXISTS(SELECT 1 FROM product_result_bindings_v1 r WHERE r.result_id=NEW.result_id OR (r.order_id=NEW.order_id AND r.lifecycle=NEW.lifecycle AND r.attempt=NEW.attempt AND r.run_id=NEW.run_id AND r.activation=NEW.activation AND r.generation=NEW.generation) OR (r.order_id=NEW.order_id AND r.attempt=NEW.attempt AND r.run_id=NEW.run_id AND r.generation=NEW.generation) OR (r.result_id=NEW.result_id AND r.binding_digest=NEW.binding_digest AND r.tuple_digest=NEW.tuple_digest)) BEGIN SELECT RAISE(ABORT,'product result already exists'); END"
+  ],
+  [
+    "trigger",
+    "product_result_bindings_no_update",
+    "product_result_bindings_v1",
+    "CREATE TRIGGER product_result_bindings_no_update BEFORE UPDATE ON product_result_bindings_v1 BEGIN SELECT RAISE(ABORT,'product result is immutable'); END"
+  ],
+  [
+    "trigger",
+    "product_result_legacy_hosts_no_delete",
+    "product_result_legacy_hosts_v1",
+    "CREATE TRIGGER product_result_legacy_hosts_no_delete BEFORE DELETE ON product_result_legacy_hosts_v1 BEGIN SELECT RAISE(ABORT,'legacy host census is sealed'); END"
+  ],
+  [
+    "trigger",
+    "product_result_legacy_hosts_no_insert",
+    "product_result_legacy_hosts_v1",
+    "CREATE TRIGGER product_result_legacy_hosts_no_insert BEFORE INSERT ON product_result_legacy_hosts_v1 BEGIN SELECT RAISE(ABORT,'legacy host census is sealed'); END"
+  ],
+  [
+    "trigger",
+    "product_result_legacy_hosts_no_update",
+    "product_result_legacy_hosts_v1",
+    "CREATE TRIGGER product_result_legacy_hosts_no_update BEFORE UPDATE ON product_result_legacy_hosts_v1 BEGIN SELECT RAISE(ABORT,'legacy host census is sealed'); END"
+  ],
+  [
+    "trigger",
+    "product_result_legacy_tuples_no_delete",
+    "product_result_legacy_tuples_v1",
+    "CREATE TRIGGER product_result_legacy_tuples_no_delete BEFORE DELETE ON product_result_legacy_tuples_v1 BEGIN SELECT RAISE(ABORT,'legacy tuple census is sealed'); END"
+  ],
+  [
+    "trigger",
+    "product_result_legacy_tuples_no_insert",
+    "product_result_legacy_tuples_v1",
+    "CREATE TRIGGER product_result_legacy_tuples_no_insert BEFORE INSERT ON product_result_legacy_tuples_v1 BEGIN SELECT RAISE(ABORT,'legacy tuple census is sealed'); END"
+  ],
+  [
+    "trigger",
+    "product_result_legacy_tuples_no_update",
+    "product_result_legacy_tuples_v1",
+    "CREATE TRIGGER product_result_legacy_tuples_no_update BEFORE UPDATE ON product_result_legacy_tuples_v1 BEGIN SELECT RAISE(ABORT,'legacy tuple census is sealed'); END"
+  ],
+  [
+    "trigger",
+    "product_result_meta_no_delete",
+    "product_result_meta_v1",
+    "CREATE TRIGGER product_result_meta_no_delete BEFORE DELETE ON product_result_meta_v1 BEGIN SELECT RAISE(ABORT,'result metadata is immutable'); END"
+  ],
+  [
+    "trigger",
+    "product_result_meta_no_replace",
+    "product_result_meta_v1",
+    "CREATE TRIGGER product_result_meta_no_replace BEFORE INSERT ON product_result_meta_v1 WHEN EXISTS(SELECT 1 FROM product_result_meta_v1 WHERE singleton=NEW.singleton) BEGIN SELECT RAISE(ABORT,'result metadata already exists'); END"
+  ],
+  [
+    "trigger",
+    "product_result_meta_no_update",
+    "product_result_meta_v1",
+    "CREATE TRIGGER product_result_meta_no_update BEFORE UPDATE ON product_result_meta_v1 BEGIN SELECT RAISE(ABORT,'result metadata is immutable'); END"
+  ],
+  [
+    "trigger",
+    "product_review_acceptance_no_delete",
+    "product_review_hold_acceptances_v1",
+    "CREATE TRIGGER product_review_acceptance_no_delete BEFORE DELETE ON product_review_hold_acceptances_v1 BEGIN SELECT RAISE(ABORT,'product review acceptance is immutable'); END"
+  ],
+  [
+    "trigger",
+    "product_review_acceptance_no_update",
+    "product_review_hold_acceptances_v1",
+    "CREATE TRIGGER product_review_acceptance_no_update BEFORE UPDATE ON product_review_hold_acceptances_v1 BEGIN SELECT RAISE(ABORT,'product review acceptance is immutable'); END"
+  ],
+  [
+    "trigger",
+    "product_review_authority_no_delete",
+    "product_review_authority_v1",
+    "CREATE TRIGGER product_review_authority_no_delete BEFORE DELETE ON product_review_authority_v1 BEGIN SELECT RAISE(ABORT,'review authority is immutable'); END"
+  ],
+  [
+    "trigger",
+    "product_review_authority_no_legacy",
+    "product_review_authority_v1",
+    "CREATE TRIGGER product_review_authority_no_legacy BEFORE INSERT ON product_review_authority_v1 WHEN EXISTS(SELECT 1 FROM product_result_legacy_hosts_v1 h WHERE h.order_id=NEW.order_id AND h.attempt=NEW.attempt AND h.run_id=NEW.run_id AND h.activation=NEW.activation) BEGIN SELECT RAISE(ABORT,'legacy authority cannot be backfilled'); END"
+  ],
+  [
+    "trigger",
+    "product_review_authority_no_replace",
+    "product_review_authority_v1",
+    "CREATE TRIGGER product_review_authority_no_replace BEFORE INSERT ON product_review_authority_v1 WHEN EXISTS(SELECT 1 FROM product_review_authority_v1 a WHERE a.key_json=NEW.key_json OR (a.order_id=NEW.order_id AND a.attempt=NEW.attempt AND a.run_id=NEW.run_id AND a.activation=NEW.activation) OR (a.order_id=NEW.order_id AND a.attempt=NEW.attempt AND a.journal_run=NEW.journal_run)) BEGIN SELECT RAISE(ABORT,'review authority already exists'); END"
+  ],
+  [
+    "trigger",
+    "product_review_authority_no_update",
+    "product_review_authority_v1",
+    "CREATE TRIGGER product_review_authority_no_update BEFORE UPDATE ON product_review_authority_v1 BEGIN SELECT RAISE(ABORT,'review authority is immutable'); END"
+  ],
+  [
+    "trigger",
+    "product_review_hold_exact_cas",
+    "product_review_holds_v1",
+    "CREATE TRIGGER product_review_hold_exact_cas BEFORE UPDATE ON product_review_holds_v1\n               WHEN OLD.state!='active' OR NEW.state!='accepted' OR NEW.order_id!=OLD.order_id OR NEW.lifecycle!=OLD.lifecycle OR NEW.attempt!=OLD.attempt OR NEW.originating_run!=OLD.originating_run OR NEW.activation!=OLD.activation OR NEW.host_epoch!=OLD.host_epoch OR NEW.hold_instance_id!=OLD.hold_instance_id OR NEW.hold_revision!=OLD.hold_revision OR NEW.expected_predecessor!=OLD.expected_predecessor OR NEW.snapshot_digest!=OLD.snapshot_digest OR NEW.snapshot_json!=OLD.snapshot_json OR NEW.allowed_targets_json!=OLD.allowed_targets_json OR NEW.deadline!=OLD.deadline OR NEW.source_revision!=OLD.source_revision OR NEW.admission_seq!=OLD.admission_seq OR NEW.admission_hash!=OLD.admission_hash\n               BEGIN SELECT RAISE(ABORT,'product review hold CAS binding changed'); END"
+  ],
+  [
+    "trigger",
+    "product_review_hold_no_delete",
+    "product_review_holds_v1",
+    "CREATE TRIGGER product_review_hold_no_delete BEFORE DELETE ON product_review_holds_v1 BEGIN SELECT RAISE(ABORT,'product review hold history is immutable'); END"
+  ],
+  [
+    "trigger",
+    "product_scope_api_locator_no_delete",
+    "product_scope_api_locators_v1",
+    "CREATE TRIGGER product_scope_api_locator_no_delete\n            BEFORE DELETE ON product_scope_api_locators_v1\n            BEGIN SELECT RAISE(ABORT,'product API locator mapping is immutable'); END"
+  ],
+  [
+    "trigger",
+    "product_scope_api_locator_no_update",
+    "product_scope_api_locators_v1",
+    "CREATE TRIGGER product_scope_api_locator_no_update\n            BEFORE UPDATE ON product_scope_api_locators_v1\n            BEGIN SELECT RAISE(ABORT,'product API locator mapping is immutable'); END"
+  ],
+  [
+    "trigger",
+    "product_scope_event_no_delete",
+    "product_scope_events_v1",
+    "CREATE TRIGGER product_scope_event_no_delete\n            BEFORE DELETE ON product_scope_events_v1\n            BEGIN SELECT RAISE(ABORT,'product scope events are append-only'); END"
+  ],
+  [
+    "trigger",
+    "product_scope_event_no_update",
+    "product_scope_events_v1",
+    "CREATE TRIGGER product_scope_event_no_update\n            BEFORE UPDATE ON product_scope_events_v1\n            BEGIN SELECT RAISE(ABORT,'product scope events are append-only'); END"
+  ],
+  [
+    "trigger",
+    "product_scope_migration_no_delete",
+    "product_scope_migrations_v1",
+    "CREATE TRIGGER product_scope_migration_no_delete\n            BEFORE DELETE ON product_scope_migrations_v1\n            BEGIN SELECT RAISE(ABORT,'product scope migration receipts are immutable'); END"
+  ],
+  [
+    "trigger",
+    "product_scope_migration_no_update",
+    "product_scope_migrations_v1",
+    "CREATE TRIGGER product_scope_migration_no_update\n            BEFORE UPDATE ON product_scope_migrations_v1\n            BEGIN SELECT RAISE(ABORT,'product scope migration receipts are immutable'); END"
+  ],
+  [
+    "trigger",
+    "product_scope_operation_no_delete",
+    "product_scope_operations_v1",
+    "CREATE TRIGGER product_scope_operation_no_delete\n            BEFORE DELETE ON product_scope_operations_v1\n            BEGIN SELECT RAISE(ABORT,'product scope operation receipts are immutable'); END"
+  ],
+  [
+    "trigger",
+    "product_scope_operation_no_update",
+    "product_scope_operations_v1",
+    "CREATE TRIGGER product_scope_operation_no_update\n            BEFORE UPDATE ON product_scope_operations_v1\n            BEGIN SELECT RAISE(ABORT,'product scope operation receipts are immutable'); END"
+  ],
+  [
+    "trigger",
+    "product_scope_provenance_immutable_delete",
+    "product_scope_order_provenance_v1",
+    "CREATE TRIGGER product_scope_provenance_immutable_delete\n            BEFORE DELETE ON product_scope_order_provenance_v1\n            BEGIN SELECT RAISE(ABORT,'product scope provenance is immutable'); END"
+  ],
+  [
+    "trigger",
+    "product_scope_provenance_immutable_update",
+    "product_scope_order_provenance_v1",
+    "CREATE TRIGGER product_scope_provenance_immutable_update\n            BEFORE UPDATE ON product_scope_order_provenance_v1\n            BEGIN SELECT RAISE(ABORT,'product scope provenance is immutable'); END"
+  ],
+  [
+    "trigger",
+    "product_scope_quarantine_no_delete",
+    "product_scope_quarantine_v1",
+    "CREATE TRIGGER product_scope_quarantine_no_delete\n            BEFORE DELETE ON product_scope_quarantine_v1\n            BEGIN SELECT RAISE(ABORT,'product scope quarantine is immutable'); END"
+  ],
+  [
+    "trigger",
+    "product_scope_quarantine_no_update",
+    "product_scope_quarantine_v1",
+    "CREATE TRIGGER product_scope_quarantine_no_update\n            BEFORE UPDATE ON product_scope_quarantine_v1\n            BEGIN SELECT RAISE(ABORT,'product scope quarantine is immutable'); END"
+  ],
+  [
+    "trigger",
+    "product_scope_repository_no_delete",
+    "product_scope_repositories_v1",
+    "CREATE TRIGGER product_scope_repository_no_delete\n            BEFORE DELETE ON product_scope_repositories_v1\n            BEGIN SELECT RAISE(ABORT,'product repository identity is immutable'); END"
+  ],
+  [
+    "trigger",
+    "product_scope_repository_no_update",
+    "product_scope_repositories_v1",
+    "CREATE TRIGGER product_scope_repository_no_update\n            BEFORE UPDATE ON product_scope_repositories_v1\n            BEGIN SELECT RAISE(ABORT,'product repository identity is immutable'); END"
+  ],
+  [
+    "trigger",
+    "product_scope_source_event_no_delete",
+    "product_scope_source_events_v1",
+    "CREATE TRIGGER product_scope_source_event_no_delete\n            BEFORE DELETE ON product_scope_source_events_v1\n            BEGIN SELECT RAISE(ABORT,'product source events are append-only'); END"
+  ],
+  [
+    "trigger",
+    "product_scope_source_event_no_update",
+    "product_scope_source_events_v1",
+    "CREATE TRIGGER product_scope_source_event_no_update\n            BEFORE UPDATE ON product_scope_source_events_v1\n            BEGIN SELECT RAISE(ABORT,'product source events are append-only'); END"
+  ],
+  [
+    "trigger",
+    "product_scope_source_identity_immutable",
+    "product_scope_source_instances_v1",
+    "CREATE TRIGGER product_scope_source_identity_immutable\n            BEFORE UPDATE ON product_scope_source_instances_v1\n            WHEN NEW.source_instance_id IS NOT OLD.source_instance_id\n              OR NEW.connector_id IS NOT OLD.connector_id\n              OR NEW.repository_key IS NOT OLD.repository_key\n              OR NEW.generation IS NOT OLD.generation\n              OR NEW.legacy_repository_locator IS NOT OLD.legacy_repository_locator\n              OR NEW.scope_query IS NOT OLD.scope_query\n              OR NEW.revision<=OLD.revision\n            BEGIN SELECT RAISE(ABORT,'product source identity is immutable'); END"
+  ],
+  [
+    "trigger",
+    "product_scope_source_no_delete",
+    "product_scope_source_instances_v1",
+    "CREATE TRIGGER product_scope_source_no_delete\n            BEFORE DELETE ON product_scope_source_instances_v1\n            BEGIN SELECT RAISE(ABORT,'product source history is immutable'); END"
+  ],
+  [
+    "trigger",
+    "product_task_immutable",
+    "product_code_tasks_v1",
+    "CREATE TRIGGER product_task_immutable BEFORE UPDATE ON product_code_tasks_v1\n BEGIN SELECT RAISE(ABORT,'immutable task'); END"
+  ],
+  [
+    "trigger",
+    "product_task_no_replace",
+    "product_code_tasks_v1",
+    "CREATE TRIGGER product_task_no_replace BEFORE INSERT ON product_code_tasks_v1\n WHEN EXISTS(SELECT 1 FROM product_code_tasks_v1 WHERE order_id=NEW.order_id OR (actor=NEW.actor AND request_key=NEW.request_key))\n BEGIN SELECT RAISE(ABORT,'immutable task'); END"
+  ],
+  [
+    "trigger",
+    "product_task_retained",
+    "product_code_tasks_v1",
+    "CREATE TRIGGER product_task_retained BEFORE DELETE ON product_code_tasks_v1\n BEGIN SELECT RAISE(ABORT,'retained task'); END"
+  ],
+  [
+    "trigger",
+    "product_tuples_no_delete",
+    "artifact_tuples",
+    "CREATE TRIGGER product_tuples_no_delete BEFORE DELETE ON artifact_tuples BEGIN SELECT RAISE(ABORT,'product tuples are immutable'); END"
+  ],
+  [
+    "trigger",
+    "product_tuples_no_replace",
+    "artifact_tuples",
+    "CREATE TRIGGER product_tuples_no_replace BEFORE INSERT ON artifact_tuples WHEN EXISTS(SELECT 1 FROM artifact_tuples t WHERE t.order_id=NEW.order_id AND t.attempt=NEW.attempt AND t.run_id=NEW.run_id AND t.generation=NEW.generation) BEGIN SELECT RAISE(ABORT,'product tuple already exists'); END"
+  ],
+  [
+    "trigger",
+    "product_tuples_no_update",
+    "artifact_tuples",
+    "CREATE TRIGGER product_tuples_no_update BEFORE UPDATE ON artifact_tuples BEGIN SELECT RAISE(ABORT,'product tuples are immutable'); END"
+  ],
+  [
+    "trigger",
+    "product_w1_claim_authority_no_delete",
+    "product_w1_claim_authority_v1",
+    "CREATE TRIGGER product_w1_claim_authority_no_delete BEFORE DELETE ON product_w1_claim_authority_v1 BEGIN SELECT RAISE(ABORT,'immutable claim authority'); END"
+  ],
+  [
+    "trigger",
+    "product_w1_claim_authority_no_replace",
+    "product_w1_claim_authority_v1",
+    "CREATE TRIGGER product_w1_claim_authority_no_replace BEFORE INSERT ON product_w1_claim_authority_v1 WHEN EXISTS(SELECT 1 FROM product_w1_claim_authority_v1 WHERE (order_id=NEW.order_id AND lifecycle=NEW.lifecycle AND epoch=NEW.epoch) OR fence=NEW.fence) BEGIN SELECT RAISE(ABORT,'immutable claim authority'); END"
+  ],
+  [
+    "trigger",
+    "product_w1_claim_authority_no_update",
+    "product_w1_claim_authority_v1",
+    "CREATE TRIGGER product_w1_claim_authority_no_update BEFORE UPDATE ON product_w1_claim_authority_v1 BEGIN SELECT RAISE(ABORT,'immutable claim authority'); END"
+  ],
+  [
+    "trigger",
+    "product_w1_grant_sidecar_no_delete",
+    "product_w1_grant_sidecar_v1",
+    "CREATE TRIGGER product_w1_grant_sidecar_no_delete BEFORE DELETE ON product_w1_grant_sidecar_v1 BEGIN SELECT RAISE(ABORT,'w1 grant sidecar immutable'); END"
+  ],
+  [
+    "trigger",
+    "product_w1_grant_sidecar_no_replace",
+    "product_w1_grant_sidecar_v1",
+    "CREATE TRIGGER product_w1_grant_sidecar_no_replace BEFORE INSERT ON product_w1_grant_sidecar_v1 WHEN EXISTS(SELECT 1 FROM product_w1_grant_sidecar_v1 WHERE order_id=NEW.order_id AND lifecycle=NEW.lifecycle AND selection_revision=NEW.selection_revision) BEGIN SELECT RAISE(ABORT,'w1 grant sidecar immutable'); END"
+  ],
+  [
+    "trigger",
+    "product_w1_grant_sidecar_no_update",
+    "product_w1_grant_sidecar_v1",
+    "CREATE TRIGGER product_w1_grant_sidecar_no_update BEFORE UPDATE ON product_w1_grant_sidecar_v1 BEGIN SELECT RAISE(ABORT,'w1 grant sidecar immutable'); END"
+  ],
+  [
+    "trigger",
+    "product_w1_lifecycle_pins_no_delete",
+    "product_w1_lifecycle_pins_v1",
+    "CREATE TRIGGER product_w1_lifecycle_pins_no_delete BEFORE DELETE ON product_w1_lifecycle_pins_v1 BEGIN SELECT RAISE(ABORT,'immutable lifecycle pin'); END"
+  ],
+  [
+    "trigger",
+    "product_w1_lifecycle_pins_no_replace",
+    "product_w1_lifecycle_pins_v1",
+    "CREATE TRIGGER product_w1_lifecycle_pins_no_replace BEFORE INSERT ON product_w1_lifecycle_pins_v1 WHEN EXISTS(SELECT 1 FROM product_w1_lifecycle_pins_v1 WHERE order_id=NEW.order_id AND lifecycle=NEW.lifecycle) BEGIN SELECT RAISE(ABORT,'immutable lifecycle pin'); END"
+  ],
+  [
+    "trigger",
+    "product_w1_lifecycle_pins_no_update",
+    "product_w1_lifecycle_pins_v1",
+    "CREATE TRIGGER product_w1_lifecycle_pins_no_update BEFORE UPDATE ON product_w1_lifecycle_pins_v1 BEGIN SELECT RAISE(ABORT,'immutable lifecycle pin'); END"
+  ],
+  [
+    "trigger",
+    "product_w1_operations_no_delete",
+    "product_w1_operations_v1",
+    "CREATE TRIGGER product_w1_operations_no_delete BEFORE DELETE ON product_w1_operations_v1 BEGIN SELECT RAISE(ABORT,'w1 operation immutable'); END"
+  ],
+  [
+    "trigger",
+    "product_w1_operations_no_replace",
+    "product_w1_operations_v1",
+    "CREATE TRIGGER product_w1_operations_no_replace BEFORE INSERT ON product_w1_operations_v1 WHEN EXISTS(SELECT 1 FROM product_w1_operations_v1 o WHERE (o.actor_id=NEW.actor_id AND o.request_key=NEW.request_key) OR (NEW.approval_result_revision IS NOT NULL AND o.source_instance_id=NEW.source_instance_id AND o.digest=NEW.digest AND o.approval_result_revision=NEW.approval_result_revision) OR (NEW.selection_result_revision IS NOT NULL AND o.order_id=NEW.order_id AND o.lifecycle=NEW.lifecycle AND o.selection_result_revision=NEW.selection_result_revision)) BEGIN SELECT RAISE(ABORT,'w1 operation duplicate'); END"
+  ],
+  [
+    "trigger",
+    "product_w1_operations_no_update",
+    "product_w1_operations_v1",
+    "CREATE TRIGGER product_w1_operations_no_update BEFORE UPDATE ON product_w1_operations_v1 BEGIN SELECT RAISE(ABORT,'w1 operation immutable'); END"
+  ]
+]

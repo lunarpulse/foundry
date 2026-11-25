@@ -1,0 +1,80 @@
+[
+  [
+    "unsupported-0",
+    "321a280792aed131c64754746073c5e777aea6d48dd057e1098f84c7bac0ca36",
+    "acked",
+    "{\"body\":\"free text\",\"issue_number\":17,\"title\":\"invalid\"}"
+  ],
+  [
+    "unsupported-1",
+    "0c28a1a402d3a8dd01344beff06210da3c913e1530851a7eb48ee0f686928450",
+    "acked",
+    "{\"body\":\"$(touch /home/cosmo/.hermes/cache/scratch/w2-rebuild/tmp/b2-w1-runtime-230-0-1795587136070837863/shell-entered)\",\"issue_number\":17,\"title\":\"invalid\"}"
+  ],
+  [
+    "unsupported-2",
+    "ec8b24192b4b29adb2b94fb338d95d8d29484256f707fc16adfc49a8b5fe0523",
+    "acked",
+    "{\"body\":\"{\\\"kind\\\":\\\"code-change-v1\\\",\\\"request\\\":\\\"Add a line\\\",\\\"acceptance\\\":[\\\"README updated\\\"],\\\"base_commit\\\":\\\"ab1602d5bc93d919bb2e2c1361268b1ae3c0ef4e\\\",\\\"pack_digest\\\":\\\"5f28e6c41d834462a93c1d77541b4d122baf58ac9c85c7674c9753d23436d8fc\\\",\\\"allowed_paths\\\":[\\\"../README\\\"],\\\"checks\\\":[{\\\"argv\\\":[\\\"git\\\",\\\"diff\\\",\\\"--check\\\"],\\\"timeout_secs\\\":5}],\\\"total_timeout_secs\\\":120,\\\"model\\\":\\\"none\\\",\\\"max_model_calls\\\":0,\\\"max_cost_microusd\\\":0,\\\"max_fix_generations\\\":0}\",\"issue_number\":17,\"title\":\"invalid\"}"
+  ],
+  [
+    "unsupported-3",
+    "751ad88b827eecc597a37ca0372a2321ffb443bb06037e97545b8fadd052b04d",
+    "acked",
+    "{\"body\":\"{\\\"kind\\\":\\\"code-change-v1\\\",\\\"request\\\":\\\"Add a line\\\",\\\"acceptance\\\":[\\\"README updated\\\"],\\\"base_commit\\\":\\\"ab1602d5bc93d919bb2e2c1361268b1ae3c0ef4e\\\",\\\"pack_digest\\\":\\\"5f28e6c41d834462a93c1d77541b4d122baf58ac9c85c7674c9753d23436d8fc\\\",\\\"allowed_paths\\\":[\\\"README\\\"],\\\"checks\\\":[{\\\"argv\\\":[\\\"sh\\\",\\\"-c\\\",\\\"true\\\"],\\\"timeout_secs\\\":5}],\\\"total_timeout_secs\\\":120,\\\"model\\\":\\\"none\\\",\\\"max_model_calls\\\":0,\\\"max_cost_microusd\\\":0,\\\"max_fix_generations\\\":0}\",\"issue_number\":17,\"title\":\"invalid\"}"
+  ],
+  [
+    "unsupported-4",
+    "005ba416f386e08917ff762a825a6fc96a261b83dfb2c25ace3e23db05e3a70b",
+    "acked",
+    "{\"body\":\"{\\\"kind\\\":\\\"code-change-v1\\\",\\\"request\\\":\\\"Add a line\\\",\\\"acceptance\\\":[\\\"README updated\\\"],\\\"base_commit\\\":\\\"ab1602d5bc93d919bb2e2c1361268b1ae3c0ef4e\\\",\\\"pack_digest\\\":\\\"5f28e6c41d834462a93c1d77541b4d122baf58ac9c85c7674c9753d23436d8fc\\\",\\\"allowed_paths\\\":[\\\"README\\\"],\\\"checks\\\":[{\\\"argv\\\":[\\\"git\\\",\\\"diff\\\",\\\"--check\\\"],\\\"timeout_secs\\\":121}],\\\"total_timeout_secs\\\":120,\\\"model\\\":\\\"none\\\",\\\"max_model_calls\\\":0,\\\"max_cost_microusd\\\":0,\\\"max_fix_generations\\\":0}\",\"issue_number\":17,\"title\":\"invalid\"}"
+  ],
+  [
+    "unsupported-5",
+    "78074094a40cf5062a3827420917b076ce310800130e3cf1a6f8c24a3fa8892d",
+    "acked",
+    "{\"body\":\"{\\\"kind\\\":\\\"code-change-v1\\\",\\\"request\\\":\\\"Add a line\\\",\\\"acceptance\\\":[\\\"README updated\\\"],\\\"base_commit\\\":\\\"ab1602d5bc93d919bb2e2c1361268b1ae3c0ef4e\\\",\\\"pack_digest\\\":\\\"5f28e6c41d834462a93c1d77541b4d122baf58ac9c85c7674c9753d23436d8fc\\\",\\\"allowed_paths\\\":[\\\"README\\\"],\\\"checks\\\":[{\\\"argv\\\":[\\\"git\\\",\\\"diff\\\",\\\"--check\\\"],\\\"timeout_secs\\\":5}],\\\"total_timeout_secs\\\":0,\\\"model\\\":\\\"none\\\",\\\"max_model_calls\\\":0,\\\"max_cost_microusd\\\":0,\\\"max_fix_generations\\\":0}\",\"issue_number\":17,\"title\":\"invalid\"}"
+  ],
+  [
+    "unsupported-6",
+    "3104340536dd14023ef99a2a066b27f1292ad8091cada33c191236c550b759c5",
+    "acked",
+    "{\"body\":\"{\\\"kind\\\":\\\"code-change-v1\\\",\\\"request\\\":\\\"Add a line\\\",\\\"acceptance\\\":[\\\"README updated\\\"],\\\"base_commit\\\":\\\"ab1602d5bc93d919bb2e2c1361268b1ae3c0ef4e\\\",\\\"pack_digest\\\":\\\"5f28e6c41d834462a93c1d77541b4d122baf58ac9c85c7674c9753d23436d8fc\\\",\\\"allowed_paths\\\":[\\\"README\\\"],\\\"checks\\\":[{\\\"argv\\\":[\\\"git\\\",\\\"diff\\\",\\\"--check\\\"],\\\"timeout_secs\\\":5}],\\\"total_timeout_secs\\\":3601,\\\"model\\\":\\\"none\\\",\\\"max_model_calls\\\":0,\\\"max_cost_microusd\\\":0,\\\"max_fix_generations\\\":0}\",\"issue_number\":17,\"title\":\"invalid\"}"
+  ],
+  [
+    "unsupported-7",
+    "450930881c4350701cf05c064a66bfb50755f7eecc36b4dbb0634231b43efc0f",
+    "acked",
+    "{\"body\":\"{\\\"kind\\\":\\\"code-change-v1\\\",\\\"request\\\":\\\"Add a line\\\",\\\"acceptance\\\":[\\\"README updated\\\"],\\\"base_commit\\\":\\\"ab1602d5bc93d919bb2e2c1361268b1ae3c0ef4e\\\",\\\"pack_digest\\\":\\\"5f28e6c41d834462a93c1d77541b4d122baf58ac9c85c7674c9753d23436d8fc\\\",\\\"allowed_paths\\\":[\\\"README\\\"],\\\"checks\\\":[{\\\"argv\\\":[\\\"git\\\",\\\"diff\\\",\\\"--check\\\"],\\\"timeout_secs\\\":5}],\\\"total_timeout_secs\\\":120,\\\"model\\\":\\\"other\\\",\\\"max_model_calls\\\":0,\\\"max_cost_microusd\\\":0,\\\"max_fix_generations\\\":0}\",\"issue_number\":17,\"title\":\"invalid\"}"
+  ],
+  [
+    "unsupported-8",
+    "400a1b8bc05bdac82abed10a70792b09cd8d202b7b40f328d31f56c6200be739",
+    "acked",
+    "{\"body\":\"{\\\"kind\\\":\\\"code-change-v1\\\",\\\"request\\\":\\\"Add a line\\\",\\\"acceptance\\\":[\\\"README updated\\\"],\\\"base_commit\\\":\\\"ab1602d5bc93d919bb2e2c1361268b1ae3c0ef4e\\\",\\\"pack_digest\\\":\\\"5f28e6c41d834462a93c1d77541b4d122baf58ac9c85c7674c9753d23436d8fc\\\",\\\"allowed_paths\\\":[\\\"README\\\"],\\\"checks\\\":[{\\\"argv\\\":[\\\"git\\\",\\\"diff\\\",\\\"--check\\\"],\\\"timeout_secs\\\":5}],\\\"total_timeout_secs\\\":120,\\\"model\\\":\\\"none\\\",\\\"max_model_calls\\\":0,\\\"max_cost_microusd\\\":1,\\\"max_fix_generations\\\":0}\",\"issue_number\":17,\"title\":\"invalid\"}"
+  ],
+  [
+    "valid-first",
+    "5474627a0fcf9feb5449fd3f323450778a9fb36fc87fb87cc9d45d1d7fc1da1b",
+    "acked",
+    "{\"body\":\"{\\\"kind\\\":\\\"code-change-v1\\\",\\\"request\\\":\\\"Add a line\\\",\\\"acceptance\\\":[\\\"README updated\\\"],\\\"base_commit\\\":\\\"ab1602d5bc93d919bb2e2c1361268b1ae3c0ef4e\\\",\\\"pack_digest\\\":\\\"5f28e6c41d834462a93c1d77541b4d122baf58ac9c85c7674c9753d23436d8fc\\\",\\\"allowed_paths\\\":[\\\"README\\\"],\\\"checks\\\":[{\\\"argv\\\":[\\\"git\\\",\\\"diff\\\",\\\"--check\\\"],\\\"timeout_secs\\\":5}],\\\"total_timeout_secs\\\":120,\\\"model\\\":\\\"none\\\",\\\"max_model_calls\\\":0,\\\"max_cost_microusd\\\":0,\\\"max_fix_generations\\\":0}\",\"issue_number\":17,\"title\":\"A\"}"
+  ],
+  [
+    "valid-first",
+    "134c96b415b5af38194b169008d03ea6fd3f72ef42d1650e322c89005b0b7332",
+    "acked",
+    "{\"body\":\"$(touch /home/cosmo/.hermes/cache/scratch/w2-rebuild/tmp/b2-w1-runtime-230-0-1795587136070837863/shell-entered)\",\"issue_number\":17,\"title\":\"B4\"}"
+  ],
+  [
+    "unsupported-first",
+    "2483bf21674928f9601389aa58b91d0255f9f2388d18babf6c0baefa22d225ec",
+    "acked",
+    "{\"body\":\"later edit\",\"issue_number\":17,\"title\":\"A\"}"
+  ],
+  [
+    "unsupported-first",
+    "1bc6a0d116ddaf7c032557bccce3af03d4a0156361e83ee3f9a010f5511527a4",
+    "acked",
+    "{\"body\":\"{\\\"kind\\\":\\\"code-change-v1\\\",\\\"request\\\":\\\"Add a line\\\",\\\"acceptance\\\":[\\\"README updated\\\"],\\\"base_commit\\\":\\\"ab1602d5bc93d919bb2e2c1361268b1ae3c0ef4e\\\",\\\"pack_digest\\\":\\\"5f28e6c41d834462a93c1d77541b4d122baf58ac9c85c7674c9753d23436d8fc\\\",\\\"allowed_paths\\\":[\\\"README\\\"],\\\"checks\\\":[{\\\"argv\\\":[\\\"git\\\",\\\"diff\\\",\\\"--check\\\"],\\\"timeout_secs\\\":5}],\\\"total_timeout_secs\\\":120,\\\"model\\\":\\\"none\\\",\\\"max_model_calls\\\":0,\\\"max_cost_microusd\\\":0,\\\"max_fix_generations\\\":0}\",\"issue_number\":17,\"title\":\"B9\"}"
+  ]
+]

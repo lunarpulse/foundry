@@ -1,0 +1,7 @@
+diff --git a/README b/README
+index 9c59e24b8393179a5d712de4f990178df5734d99..edb6905b917a0332f7d704e5519cb5780db64606 100644
+--- a/README
++++ b/README
+@@ -1 +1,2 @@
+ first
++fixture child output

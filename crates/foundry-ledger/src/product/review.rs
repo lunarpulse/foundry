@@ -160,7 +160,12 @@ fn append_hold_outcome_in(
         .ok_or_else(|| HostError::Acceptance("hold outcome has no verified S1 lifecycle".into()))?;
     if current.lifecycle as i64 + 1 != receipt.lifecycle
         || current.order.attempt() as i64 != receipt.attempt
-        || (current.order.state().to_string() != "waiting" && !a01_review_state_in(tx,&receipt.order_id,&current.order.state().to_string())?)
+        || (current.order.state().to_string() != "waiting"
+            && !producer_review_state_in(
+                tx,
+                &receipt.order_id,
+                &current.order.state().to_string(),
+            )?)
         || current.last_seq != receipt.predecessor_seq
     {
         return Err(HostError::Acceptance(
@@ -235,7 +240,15 @@ fn append_hold_outcome_in(
     Ok(())
 }
 
-fn a01_review_state_in(tx: &rusqlite::Transaction<'_>, order: &str, state: &str) -> Result<bool,HostError> {
+fn producer_review_state_in(
+    tx: &rusqlite::Transaction<'_>,
+    order: &str,
+    state: &str,
+) -> Result<bool, HostError> {
+    #[cfg(feature = "product-pack-pins")]
+    if state == "review" && super::code_change::enabled_for(tx, order).map_err(db_error)? {
+        return Ok(super::code_change::collected(tx, order).is_ok());
+    }
     #[cfg(feature = "a01-harness-support")]
     if state == "review" { return super::a01_task::canonical_review_in(tx,order).map_err(db_error); }
     let _ = (tx,order,state);
@@ -439,7 +452,7 @@ fn validate_admitted(
         || !matches!(
             state.as_str(),
             "queued" | "working" | "held" | "waiting" | "inspecting"
-        ) && !a01_review_state_in(&tx,order,&state)?
+        ) && !producer_review_state_in(&tx, order, &state)?
     {
         return Err(HostError::Acceptance(
             "product lifecycle does not admit review work".into(),
@@ -486,7 +499,7 @@ fn validate_admitted_in(
     let allowed = match latest {
         Some((seq,state)) => seq >= admission_seq && (
             matches!(state.as_str(),"queued"|"working"|"held"|"waiting"|"inspecting")
-            || a01_review_state_in(tx,order,&state)?),
+            || producer_review_state_in(tx,order,&state)?),
         None => false,
     };
     if !allowed {
@@ -846,7 +859,7 @@ impl ProductStore {
             .map_err(db_error)?;
         #[cfg(feature = "a01-harness-support")]
         super::a01_task::validate_host_intent_in(&tx,intent).map_err(db_error)?;
-        if self.open_mode != super::StoreOpenMode::Normal && !a01_review_state_in(&tx,&intent.order.0,"review")? {
+        if self.open_mode != super::StoreOpenMode::Normal && !producer_review_state_in(&tx,&intent.order.0,"review")? {
             // Check the marker on this connection while holding the writer lock.
             // Missing, malformed, or mismatched markers all fail closed as well.
             let marker = tx.query_row(
@@ -876,6 +889,35 @@ impl ProductStore {
             HostError::Acceptance("product review requires a durable work claim".into())
         })?;
         validate_work_claim_in(&tx, work, intent, lifecycle, source_revision, now)?;
+        #[cfg(feature = "product-pack-pins")]
+        if super::code_change::enabled_for(&tx, &intent.order.0).map_err(db_error)? {
+            let (task, producer) =
+                super::code_change::collected(&tx, &intent.order.0).map_err(db_error)?;
+            let recorded: String = tx.query_row("SELECT at FROM product_producer_events_v1 WHERE order_id=?1 AND state='collected'", [&intent.order.0], |r| r.get(0)).map_err(db_error)?;
+            if selected_request.as_ref().is_none_or(|(binding, key)| {
+                *binding != task.selection() || *key != producer.operation_key
+            }) || producer.result_commit.as_ref() != Some(&request.result_commit)
+                || request.base_commit != task.base_commit
+                || work.worker_id != producer.worker
+                || work.fence != producer.fence
+                || work.epoch != producer.epoch
+                || intent.attempt.0 != 1
+                || intent.run.0 != 1
+                || intent.activation != 1
+                || intent.generation.0 != 0
+                || intent.epoch.0 != producer.fence as u64
+                || intent.recorded_at.to_rfc3339() != recorded
+                || intent.external_ref
+                    != format!(
+                        "review:{}:1:{}..{}",
+                        intent.order.0, task.base_commit, request.result_commit
+                    )
+            {
+                return Err(HostError::Acceptance(
+                    "collected producer binding changed".into(),
+                ));
+            }
+        }
         #[cfg(feature = "product-pack-pins")]
         if work.task_kind == super::COMMIT_REVIEW_KIND
             && self.open_mode == super::StoreOpenMode::Normal
@@ -1501,6 +1543,39 @@ impl ReviewDispatchStore for ProductStore {
             ));
         }
         tx.execute("INSERT INTO product_review_host_results_v1(order_id,attempt,run_id,activation,result_json) VALUES(?1,?2,?3,?4,?5)",params![request.intent.order.0,request.intent.attempt.0 as i64,request.intent.run.0 as i64,request.intent.activation as i64,result]).map_err(db_error)?;
+        #[cfg(feature = "product-pack-pins")]
+        if super::code_change::enabled_for(&tx, &request.intent.order.0).map_err(db_error)? {
+            let (task, producer) =
+                super::code_change::collected(&tx, &request.intent.order.0).map_err(db_error)?;
+            if request.result.base_commit != task.base_commit
+                || Some(&request.result.result_commit) != producer.result_commit.as_ref()
+                || request.result.generations.len() != 1
+            {
+                return Err(HostError::Acceptance(
+                    "review differs from collected commit".into(),
+                ));
+            }
+            let event = match request.status {
+                ReviewTerminalStatus::Passed => super::OrderEvent::InspectionPassed,
+                ReviewTerminalStatus::Failed => super::OrderEvent::InspectionFailed {
+                    reason: "code-change review failed".into(),
+                },
+                ReviewTerminalStatus::Held => super::OrderEvent::ReviewHeld {
+                    reason: "code-change review held".into(),
+                },
+            };
+            super::commit_review::append_execution_transition(
+                &tx,
+                &task.order_id,
+                task.lifecycle,
+                event,
+                "code-change-review",
+                "Service/product-review",
+                &json(&producer)?,
+                now,
+            )
+            .map_err(db_error)?;
+        }
         #[cfg(feature = "a01-harness-support")]
         if self.open_mode.is_a01_task() && status == "passed" {
             super::a01_task::complete_bridge_in(&tx,&request.intent,&request.result,now).map_err(db_error)?;
@@ -3184,7 +3259,7 @@ fn ensure_new_work(
     if !state
         .as_deref()
         .is_some_and(|s| matches!(s, "queued" | "working" | "held" | "waiting" | "inspecting"))
-        && !a01_review_state_in(tx,&intent.order.0,state.as_deref().unwrap_or(""))?
+        && !producer_review_state_in(tx, &intent.order.0, state.as_deref().unwrap_or(""))?
     {
         return Err(HostError::Acceptance(
             "product lifecycle no longer admits review work".into(),
@@ -3363,7 +3438,7 @@ fn ensure_product_source_for_new_stage(
         || !matches!(
             state.as_str(),
             "queued" | "working" | "held" | "waiting" | "inspecting"
-        ) && !a01_review_state_in(tx,order,&state)?
+        ) && !producer_review_state_in(tx, order, &state)?
     {
         return Err(HostError::Acceptance(
             "product lifecycle no longer admits continuation work".into(),
@@ -3599,6 +3674,11 @@ pub(super) fn check_commit_review_resume(
     run: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), HostError> {
+    if super::code_change::enabled_for(tx, order).map_err(db_error)? {
+        return Err(HostError::Acceptance(
+            "offline task cannot launch a continuation".into(),
+        ));
+    }
     let selected: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM product_orders_v1 WHERE order_id=?1 AND task_kind=?2) AND (SELECT schema_version FROM product_meta_v1 WHERE singleton=1)=4",
         params![order,super::COMMIT_REVIEW_KIND],|row|row.get(0),

@@ -1,0 +1,21 @@
+All 15 distinct inbox deliveries acknowledged. Both edits sorted ahead of their originals.
+The only task matches valid-first A byte-for-byte. Digest, snapshot, delivery, owner and lifecycle match.
+admission=71be20aaae41d60d125218a4177613f5d6d15cefda4d2495d3ecc9d34e0edf32 snapshot=edc1e1cbd3a5efb91455dcd703bc5ef4614247f65cd3d1b9030502482e37b634 normalized=3346f02e9b04e4fea893e625d26dedf137975336dd4053734825fbbe2aea2a7d
+Unsupported-first A retained its free-text body.
+Counts from the combined W21 fixture:
+product_intake_inbox_v1 15
+product_issue_first_v1 13
+product_orders_v1 13
+product_transition_receipts_v1 13
+product_work_backlog_v1 13
+product_code_tasks_v1 1
+product_work_claims_v1 0
+product_producers_v1 0
+product_producer_events_v1 0
+product_review_runs_v1 0
+product_result_bindings_v1 0
+product_grants_v1 0
+product_token_consumptions_v1 0
+product_outcomes_v1 0
+product_approval_result_bindings_v1 0
+product_publish_outcomes_v1 0

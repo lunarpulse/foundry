@@ -1,0 +1,80 @@
+[
+  {
+    "delivery": "f4dc3fd53d58f9bcf286ec9e8746b0a4d12d9aa84142596af38d3108055a21f2",
+    "issue": "unsupported-0",
+    "sha256": "fa0e85f191d4230d7318db957982776448ce9d4dc4df84f7c972176d42256313",
+    "snapshot": "{\"body\":\"free text\",\"issue_number\":17,\"title\":\"invalid\"}"
+  },
+  {
+    "delivery": "7efc6ce961f31391499e2604665618ec7aeecfbb710252c7e3499ca38238fdd9",
+    "issue": "unsupported-1",
+    "sha256": "8d8d7d0eed0c88a52abd285743eb7afd5797d2e19ec270005ed850e354b64f18",
+    "snapshot": "{\"body\":\"$(touch /home/cosmo/.hermes/cache/scratch/w2-rebuild/tmp/b2-w1-runtime-228-1-1795587993567588347/shell-entered)\",\"issue_number\":17,\"title\":\"invalid\"}"
+  },
+  {
+    "delivery": "64539fe0012f173bce8880b139292cab82fad53cdc368f79be18403161cd0a05",
+    "issue": "unsupported-10",
+    "sha256": "539d6d793139dd396a7094128f5b310ffd13f4fc9bffe32d96bf6d6c9eae166d",
+    "snapshot": "{\"body\":\"{\\\"kind\\\":\\\"code-change-v1\\\",\\\"request\\\":\\\"Add a line\\\",\\\"acceptance\\\":[\\\"README updated\\\"],\\\"base_commit\\\":\\\"6c803a60450ad2391d870baa6dbf25cf71ac5d6a\\\",\\\"pack_digest\\\":\\\"5f28e6c41d834462a93c1d77541b4d122baf58ac9c85c7674c9753d23436d8fc\\\",\\\"allowed_paths\\\":[\\\"README\\\"],\\\"checks\\\":[{\\\"argv\\\":[\\\"git\\\",\\\"diff\\\",\\\"--check\\\"],\\\"timeout_secs\\\":5}],\\\"total_timeout_secs\\\":120,\\\"model\\\":\\\"none\\\",\\\"max_model_calls\\\":0,\\\"max_cost_microusd\\\":1,\\\"max_fix_generations\\\":0}\",\"issue_number\":17,\"title\":\"invalid\"}"
+  },
+  {
+    "delivery": "6366d1ee3ad712ed4e2f558c9552cba39d66bc3b3154a28b324cf12b95c73105",
+    "issue": "unsupported-2",
+    "sha256": "dd062ede1b3b14c1de79725b9095f1d7d0167276556485461e8b70e1ce447cfb",
+    "snapshot": "{\"body\":\"{\\\"kind\\\":\\\"code-change-v1\\\",\\\"request\\\":\\\"Add a line\\\",\\\"acceptance\\\":[\\\"README updated\\\"],\\\"base_commit\\\":\\\"6c803a60450ad2391d870baa6dbf25cf71ac5d6a\\\",\\\"pack_digest\\\":\\\"5f28e6c41d834462a93c1d77541b4d122baf58ac9c85c7674c9753d23436d8fc\\\",\\\"allowed_paths\\\":[\\\"../README\\\"],\\\"checks\\\":[{\\\"argv\\\":[\\\"git\\\",\\\"diff\\\",\\\"--check\\\"],\\\"timeout_secs\\\":5}],\\\"total_timeout_secs\\\":120,\\\"model\\\":\\\"none\\\",\\\"max_model_calls\\\":0,\\\"max_cost_microusd\\\":0,\\\"max_fix_generations\\\":0}\",\"issue_number\":17,\"title\":\"invalid\"}"
+  },
+  {
+    "delivery": "0a85cdd2470aec1546592908ffc2bba32bb7f700529262fcaba26c42d4339b9d",
+    "issue": "unsupported-3",
+    "sha256": "29b32b96cc199360635c807ef5490301e0fa23186a09ae126fd452c1a422007f",
+    "snapshot": "{\"body\":\"{\\\"kind\\\":\\\"code-change-v1\\\",\\\"request\\\":\\\"Add a line\\\",\\\"acceptance\\\":[\\\"README updated\\\"],\\\"base_commit\\\":\\\"6c803a60450ad2391d870baa6dbf25cf71ac5d6a\\\",\\\"pack_digest\\\":\\\"5f28e6c41d834462a93c1d77541b4d122baf58ac9c85c7674c9753d23436d8fc\\\",\\\"allowed_paths\\\":[\\\"README\\\"],\\\"checks\\\":[{\\\"argv\\\":[\\\"sh\\\",\\\"-c\\\",\\\"true\\\"],\\\"timeout_secs\\\":5}],\\\"total_timeout_secs\\\":120,\\\"model\\\":\\\"none\\\",\\\"max_model_calls\\\":0,\\\"max_cost_microusd\\\":0,\\\"max_fix_generations\\\":0}\",\"issue_number\":17,\"title\":\"invalid\"}"
+  },
+  {
+    "delivery": "b1e496d87783b4808a36d1cdef9387279296851478c243eb33c1e1ec3588c542",
+    "issue": "unsupported-4",
+    "sha256": "eaee45824d44814be7645c8ed9185c2bc72cacd059690f84fd7407b9f1d21e4b",
+    "snapshot": "{\"body\":\"{\\\"kind\\\":\\\"code-change-v1\\\",\\\"request\\\":\\\"Add a line\\\",\\\"acceptance\\\":[\\\"README updated\\\"],\\\"base_commit\\\":\\\"6c803a60450ad2391d870baa6dbf25cf71ac5d6a\\\",\\\"pack_digest\\\":\\\"5f28e6c41d834462a93c1d77541b4d122baf58ac9c85c7674c9753d23436d8fc\\\",\\\"allowed_paths\\\":[\\\"README\\\"],\\\"checks\\\":[{\\\"argv\\\":[\\\"git\\\",\\\"diff\\\",\\\"--check\\\"],\\\"timeout_secs\\\":121}],\\\"total_timeout_secs\\\":120,\\\"model\\\":\\\"none\\\",\\\"max_model_calls\\\":0,\\\"max_cost_microusd\\\":0,\\\"max_fix_generations\\\":0}\",\"issue_number\":17,\"title\":\"invalid\"}"
+  },
+  {
+    "delivery": "17d3c7bf071b7750ce8d5088197796f1def27e0c2bb27ac1ace95b443000a0ce",
+    "issue": "unsupported-5",
+    "sha256": "30895f263f78357d953a41b6c50bd37bc22479cde30f0757e808831eddbbff5d",
+    "snapshot": "{\"body\":\"{\\\"kind\\\":\\\"code-change-v1\\\",\\\"request\\\":\\\"Add a line\\\",\\\"acceptance\\\":[\\\"README updated\\\"],\\\"base_commit\\\":\\\"6c803a60450ad2391d870baa6dbf25cf71ac5d6a\\\",\\\"pack_digest\\\":\\\"5f28e6c41d834462a93c1d77541b4d122baf58ac9c85c7674c9753d23436d8fc\\\",\\\"allowed_paths\\\":[\\\"README\\\"],\\\"checks\\\":[{\\\"argv\\\":[\\\"git\\\",\\\"diff\\\",\\\"--check\\\"],\\\"timeout_secs\\\":0}],\\\"total_timeout_secs\\\":120,\\\"model\\\":\\\"none\\\",\\\"max_model_calls\\\":0,\\\"max_cost_microusd\\\":0,\\\"max_fix_generations\\\":0}\",\"issue_number\":17,\"title\":\"invalid\"}"
+  },
+  {
+    "delivery": "f2cc5969986c68884b8c98b30544fdc528c69ce9e59169729e6c6d760f544ddd",
+    "issue": "unsupported-6",
+    "sha256": "253fbe19e025445ec25f866c9ad673d05eaf3c35bf902353ec4832d4ed8c5b63",
+    "snapshot": "{\"body\":\"{\\\"kind\\\":\\\"code-change-v1\\\",\\\"request\\\":\\\"Add a line\\\",\\\"acceptance\\\":[\\\"README updated\\\"],\\\"base_commit\\\":\\\"6c803a60450ad2391d870baa6dbf25cf71ac5d6a\\\",\\\"pack_digest\\\":\\\"5f28e6c41d834462a93c1d77541b4d122baf58ac9c85c7674c9753d23436d8fc\\\",\\\"allowed_paths\\\":[\\\"README\\\"],\\\"checks\\\":[{\\\"argv\\\":[\\\"git\\\",\\\"diff\\\",\\\"--check\\\"],\\\"timeout_secs\\\":5}],\\\"total_timeout_secs\\\":120,\\\"model\\\":\\\"none\\\",\\\"max_model_calls\\\":1,\\\"max_cost_microusd\\\":0,\\\"max_fix_generations\\\":0}\",\"issue_number\":17,\"title\":\"invalid\"}"
+  },
+  {
+    "delivery": "371a46725fc0ff0ddf9be6230275869d2fbdb68aff1d91433aab041d1680bcb8",
+    "issue": "unsupported-7",
+    "sha256": "12dd259b10d7268cce194bd5389abe87c56e29f6d50bf8f729e66736b0c1b1b6",
+    "snapshot": "{\"body\":\"{\\\"kind\\\":\\\"code-change-v1\\\",\\\"request\\\":\\\"Add a line\\\",\\\"acceptance\\\":[\\\"README updated\\\"],\\\"base_commit\\\":\\\"6c803a60450ad2391d870baa6dbf25cf71ac5d6a\\\",\\\"pack_digest\\\":\\\"5f28e6c41d834462a93c1d77541b4d122baf58ac9c85c7674c9753d23436d8fc\\\",\\\"allowed_paths\\\":[\\\"README\\\"],\\\"checks\\\":[{\\\"argv\\\":[\\\"git\\\",\\\"diff\\\",\\\"--check\\\"],\\\"timeout_secs\\\":5}],\\\"total_timeout_secs\\\":0,\\\"model\\\":\\\"none\\\",\\\"max_model_calls\\\":0,\\\"max_cost_microusd\\\":0,\\\"max_fix_generations\\\":0}\",\"issue_number\":17,\"title\":\"invalid\"}"
+  },
+  {
+    "delivery": "543b7b9d6a1230156cf7d7c40b97bcf234439a29a05e56eb1fb87ee65306c801",
+    "issue": "unsupported-8",
+    "sha256": "025b9310ffd532e9a89d25060d03dff9afb6ed7334d5316adf0c5e9954dbc7e2",
+    "snapshot": "{\"body\":\"{\\\"kind\\\":\\\"code-change-v1\\\",\\\"request\\\":\\\"Add a line\\\",\\\"acceptance\\\":[\\\"README updated\\\"],\\\"base_commit\\\":\\\"6c803a60450ad2391d870baa6dbf25cf71ac5d6a\\\",\\\"pack_digest\\\":\\\"5f28e6c41d834462a93c1d77541b4d122baf58ac9c85c7674c9753d23436d8fc\\\",\\\"allowed_paths\\\":[\\\"README\\\"],\\\"checks\\\":[{\\\"argv\\\":[\\\"git\\\",\\\"diff\\\",\\\"--check\\\"],\\\"timeout_secs\\\":5}],\\\"total_timeout_secs\\\":3601,\\\"model\\\":\\\"none\\\",\\\"max_model_calls\\\":0,\\\"max_cost_microusd\\\":0,\\\"max_fix_generations\\\":0}\",\"issue_number\":17,\"title\":\"invalid\"}"
+  },
+  {
+    "delivery": "187becd851b571d49798ef35ab27769a0ce10533066b164d9a838322a365004d",
+    "issue": "unsupported-9",
+    "sha256": "29b71d24d7845b698d4ee4cade1dbf0f62b9c950b28515cc13b7e8191cccf131",
+    "snapshot": "{\"body\":\"{\\\"kind\\\":\\\"code-change-v1\\\",\\\"request\\\":\\\"Add a line\\\",\\\"acceptance\\\":[\\\"README updated\\\"],\\\"base_commit\\\":\\\"6c803a60450ad2391d870baa6dbf25cf71ac5d6a\\\",\\\"pack_digest\\\":\\\"5f28e6c41d834462a93c1d77541b4d122baf58ac9c85c7674c9753d23436d8fc\\\",\\\"allowed_paths\\\":[\\\"README\\\"],\\\"checks\\\":[{\\\"argv\\\":[\\\"git\\\",\\\"diff\\\",\\\"--check\\\"],\\\"timeout_secs\\\":5}],\\\"total_timeout_secs\\\":120,\\\"model\\\":\\\"other\\\",\\\"max_model_calls\\\":0,\\\"max_cost_microusd\\\":0,\\\"max_fix_generations\\\":0}\",\"issue_number\":17,\"title\":\"invalid\"}"
+  },
+  {
+    "delivery": "3ea671f48bab7fc4463263c4326768aa0798d94400a28fb8eee2d7310bc5458f",
+    "issue": "unsupported-first",
+    "sha256": "24bec975ca87c87452a4e7ad6c5e3bf5ddd02ee682c96dec633bb331ef4789b1",
+    "snapshot": "{\"body\":\"later edit\",\"issue_number\":17,\"title\":\"A\"}"
+  },
+  {
+    "delivery": "2f86d280e9cea4ebaaad4ce571525b29594033728f012f29ef5e0dba880c7d6f",
+    "issue": "valid-first",
+    "sha256": "edc1e1cbd3a5efb91455dcd703bc5ef4614247f65cd3d1b9030502482e37b634",
+    "snapshot": "{\"body\":\"{\\\"kind\\\":\\\"code-change-v1\\\",\\\"request\\\":\\\"Add a line\\\",\\\"acceptance\\\":[\\\"README updated\\\"],\\\"base_commit\\\":\\\"6c803a60450ad2391d870baa6dbf25cf71ac5d6a\\\",\\\"pack_digest\\\":\\\"5f28e6c41d834462a93c1d77541b4d122baf58ac9c85c7674c9753d23436d8fc\\\",\\\"allowed_paths\\\":[\\\"README\\\"],\\\"checks\\\":[{\\\"argv\\\":[\\\"git\\\",\\\"diff\\\",\\\"--check\\\"],\\\"timeout_secs\\\":5}],\\\"total_timeout_secs\\\":120,\\\"model\\\":\\\"none\\\",\\\"max_model_calls\\\":0,\\\"max_cost_microusd\\\":0,\\\"max_fix_generations\\\":0}\",\"issue_number\":17,\"title\":\"A\"}"
+  }
+]

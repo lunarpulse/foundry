@@ -405,6 +405,12 @@ enum Cmd {
     /// Approve, revoke or select a review pack by digest.
     #[cfg(feature = "product-pack-pins")]
     ProductPack(selected_review::PackArgs),
+    /// Authorize the first acknowledged code-change task.
+    #[cfg(feature = "product-pack-pins")]
+    ProductTask(selected_review::TaskArgs),
+    /// Inspect or advance an explicit offline producer reservation.
+    #[cfg(feature = "product-pack-pins")]
+    ProductProducer(selected_review::ProducerArgs),
     /// Review an existing commit using its order's selected pack.
     #[cfg(feature = "product-pack-pins")]
     ProductReviewDispatch(selected_review::DispatchArgs),
@@ -731,10 +737,7 @@ fn build_product_review_host(
     ) {
         (Ok(binary), Ok(repo)) if !binary.is_empty() && !repo.is_empty() => {
             let profile = std::env::var("FOUNDRY_DIE_PROFILE").unwrap_or_else(|_| "coding".into());
-            let timeout = std::env::var("FOUNDRY_DIE_TIMEOUT")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(600);
+            let timeout = DieStageExecutor::configured_timeout()?;
             let executor = DieStageExecutor::new(
                 std::path::PathBuf::from(binary),
                 profile,
@@ -2493,6 +2496,10 @@ async fn main() {
         ),
         #[cfg(feature = "product-pack-pins")]
         Cmd::ProductIntake(args) => selected_review::intake(args),
+        #[cfg(feature = "product-pack-pins")]
+        Cmd::ProductProducer(args) => selected_review::producer(args),
+        #[cfg(feature = "product-pack-pins")]
+        Cmd::ProductTask(args) => selected_review::task(args),
         #[cfg(feature = "product-pack-pins")]
         Cmd::ProductPack(args) => selected_review::pack(args),
         #[cfg(feature = "product-pack-pins")]

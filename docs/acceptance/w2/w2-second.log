@@ -1,0 +1,91 @@
++ cargo test --locked --offline -j1 -p foundry --features p2-test-support,product-pack-pins --test w2 -- --nocapture --test-threads=1
+   Compiling foundry-ledger v0.1.0 (/home/cosmo/worktrees/foundry-w2-integration/crates/foundry-ledger)
+warning: function `nothing` is never used
+ --> crates/foundry-furnace/src/lib.rs:2:4
+  |
+2 | fn nothing() {}
+  |    ^^^^^^^
+  |
+  = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `foundry-furnace` (lib) generated 1 warning
+   Compiling foundry-line v0.1.0 (/home/cosmo/worktrees/foundry-w2-integration/crates/foundry-line)
+   Compiling foundry-watch v0.1.0 (/home/cosmo/worktrees/foundry-w2-integration/crates/foundry-watch)
+warning: unused import: `CostFields`
+  --> crates/foundry-watch/src/benchmark.rs:22:37
+   |
+22 | use crate::corpus::{CorpusManifest, CostFields};
+   |                                     ^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `foundry_domain::OrderState`
+  --> crates/foundry-watch/src/corpus_emit.rs:15:5
+   |
+15 | use foundry_domain::OrderState;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `Sha256`
+   --> crates/foundry-watch/src/dry_die.rs:101:28
+    |
+101 |         use sha2::{Digest, Sha256};
+    |                            ^^^^^^
+
+warning: unused import: `Sha256`
+   --> crates/foundry-watch/src/dry_die.rs:145:24
+    |
+145 |     use sha2::{Digest, Sha256};
+    |                        ^^^^^^
+
+warning: unused import: `std::os::unix::ffi::OsStrExt`
+  --> crates/foundry-watch/src/gc.rs:58:9
+   |
+58 |     use std::os::unix::ffi::OsStrExt;
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `foundry-watch` (lib) generated 5 warnings (run `cargo fix --lib -p foundry-watch` to apply 4 suggestions)
+   Compiling foundry-workflow v0.1.0 (/home/cosmo/worktrees/foundry-w2-integration/crates/foundry-workflow)
+   Compiling foundry-serve v0.1.0 (/home/cosmo/worktrees/foundry-w2-integration/crates/foundry-serve)
+warning: unused imports: `IdentityError` and `Role`
+  --> crates/foundry-serve/src/scope.rs:16:54
+   |
+16 | use crate::identity::{AuthenticatedUser, Capability, IdentityError, Role};
+   |                                                      ^^^^^^^^^^^^^  ^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `foundry-serve` (lib) generated 1 warning (run `cargo fix --lib -p foundry-serve` to apply 1 suggestion)
+   Compiling foundry-orch v0.1.0 (/home/cosmo/worktrees/foundry-w2-integration/crates/foundry-orch)
+warning: unused import: `foundry_domain::order as _`
+ --> crates/foundry-blueprint/src/lib.rs:3:5
+  |
+3 | use foundry_domain::order as _; // reserve: line→Order factory comes in T7
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `foundry-blueprint` (lib) generated 1 warning (run `cargo fix --lib -p foundry-blueprint` to apply 1 suggestion)
+   Compiling foundry v0.1.0 (/home/cosmo/worktrees/foundry-w2-integration/crates/foundry)
+    Finished `test` profile [unoptimized] target(s) in 34.64s
+     Running tests/w2.rs (/home/cosmo/.hermes/cache/scratch/w2-rebuild/target/debug/deps/w2-6c3992339f29af01)
+
+running 2 tests
+test w21_intake::disallowed_and_edited_observations ... E02b valid-first receipt={"actor":"owner","admission_hash":"4d79f121968594bc3f0c17b2e16047175bfc084db7ca53816c76cae494090bd0","admission_sequence":10,"approval_revision":1,"authority_revision":1,"base_commit":"7a1de2bf81cc895a0d164bbd38eff077dc6a2d44","delivery_id":"2a9b45b02174cbb64f68bbeb25df9dbbb6ce930d6618a899738c0a7c3d12811e","generation":1,"grant_revision":1,"instance_revision":1,"lifecycle":1,"order_id":"p-05632b07fe3b8d46bfd93e970a77c06c616b36b4ca0bf472c4a62e277279c200","pack_digest":"8528b29eb4564756d29adfa58698dcfc74cd7a1fbd6c365632ec6d7c2e9160c6","request_key":"owner-p-05632b07fe3b8d46bfd93e970a77c06c616b36b4ca0bf472c4a62e277279c200","scope_revision":4,"selection_revision":1,"snapshot_sha256":"93bb4734639f5b7cf81664bf385eac9197c62aaf4a8b18058c2117ecdcfe0c86","source":"b2-w1-source","source_revision":1,"task_sha256":"961d75ce8e9d44c56e261702a484915f2625a37a76c6f67ef451db4d159b010a"}
+E02b valid-first deliveries=["2a9b45b02174cbb64f68bbeb25df9dbbb6ce930d6618a899738c0a7c3d12811e", "24c3dc85dd846b695c7ac69850fc4905adcb4d12a3f61fd029ecfa70f2cc9006"] admission=4d79f121968594bc3f0c17b2e16047175bfc084db7ca53816c76cae494090bd0 order=p-05632b07fe3b8d46bfd93e970a77c06c616b36b4ca0bf472c4a62e277279c200
+E02b unsupported-first deliveries=["3751d5594f5cf43d287aadcc1e9ef706bc0f269748c0db3b34e9edb637dae4d9", "2c02f1c5a654bd24e38cc9cc4d38931ef958ce64f83d37585927ec96ad06698a"] admission=9c12af8e0645c4fd7e17948e1a259e5e3074cecc1fcea8268b9063c391bf29ea order=p-28c842e3f49eb2eb9c2bdf0c51fbec45696f00c001c88f2f3ea6139b31aec1c4
+E02 disallowed=9 claims=0 producer=0 review=0 grant=0 approval=0 canary_absent=true
+ok
+test w22_code_change::fenced_producer_and_loss_boundaries ... 
+thread 'w22_code_change::fenced_producer_and_loss_boundaries' (454) panicked at crates/foundry/tests/w2.rs:681:14:
+called `Result::unwrap()` on an `Err` value: Worker("held snapshot does not match terminal run evidence")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    w22_code_change::fenced_producer_and_loss_boundaries
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 26.77s
+
+error: test failed, to rerun pass `-p foundry --test w2`

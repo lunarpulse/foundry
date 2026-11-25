@@ -1,0 +1,84 @@
+{
+  "disposition": "W20\u201322 measured; slice adjudication pending",
+  "base": "e3631b1ba40511159b58ff7b2c2c0817a44d2cc5",
+  "candidate_patch_sha256": "71187cdb3ffa8dfdcfea7fabbac79812e921d9f3fcec3979ec65a036986ea080",
+  "frozen_oracle_sha256": "2849b2ecdaafa96e522a91f84e8f8f071cb43d56907ab87829eda8b1057e4882",
+  "cargo": {
+    "final-rows": {
+      "passed": 3,
+      "failed": 0,
+      "ignored": 0,
+      "measured": 0,
+      "filtered": 0,
+      "exit": 0,
+      "command": "cargo test --locked --offline -j1 -p foundry --features p2-test-support,product-pack-pins --test w2 -- --test-threads=1 --nocapture"
+    },
+    "final-v4": {
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "measured": 0,
+      "filtered": 0,
+      "exit": 0,
+      "command": "cargo test --locked --offline -j1 -p foundry --features product-pack-pins --test selected_review_cli"
+    },
+    "final-w22": {
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "measured": 0,
+      "filtered": 2,
+      "exit": 0,
+      "command": "cargo test --locked --offline -j1 -p foundry --features p2-test-support,product-pack-pins --test w2 -- w22_code_change::fenced_producer_and_loss_boundaries --exact --nocapture"
+    }
+  },
+  "exact": {
+    "reader": {
+      "tables": 82,
+      "changed": [
+        "product_producer_events_v1",
+        "product_producers_v1"
+      ],
+      "retries_equal": 2,
+      "retained_review_and_producer_files": 6,
+      "bundles_verified": 2,
+      "finalized_head": "59951eef0813f7af50483dd050496cf4c818edca",
+      "tuple_sha256": "067dba8debd9678bbb5e57c6f0d3db16d1c7370573451ca0f7efb3019446f155",
+      "sealed_patch_sha256": "0f814fe1d98112eddcecef676c8202038c2b45564dede044fe5921e1bf093217",
+      "original_collection_missing_denial": "see exact Cargo test",
+      "owner_withdrawal_database_and_files_equal": true
+    },
+    "loss": {
+      "order_id": "loss",
+      "operation_key": "lost-producer",
+      "service": "b2-w1-service",
+      "service_revision": 1,
+      "credential_revision": 1,
+      "worker": "code-change-598cbe934c86f855a3c4d05428c69b572c725ed0a533b267e400b631ea322014",
+      "epoch": 1,
+      "fence": 3,
+      "deadline": "2026-11-25T06:20:30.670895742+00:00",
+      "state": "uncertain",
+      "result_commit": "87ce14604e85c19d03bbce81548c3fbe23c448e1",
+      "artifact_sha256": "8c9a7e107e4b9767d034624c1b7aeecfa2a78c5e0aef8443fbbf4eaad7856a21"
+    },
+    "host_result_digest": "e10fc459a8b7d975dd7a0e820a3bff8f236e9743cdd32014a3ab510ed04b9ea8",
+    "final_artifact_id": "8114af6d9dbfca1715cc4f0b66b4c928fd6cf65601991c42d8b99a5126a3c4c9",
+    "admission": "6105ae06d0469ce0afacf508692c0f2d75cee509bb25bf95a9d9ef2a3a647275",
+    "generation": 0
+  },
+  "scope": {
+    "real_die_entries": 0,
+    "model_calls": 0,
+    "publication": 0,
+    "W23": "not run",
+    "integration_commit": "pending adjudication",
+    "push": false
+  },
+  "graph": {
+    "nodes": 6308,
+    "edges": 15884,
+    "communities": 333,
+    "saved_report_sha256": "d5a27a4a5b3cd3b003768e12c2d657f55b983639cd4eeed3722d5e3c062f7f75"
+  }
+}
