@@ -1,0 +1,23 @@
+{
+  "services": {
+    "cast": {
+      "image": "${FOUNDRY_W3_IMAGE:?local image ID required}",
+      "pull_policy": "never",
+      "user": "65534:65534",
+      "read_only": true,
+      "network_mode": "none",
+      "cap_drop": ["ALL"],
+      "security_opt": ["no-new-privileges:true"],
+      "pids_limit": 64,
+      "mem_limit": "512m",
+      "tmpfs": ["/work:rw,nosuid,nodev,size=256m,uid=65534,gid=65534,mode=0700"],
+      "working_dir": "/work",
+      "stdin_open": true,
+      "ipc": "private",
+      "healthcheck": {"disable": true},
+      "logging": {"driver": "none"},
+      "entrypoint": ["/usr/bin/python3","-I","/opt/foundry/worker.py"],
+      "volumes": [{"type":"bind","source":"${FOUNDRY_W3_SOCKET:?launcher-owned socket required}","target":"/run/foundry-model.sock","read_only":true,"bind":{"create_host_path":false}}]
+    }
+  }
+}

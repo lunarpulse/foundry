@@ -1,0 +1,5 @@
+fixture image operand=sha256:0bd13ffeea7eea43da96258f77ec63d02a605ae5adf28aaa94ce48e4eff39005
+fixture socket operand=/tmp/w3-render-fixture/model.sock
+argv=["/usr/bin/docker", "--host", "unix:///var/run/docker.sock", "compose", "-p", "foundry-w3-render", "-f", "deploy/compose.yaml", "config", "--format", "json"]
+exit=0
+All service fields match launcher render after Compose memory normalization and null default command.

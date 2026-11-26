@@ -63,6 +63,7 @@ pub enum ProxyError {
 /// material. The caller physically cannot express an arbitrary
 /// egress — the type is the boundary.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProxyRequest {
     pub provider: String,
     pub body: String,

@@ -1,0 +1,20 @@
+#!/bin/bash
+set -eu
+umask 077
+private=$(mktemp -d /home/cosmo/.hermes/cache/scratch/w3-cargo.XXXXXXXX)
+export TMPDIR="$private"
+export CARGO_TARGET_DIR=/home/cosmo/.hermes/cache/scratch/w3-w30b/target
+export CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_NET_OFFLINE=true
+export CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_DEV_DEBUG=0
+name=$1
+shift
+log="docs/acceptance/w3/$name.log"
+rustfmt --edition 2024 --check crates/foundry/src/isolation.rs
+git diff --check
+git diff --stat
+set +e
+( set -x; cargo test --locked --offline -j1 "$@" ) >"$log" 2>&1
+status=$?
+echo "exit=$status" >>"$log"
+tail -16 "$log"
+exit "$status"

@@ -1,0 +1,49 @@
+{
+  "name": "foundry-w3-render",
+  "services": {
+    "cast": {
+      "cap_drop": [
+        "ALL"
+      ],
+      "command": null,
+      "entrypoint": [
+        "/usr/bin/python3",
+        "-I",
+        "/opt/foundry/worker.py"
+      ],
+      "healthcheck": {
+        "disable": true
+      },
+      "image": "sha256:0bd13ffeea7eea43da96258f77ec63d02a605ae5adf28aaa94ce48e4eff39005",
+      "ipc": "private",
+      "logging": {
+        "driver": "none"
+      },
+      "mem_limit": "536870912",
+      "network_mode": "none",
+      "pids_limit": 64,
+      "pull_policy": "never",
+      "read_only": true,
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "stdin_open": true,
+      "tmpfs": [
+        "/work:rw,nosuid,nodev,size=256m,uid=65534,gid=65534,mode=0700"
+      ],
+      "user": "65534:65534",
+      "volumes": [
+        {
+          "type": "bind",
+          "source": "/tmp/w3-render-fixture/model.sock",
+          "target": "/run/foundry-model.sock",
+          "read_only": true,
+          "bind": {
+            "create_host_path": false
+          }
+        }
+      ],
+      "working_dir": "/work"
+    }
+  }
+}

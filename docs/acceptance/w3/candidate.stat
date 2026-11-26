@@ -1,0 +1,19 @@
+ crates/foundry-exec/src/review_run.rs            |    1 
+ crates/foundry-ledger/src/product/code_change.rs |   18 +
+ crates/foundry-ledger/src/product/review.rs      |    8 
+ crates/foundry-line/src/review_host.rs           |   69 ++++
+ crates/foundry-watch/src/model_proxy.rs          |    1 
+ crates/foundry/src/main.rs                       |   96 ++++--
+ crates/foundry/src/selected_review.rs            |  146 +++++----
+ crates/foundry/tests/w2.rs                       |   32 ++
+ crates/foundry/src/isolation.rs                  |  330 ++++++++++++++++++++
+ crates/foundry/src/isolation/dispatch.rs         |  288 ++++++++++++++++++
+ crates/foundry/src/isolation/listener.rs         |  355 ++++++++++++++++++++++
+ deploy/Dockerfile                                |   10 +
+ deploy/compose.yaml                              |   23 +
+ deploy/launcher.py                               |  213 +++++++++++++
+ deploy/model-client.py                           |   42 +++
+ deploy/profile.py                                |   30 ++
+ deploy/worker.py                                 |  124 ++++++++
+ scripts/check-deploy.py                          |   20 +
+ 18 files changed, 1705 insertions(+), 101 deletions(-)

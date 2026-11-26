@@ -1923,7 +1923,15 @@ impl ReviewHostStore for ProductStore {
             "SELECT pack_digest,COALESCE((SELECT MAX(sequence) FROM product_review_stages_v1 WHERE order_id=?1 AND run_id=?2),0),result_json FROM product_review_runs_v1 WHERE order_id=?1 AND attempt=?3 AND run_id=?2 AND status='resuming'",
             params![order, run, attempt], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
         ).map_err(db_error)?;
+        #[cfg(feature = "product-pack-pins")]
+        let inspection_only = conn.query_row(
+            "SELECT o.task_kind=?4 AND (SELECT schema_version FROM product_meta_v1 WHERE singleton=1)=4 FROM product_review_runs_v1 r JOIN product_orders_v1 o ON o.order_id=r.order_id AND o.lifecycle=r.product_lifecycle WHERE r.order_id=?1 AND r.attempt=?2 AND r.run_id=?3",
+            params![order, attempt, run, super::COMMIT_REVIEW_KIND], |row| row.get(0),
+        ).map_err(db_error)?;
+        #[cfg(not(feature = "product-pack-pins"))]
+        let inspection_only = false;
         Ok(ReviewContinuationBinding {
+            inspection_only,
             pack_digest: pack,
             next_sequence: sequence.max(0) as u64,
             stored_result: decode(&result)?,

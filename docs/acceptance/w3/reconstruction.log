@@ -1,0 +1,4 @@
+base=a4e07fd56646503fd06ba5b846130a1d2189c9f0
+source paths=18, tracked=8, new=10
+fresh base files + candidate.patch reproduce every source byte and executable bit
+patch_sha256=ea137f812ca47b3aa88815dae8904890de04c04b7e58519aad4a70de87458d32

@@ -1417,3 +1417,35 @@ mod w22_code_change {
         );
     }
 }
+
+// W30b uses the accepted W2 fixture to exercise the producer's new read port.
+// Only fixture Git and the ledger run; no external stage is launched.
+#[test]
+fn w30b_launcher_reads_exact_reserved_task() {
+    let f = Fixture::new();
+    f.approved("w3-input");
+    let mut store = f.f.store();
+    let service = &f.f.service;
+    let claim = store
+        .reserve_code_change(service, "w3-input", "w3-op")
+        .unwrap();
+    assert_eq!(
+        store
+            .reserved_code_change_task(service, &claim, "w3-op")
+            .unwrap(),
+        f.task()
+    );
+    assert!(
+        store
+            .reserved_code_change_task(service, &claim, "other-op")
+            .is_err()
+    );
+    store
+        .mark_code_change_uncertain(service, "w3-input", "w3-op")
+        .unwrap();
+    assert!(
+        store
+            .reserved_code_change_task(service, &claim, "w3-op")
+            .is_err()
+    );
+}

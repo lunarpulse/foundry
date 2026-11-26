@@ -45,6 +45,14 @@ pub struct StageOutput {
 /// confine process, git-ref, and session writes to the supplied workdir.
 pub trait StageExecutor: Send {
     fn execute(&mut self, task: &StageTask) -> Result<StageOutput, String>;
+    fn execute_in_run(
+        &mut self,
+        _intent: &ExecutionIntent,
+        _journal: &str,
+        task: &StageTask,
+    ) -> Result<StageOutput, String> {
+        self.execute(task)
+    }
     fn ensure_available(&self) -> Result<(), String> {
         Ok(())
     }
@@ -59,6 +67,14 @@ pub trait StageExecutor: Send {
     #[cfg(feature = "a01-harness-support")]
     fn before_terminal_commit(&mut self, _completion: &foundry_exec::ReviewDispatchCompletion) -> Result<(),String> {
         Ok(())
+    }
+    fn restore_session_for_order(
+        &mut self,
+        _order: &str,
+        session_id: &str,
+        workdir: &Path,
+    ) -> Result<(), String> {
+        self.restore_session(session_id, workdir)
     }
     fn restore_session(&mut self, _session_id: &str, _workdir: &Path) -> Result<(), String> {
         Err("session restoration is not implemented".into())
@@ -78,8 +94,24 @@ impl<T: StageExecutor + ?Sized> StageExecutor for Box<T> {
     fn execute(&mut self, task: &StageTask) -> Result<StageOutput, String> {
         (**self).execute(task)
     }
+    fn execute_in_run(
+        &mut self,
+        intent: &ExecutionIntent,
+        journal: &str,
+        task: &StageTask,
+    ) -> Result<StageOutput, String> {
+        (**self).execute_in_run(intent, journal, task)
+    }
     fn ensure_available(&self) -> Result<(), String> {
         (**self).ensure_available()
+    }
+    fn restore_session_for_order(
+        &mut self,
+        order: &str,
+        session_id: &str,
+        workdir: &Path,
+    ) -> Result<(), String> {
+        (**self).restore_session_for_order(order, session_id, workdir)
     }
     fn restore_session(&mut self, session_id: &str, workdir: &Path) -> Result<(), String> {
         (**self).restore_session(session_id, workdir)
@@ -389,6 +421,7 @@ impl ReviewHostStore for StandaloneReviewStore {
             params![order, run, attempt], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         ).map_err(sqlerr)?;
         Ok(foundry_exec::ReviewContinuationBinding {
+            inspection_only: false,
             pack_digest: pack,
             next_sequence: sequence.max(0) as u64,
             stored_result: serde_json::from_str(&result).map_err(sqlerr)?,
@@ -1250,7 +1283,11 @@ impl PackReviewHost {
                         if session_output_valid(saved)
                             && self
                                 .executor
-                                .restore_session(&saved.session_id, &workdir)
+                                .restore_session_for_order(
+                                    &intent.order.0,
+                                    &saved.session_id,
+                                    &workdir,
+                                )
                                 .is_ok()
                         {
                             saved.session_id.clone()
@@ -1288,7 +1325,7 @@ impl PackReviewHost {
                         .map_err(host_port_packerr)?;
                     let out = self
                         .executor
-                        .execute(&task)
+                        .execute_in_run(&intent, &run_id, &task)
                         .and_then(|out| accept_output(&task, out))
                         .map_err(|e| foundry_pack::PackError {
                             code: "E_EXEC_REDRIVE_ERROR",
@@ -1453,7 +1490,7 @@ impl PackReviewHost {
                         && (!saved_output_valid
                             || self
                                 .executor
-                                .restore_session(&restored_id, &workdir)
+                                .restore_session_for_order(&intent.order.0, &restored_id, &workdir)
                                 .is_err())
                     {
                         self.store
@@ -1475,7 +1512,7 @@ impl PackReviewHost {
                     };
                     let out = match self
                         .executor
-                        .execute(&task)
+                        .execute_in_run(&intent, &run_id, &task)
                         .and_then(|out| accept_output(&task, out))
                     {
                         Ok(out) => out,
@@ -1900,6 +1937,9 @@ impl PackReviewHost {
                         &expected_digest,
                     )
                     .map_err(host_port_packerr)?;
+                if redrive && continuation_binding.inspection_only {
+                    return Err(packerr("commit review cannot start a fix generation"));
+                }
                 if redrive {
                     let node = snap
                         .nodes()
@@ -1957,7 +1997,11 @@ impl PackReviewHost {
                         if session_output_valid(saved)
                             && self
                                 .executor
-                                .restore_session(&saved.session_id, &workdir)
+                                .restore_session_for_order(
+                                    &intent.order.0,
+                                    &saved.session_id,
+                                    &workdir,
+                                )
                                 .is_ok()
                         {
                             saved.session_id.clone()
@@ -1995,7 +2039,7 @@ impl PackReviewHost {
                         .map_err(host_port_packerr)?;
                     let out = self
                         .executor
-                        .execute(&task)
+                        .execute_in_run(&intent, &run_id, &task)
                         .and_then(|o| accept_output(&task, o))
                         .map_err(|e| foundry_pack::PackError {
                             code: "E_EXEC_REDRIVE_ERROR",
@@ -2082,6 +2126,11 @@ impl PackReviewHost {
                         .and_then(toml::Value::as_str)
                         .ok_or_else(|| packerr("stage missing role"))?
                         .to_owned();
+                    if continuation_binding.inspection_only
+                        && !matches!(role.as_str(), "verify" | "lens")
+                    {
+                        return Err(packerr("commit review requires an inspection stage"));
+                    }
                     let inputs = match sealed_inputs(&stage, &done) {
                         Ok(v) => v,
                         Err(_) => {
@@ -2134,7 +2183,11 @@ impl PackReviewHost {
                         && (!session_output_valid(saved)
                             || self
                                 .executor
-                                .restore_session(&saved.session_id, &workdir)
+                                .restore_session_for_order(
+                                    &intent.order.0,
+                                    &saved.session_id,
+                                    &workdir,
+                                )
                                 .is_err())
                     {
                         self.store
@@ -2169,7 +2222,7 @@ impl PackReviewHost {
                         .map_err(host_port_packerr)?;
                     let output = match self
                         .executor
-                        .execute(&task)
+                        .execute_in_run(&intent, &run_id, &task)
                         .and_then(|o| accept_output(&task, o))
                     {
                         Ok(o) => o,

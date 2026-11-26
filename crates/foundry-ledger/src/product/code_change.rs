@@ -569,6 +569,24 @@ impl ProductStore {
         Ok(claim)
     }
 
+    /// Canonical owner-authorized input at the isolated producer boundary.
+    /// Resolve both the task and the exact reserved worker in one snapshot.
+    pub fn reserved_code_change_task(
+        &self,
+        service: &ProductServiceContext,
+        claim: &ProductWorkClaim,
+        key: &str,
+    ) -> Result<String, ProductError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let now = self.clock.now();
+        let status = status_in(&tx, service, claim.order_id(), key, now)?;
+        if status.state != "reserved" || claim_in(&tx, service, &status, now)? != *claim {
+            return Err(denied());
+        }
+        let (_, task) = load_task(&tx, claim.order_id())?;
+        serde_json::to_string(&task).map_err(|_| denied())
+    }
+
     pub fn code_change_status(
         &self,
         service: &ProductServiceContext,

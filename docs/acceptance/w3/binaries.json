@@ -1,0 +1,26 @@
+{
+  "rows": {
+    "name": "w2-6c3992339f29af01",
+    "sha256": "021843832d30fce233180bec283342f57dab953d16b566d83645556166332a45"
+  },
+  "selected": {
+    "name": "selected_review_cli-56cc872e90deeb2b",
+    "sha256": "2cf681d0ea43b5dbea594da5b2b2d75299e7e94b3e0be4bcb7d0744653d5249c"
+  },
+  "unit": {
+    "name": "foundry-5b655f659b7c3fb2",
+    "sha256": "ead2442ee26d79f41ce925a76872e90ebfe725f4ad89223fa3ecf55d228fc5bc"
+  },
+  "default": {
+    "name": "foundry-4da877a18ef22f7a",
+    "sha256": "d2c49619687b53626bc5296755771724b24004fdb51e6bbbbabf7a6d1fd61c48"
+  },
+  "wire": {
+    "name": "foundry-5b655f659b7c3fb2",
+    "sha256": "ead2442ee26d79f41ce925a76872e90ebfe725f4ad89223fa3ecf55d228fc5bc"
+  },
+  "normal_cli": {
+    "name": "foundry",
+    "sha256": "e06ce4d752cd55e48db4bffabbbed8049b6f9978b4795c2202dce0907a3f1176"
+  }
+}

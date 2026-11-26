@@ -17,6 +17,7 @@
 use clap::{Parser, Subcommand};
 
 mod deploy_profile;
+mod isolation;
 #[cfg(feature = "a01-harness-support")]
 pub(crate) mod a01_harness_live;
 #[cfg(feature = "a01-harness-support")]
@@ -731,26 +732,36 @@ fn build_product_review_host(
     let artifact_root = get_root("FOUNDRY_PRODUCT_ARTIFACT_ROOT")?;
     let session_root = get_root("FOUNDRY_PRODUCT_SESSION_ROOT")?;
     let claim_root = get_root("FOUNDRY_PRODUCT_CLAIM_ROOT")?;
-    let executor: Box<dyn foundry_line::StageExecutor> = match (
-        std::env::var("FOUNDRY_DIE_BINARY"),
-        std::env::var("FOUNDRY_REPO_PATH"),
-    ) {
-        (Ok(binary), Ok(repo)) if !binary.is_empty() && !repo.is_empty() => {
-            let profile = std::env::var("FOUNDRY_DIE_PROFILE").unwrap_or_else(|_| "coding".into());
-            let timeout = DieStageExecutor::configured_timeout()?;
-            let executor = DieStageExecutor::new(
-                std::path::PathBuf::from(binary),
-                profile,
-                timeout,
-                std::path::PathBuf::from(repo),
-                session_root.clone(),
-            );
-            #[cfg(feature = "product-pack-pins")]
-            let executor = executor.with_commit_review(_commit_review);
-            Box::new(executor)
-        }
-        _ => Box::new(UnavailableStageExecutor),
-    };
+    let executor: Box<dyn foundry_line::StageExecutor> =
+        if std::env::var_os("FOUNDRY_W3_IMAGE").is_some() {
+            Box::new(isolation::ProductLauncher::configured(
+                &artifact_root,
+                &session_root,
+                _commit_review,
+            )?)
+        } else {
+            match (
+                std::env::var("FOUNDRY_DIE_BINARY"),
+                std::env::var("FOUNDRY_REPO_PATH"),
+            ) {
+                (Ok(binary), Ok(repo)) if !binary.is_empty() && !repo.is_empty() => {
+                    let profile =
+                        std::env::var("FOUNDRY_DIE_PROFILE").unwrap_or_else(|_| "coding".into());
+                    let timeout = DieStageExecutor::configured_timeout()?;
+                    let executor = DieStageExecutor::new(
+                        std::path::PathBuf::from(binary),
+                        profile,
+                        timeout,
+                        std::path::PathBuf::from(repo),
+                        session_root.clone(),
+                    );
+                    #[cfg(feature = "product-pack-pins")]
+                    let executor = executor.with_commit_review(_commit_review);
+                    Box::new(executor)
+                }
+                _ => Box::new(UnavailableStageExecutor),
+            }
+        };
     #[cfg(feature = "product-pack-pins")]
     let host = PackReviewHost::with_selected_product_pack(
         pack,
@@ -2220,6 +2231,15 @@ async fn main() {
         Cmd::Reconcile { db, apply } => reconcile_cmd(&expand(&db), apply).await,
         Cmd::Serve { db, bind, product } => {
             let app = if product {
+                // API-only serving needs no runtime. A configured execution host
+                // must never fall back to spawning an operator binary on the host.
+                let isolated = std::env::var_os("FOUNDRY_W3_IMAGE").is_some();
+                if std::env::var_os("FOUNDRY_DIE_BINARY").is_some()
+                    || std::env::var_os("FOUNDRY_REVIEW_PACK").is_some() != isolated
+                {
+                    eprintln!("product serve requires a pack and pinned W3 image for execution");
+                    std::process::exit(1);
+                }
                 let installation_id = match std::env::var("FOUNDRY_INSTALLATION_ID") {
                     Ok(v) if !v.trim().is_empty() => v,
                     _ => {
@@ -2235,10 +2255,25 @@ async fn main() {
                     }
                 };
                 let product_db = expand(&db);
-                let mut store = match foundry_ledger::ProductStore::open(
-                    std::path::Path::new(&product_db),
-                    product_config(&installation_id, &database_id),
-                ) {
+                let path = std::path::Path::new(&product_db);
+                let config = product_config(&installation_id, &database_id);
+                let opened = if isolated {
+                    #[cfg(feature = "product-pack-pins")]
+                    {
+                        if path.is_file() {
+                            foundry_ledger::ProductStore::create_product_pin_store(path, &config)
+                        } else {
+                            Err(foundry_ledger::ProductError::InvalidConfig)
+                        }
+                    }
+                    #[cfg(not(feature = "product-pack-pins"))]
+                    {
+                        Err(foundry_ledger::ProductError::InvalidConfig)
+                    }
+                } else {
+                    foundry_ledger::ProductStore::open(path, config)
+                };
+                let mut store = match opened {
                     Ok(store) => store,
                     Err(_) => {
                         eprintln!("✗ product database contract/configuration rejected");
@@ -2270,7 +2305,18 @@ async fn main() {
                         std::process::exit(1);
                     }
                 };
-                foundry_serve::http::product_router(state)
+                let app = foundry_serve::http::product_router(state);
+                #[cfg(feature = "product-pack-pins")]
+                let app = if isolated {
+                    app.merge(isolation::dispatch::router(
+                        product_db.into(),
+                        installation_id,
+                        database_id,
+                    ))
+                } else {
+                    app
+                };
+                app
             } else {
                 let state =
                     std::sync::Arc::new(match foundry_serve::ServeState::new(&expand(&db)) {

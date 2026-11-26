@@ -367,6 +367,7 @@ pub struct ReviewAcceptedHold {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewContinuationBinding {
+    pub inspection_only: bool,
     pub pack_digest: String,
     pub next_sequence: u64,
     pub stored_result: HostResult,

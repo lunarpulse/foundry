@@ -1,0 +1,2112 @@
+diff --git a/crates/foundry-exec/src/review_run.rs b/crates/foundry-exec/src/review_run.rs
+index 42f2859..83df008 100644
+--- a/crates/foundry-exec/src/review_run.rs
++++ b/crates/foundry-exec/src/review_run.rs
+@@ -367,6 +367,7 @@ pub struct ReviewAcceptedHold {
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct ReviewContinuationBinding {
++    pub inspection_only: bool,
+     pub pack_digest: String,
+     pub next_sequence: u64,
+     pub stored_result: HostResult,
+diff --git a/crates/foundry-ledger/src/product/code_change.rs b/crates/foundry-ledger/src/product/code_change.rs
+index 084bc84..1c86963 100644
+--- a/crates/foundry-ledger/src/product/code_change.rs
++++ b/crates/foundry-ledger/src/product/code_change.rs
+@@ -569,6 +569,24 @@ impl ProductStore {
+         Ok(claim)
+     }
+ 
++    /// Canonical owner-authorized input at the isolated producer boundary.
++    /// Resolve both the task and the exact reserved worker in one snapshot.
++    pub fn reserved_code_change_task(
++        &self,
++        service: &ProductServiceContext,
++        claim: &ProductWorkClaim,
++        key: &str,
++    ) -> Result<String, ProductError> {
++        let tx = self.conn.unchecked_transaction()?;
++        let now = self.clock.now();
++        let status = status_in(&tx, service, claim.order_id(), key, now)?;
++        if status.state != "reserved" || claim_in(&tx, service, &status, now)? != *claim {
++            return Err(denied());
++        }
++        let (_, task) = load_task(&tx, claim.order_id())?;
++        serde_json::to_string(&task).map_err(|_| denied())
++    }
++
+     pub fn code_change_status(
+         &self,
+         service: &ProductServiceContext,
+diff --git a/crates/foundry-ledger/src/product/review.rs b/crates/foundry-ledger/src/product/review.rs
+index 0a7bb49..56097c3 100644
+--- a/crates/foundry-ledger/src/product/review.rs
++++ b/crates/foundry-ledger/src/product/review.rs
+@@ -1923,7 +1923,15 @@ impl ReviewHostStore for ProductStore {
+             "SELECT pack_digest,COALESCE((SELECT MAX(sequence) FROM product_review_stages_v1 WHERE order_id=?1 AND run_id=?2),0),result_json FROM product_review_runs_v1 WHERE order_id=?1 AND attempt=?3 AND run_id=?2 AND status='resuming'",
+             params![order, run, attempt], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+         ).map_err(db_error)?;
++        #[cfg(feature = "product-pack-pins")]
++        let inspection_only = conn.query_row(
++            "SELECT o.task_kind=?4 AND (SELECT schema_version FROM product_meta_v1 WHERE singleton=1)=4 FROM product_review_runs_v1 r JOIN product_orders_v1 o ON o.order_id=r.order_id AND o.lifecycle=r.product_lifecycle WHERE r.order_id=?1 AND r.attempt=?2 AND r.run_id=?3",
++            params![order, attempt, run, super::COMMIT_REVIEW_KIND], |row| row.get(0),
++        ).map_err(db_error)?;
++        #[cfg(not(feature = "product-pack-pins"))]
++        let inspection_only = false;
+         Ok(ReviewContinuationBinding {
++            inspection_only,
+             pack_digest: pack,
+             next_sequence: sequence.max(0) as u64,
+             stored_result: decode(&result)?,
+diff --git a/crates/foundry-line/src/review_host.rs b/crates/foundry-line/src/review_host.rs
+index e36096d..d0c2280 100644
+--- a/crates/foundry-line/src/review_host.rs
++++ b/crates/foundry-line/src/review_host.rs
+@@ -45,6 +45,14 @@ pub struct StageOutput {
+ /// confine process, git-ref, and session writes to the supplied workdir.
+ pub trait StageExecutor: Send {
+     fn execute(&mut self, task: &StageTask) -> Result<StageOutput, String>;
++    fn execute_in_run(
++        &mut self,
++        _intent: &ExecutionIntent,
++        _journal: &str,
++        task: &StageTask,
++    ) -> Result<StageOutput, String> {
++        self.execute(task)
++    }
+     fn ensure_available(&self) -> Result<(), String> {
+         Ok(())
+     }
+@@ -60,6 +68,14 @@ pub trait StageExecutor: Send {
+     fn before_terminal_commit(&mut self, _completion: &foundry_exec::ReviewDispatchCompletion) -> Result<(),String> {
+         Ok(())
+     }
++    fn restore_session_for_order(
++        &mut self,
++        _order: &str,
++        session_id: &str,
++        workdir: &Path,
++    ) -> Result<(), String> {
++        self.restore_session(session_id, workdir)
++    }
+     fn restore_session(&mut self, _session_id: &str, _workdir: &Path) -> Result<(), String> {
+         Err("session restoration is not implemented".into())
+     }
+@@ -78,9 +94,25 @@ impl<T: StageExecutor + ?Sized> StageExecutor for Box<T> {
+     fn execute(&mut self, task: &StageTask) -> Result<StageOutput, String> {
+         (**self).execute(task)
+     }
++    fn execute_in_run(
++        &mut self,
++        intent: &ExecutionIntent,
++        journal: &str,
++        task: &StageTask,
++    ) -> Result<StageOutput, String> {
++        (**self).execute_in_run(intent, journal, task)
++    }
+     fn ensure_available(&self) -> Result<(), String> {
+         (**self).ensure_available()
+     }
++    fn restore_session_for_order(
++        &mut self,
++        order: &str,
++        session_id: &str,
++        workdir: &Path,
++    ) -> Result<(), String> {
++        (**self).restore_session_for_order(order, session_id, workdir)
++    }
+     fn restore_session(&mut self, session_id: &str, workdir: &Path) -> Result<(), String> {
+         (**self).restore_session(session_id, workdir)
+     }
+@@ -389,6 +421,7 @@ impl ReviewHostStore for StandaloneReviewStore {
+             params![order, run, attempt], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+         ).map_err(sqlerr)?;
+         Ok(foundry_exec::ReviewContinuationBinding {
++            inspection_only: false,
+             pack_digest: pack,
+             next_sequence: sequence.max(0) as u64,
+             stored_result: serde_json::from_str(&result).map_err(sqlerr)?,
+@@ -1250,7 +1283,11 @@ impl PackReviewHost {
+                         if session_output_valid(saved)
+                             && self
+                                 .executor
+-                                .restore_session(&saved.session_id, &workdir)
++                                .restore_session_for_order(
++                                    &intent.order.0,
++                                    &saved.session_id,
++                                    &workdir,
++                                )
+                                 .is_ok()
+                         {
+                             saved.session_id.clone()
+@@ -1288,7 +1325,7 @@ impl PackReviewHost {
+                         .map_err(host_port_packerr)?;
+                     let out = self
+                         .executor
+-                        .execute(&task)
++                        .execute_in_run(&intent, &run_id, &task)
+                         .and_then(|out| accept_output(&task, out))
+                         .map_err(|e| foundry_pack::PackError {
+                             code: "E_EXEC_REDRIVE_ERROR",
+@@ -1453,7 +1490,7 @@ impl PackReviewHost {
+                         && (!saved_output_valid
+                             || self
+                                 .executor
+-                                .restore_session(&restored_id, &workdir)
++                                .restore_session_for_order(&intent.order.0, &restored_id, &workdir)
+                                 .is_err())
+                     {
+                         self.store
+@@ -1475,7 +1512,7 @@ impl PackReviewHost {
+                     };
+                     let out = match self
+                         .executor
+-                        .execute(&task)
++                        .execute_in_run(&intent, &run_id, &task)
+                         .and_then(|out| accept_output(&task, out))
+                     {
+                         Ok(out) => out,
+@@ -1900,6 +1937,9 @@ impl PackReviewHost {
+                         &expected_digest,
+                     )
+                     .map_err(host_port_packerr)?;
++                if redrive && continuation_binding.inspection_only {
++                    return Err(packerr("commit review cannot start a fix generation"));
++                }
+                 if redrive {
+                     let node = snap
+                         .nodes()
+@@ -1957,7 +1997,11 @@ impl PackReviewHost {
+                         if session_output_valid(saved)
+                             && self
+                                 .executor
+-                                .restore_session(&saved.session_id, &workdir)
++                                .restore_session_for_order(
++                                    &intent.order.0,
++                                    &saved.session_id,
++                                    &workdir,
++                                )
+                                 .is_ok()
+                         {
+                             saved.session_id.clone()
+@@ -1995,7 +2039,7 @@ impl PackReviewHost {
+                         .map_err(host_port_packerr)?;
+                     let out = self
+                         .executor
+-                        .execute(&task)
++                        .execute_in_run(&intent, &run_id, &task)
+                         .and_then(|o| accept_output(&task, o))
+                         .map_err(|e| foundry_pack::PackError {
+                             code: "E_EXEC_REDRIVE_ERROR",
+@@ -2082,6 +2126,11 @@ impl PackReviewHost {
+                         .and_then(toml::Value::as_str)
+                         .ok_or_else(|| packerr("stage missing role"))?
+                         .to_owned();
++                    if continuation_binding.inspection_only
++                        && !matches!(role.as_str(), "verify" | "lens")
++                    {
++                        return Err(packerr("commit review requires an inspection stage"));
++                    }
+                     let inputs = match sealed_inputs(&stage, &done) {
+                         Ok(v) => v,
+                         Err(_) => {
+@@ -2134,7 +2183,11 @@ impl PackReviewHost {
+                         && (!session_output_valid(saved)
+                             || self
+                                 .executor
+-                                .restore_session(&saved.session_id, &workdir)
++                                .restore_session_for_order(
++                                    &intent.order.0,
++                                    &saved.session_id,
++                                    &workdir,
++                                )
+                                 .is_err())
+                     {
+                         self.store
+@@ -2169,7 +2222,7 @@ impl PackReviewHost {
+                         .map_err(host_port_packerr)?;
+                     let output = match self
+                         .executor
+-                        .execute(&task)
++                        .execute_in_run(&intent, &run_id, &task)
+                         .and_then(|o| accept_output(&task, o))
+                     {
+                         Ok(o) => o,
+diff --git a/crates/foundry-watch/src/model_proxy.rs b/crates/foundry-watch/src/model_proxy.rs
+index 2214721..b2782ca 100644
+--- a/crates/foundry-watch/src/model_proxy.rs
++++ b/crates/foundry-watch/src/model_proxy.rs
+@@ -63,6 +63,7 @@ pub enum ProxyError {
+ /// material. The caller physically cannot express an arbitrary
+ /// egress — the type is the boundary.
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
+ pub struct ProxyRequest {
+     pub provider: String,
+     pub body: String,
+diff --git a/crates/foundry/src/main.rs b/crates/foundry/src/main.rs
+index 487f7e8..c28cfdc 100644
+--- a/crates/foundry/src/main.rs
++++ b/crates/foundry/src/main.rs
+@@ -17,6 +17,7 @@
+ use clap::{Parser, Subcommand};
+ 
+ mod deploy_profile;
++mod isolation;
+ #[cfg(feature = "a01-harness-support")]
+ pub(crate) mod a01_harness_live;
+ #[cfg(feature = "a01-harness-support")]
+@@ -731,26 +732,36 @@ fn build_product_review_host(
+     let artifact_root = get_root("FOUNDRY_PRODUCT_ARTIFACT_ROOT")?;
+     let session_root = get_root("FOUNDRY_PRODUCT_SESSION_ROOT")?;
+     let claim_root = get_root("FOUNDRY_PRODUCT_CLAIM_ROOT")?;
+-    let executor: Box<dyn foundry_line::StageExecutor> = match (
+-        std::env::var("FOUNDRY_DIE_BINARY"),
+-        std::env::var("FOUNDRY_REPO_PATH"),
+-    ) {
+-        (Ok(binary), Ok(repo)) if !binary.is_empty() && !repo.is_empty() => {
+-            let profile = std::env::var("FOUNDRY_DIE_PROFILE").unwrap_or_else(|_| "coding".into());
+-            let timeout = DieStageExecutor::configured_timeout()?;
+-            let executor = DieStageExecutor::new(
+-                std::path::PathBuf::from(binary),
+-                profile,
+-                timeout,
+-                std::path::PathBuf::from(repo),
+-                session_root.clone(),
+-            );
+-            #[cfg(feature = "product-pack-pins")]
+-            let executor = executor.with_commit_review(_commit_review);
+-            Box::new(executor)
+-        }
+-        _ => Box::new(UnavailableStageExecutor),
+-    };
++    let executor: Box<dyn foundry_line::StageExecutor> =
++        if std::env::var_os("FOUNDRY_W3_IMAGE").is_some() {
++            Box::new(isolation::ProductLauncher::configured(
++                &artifact_root,
++                &session_root,
++                _commit_review,
++            )?)
++        } else {
++            match (
++                std::env::var("FOUNDRY_DIE_BINARY"),
++                std::env::var("FOUNDRY_REPO_PATH"),
++            ) {
++                (Ok(binary), Ok(repo)) if !binary.is_empty() && !repo.is_empty() => {
++                    let profile =
++                        std::env::var("FOUNDRY_DIE_PROFILE").unwrap_or_else(|_| "coding".into());
++                    let timeout = DieStageExecutor::configured_timeout()?;
++                    let executor = DieStageExecutor::new(
++                        std::path::PathBuf::from(binary),
++                        profile,
++                        timeout,
++                        std::path::PathBuf::from(repo),
++                        session_root.clone(),
++                    );
++                    #[cfg(feature = "product-pack-pins")]
++                    let executor = executor.with_commit_review(_commit_review);
++                    Box::new(executor)
++                }
++                _ => Box::new(UnavailableStageExecutor),
++            }
++        };
+     #[cfg(feature = "product-pack-pins")]
+     let host = PackReviewHost::with_selected_product_pack(
+         pack,
+@@ -2220,6 +2231,15 @@ async fn main() {
+         Cmd::Reconcile { db, apply } => reconcile_cmd(&expand(&db), apply).await,
+         Cmd::Serve { db, bind, product } => {
+             let app = if product {
++                // API-only serving needs no runtime. A configured execution host
++                // must never fall back to spawning an operator binary on the host.
++                let isolated = std::env::var_os("FOUNDRY_W3_IMAGE").is_some();
++                if std::env::var_os("FOUNDRY_DIE_BINARY").is_some()
++                    || std::env::var_os("FOUNDRY_REVIEW_PACK").is_some() != isolated
++                {
++                    eprintln!("product serve requires a pack and pinned W3 image for execution");
++                    std::process::exit(1);
++                }
+                 let installation_id = match std::env::var("FOUNDRY_INSTALLATION_ID") {
+                     Ok(v) if !v.trim().is_empty() => v,
+                     _ => {
+@@ -2235,10 +2255,25 @@ async fn main() {
+                     }
+                 };
+                 let product_db = expand(&db);
+-                let mut store = match foundry_ledger::ProductStore::open(
+-                    std::path::Path::new(&product_db),
+-                    product_config(&installation_id, &database_id),
+-                ) {
++                let path = std::path::Path::new(&product_db);
++                let config = product_config(&installation_id, &database_id);
++                let opened = if isolated {
++                    #[cfg(feature = "product-pack-pins")]
++                    {
++                        if path.is_file() {
++                            foundry_ledger::ProductStore::create_product_pin_store(path, &config)
++                        } else {
++                            Err(foundry_ledger::ProductError::InvalidConfig)
++                        }
++                    }
++                    #[cfg(not(feature = "product-pack-pins"))]
++                    {
++                        Err(foundry_ledger::ProductError::InvalidConfig)
++                    }
++                } else {
++                    foundry_ledger::ProductStore::open(path, config)
++                };
++                let mut store = match opened {
+                     Ok(store) => store,
+                     Err(_) => {
+                         eprintln!("✗ product database contract/configuration rejected");
+@@ -2270,7 +2305,18 @@ async fn main() {
+                         std::process::exit(1);
+                     }
+                 };
+-                foundry_serve::http::product_router(state)
++                let app = foundry_serve::http::product_router(state);
++                #[cfg(feature = "product-pack-pins")]
++                let app = if isolated {
++                    app.merge(isolation::dispatch::router(
++                        product_db.into(),
++                        installation_id,
++                        database_id,
++                    ))
++                } else {
++                    app
++                };
++                app
+             } else {
+                 let state =
+                     std::sync::Arc::new(match foundry_serve::ServeState::new(&expand(&db)) {
+diff --git a/crates/foundry/src/selected_review.rs b/crates/foundry/src/selected_review.rs
+index af530b4..f2583d8 100644
+--- a/crates/foundry/src/selected_review.rs
++++ b/crates/foundry/src/selected_review.rs
+@@ -10,18 +10,18 @@ use foundry_ledger::{PackRegistryConfig, ProductStore};
+ use serde_json::{Value, json};
+ use std::path::PathBuf;
+ 
+-#[derive(Args)]
+-struct Database {
++#[derive(Args, Clone)]
++pub(super) struct Database {
+     #[arg(long)]
+-    db: PathBuf,
++    pub(super) db: PathBuf,
+     #[arg(long)]
+-    installation_id: String,
++    pub(super) installation_id: String,
+     #[arg(long)]
+-    database_id: String,
++    pub(super) database_id: String,
+ }
+ 
+ impl Database {
+-    fn open(&self) -> Result<ProductStore, ()> {
++    pub(super) fn open(&self) -> Result<ProductStore, ()> {
+         if !self.db.is_file() {
+             return Err(());
+         }
+@@ -144,7 +144,7 @@ fn report(value: Result<Value, ()>) -> i32 {
+     }
+ }
+ 
+-fn registry() -> Result<PackRegistryConfig, ()> {
++pub(super) fn registry() -> Result<PackRegistryConfig, ()> {
+     let paths: Vec<PathBuf> = match (
+         std::env::var_os("FOUNDRY_REVIEW_PACK_REGISTRY"),
+         std::env::var_os("FOUNDRY_REVIEW_PACK"),
+@@ -319,7 +319,7 @@ pub(super) fn pack(args: PackArgs) -> i32 {
+ }
+ 
+ /// Require a locally available commit before exposing the order to a worker.
+-fn require_local_commit(commit: &str) -> Result<(), ()> {
++pub(super) fn require_local_commit(commit: &str) -> Result<(), ()> {
+     let repository = std::env::var_os("FOUNDRY_REPO_PATH").ok_or(())?;
+     let object = std::process::Command::new("git")
+         .arg("-C")
+@@ -345,13 +345,6 @@ pub(super) fn dispatch(args: DispatchArgs) -> i32 {
+             &mut store,
+             foundry_ledger::ProductServiceAction::DriveReview,
+         )?;
+-        if std::env::var("FOUNDRY_PRODUCT_REVIEW_SOURCE")
+-            .ok()
+-            .as_deref()
+-            != Some(service.source_instance_id())
+-        {
+-            return Err(());
+-        }
+         let request = CommitReviewRequest {
+             order: &args.order,
+             lifecycle: args.lifecycle,
+@@ -360,63 +353,80 @@ pub(super) fn dispatch(args: DispatchArgs) -> i32 {
+             selection_revision: args.selection_revision,
+             request_key: &args.request_key,
+         };
+-        let (binding, work) = store
+-            .prepare_commit_review(&session, &service, &request, false)
++        dispatch_bound(&args.database, store, &session, &service, request)
++    })())
++}
++
++pub(super) fn dispatch_bound(
++    database: &Database,
++    mut store: ProductStore,
++    session: &str,
++    service: &foundry_ledger::ProductServiceContext,
++    request: CommitReviewRequest<'_>,
++) -> Result<Value, ()> {
++    if std::env::var("FOUNDRY_PRODUCT_REVIEW_SOURCE")
++        .ok()
++        .as_deref()
++        != Some(service.source_instance_id())
++    {
++        return Err(());
++    }
++    let (binding, work) = store
++        .prepare_commit_review(session, service, &request, false)
++        .map_err(|_| ())?;
++    let digest = binding.pack_digest.clone();
++    let registry = registry()?;
++    let path = registry.snapshots.get(&digest).ok_or(())?.clone();
++    store = store.with_product_registry(registry.clone());
++    let result = match work {
++        CommitReviewWork::Recorded(result) => result,
++        CommitReviewWork::Dispatch(_) => return Err(()),
++        CommitReviewWork::Pending => {
++            require_local_commit(request.commit)?;
++            let mut host = build_product_review_host(
++                &path,
++                database.open()?.with_product_registry(registry),
++                true,
++            )
+             .map_err(|_| ())?;
+-        let digest = binding.pack_digest.clone();
+-        let registry = registry()?;
+-        let path = registry.snapshots.get(&digest).ok_or(())?.clone();
+-        store = store.with_product_registry(registry.clone());
+-        let result = match work {
+-            CommitReviewWork::Recorded(result) => result,
+-            CommitReviewWork::Dispatch(_) => return Err(()),
+-            CommitReviewWork::Pending => {
+-                require_local_commit(&args.commit)?;
+-                let mut host = build_product_review_host(
+-                    &path,
+-                    args.database.open()?.with_product_registry(registry),
+-                    true,
+-                )
++            host.ensure_commit_review_available().map_err(|_| ())?;
++            let (current, work) = store
++                .prepare_commit_review(session, service, &request, true)
+                 .map_err(|_| ())?;
+-                host.ensure_commit_review_available().map_err(|_| ())?;
+-                let (current, work) = store
+-                    .prepare_commit_review(&session, &service, &request, true)
+-                    .map_err(|_| ())?;
+-                if binding != current {
+-                    return Err(());
+-                }
+-                match work {
+-                    CommitReviewWork::Recorded(result) => result,
+-                    CommitReviewWork::Pending => return Err(()),
+-                    CommitReviewWork::Dispatch(claim) => {
+-                        let intent = foundry_exec::ExecutionIntent {
+-                            order: foundry_exec::OrderId(args.order.clone()),
+-                            attempt: foundry_exec::Attempt(1),
+-                            run: foundry_exec::RunId(1),
+-                            activation: 1,
+-                            generation: foundry_exec::Generation(0),
+-                            epoch: foundry_exec::Epoch(claim.review_binding().fence as u64),
+-                            recorded_at: claim.lease_until() - chrono::Duration::minutes(30),
+-                            external_ref: format!(
+-                                "review:{}:1:{}..{}",
+-                                args.order, args.commit, args.commit
+-                            ),
+-                        };
+-                        host.try_dispatch_selected_product_work(
+-                            &intent,
+-                            &claim,
+-                            binding,
+-                            &args.request_key,
+-                        )
+-                        .map_err(|_| ())?
+-                    }
++            if binding != current {
++                return Err(());
++            }
++            match work {
++                CommitReviewWork::Recorded(result) => result,
++                CommitReviewWork::Pending => return Err(()),
++                CommitReviewWork::Dispatch(claim) => {
++                    let intent = foundry_exec::ExecutionIntent {
++                        order: foundry_exec::OrderId(request.order.to_owned()),
++                        attempt: foundry_exec::Attempt(1),
++                        run: foundry_exec::RunId(1),
++                        activation: 1,
++                        generation: foundry_exec::Generation(0),
++                        epoch: foundry_exec::Epoch(claim.review_binding().fence as u64),
++                        recorded_at: claim.lease_until() - chrono::Duration::minutes(30),
++                        external_ref: format!(
++                            "review:{}:1:{}..{}",
++                            request.order, request.commit, request.commit
++                        ),
++                    };
++                    host.try_dispatch_selected_product_work(
++                        &intent,
++                        &claim,
++                        binding,
++                        request.request_key,
++                    )
++                    .map_err(|_| ())?
+                 }
+             }
+-        };
+-        Ok(
+-            json!({"order_id":args.order,"lifecycle":args.lifecycle,"selection_revision":args.selection_revision,"pack_digest":digest,"commit":result.result_commit,"exit_code":result.exit_code,"hold":result.held}),
+-        )
+-    })())
++        }
++    };
++    Ok(
++        json!({"order_id":request.order,"lifecycle":request.lifecycle,"selection_revision":request.selection_revision,"pack_digest":digest,"commit":result.result_commit,"exit_code":result.exit_code,"hold":result.held}),
++    )
+ }
+ 
+ fn hold_host(
+diff --git a/crates/foundry/tests/w2.rs b/crates/foundry/tests/w2.rs
+index 4ef5f2d..e501499 100644
+--- a/crates/foundry/tests/w2.rs
++++ b/crates/foundry/tests/w2.rs
+@@ -1417,3 +1417,35 @@ mod w22_code_change {
+         );
+     }
+ }
++
++// W30b uses the accepted W2 fixture to exercise the producer's new read port.
++// Only fixture Git and the ledger run; no external stage is launched.
++#[test]
++fn w30b_launcher_reads_exact_reserved_task() {
++    let f = Fixture::new();
++    f.approved("w3-input");
++    let mut store = f.f.store();
++    let service = &f.f.service;
++    let claim = store
++        .reserve_code_change(service, "w3-input", "w3-op")
++        .unwrap();
++    assert_eq!(
++        store
++            .reserved_code_change_task(service, &claim, "w3-op")
++            .unwrap(),
++        f.task()
++    );
++    assert!(
++        store
++            .reserved_code_change_task(service, &claim, "other-op")
++            .is_err()
++    );
++    store
++        .mark_code_change_uncertain(service, "w3-input", "w3-op")
++        .unwrap();
++    assert!(
++        store
++            .reserved_code_change_task(service, &claim, "w3-op")
++            .is_err()
++    );
++}
+diff --git a/crates/foundry/src/isolation.rs b/crates/foundry/src/isolation.rs
+new file mode 100644
+index 0000000..defa680
+--- /dev/null
++++ b/crates/foundry/src/isolation.rs
+@@ -0,0 +1,330 @@
++//! Product pack stages cross this port only with a durable host intent and journal run.
++#[cfg(feature = "product-pack-pins")]
++pub(crate) mod dispatch;
++mod listener;
++
++use foundry_exec::{ExecutionIntent, ReviewInputManifest, ReviewRedriveArtifact};
++use foundry_line::{StageExecutor, StageOutput, StageTask};
++use rand_core::{OsRng, RngCore};
++use serde::{Deserialize, Serialize};
++use serde_json::{Value, json};
++use sha2::{Digest, Sha256};
++use std::{
++    collections::BTreeMap,
++    fs,
++    io::{Read, Write},
++    os::unix::fs::DirBuilderExt,
++    path::{Path, PathBuf},
++    process::{Command, Stdio},
++    time::{Duration, Instant},
++};
++
++const LAUNCHER: &str = concat!(
++    include_str!("../../../deploy/profile.py"),
++    "\n",
++    include_str!("../../../deploy/launcher.py")
++);
++const PROFILE: &str = include_str!("../../../deploy/compose.yaml");
++
++pub(super) struct ProductLauncher {
++    image: String,
++    repo: PathBuf,
++    artifacts: PathBuf,
++    cache: PathBuf,
++    timeout: Duration,
++    inspection_only: bool,
++    producer_task: Option<String>,
++    deadline: Option<chrono::DateTime<chrono::Utc>>,
++}
++
++fn reject() -> String {
++    "product isolation configuration or evidence rejected".into()
++}
++
++impl ProductLauncher {
++    pub fn configured(
++        artifacts: &Path,
++        sessions: &Path,
++        inspection_only: bool,
++    ) -> Result<Self, String> {
++        let image = std::env::var("FOUNDRY_W3_IMAGE").map_err(|_| reject())?;
++        if !image.strip_prefix("sha256:").is_some_and(|s| {
++            s.len() == 64
++                && s.bytes()
++                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
++        }) {
++            return Err(reject());
++        }
++        let repo = PathBuf::from(std::env::var_os("FOUNDRY_REPO_PATH").ok_or_else(reject)?)
++            .canonicalize()
++            .map_err(|_| reject())?;
++        Ok(Self {
++            image,
++            repo,
++            artifacts: artifacts.to_owned(),
++            cache: sessions.join("w3-objects"),
++            timeout: Duration::from_secs(foundry_line::DieStageExecutor::configured_timeout()?),
++            inspection_only,
++            producer_task: None,
++            deadline: None,
++        })
++    }
++
++    fn inputs(
++        &self,
++        task: &StageTask,
++    ) -> Result<(BTreeMap<String, String>, BTreeMap<String, Vec<u8>>), String> {
++        let root = self.artifacts.canonicalize().map_err(|_| reject())?;
++        let mut files = BTreeMap::new();
++        let mut total = 0;
++        let mut materialize = |name: &str| -> Result<String, String> {
++            let path = Path::new(name).canonicalize().map_err(|_| reject())?;
++            if !path.starts_with(&root)
++                || path.file_name().and_then(|s| s.to_str()) != Some("accepted-output")
++            {
++                return Err(reject());
++            }
++            let mut bytes = Vec::new();
++            fs::File::open(path)
++                .and_then(|f| f.take(1_048_577).read_to_end(&mut bytes))
++                .map_err(|_| reject())?;
++            total += bytes.len();
++            if bytes.len() > 1_048_576 || total > 2_097_152 {
++                return Err(reject());
++            }
++            let local = format!("input-{}", files.len());
++            files.insert(local.clone(), bytes);
++            Ok(format!("/work/{local}"))
++        };
++        let mut inputs = BTreeMap::new();
++        for (key, val) in &task.inputs {
++            let mapped = if task.fix_context.is_some() {
++                let mut rows: Vec<ReviewRedriveArtifact> =
++                    serde_json::from_str(val).map_err(|_| reject())?;
++                for row in &mut rows {
++                    row.log_path = materialize(&row.log_path)?;
++                }
++                serde_json::to_string(&rows).map_err(|_| reject())?
++            } else {
++                materialize(val)?
++            };
++            inputs.insert(key.clone(), mapped);
++        }
++        Ok((inputs, files))
++    }
++}
++
++#[derive(Serialize, Deserialize)]
++struct StageSession {
++    manifest: ReviewInputManifest,
++    output: Value,
++}
++
++impl ProductLauncher {
++    fn session_file(&self, order: &str, id: &str) -> PathBuf {
++        let key =
++            Sha256::digest(serde_json::to_vec(&(&self.image, order, id)).expect("string tuple"));
++        self.cache.join("sessions").join(hex::encode(key))
++    }
++
++    fn previous(&self, order: &str, id: &str) -> Result<Option<StageSession>, String> {
++        match fs::read(self.session_file(order, id)) {
++            Ok(bytes) => serde_json::from_slice(&bytes)
++                .map(Some)
++                .map_err(|_| reject()),
++            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
++            Err(_) => Err(reject()),
++        }
++    }
++
++    fn save_session(
++        &self,
++        order: &str,
++        id: &str,
++        manifest: ReviewInputManifest,
++        bytes: &[u8],
++    ) -> Result<(), String> {
++        let dst = self.session_file(order, id);
++        let parent = dst.parent().ok_or_else(reject)?;
++        fs::create_dir_all(parent).map_err(|_| reject())?;
++        let mut nonce = [0; 16];
++        OsRng.try_fill_bytes(&mut nonce).map_err(|_| reject())?;
++        let tmp = parent.join(hex::encode(nonce));
++        let mut file = fs::File::create_new(&tmp).map_err(|_| reject())?;
++        let output = serde_json::from_slice(bytes).map_err(|_| reject())?;
++        serde_json::to_writer(&mut file, &StageSession { manifest, output })
++            .map_err(|_| reject())?;
++        file.sync_all()
++            .and_then(|_| fs::rename(&tmp, dst))
++            .map_err(|_| reject())
++    }
++}
++
++struct SocketDir(PathBuf);
++impl SocketDir {
++    fn new() -> Result<Self, String> {
++        let mut random = [0; 16];
++        OsRng.try_fill_bytes(&mut random).map_err(|_| reject())?;
++        let path = PathBuf::from("/tmp").join(format!("foundry-w3-{}", hex::encode(random)));
++        fs::DirBuilder::new()
++            .mode(0o700)
++            .create(&path)
++            .map_err(|_| reject())?;
++        Ok(Self(path))
++    }
++}
++impl Drop for SocketDir {
++    fn drop(&mut self) {
++        let _ = fs::remove_dir(&self.0);
++    }
++}
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct DieOutput {
++    findings: bool,
++    verdict_category: Option<String>,
++    #[serde(default)]
++    verdict_categories: Vec<String>,
++    inspected_commit: Option<String>,
++    produced_commit: Option<String>,
++}
++
++impl StageExecutor for ProductLauncher {
++    fn ensure_available(&self) -> Result<(), String> {
++        let status = Command::new("/usr/bin/timeout")
++            .args([
++                "5",
++                "/usr/bin/docker",
++                "--host",
++                "unix:///var/run/docker.sock",
++                "image",
++                "inspect",
++                "--format",
++                "{{.Id}}",
++            ])
++            .arg(&self.image)
++            .env_clear()
++            .env("HOME", "/nonexistent")
++            .env("PATH", "/usr/bin:/bin")
++            .output()
++            .map_err(|_| reject())?;
++        if !status.status.success() || status.stdout != format!("{}\n", self.image).as_bytes() {
++            return Err(reject());
++        }
++        Ok(())
++    }
++
++    fn restore_session_for_order(
++        &mut self,
++        order: &str,
++        id: &str,
++        _workdir: &Path,
++    ) -> Result<(), String> {
++        self.previous(order, id)?.ok_or_else(reject)?;
++        Ok(())
++    }
++
++    fn execute(&mut self, _: &StageTask) -> Result<StageOutput, String> {
++        Err("product execution requires a bound journal run".into())
++    }
++
++    fn execute_in_run(
++        &mut self,
++        intent: &ExecutionIntent,
++        journal: &str,
++        task: &StageTask,
++    ) -> Result<StageOutput, String> {
++        let inspect = matches!(task.role.as_str(), "verify" | "lens");
++        if journal.is_empty()
++            || (!inspect
++                && (self.inspection_only
++                    || !matches!(
++                        task.role.as_str(),
++                        "producer" | "implement" | "fix" | "replan"
++                    )))
++        {
++            return Err(reject());
++        }
++        self.ensure_available()?;
++        let timeout = match self.deadline {
++            Some(deadline) => self.timeout.min(
++                (deadline - chrono::Utc::now())
++                    .to_std()
++                    .map_err(|_| reject())?,
++            ),
++            None => self.timeout,
++        };
++        if timeout.as_secs() == 0 {
++            return Err(reject());
++        }
++        let (inputs, files) = self.inputs(task)?;
++        let scope = vec![
++            intent.order.0.clone(),
++            intent.epoch.0.to_string(),
++            journal.to_owned(),
++        ];
++        let dir = SocketDir::new()?;
++        let listener = listener::Listener::offline(
++            dir.0.join("model.sock"),
++            journal,
++            &scope,
++            Instant::now() + timeout,
++        )
++        .map_err(|_| reject())?;
++        let previous = self.previous(&intent.order.0, &task.session_id)?;
++        let mut manifest = ReviewInputManifest {
++            order_id: task.session_id.clone(),
++            attempt: 0,
++            task: format!("{}:{}", task.role, task.stage_id),
++            profile: "coding".into(),
++            base: task.base_commit.clone(),
++            fix_context: task.fix_context.is_some(),
++            context: inputs.iter().map(|(k, v)| format!("{k}={v}")).collect(),
++        };
++        if let Some(saved) = &previous {
++            manifest
++                .context
++                .push(format!("previous_task={}", saved.manifest.task));
++            manifest
++                .context
++                .push("previous_die_output=/work/.die-session/die-output.json".into());
++        }
++        let image_files = json!({
++            "worker.py":hex::encode(Sha256::digest(include_bytes!("../../../deploy/worker.py"))),
++            "model-client":hex::encode(Sha256::digest(include_bytes!("../../../deploy/model-client.py"))),
++        });
++        let spec = json!({"image_files":image_files,"workdir":task.workdir,"cache":self.cache,"repo":self.repo,"image":self.image,
++            "profile":serde_json::from_str::<Value>(PROFILE).map_err(|_|reject())?, "socket":listener.path,
++            "intent":intent,"run":journal,"order":intent.order.0,"provider":"none","budget_scope":scope,"token":listener.token,
++            "timeout":timeout.as_secs(),"lease_end_ms":self.deadline.map(|t|t.timestamp_millis()),"task":self.producer_task,"inputs":files, "manifest":manifest,"previous":previous,
++            "stage":{"version":1,"role":task.role,"stage_id":task.stage_id,"artifact_commit":task.artifact_commit,
++            "lens_bytes":task.lens_bytes,"inputs":inputs}});
++        let mut child = Command::new("/usr/bin/python3")
++            .args(["-I", "-c", LAUNCHER])
++            .env_clear()
++            .stdin(Stdio::piped())
++            .stdout(Stdio::piped())
++            .spawn()
++            .map_err(|_| reject())?;
++        let sent = serde_json::to_writer(child.stdin.take().ok_or_else(reject)?, &spec);
++        let output = child.wait_with_output().map_err(|_| reject())?;
++        if sent.is_err() || !output.status.success() || output.stdout.len() > 1_048_576 {
++            return Err(reject());
++        }
++        let result: DieOutput = serde_json::from_slice(&output.stdout).map_err(|_| reject())?;
++        let path = task.workdir.join("die-output.json");
++        fs::File::create_new(&path)
++            .and_then(|mut f| f.write_all(&output.stdout))
++            .map_err(|_| reject())?;
++        self.save_session(&intent.order.0, &task.session_id, manifest, &output.stdout)?;
++        Ok(StageOutput {
++            log_path: path.to_string_lossy().into_owned(),
++            findings: result.findings,
++            verdict_category: result.verdict_category,
++            verdict_categories: result.verdict_categories,
++            produced_commit: result.produced_commit,
++            inspected_commit: result.inspected_commit,
++        })
++    }
++}
+diff --git a/crates/foundry/src/isolation/dispatch.rs b/crates/foundry/src/isolation/dispatch.rs
+new file mode 100644
+index 0000000..bd23b14
+--- /dev/null
++++ b/crates/foundry/src/isolation/dispatch.rs
+@@ -0,0 +1,288 @@
++//! Explicit product requests. Executable work needs a fresh decision from the
++//! task's original owner naming this image and the exact W2 receipt.
++use super::ProductLauncher;
++use crate::selected_review::{Database, dispatch_bound, registry, require_local_commit};
++use axum::{
++    Json, Router,
++    extract::{DefaultBodyLimit, State},
++    http::{HeaderMap, StatusCode},
++    routing::post,
++};
++use foundry_ledger::{
++    ProductServiceAction, ProductServiceContext, ProductStore, product::CommitReviewRequest,
++};
++use foundry_line::{StageExecutor, StageTask};
++use serde::Deserialize;
++use serde_json::{Value, json};
++use sha2::{Digest, Sha256};
++use std::{collections::BTreeMap, fs, path::PathBuf};
++
++#[derive(Deserialize)]
++#[serde(tag = "action", deny_unknown_fields, rename_all = "kebab-case")]
++enum Operation {
++    Review {
++        commit: String,
++        selection_revision: i64,
++    },
++    Produce {
++        task_sha256: String,
++        image: String,
++    },
++}
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Request {
++    order: String,
++    lifecycle: i64,
++    admission_hash: String,
++    request_key: String,
++    connector: String,
++    repository_id: String,
++    api_origin: String,
++    operation: Operation,
++}
++
++pub(crate) fn router(db: PathBuf, installation_id: String, database_id: String) -> Router {
++    Router::new()
++        .route("/api/product/execution", post(execute))
++        .layer(DefaultBodyLimit::max(8192))
++        .with_state(Database {
++            db,
++            installation_id,
++            database_id,
++        })
++}
++
++async fn execute(
++    State(db): State<Database>,
++    headers: HeaderMap,
++    Json(req): Json<Request>,
++) -> Result<(StatusCode, Json<Value>), StatusCode> {
++    let owner = headers
++        .get("authorization")
++        .and_then(|v| v.to_str().ok())
++        .and_then(|s| s.strip_prefix("Bearer "))
++        .filter(|s| !s.is_empty())
++        .ok_or(StatusCode::UNAUTHORIZED)?;
++    let session = hex::encode(Sha256::digest(owner.as_bytes()));
++    let token = headers
++        .get("x-foundry-service")
++        .and_then(|v| v.to_str().ok())
++        .filter(|s| !s.is_empty())
++        .ok_or(StatusCode::UNAUTHORIZED)?
++        .to_owned();
++    tokio::task::spawn_blocking(move || {
++        let store = db.open()?;
++        if !store.scope_policy_enforced().map_err(|_| ())? {
++            return Err(());
++        }
++        let service = store
++            .authenticate_product_service_for_action(
++                &token,
++                &req.connector,
++                &req.api_origin,
++                &req.repository_id,
++                ProductServiceAction::DriveReview,
++                chrono::Utc::now(),
++            )
++            .map_err(|_| ())?;
++        drop(token);
++        if std::env::var("FOUNDRY_PRODUCT_REVIEW_SOURCE")
++            .ok()
++            .as_deref()
++            != Some(service.source_instance_id())
++        {
++            return Err(());
++        }
++        match &req.operation {
++            Operation::Review {
++                commit,
++                selection_revision,
++            } => dispatch_bound(
++                &db,
++                store,
++                &session,
++                &service,
++                CommitReviewRequest {
++                    order: &req.order,
++                    lifecycle: req.lifecycle,
++                    admission_hash: &req.admission_hash,
++                    commit,
++                    selection_revision: *selection_revision,
++                    request_key: &req.request_key,
++                },
++            ),
++            Operation::Produce { task_sha256, image } => {
++                produce(store, &session, &service, &req, task_sha256, image)
++            }
++        }
++    })
++    .await
++    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
++    .map(|value| {
++        let status = match value.get("state").and_then(Value::as_str) {
++            Some("uncertain" | "reserved" | "sealed") => StatusCode::CONFLICT,
++            _ => StatusCode::OK,
++        };
++        (status, Json(value))
++    })
++    .map_err(|_| StatusCode::FORBIDDEN)
++}
++
++fn produce(
++    mut store: ProductStore,
++    session: &str,
++    service: &ProductServiceContext,
++    req: &Request,
++    task_sha: &str,
++    image: &str,
++) -> Result<Value, ()> {
++    let receipt = store
++        .code_change_for_producer(service, &req.order)
++        .map_err(|_| ())?;
++    if receipt.lifecycle != req.lifecycle
++        || receipt.admission_hash != req.admission_hash
++        || receipt.task_sha256 != task_sha
++        || req.request_key.is_empty()
++    {
++        return Err(());
++    }
++    // Replaying the exact immutable receipt requires the original live owner,
++    // task grant, source, selection and approval revisions.
++    let fresh = store
++        .authorize_code_change(
++            session,
++            &req.order,
++            req.lifecycle,
++            &req.admission_hash,
++            task_sha,
++            &receipt.request_key,
++        )
++        .map_err(|_| ())?;
++    if fresh != receipt {
++        return Err(());
++    }
++    let decision = json!(["isolated-produce-v1", receipt, image, req.request_key]);
++    let key = format!(
++        "w3-{:x}",
++        Sha256::digest(serde_json::to_vec(&decision).map_err(|_| ())?)
++    );
++    if let Ok(existing) = store.code_change_status(service, &req.order, &key) {
++        return serde_json::to_value(existing).map_err(|_| ());
++    }
++    let artifacts = PathBuf::from(std::env::var_os("FOUNDRY_PRODUCT_ARTIFACT_ROOT").ok_or(())?);
++    let sessions = PathBuf::from(std::env::var_os("FOUNDRY_PRODUCT_SESSION_ROOT").ok_or(())?);
++    let mut launcher = ProductLauncher::configured(&artifacts, &sessions, false).map_err(|_| ())?;
++    if launcher.image != image {
++        return Err(());
++    }
++    launcher.ensure_available().map_err(|_| ())?;
++    require_local_commit(&receipt.base_commit)?;
++    let configured = registry()?;
++    if !configured.snapshots.contains_key(&receipt.pack_digest) {
++        return Err(());
++    }
++    store = store.with_product_registry(configured);
++    let claim = store
++        .reserve_code_change(service, &req.order, &key)
++        .map_err(|_| ())?;
++    let run: Result<(), ()> = (|| {
++        let dir = artifacts.join("w3-producers").join(&key);
++        fs::create_dir_all(dir.parent().ok_or(())?).map_err(|_| ())?;
++        fs::create_dir(&dir).map_err(|_| ())?;
++        fs::write(
++            dir.join("decision.json"),
++            serde_json::to_vec(&decision).map_err(|_| ())?,
++        )
++        .map_err(|_| ())?;
++        launcher.producer_task = Some(
++            store
++                .reserved_code_change_task(service, &claim, &key)
++                .map_err(|_| ())?,
++        );
++        launcher.deadline = Some(claim.lease_until());
++        let fence = claim.review_binding().fence;
++        let intent = foundry_exec::ExecutionIntent {
++            order: foundry_exec::OrderId(req.order.clone()),
++            attempt: foundry_exec::Attempt(1),
++            run: foundry_exec::RunId(1),
++            activation: 1,
++            generation: foundry_exec::Generation(0),
++            epoch: foundry_exec::Epoch(fence as u64),
++            recorded_at: chrono::Utc::now(),
++            external_ref: key.clone(),
++        };
++        let stage = StageTask {
++            stage_id: "authorized-producer".into(),
++            role: "producer".into(),
++            session_id: key.clone(),
++            fix_context: None,
++            base_commit: receipt.base_commit.clone(),
++            artifact_commit: receipt.base_commit.clone(),
++            lens_bytes: vec![],
++            inputs: BTreeMap::new(),
++            workdir: dir.clone(),
++        };
++        store
++            .validate_product_work_claim(&claim, chrono::Utc::now())
++            .map_err(|_| ())?;
++        let output = launcher
++            .execute_in_run(&intent, &key, &stage)
++            .map_err(|_| ())?;
++        let head = output.produced_commit.ok_or(())?;
++        let sealed = store
++            .seal_code_change(service, &req.order, &key, &dir.join("objects.git"), &head)
++            .map_err(|_| ())?;
++        let patch = fs::read(dir.join("collected.patch")).map_err(|_| ())?;
++        if sealed.artifact_sha256.as_deref() != Some(&format!("{:x}", Sha256::digest(patch))) {
++            return Err(());
++        }
++        store
++            .collect_code_change(service, &req.order, &key)
++            .map_err(|_| ())?;
++        Ok(())
++    })();
++    let status = if run.is_ok() {
++        store.code_change_status(service, &req.order, &key)
++    } else {
++        store.mark_code_change_uncertain(service, &req.order, &key)
++    }
++    .map_err(|_| ())?;
++    serde_json::to_value(status).map_err(|_| ())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[tokio::test]
++    async fn execution_requires_both_credentials_and_fixed_request_shape() {
++        let root = std::env::temp_dir().join("unused-w3-execution-store");
++        let db = Database {
++            db: root.clone(),
++            installation_id: "fixture".into(),
++            database_id: "fixture".into(),
++        };
++        let body = json!({"order":"fixture","lifecycle":1,"admission_hash":"fixture","request_key":"fixture",
++            "api_origin":"https://api.github.com","connector":"github-primary","repository_id":"repo:1",
++            "operation":{"action":"produce","task_sha256":"fixture","image":"fixture"}});
++        let mut injected = body.clone();
++        injected["operation"]["argv"] = json!(["forbidden"]);
++        assert!(serde_json::from_value::<Request>(injected).is_err());
++        for (name, value) in [
++            ("authorization", "Bearer fixture"),
++            ("x-foundry-service", "fixture"),
++        ] {
++            let mut headers = HeaderMap::new();
++            headers.insert(name, value.parse().unwrap());
++            let result = execute(
++                State(db.clone()),
++                headers,
++                Json(serde_json::from_value(body.clone()).unwrap()),
++            )
++            .await;
++            assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
++        }
++        assert!(!root.exists());
++    }
++}
+diff --git a/crates/foundry/src/isolation/listener.rs b/crates/foundry/src/isolation/listener.rs
+new file mode 100644
+index 0000000..e665984
+--- /dev/null
++++ b/crates/foundry/src/isolation/listener.rs
+@@ -0,0 +1,355 @@
++//! One stage, one short-lived socket and one controller-issued capability.
++//! Frames are a big-endian u32 length followed by UTF-8 JSON.
++use foundry_watch::model_proxy::{ModelProxy, ProviderEndpoint, ProxyRequest};
++use rand_core::{OsRng, RngCore};
++use serde::Deserialize;
++use serde_json::{Value, json};
++use sha2::{Digest, Sha256};
++use std::{
++    fs,
++    io::{self, Read, Write},
++    os::unix::{
++        fs::PermissionsExt,
++        net::{UnixListener, UnixStream},
++    },
++    path::{Path, PathBuf},
++    sync::{
++        Arc,
++        atomic::{AtomicBool, Ordering},
++    },
++    thread,
++    time::{Duration, Instant},
++};
++
++const MAX: usize = 256 * 1024;
++
++fn rejected() -> io::Error {
++    io::Error::other("proxy operation rejected")
++}
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Envelope {
++    token: String,
++    request: ProxyRequest,
++}
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct ProviderReply {
++    status: u16,
++    body: String,
++}
++
++struct Grant {
++    token_hash: [u8; 32],
++    run: String,
++    provider: String,
++    scope: Vec<String>,
++    remaining: u32,
++    deadline: Instant,
++    upstream: PathBuf,
++}
++
++fn read_frame(stream: &mut UnixStream, deadline: Instant, limit: usize) -> io::Result<Vec<u8>> {
++    fn exact(s: &mut UnixStream, mut dst: &mut [u8], until: Instant) -> io::Result<()> {
++        while !dst.is_empty() {
++            s.set_read_timeout(Some(
++                until
++                    .checked_duration_since(Instant::now())
++                    .ok_or_else(rejected)?,
++            ))?;
++            let n = s.read(dst)?;
++            if n == 0 {
++                return Err(rejected());
++            }
++            dst = &mut dst[n..];
++        }
++        Ok(())
++    }
++    let mut size = [0; 4];
++    exact(stream, &mut size, deadline)?;
++    let n = u32::from_be_bytes(size) as usize;
++    if n > limit {
++        return Err(rejected());
++    }
++    let mut data = vec![0; n];
++    exact(stream, &mut data, deadline)?;
++    Ok(data)
++}
++
++fn write_frame(stream: &mut UnixStream, v: &Value) -> io::Result<()> {
++    let bytes = serde_json::to_vec(v)?;
++    if bytes.len() > MAX {
++        return Err(rejected());
++    }
++    stream.set_write_timeout(Some(Duration::from_secs(1)))?;
++    stream.write_all(&(bytes.len() as u32).to_be_bytes())?;
++    stream.write_all(&bytes)
++}
++
++impl Grant {
++    fn reserve(&mut self, wire: &[u8], policy: &ModelProxy) -> io::Result<(ProxyRequest, usize)> {
++        let envelope: Envelope = serde_json::from_slice(wire)?;
++        let req = envelope.request;
++        let hash: [u8; 32] = Sha256::digest(envelope.token.as_bytes()).into();
++        if hash != self.token_hash
++            || req.run != self.run
++            || req.provider != self.provider
++            || req.budget_scope != self.scope
++            || self.remaining == 0
++            || Instant::now() >= self.deadline
++        {
++            return Err(rejected());
++        }
++        let provider = policy.validate(&req).map_err(|_| rejected())?;
++        let actual = format!("unix://{}", self.upstream.display());
++        policy
++            .screen_egress(&req.provider, &actual)
++            .map_err(|_| rejected())?;
++        // Reserve the call before sending. An uncertain send cannot be retried for free.
++        self.remaining -= 1;
++        Ok((req, provider.max_response_bytes.min(MAX as u64) as usize))
++    }
++
++    fn forward(&mut self, wire: &[u8], policy: &ModelProxy) -> io::Result<Value> {
++        let (req, limit) = self.reserve(wire, policy)?;
++        let until = self.deadline.min(Instant::now() + Duration::from_secs(1));
++        let runtime = tokio::runtime::Builder::new_current_thread()
++            .enable_io()
++            .enable_time()
++            .build()?;
++        let mut upstream = runtime
++            .block_on(async {
++                tokio::time::timeout_at(
++                    until.into(),
++                    tokio::net::UnixStream::connect(&self.upstream),
++                )
++                .await
++                .map_err(|_| rejected())?
++            })?
++            .into_std()?;
++        upstream.set_nonblocking(false)?;
++        let id = policy.request_id(&req);
++        write_frame(&mut upstream, &json!({"request_id":id,"request":req}))?;
++        let raw = read_frame(&mut upstream, until, MAX)?;
++        let reply: ProviderReply = serde_json::from_slice(&raw)?;
++        if !(200..300).contains(&reply.status) || reply.body.len() > limit {
++            return Err(rejected());
++        }
++        let body = reply.body;
++        policy
++            .check_response_size(&req.provider, body.len() as u64)
++            .map_err(|_| rejected())?;
++        Ok(json!({"request_id":id,"body":body,
++                  "run":req.run,"provider":req.provider,"budget_scope":req.budget_scope}))
++    }
++}
++
++pub(super) struct Listener {
++    pub token: String,
++    pub path: PathBuf,
++    stop: Arc<AtomicBool>,
++    thread: Option<thread::JoinHandle<()>>,
++}
++
++impl Listener {
++    pub fn offline(path: PathBuf, run: &str, scope: &[String], until: Instant) -> io::Result<Self> {
++        Self::start(
++            path,
++            run,
++            "none",
++            scope,
++            until,
++            0,
++            Path::new("/run/foundry/providers/none.sock"),
++        )
++    }
++
++    fn start(
++        path: PathBuf,
++        run: &str,
++        provider: &str,
++        scope: &[String],
++        until: Instant,
++        remaining: u32,
++        upstream: &Path,
++    ) -> io::Result<Self> {
++        let mut secret = [0; 32];
++        OsRng.try_fill_bytes(&mut secret).map_err(|_| rejected())?;
++        let token = hex::encode(secret);
++        let mut grant = Grant {
++            token_hash: Sha256::digest(token.as_bytes()).into(),
++            run: run.into(),
++            provider: provider.into(),
++            scope: scope.into(),
++            deadline: until,
++            remaining,
++            upstream: upstream.into(),
++        };
++        let listener = UnixListener::bind(&path)?;
++        // Parent is controller-private. The sole child bind-mounts the socket inode.
++        fs::set_permissions(&path, fs::Permissions::from_mode(0o666))?;
++        listener.set_nonblocking(true)?;
++        let policy = ModelProxy::new(
++            vec![ProviderEndpoint {
++                name: provider.into(),
++                origin: format!("unix://{}", upstream.display()),
++                env_key_name: String::new(),
++                max_response_bytes: 64 * 1024,
++            }],
++            move |_| {
++                if Instant::now() < until {
++                    Ok(())
++                } else {
++                    Err("expired".into())
++                }
++            },
++        );
++        let stop = Arc::new(AtomicBool::new(false));
++        let stopping = stop.clone();
++        let thread = thread::spawn(move || {
++            while !stopping.load(Ordering::Acquire) && Instant::now() < until {
++                match listener.accept() {
++                    Ok((mut client, _)) => {
++                        let deadline = until.min(Instant::now() + Duration::from_secs(1));
++                        let response = read_frame(&mut client, deadline, MAX)
++                            .and_then(|wire| grant.forward(&wire, &policy))
++                            .unwrap_or_else(|_| json!({"error":"denied"}));
++                        let _ = write_frame(&mut client, &response);
++                    }
++                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
++                        thread::sleep(Duration::from_millis(5))
++                    }
++                    Err(_) => break,
++                }
++            }
++        });
++        Ok(Self {
++            token,
++            path,
++            stop,
++            thread: Some(thread),
++        })
++    }
++}
++impl Drop for Listener {
++    fn drop(&mut self) {
++        self.stop.store(true, Ordering::Release);
++        if let Some(handle) = self.thread.take() {
++            let _ = handle.join();
++        }
++        let _ = fs::remove_file(&self.path);
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn binding_and_budget_precede_transport() {
++        let until = Instant::now() + Duration::from_secs(30);
++        let scope = vec!["order".into(), "7".into(), "journal".into()];
++        let mut grant = Grant {
++            token_hash: Sha256::digest(b"fixture-token").into(),
++            run: "journal".into(),
++            provider: "fixture".into(),
++            scope: scope.clone(),
++            deadline: until,
++            remaining: 1,
++            upstream: "/fixture.sock".into(),
++        };
++        let policy = ModelProxy::new(
++            vec![ProviderEndpoint {
++                name: "fixture".into(),
++                origin: "unix:///fixture.sock".into(),
++                env_key_name: String::new(),
++                max_response_bytes: 512,
++            }],
++            |_| Ok(()),
++        );
++        let valid = json!({"token":"fixture-token","request":{"run":"journal","provider":"fixture","budget_scope":scope,"body":"test"}});
++        for (field, value) in [
++            ("/token", json!("other")),
++            ("/request/run", json!("other")),
++            ("/request/provider", json!("other")),
++            ("/request/budget_scope", json!([])),
++        ] {
++            let mut bad = valid.clone();
++            *bad.pointer_mut(field).unwrap() = value;
++            assert!(
++                grant
++                    .reserve(&serde_json::to_vec(&bad).unwrap(), &policy)
++                    .is_err()
++            );
++        }
++        let mut extra = valid.clone();
++        extra["request"]["url"] = json!("forbidden");
++        assert!(
++            grant
++                .reserve(&serde_json::to_vec(&extra).unwrap(), &policy)
++                .is_err()
++        );
++        let wire = serde_json::to_vec(&valid).unwrap();
++        assert_eq!(grant.reserve(&wire, &policy).unwrap().1, 512);
++        assert!(grant.reserve(&wire, &policy).is_err());
++    }
++
++    #[test]
++    fn authenticated_listener_uses_bound_test_upstream() {
++        let root = std::env::temp_dir().join(format!("w3-wire-{}", std::process::id()));
++        fs::create_dir(&root).unwrap();
++        let address = root.join("up.sock");
++        let upstream = UnixListener::bind(&address).unwrap();
++        let until = Instant::now() + Duration::from_secs(5);
++        let scope = vec!["fixture-budget".to_owned()];
++        let gate = Listener::start(
++            root.join("model.sock"),
++            "fixture-run",
++            "test",
++            &scope,
++            until,
++            1,
++            &address,
++        )
++        .unwrap();
++        let call = |token: &str, run: &str, provider: &str, scope: &[String]| {
++            let mut client = UnixStream::connect(&gate.path).unwrap();
++            write_frame(&mut client,&json!({"token":token,"request":{"provider":provider,"run":run,"budget_scope":scope,"body":"inert"}})).unwrap();
++            serde_json::from_slice::<Value>(&read_frame(&mut client, until, MAX).unwrap()).unwrap()
++        };
++        for reply in [
++            call("wrong", "fixture-run", "test", &scope),
++            call(&gate.token, "other", "test", &scope),
++            call(&gate.token, "fixture-run", "other", &scope),
++            call(&gate.token, "fixture-run", "test", &[]),
++        ] {
++            assert_eq!(reply, json!({"error":"denied"}));
++        }
++        let server = thread::spawn(move || {
++            upstream.set_nonblocking(true).unwrap();
++            let mut conn = loop {
++                if let Ok((stream, _)) = upstream.accept() {
++                    break stream;
++                }
++                assert!(Instant::now() < until);
++                thread::sleep(Duration::from_millis(5));
++            };
++            let bytes = read_frame(&mut conn, until, MAX).unwrap();
++            let frame: Value = serde_json::from_slice(&bytes).unwrap();
++            assert_eq!(frame["request"]["body"], "inert");
++            write_frame(&mut conn, &json!({"status":200,"body":"test"})).unwrap();
++            frame["request_id"].clone()
++        });
++        let response = call(&gate.token, "fixture-run", "test", &scope);
++        assert_eq!(response["body"], "test");
++        assert_eq!(response["request_id"], server.join().unwrap());
++        assert_eq!(
++            call(&gate.token, "fixture-run", "test", &scope),
++            json!({"error":"denied"})
++        );
++        drop(gate);
++        fs::remove_file(address).unwrap();
++        fs::remove_dir(root).unwrap();
++    }
++}
+diff --git a/deploy/Dockerfile b/deploy/Dockerfile
+new file mode 100644
+index 0000000..72c89d6
+--- /dev/null
++++ b/deploy/Dockerfile
+@@ -0,0 +1,10 @@
++# Offline packaging context is deploy/. BASE_REPO and its manifest digest must
++# identify approved, preloaded Python, Git and /opt/foundry/die.
++ARG BASE_REPO
++ARG BASE_SHA256
++FROM ${BASE_REPO}@sha256:${BASE_SHA256}
++COPY --chmod=0555 worker.py /opt/foundry/worker.py
++COPY --chmod=0555 model-client.py /opt/foundry/model-client
++USER 65534:65534
++WORKDIR /work
++ENTRYPOINT ["/usr/bin/python3","-I","/opt/foundry/worker.py"]
+diff --git a/deploy/compose.yaml b/deploy/compose.yaml
+new file mode 100644
+index 0000000..2105c33
+--- /dev/null
++++ b/deploy/compose.yaml
+@@ -0,0 +1,23 @@
++{
++  "services": {
++    "cast": {
++      "image": "${FOUNDRY_W3_IMAGE:?local image ID required}",
++      "pull_policy": "never",
++      "user": "65534:65534",
++      "read_only": true,
++      "network_mode": "none",
++      "cap_drop": ["ALL"],
++      "security_opt": ["no-new-privileges:true"],
++      "pids_limit": 64,
++      "mem_limit": "512m",
++      "tmpfs": ["/work:rw,nosuid,nodev,size=256m,uid=65534,gid=65534,mode=0700"],
++      "working_dir": "/work",
++      "stdin_open": true,
++      "ipc": "private",
++      "healthcheck": {"disable": true},
++      "logging": {"driver": "none"},
++      "entrypoint": ["/usr/bin/python3","-I","/opt/foundry/worker.py"],
++      "volumes": [{"type":"bind","source":"${FOUNDRY_W3_SOCKET:?launcher-owned socket required}","target":"/run/foundry-model.sock","read_only":true,"bind":{"create_host_path":false}}]
++    }
++  }
++}
+diff --git a/deploy/launcher.py b/deploy/launcher.py
+new file mode 100644
+index 0000000..79bb6e3
+--- /dev/null
++++ b/deploy/launcher.py
+@@ -0,0 +1,213 @@
++# Embedded after profile.py in the foundry binary. All Docker invocations use
++# the local Unix socket and a clean client environment.
++import base64
++import hashlib
++import io
++import tarfile
++import os
++import selectors
++import subprocess
++import sys
++import threading
++import time
++
++DOCKER = ["/usr/bin/docker", "--host", "unix:///var/run/docker.sock"]
++ENV = {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "GIT_CONFIG_NOSYSTEM": "1",
++       "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_NO_LAZY_FETCH": "1",
++       "GIT_NO_REPLACE_OBJECTS": "1", "GIT_ALLOW_PROTOCOL": ""}
++
++
++def command(argv, until, data=b"", limit=1 << 20):
++    # Drain stdout concurrently with stdin; never buffer arbitrary child logs.
++    if time.monotonic() >= until:
++        raise TimeoutError("command deadline")
++    with subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
++                          stderr=subprocess.DEVNULL, env=ENV) as proc:
++        try:
++            def feed():
++                try:
++                    with proc.stdin:
++                        proc.stdin.write(data)
++                except BrokenPipeError:
++                    pass
++            writer = threading.Thread(target=feed)
++            writer.start()
++            out = bytearray()
++            with selectors.DefaultSelector() as selector:
++                selector.register(proc.stdout, selectors.EVENT_READ)
++                while selector.select(max(0, until - time.monotonic())):
++                    chunk = os.read(proc.stdout.fileno(), 65536)
++                    if not chunk:
++                        break
++                    out.extend(chunk)
++                    if len(out) > limit or time.monotonic() >= until:
++                        raise ValueError("command limit")
++                else:
++                    raise TimeoutError()
++            if proc.wait(timeout=max(0, until - time.monotonic())):
++                raise ValueError("command failed")
++            return bytes(out)
++        finally:
++            proc.kill()
++            proc.wait()
++            writer.join()
++
++
++def fingerprint(info, service, cid):
++    hc, cfg = info["HostConfig"], info["Config"]
++    mounts = [{"type": m["Type"], "source": m["Source"], "target": m["Destination"],
++               "rw": m["RW"], "propagation": m["Propagation"]} for m in info["Mounts"]]
++    expected = service["volumes"][0]
++    if (info["Id"] != cid or info["Image"] != service["image"] or cfg["User"] != service["user"]
++        or cfg["WorkingDir"] != "/work" or cfg["Entrypoint"] != ENTRY[:1] or cfg["Cmd"] != ENTRY[1:]
++        or hc["ReadonlyRootfs"] is not True or hc["Privileged"] or hc["CapAdd"]
++        or hc["CapDrop"] != ["ALL"] or hc["SecurityOpt"] != service["security_opt"]
++        or hc["NetworkMode"] != "none" or hc["PidMode"] or hc["IpcMode"] != "private" or hc["LogConfig"]["Type"] != "none"
++        or hc["Devices"] or hc.get("DeviceRequests") or hc["VolumesFrom"]
++        or hc["Tmpfs"] != {"/work": TMPFS.split(":", 1)[1]}
++        or hc["PidsLimit"] != 64 or hc["Memory"] != 512 << 20
++        or cfg.get("Healthcheck", {}).get("Test") != ["NONE"]
++        or any(not v.startswith("PATH=") for v in cfg["Env"] or [])
++        or mounts != [{"type": "bind", "source": expected["source"], "target": expected["target"],
++                       "rw": False, "propagation": "rprivate"}]):
++        raise ValueError("container differs from render")
++    return {"container": cid, "image": info["Image"], "user": cfg["User"], "mounts": mounts,
++            "tmpfs": hc["Tmpfs"], "cap_drop": hc["CapDrop"], "security_opt": hc["SecurityOpt"],
++            "readonly": hc["ReadonlyRootfs"], "network": hc["NetworkMode"]}
++
++
++def verify_image_files(cid, expected, until):
++    for name, digest in expected.items():
++        archive = command(DOCKER + ["cp", cid + ":/opt/foundry/" + name, "-"], until, limit=128 << 10)
++        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as tar:
++            members = tar.getmembers()
++            if len(members) != 1 or not members[0].isreg() or members[0].name != name:
++                raise ValueError("image entrypoint file type mismatch")
++            if hashlib.sha256(tar.extractfile(members[0]).read()).hexdigest() != digest:
++                raise ValueError("image entrypoint content mismatch")
++
++
++def launch(service, job, root, until, run, image_files):
++    socket = service["volumes"][0]["source"]
++    args = ["create", "--pull=never", "--interactive", "--read-only", "--network=none",
++            "--user", service["user"], "--cap-drop=ALL", "--security-opt=no-new-privileges:true",
++            "--no-healthcheck", "--ipc=private", "--log-driver=none", "--pids-limit=64", "--memory=512m", "--workdir=/work",
++            "--tmpfs", TMPFS, "--mount", f"type=bind,source={socket},target=/run/foundry-model.sock,readonly",
++            "--entrypoint", ENTRY[0], service["image"], *ENTRY[1:]]
++    # A random ownership label + name allow cleanup after a lost create reply.
++    owner = os.urandom(24).hex()
++    args[1:1] = ["--label", "foundry.w3.owner=" + owner, "--name", "foundry-w3-" + owner]
++    cid = None
++    record = {"phase": job["phase"], "run": run, "owner": owner,
++              "render_sha256": hashlib.sha256(json.dumps(service, sort_keys=True).encode()).hexdigest()}
++    path = root / ("runtime-" + job["phase"] + ".json")
++    path.write_text(json.dumps(record))
++    try:
++        raw = command(DOCKER + args, until).decode().strip()
++        if not re.fullmatch("[0-9a-f]{64}", raw):
++            raise ValueError("invalid container ID")
++        info = json.loads(command(DOCKER + ["container", "inspect", raw], until))[0]
++        if (info["Config"]["Labels"].get("foundry.w3.owner") != owner or info["Id"] != raw
++                or info["Name"] != "/foundry-w3-" + owner):
++            raise ValueError("ownership mismatch")
++        cid = raw
++        record.update(fingerprint(info, service, cid))
++        verify_image_files(cid, image_files, until)
++        record["image_files_sha256"] = image_files
++        path.write_text(json.dumps(record))
++        result = command(DOCKER + ["start", "--attach", "--interactive", cid], until,
++                         json.dumps(job).encode(), 32 << 20)
++        status = json.loads(command(DOCKER + ["inspect", "--format", "{{json .State}}", cid], until))
++        if status["Status"] != "exited" or status["ExitCode"] != 0 or status["OOMKilled"]:
++            raise ValueError("worker did not complete")
++        return json.loads(result)
++    finally:
++        deadline = time.monotonic() + 10
++        if cid is None:
++            # Only resolve the unique name allocated above; never list containers.
++            try:
++                info = json.loads(command(DOCKER + ["inspect", "foundry-w3-" + owner], deadline))[0]
++                if (info["Config"]["Labels"].get("foundry.w3.owner") == owner
++                        and info["Name"] == "/foundry-w3-" + owner
++                        and re.fullmatch("[0-9a-f]{64}", info["Id"])):
++                    cid = info["Id"]
++            except (ValueError, TimeoutError, subprocess.TimeoutExpired):
++                record["ownership_lookup"] = "unconfirmed"
++        if cid:
++            command(DOCKER + ["rm", "--force", "--volumes", cid], deadline)
++            record["removed"] = cid
++        path.write_text(json.dumps(record))
++
++
++def dispatch(spec):
++    root = Path(spec["workdir"])
++    remaining = spec["timeout"]
++    if spec.get("lease_end_ms") is not None:
++        remaining = min(remaining, spec["lease_end_ms"] / 1000 - time.time())
++    until = time.monotonic() + remaining
++    if remaining <= 0:
++        raise TimeoutError("expired lease")
++    profile = render(spec["profile"], spec["image"], spec["socket"])["services"]["cast"]
++    (root / "render.json").write_text(json.dumps(profile, sort_keys=True))
++    (root / "binding.json").write_text(json.dumps({
++        "intent": spec["intent"], "run": spec["run"], "stage": spec["stage"]["stage_id"],
++        "role": spec["stage"]["role"], "provider": spec["provider"], "budget_scope": spec["budget_scope"],
++        "calls": 0, "max_cost_microusd": 0, "timeout_secs": spec["timeout"]
++    }, sort_keys=True))
++    base = spec["stage"]["artifact_commit"]
++    if not re.fullmatch("[0-9a-f]{40}", base) or spec["manifest"]["base"] != base:
++        raise ValueError("invalid base")
++    # Scope generated object packs to this product order. Never run host Git
++    # against a writable child repository.
++    cache = Path(spec["cache"]) / hashlib.sha256(spec["order"].encode()).hexdigest()
++    cache.mkdir(parents=True, exist_ok=True, mode=0o700)
++    cached = cache / base
++    if cached.exists():
++        pack = cached.read_bytes()
++    else:
++        pack = command(["/usr/bin/git", "-C", spec["repo"], "pack-objects", "--stdout", "--revs"],
++                       until, (base + "\n").encode(), 16 << 20)
++    common = {"run": spec["run"], "base": base}
++    result = launch(profile, dict(common, phase="stage", pack=base64.b64encode(pack).decode(),
++                                  stage=spec["stage"], manifest=spec["manifest"], inputs=spec["inputs"], task=spec["task"], previous=spec["previous"],
++                                  provider=spec["provider"], budget_scope=spec["budget_scope"],
++                                  token=spec["token"]), root, until, spec["run"], spec["image_files"])
++    output = result["output"]
++    if spec["stage"]["role"] not in ("verify", "lens"):
++        head = output["produced_commit"]
++        if not re.fullmatch("[0-9a-f]{40}", head):
++            raise ValueError("invalid produced commit")
++        returned = base64.b64decode(result["pack"], validate=True)
++        if len(returned) > 16 << 20:
++            raise ValueError("object limit")
++        payload = dict(common, head=head, pack=result["pack"])
++        approved = json.loads(spec["task"]) if spec["task"] is not None else None
++        check_until = min(until, time.monotonic() + approved["checks"][0]["timeout_secs"]) if approved else until
++        paths = approved["allowed_paths"] if approved else None
++        checked = launch(profile, dict(payload, phase="checks", allowed_paths=paths), root, check_until, spec["run"], spec["image_files"])
++        collected = launch(profile, dict(payload, phase="collect"), root, until, spec["run"], spec["image_files"])
++        if checked != {"checked": head} or collected["head"] != head:
++            raise ValueError("collector binding")
++        patch = base64.b64decode(collected["patch"], validate=True)
++        if not patch or len(patch) > 4 << 20:
++            raise ValueError("invalid collected patch")
++        (root / "collected.patch").write_bytes(patch)
++        if spec["task"] is not None:
++            db = str(root / "objects.git")
++            command(["/usr/bin/git", "init", "--bare", "--template=", db], until)
++            command(["/usr/bin/git", "-C", db, "index-pack", "--stdin", "--strict"], until, returned)
++        # Publish complete bytes atomically. No mutable child ever sees cache.
++        temp = cache / os.urandom(24).hex()
++        temp.write_bytes(returned)
++        temp.replace(cache / head)
++    elif output.get("inspected_commit") != base or output.get("produced_commit") is not None:
++        raise ValueError("inspector binding")
++    (root / "input-manifest.json").write_text(json.dumps(spec["manifest"]))
++    print(json.dumps(output))
++
++
++if __name__ == "__main__":
++    try:
++        dispatch(json.load(sys.stdin))
++    except Exception as error:
++        sys.exit("isolated launcher rejected " + type(error).__name__)
+diff --git a/deploy/model-client.py b/deploy/model-client.py
+new file mode 100644
+index 0000000..6c5cce9
+--- /dev/null
++++ b/deploy/model-client.py
+@@ -0,0 +1,42 @@
++#!/usr/bin/python3 -I
++"""Read one provider body on stdin, forward it under this stage's capability."""
++import json
++import os
++import socket
++import sys
++
++
++def main():
++    body = sys.stdin.buffer.read(65537)
++    if len(body) > 65536:
++        raise ValueError("request size")
++    request = {"run": os.environ["FOUNDRY_PROXY_RUN"],
++               "provider": os.environ["FOUNDRY_PROXY_PROVIDER"],
++               "budget_scope": json.loads(os.environ["FOUNDRY_PROXY_BUDGET_SCOPE"]),
++               "body": body.decode()}
++    wire = json.dumps({"token": os.environ["FOUNDRY_PROXY_TOKEN"], "request": request}).encode()
++    if len(wire) > 256 << 10:
++        raise ValueError("frame size")
++    with socket.socket(socket.AF_UNIX) as client:
++        client.settimeout(2)
++        client.connect("/run/foundry-model.sock")
++        client.sendall(len(wire).to_bytes(4, "big") + wire)
++        with client.makefile("rb") as reader:
++            header = reader.read(4)
++            size = int.from_bytes(header, "big")
++            if len(header) != 4 or size > 256 << 10:
++                raise ValueError("bad response")
++            payload = reader.read(size)
++            if len(payload) != size:
++                raise ValueError("partial response")
++            response = json.loads(payload)
++    if any(response.get(k) != request[k] for k in ("run", "provider", "budget_scope")):
++        raise ValueError("request denied")
++    sys.stdout.buffer.write(response["body"].encode())
++
++
++if __name__ == "__main__":
++    try:
++        main()
++    except Exception:
++        sys.exit("proxy request denied")
+diff --git a/deploy/profile.py b/deploy/profile.py
+new file mode 100644
+index 0000000..f6225be
+--- /dev/null
++++ b/deploy/profile.py
+@@ -0,0 +1,30 @@
++#!/usr/bin/env python3
++"""Render the product child profile offline. Reject extra Compose settings."""
++import json
++from pathlib import Path
++import re
++
++IMAGE = "${FOUNDRY_W3_IMAGE:?local image ID required}"
++SOCKET = "${FOUNDRY_W3_SOCKET:?launcher-owned socket required}"
++TMPFS = "/work:rw,nosuid,nodev,size=256m,uid=65534,gid=65534,mode=0700"
++ENTRY = ["/usr/bin/python3", "-I", "/opt/foundry/worker.py"]
++
++
++def render(profile, image, socket):
++    if not re.fullmatch(r"sha256:[0-9a-f]{64}", image):
++        raise ValueError("expected immutable local image ID")
++    if not re.fullmatch(r"/[a-zA-Z0-9_./-]+/model\.sock", socket) or ".." in Path(socket).parts:
++        raise ValueError("invalid socket operand")
++    mount = {"type": "bind", "source": SOCKET, "target": "/run/foundry-model.sock",
++             "read_only": True, "bind": {"create_host_path": False}}
++    service = {"image": IMAGE, "pull_policy": "never", "user": "65534:65534",
++               "read_only": True, "network_mode": "none", "cap_drop": ["ALL"],
++               "security_opt": ["no-new-privileges:true"], "pids_limit": 64,
++               "mem_limit": "512m", "tmpfs": [TMPFS], "working_dir": "/work",
++               "stdin_open": True, "ipc": "private", "healthcheck": {"disable": True},
++               "logging": {"driver": "none"}, "entrypoint": ENTRY, "volumes": [mount]}
++    if json.dumps(profile, sort_keys=True) != json.dumps({"services": {"cast": service}}, sort_keys=True):
++        raise ValueError("child profile differs from the supported boundary")
++    service["image"] = image
++    mount["source"] = socket
++    return {"services": {"cast": service}}
+diff --git a/deploy/worker.py b/deploy/worker.py
+new file mode 100644
+index 0000000..cba2a2f
+--- /dev/null
++++ b/deploy/worker.py
+@@ -0,0 +1,124 @@
++"""Image entrypoint. Each phase receives a fresh /work tmpfs and a bounded frame."""
++import base64
++import json
++import os
++from pathlib import Path
++import re
++import subprocess
++import sys
++
++LIMIT = 16 << 20
++GIT = "/usr/bin/git"
++
++
++def oid(value):
++    if not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{40}", value):
++        raise ValueError("invalid commit")
++    return value
++
++
++def git(*args, data=None):
++    return subprocess.run([GIT, "--no-replace-objects", "-c", "core.hooksPath=/dev/null", *args],
++                          input=data or b"", stdout=subprocess.PIPE, check=True).stdout
++
++
++def import_objects(data):
++    pack = base64.b64decode(data, validate=True)
++    if len(pack) > LIMIT:
++        raise ValueError("object limit")
++    git("init", "-q", "--template=")
++    git("index-pack", "--stdin", "--strict", data=pack)
++
++
++def export(head):
++    pack = git("pack-objects", "--stdout", "--revs", data=(oid(head) + "\n").encode())
++    if len(pack) > LIMIT:
++        raise ValueError("object limit")
++    return base64.b64encode(pack).decode()
++
++
++def perform(job):
++    base = oid(job["base"])
++    import_objects(job["pack"])
++    phase = job["phase"]
++    if phase in ("checks", "collect"):
++        head = oid(job["head"])
++        if git("rev-list", "--parents", "-1", head).decode().split() != [head, base]:
++            raise ValueError("commit parent mismatch")
++        flags = ["--no-ext-diff", "--no-textconv", "--no-renames"]
++        if phase == "checks":
++            if job.get("allowed_paths") is not None:
++                changed = git("diff-tree", "--no-renames", "--no-commit-id", "--name-only", "-z", "-r", base, head, "--")
++                names = changed.decode().split("\0")
++                if names[-1] or len(names) < 2 or not set(names[:-1]).issubset(job["allowed_paths"]):
++                    raise ValueError("unapproved changed path")
++            git("diff", *flags, "--check", base, head, "--")
++            return {"checked": head}
++        patch = git("diff", *flags, "--binary", "--full-index", base, head, "--")
++        if not patch or len(patch) > 4 << 20:
++            raise ValueError("artifact limit")
++        return {"head": head, "patch": base64.b64encode(patch).decode()}
++    if phase != "stage":
++        raise ValueError("unknown phase")
++    git("checkout", "-q", "--detach", base)
++    manifest = job["manifest"]
++    stage = job["stage"]
++    # Staging files are created exclusively, including on trees with symlinks.
++    for path, value in job["inputs"].items():
++        if not re.fullmatch(r"input-[0-9]+", path):
++            raise ValueError("unknown input")
++        with open(path, "xb") as target:
++            target.write(bytes(value))
++    if job.get("previous") is not None:
++        session = Path(".die-session")
++        session.mkdir(mode=0o700)
++        with (session / "die-output.json").open("x") as saved:
++            json.dump(job["previous"]["output"], saved)
++    if job.get("task") is not None:
++        with open("code-change-task.json", "x") as task_file:
++            task_file.write(job["task"])
++    for path, value in [("stage-input.json", stage), ("input-manifest.json", manifest)]:
++        with open(path, "x") as target:
++            json.dump(value, target)
++    if os.path.lexists("die-output.json"):
++        raise ValueError("preexisting result")
++    env = dict(os.environ, FOUNDRY_ORDER_ID=manifest["order_id"], FOUNDRY_ATTEMPT="0",
++               FOUNDRY_MODEL_CLIENT="/opt/foundry/model-client", FOUNDRY_PROXY_ADDR="/run/foundry-model.sock",
++               FOUNDRY_PROXY_TOKEN=job["token"], FOUNDRY_PROXY_RUN=job["run"],
++               FOUNDRY_PROXY_PROVIDER=job["provider"],
++               FOUNDRY_PROXY_BUDGET_SCOPE=json.dumps(job["budget_scope"]))
++    args = ["/opt/foundry/die", "--profile", manifest["profile"], "--task", manifest["task"]]
++    if manifest["fix_context"]:
++        args.append("--fix-context")
++    subprocess.run([*args, "--base", base], env=env, check=True, stdin=subprocess.DEVNULL,
++                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++    with open("die-output.json", "rb") as result:
++        raw = result.read((1 << 20) + 1)
++    if len(raw) > 1 << 20 or json.loads(Path("input-manifest.json").read_bytes()) != manifest or json.loads(Path("stage-input.json").read_bytes()) != stage:
++        raise ValueError("stage result or input rejected")
++    output = json.loads(raw)
++    head = oid(git("rev-parse", "HEAD^{commit}").decode().strip())
++    if stage["role"] in ("verify", "lens"):
++        if head != base or output.get("inspected_commit") != base or output.get("produced_commit") is not None or not isinstance(output.get("verdict_categories"), list):
++            raise ValueError("inspection binding")
++        return {"output": output}
++    if output.get("produced_commit") != head:
++        raise ValueError("production binding")
++    return {"output": output, "pack": export(head)}
++
++
++def main():
++    os.environ.clear()
++    os.environ.update(PATH="/usr/bin:/bin", HOME="/work", GIT_CONFIG_NOSYSTEM="1",
++                      GIT_CONFIG_GLOBAL="/dev/null", GIT_ALLOW_PROTOCOL="", GIT_NO_LAZY_FETCH="1")
++    raw = sys.stdin.buffer.read((32 << 20) + 1)
++    if len(raw) > 32 << 20:
++        raise ValueError("request limit")
++    print(json.dumps(perform(json.loads(raw))))
++
++
++if __name__ == "__main__":
++    try:
++        main()
++    except Exception:
++        sys.exit("stage rejected")
+diff --git a/scripts/check-deploy.py b/scripts/check-deploy.py
+new file mode 100644
+index 0000000..24358c8
+--- /dev/null
++++ b/scripts/check-deploy.py
+@@ -0,0 +1,20 @@
++#!/usr/bin/env python3
++"""Render the product child profile offline."""
++import argparse
++import json
++from pathlib import Path
++import sys
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "deploy"))
++from profile import render
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--profile", type=Path, default=Path(__file__).resolve().parents[1] / "deploy/compose.yaml")
++    parser.add_argument("--image", required=True)
++    parser.add_argument("--socket", required=True)
++    args = parser.parse_args()
++    try:
++        print(json.dumps(render(json.loads(args.profile.read_bytes()), args.image, args.socket), indent=2))
++    except (ValueError, OSError) as error:
++        parser.exit(1, f"{error}\n")

@@ -1,0 +1,15 @@
+rustfmt --edition 2024 --config skip_children=true,reorder_modules=false --emit stdout
+Unformatted baseline regions outside candidate edits excluded.
+crates/foundry-exec/src/review_run.rs OK
+crates/foundry-ledger/src/product/code_change.rs OK
+crates/foundry-ledger/src/product/review.rs OK
+crates/foundry-line/src/review_host.rs OK
+crates/foundry-watch/src/model_proxy.rs OK
+crates/foundry/src/isolation.rs OK
+crates/foundry/src/isolation/dispatch.rs OK
+crates/foundry/src/isolation/listener.rs OK
+crates/foundry/src/main.rs OK
+crates/foundry/src/selected_review.rs OK
+crates/foundry/tests/w2.rs OK
+git diff --check
+git apply --check --no-index --whitespace=error-all on all tracked and new files: see reconstruction.log

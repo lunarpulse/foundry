@@ -1,0 +1,5 @@
+argv: timeout 5 /usr/bin/docker --host unix:///var/run/docker.sock version --format {{.Server.Version}}
+
+permission denied while trying to connect to the docker API at unix:///var/run/docker.sock
+exit=1
+FOUNDRY_W3_IMAGE absent

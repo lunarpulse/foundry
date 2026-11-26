@@ -10,18 +10,18 @@ use foundry_ledger::{PackRegistryConfig, ProductStore};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
-#[derive(Args)]
-struct Database {
+#[derive(Args, Clone)]
+pub(super) struct Database {
     #[arg(long)]
-    db: PathBuf,
+    pub(super) db: PathBuf,
     #[arg(long)]
-    installation_id: String,
+    pub(super) installation_id: String,
     #[arg(long)]
-    database_id: String,
+    pub(super) database_id: String,
 }
 
 impl Database {
-    fn open(&self) -> Result<ProductStore, ()> {
+    pub(super) fn open(&self) -> Result<ProductStore, ()> {
         if !self.db.is_file() {
             return Err(());
         }
@@ -144,7 +144,7 @@ fn report(value: Result<Value, ()>) -> i32 {
     }
 }
 
-fn registry() -> Result<PackRegistryConfig, ()> {
+pub(super) fn registry() -> Result<PackRegistryConfig, ()> {
     let paths: Vec<PathBuf> = match (
         std::env::var_os("FOUNDRY_REVIEW_PACK_REGISTRY"),
         std::env::var_os("FOUNDRY_REVIEW_PACK"),
@@ -319,7 +319,7 @@ pub(super) fn pack(args: PackArgs) -> i32 {
 }
 
 /// Require a locally available commit before exposing the order to a worker.
-fn require_local_commit(commit: &str) -> Result<(), ()> {
+pub(super) fn require_local_commit(commit: &str) -> Result<(), ()> {
     let repository = std::env::var_os("FOUNDRY_REPO_PATH").ok_or(())?;
     let object = std::process::Command::new("git")
         .arg("-C")
@@ -345,13 +345,6 @@ pub(super) fn dispatch(args: DispatchArgs) -> i32 {
             &mut store,
             foundry_ledger::ProductServiceAction::DriveReview,
         )?;
-        if std::env::var("FOUNDRY_PRODUCT_REVIEW_SOURCE")
-            .ok()
-            .as_deref()
-            != Some(service.source_instance_id())
-        {
-            return Err(());
-        }
         let request = CommitReviewRequest {
             order: &args.order,
             lifecycle: args.lifecycle,
@@ -360,63 +353,80 @@ pub(super) fn dispatch(args: DispatchArgs) -> i32 {
             selection_revision: args.selection_revision,
             request_key: &args.request_key,
         };
-        let (binding, work) = store
-            .prepare_commit_review(&session, &service, &request, false)
+        dispatch_bound(&args.database, store, &session, &service, request)
+    })())
+}
+
+pub(super) fn dispatch_bound(
+    database: &Database,
+    mut store: ProductStore,
+    session: &str,
+    service: &foundry_ledger::ProductServiceContext,
+    request: CommitReviewRequest<'_>,
+) -> Result<Value, ()> {
+    if std::env::var("FOUNDRY_PRODUCT_REVIEW_SOURCE")
+        .ok()
+        .as_deref()
+        != Some(service.source_instance_id())
+    {
+        return Err(());
+    }
+    let (binding, work) = store
+        .prepare_commit_review(session, service, &request, false)
+        .map_err(|_| ())?;
+    let digest = binding.pack_digest.clone();
+    let registry = registry()?;
+    let path = registry.snapshots.get(&digest).ok_or(())?.clone();
+    store = store.with_product_registry(registry.clone());
+    let result = match work {
+        CommitReviewWork::Recorded(result) => result,
+        CommitReviewWork::Dispatch(_) => return Err(()),
+        CommitReviewWork::Pending => {
+            require_local_commit(request.commit)?;
+            let mut host = build_product_review_host(
+                &path,
+                database.open()?.with_product_registry(registry),
+                true,
+            )
             .map_err(|_| ())?;
-        let digest = binding.pack_digest.clone();
-        let registry = registry()?;
-        let path = registry.snapshots.get(&digest).ok_or(())?.clone();
-        store = store.with_product_registry(registry.clone());
-        let result = match work {
-            CommitReviewWork::Recorded(result) => result,
-            CommitReviewWork::Dispatch(_) => return Err(()),
-            CommitReviewWork::Pending => {
-                require_local_commit(&args.commit)?;
-                let mut host = build_product_review_host(
-                    &path,
-                    args.database.open()?.with_product_registry(registry),
-                    true,
-                )
+            host.ensure_commit_review_available().map_err(|_| ())?;
+            let (current, work) = store
+                .prepare_commit_review(session, service, &request, true)
                 .map_err(|_| ())?;
-                host.ensure_commit_review_available().map_err(|_| ())?;
-                let (current, work) = store
-                    .prepare_commit_review(&session, &service, &request, true)
-                    .map_err(|_| ())?;
-                if binding != current {
-                    return Err(());
-                }
-                match work {
-                    CommitReviewWork::Recorded(result) => result,
-                    CommitReviewWork::Pending => return Err(()),
-                    CommitReviewWork::Dispatch(claim) => {
-                        let intent = foundry_exec::ExecutionIntent {
-                            order: foundry_exec::OrderId(args.order.clone()),
-                            attempt: foundry_exec::Attempt(1),
-                            run: foundry_exec::RunId(1),
-                            activation: 1,
-                            generation: foundry_exec::Generation(0),
-                            epoch: foundry_exec::Epoch(claim.review_binding().fence as u64),
-                            recorded_at: claim.lease_until() - chrono::Duration::minutes(30),
-                            external_ref: format!(
-                                "review:{}:1:{}..{}",
-                                args.order, args.commit, args.commit
-                            ),
-                        };
-                        host.try_dispatch_selected_product_work(
-                            &intent,
-                            &claim,
-                            binding,
-                            &args.request_key,
-                        )
-                        .map_err(|_| ())?
-                    }
+            if binding != current {
+                return Err(());
+            }
+            match work {
+                CommitReviewWork::Recorded(result) => result,
+                CommitReviewWork::Pending => return Err(()),
+                CommitReviewWork::Dispatch(claim) => {
+                    let intent = foundry_exec::ExecutionIntent {
+                        order: foundry_exec::OrderId(request.order.to_owned()),
+                        attempt: foundry_exec::Attempt(1),
+                        run: foundry_exec::RunId(1),
+                        activation: 1,
+                        generation: foundry_exec::Generation(0),
+                        epoch: foundry_exec::Epoch(claim.review_binding().fence as u64),
+                        recorded_at: claim.lease_until() - chrono::Duration::minutes(30),
+                        external_ref: format!(
+                            "review:{}:1:{}..{}",
+                            request.order, request.commit, request.commit
+                        ),
+                    };
+                    host.try_dispatch_selected_product_work(
+                        &intent,
+                        &claim,
+                        binding,
+                        request.request_key,
+                    )
+                    .map_err(|_| ())?
                 }
             }
-        };
-        Ok(
-            json!({"order_id":args.order,"lifecycle":args.lifecycle,"selection_revision":args.selection_revision,"pack_digest":digest,"commit":result.result_commit,"exit_code":result.exit_code,"hold":result.held}),
-        )
-    })())
+        }
+    };
+    Ok(
+        json!({"order_id":request.order,"lifecycle":request.lifecycle,"selection_revision":request.selection_revision,"pack_digest":digest,"commit":result.result_commit,"exit_code":result.exit_code,"hold":result.held}),
+    )
 }
 
 fn hold_host(
