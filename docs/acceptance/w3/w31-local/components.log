@@ -1,0 +1,26 @@
+render input = sha256 of UTF-8 'W30b render fixture; no image'; socket is a placeholder
+12 profile mutations rejected
+3 invalid image operands rejected
+{"produced_commit": "434c6d28357e72d7b18729bcc22f3eca4d850563", "findings": false}
+role=producer controller phases=['stage', 'checks', 'collect']; stage is a recording double
+{"produced_commit": "434c6d28357e72d7b18729bcc22f3eca4d850563", "findings": false}
+role=fix controller phases=['stage', 'checks', 'collect']; stage is a recording double
+{"produced_commit": "434c6d28357e72d7b18729bcc22f3eca4d850563", "findings": false}
+role=replan controller phases=['stage', 'checks', 'collect']; stage is a recording double
+{"inspected_commit": "37ecb3bbc2821d7c656e5745942ae284584ba1d7", "findings": false, "verdict_categories": []}
+role=verify controller phases=['stage']; stage is a recording double
+{"inspected_commit": "37ecb3bbc2821d7c656e5745942ae284584ba1d7", "findings": false, "verdict_categories": []}
+role=lens controller phases=['stage']; stage is a recording double
+real Git worker check+collect: 37ecb3bbc2821d7c656e5745942ae284584ba1d7..434c6d28357e72d7b18729bcc22f3eca4d850563, patch=181 bytes, sha256=081f7e20cc61933506b70be8c852613bc2d006f5ef9889dee262b2a2506c2117
+wrong parent and disallowed path refused; no product container or model observation
+simulated Docker client ok: ['create', 'container', 'cp', 'start', 'inspect', 'rm']
+simulated Docker client wrong-uid: ['create', 'container', 'rm']
+simulated Docker client stale-file: ['create', 'container', 'cp', 'rm']
+simulated Docker client foreign: ['create', 'container', 'inspect']
+simulated Docker client timeout: ['create', 'container', 'cp', 'start', 'rm']
+simulated Docker client lost-create: ['create', 'inspect', 'rm']
+actual serve --product: FOUNDRY_W3_IMAGE alone rejected before store open, exit=1
+actual serve --product: FOUNDRY_REVIEW_PACK alone rejected before store open, exit=1
+actual serve --product: FOUNDRY_DIE_BINARY alone rejected before store open, exit=1
+pinned render static SHA-256 ad7667ae34fe54c21b031d50cb83a378963714771b5d005f325a3c0e86344fc6, 16 pre-command refusals
+exit=0

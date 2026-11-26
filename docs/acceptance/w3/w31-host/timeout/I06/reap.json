@@ -1,0 +1,30 @@
+{
+  "absent": true,
+  "deadline_expired": true,
+  "deadline_monotonic_ns": 740092063499046,
+  "error": "TimeoutError",
+  "inspect_exit": 1,
+  "join": {
+    "container": "e782c1d892970ec4a15baa32594ffc0db582754f2f7972d4a38f220b0cfd07fc",
+    "epoch": 1,
+    "fence": 1,
+    "image": "sha256:949511f82f9d8723b68f85c6c23c213a8b9ee0a3aaa5f78cbfce2ab950520a60",
+    "order": "w31-subject",
+    "render_sha256": "f8cdd47ea28b03aa2718a79f55b8e1de88d11f9d6fe6006b1f1b23399fd9a90f",
+    "run": "w3-a96373e911ad89a5d39292be53d124edb2bc337a681f42a93ef9379e9ff8234d",
+    "source_sha256": "9e05a2b619094b44bd431c7289fea7f163f4865fad6644d1d62bc3e6ab9b8251",
+    "stage": "authorized-producer"
+  },
+  "observed_reap_ns": 740092414971941,
+  "pre_rm": {
+    "ExitCode": 1,
+    "OOMKilled": false,
+    "Running": false,
+    "Status": "exited"
+  },
+  "pre_rm_bytes": 658,
+  "removed": "e782c1d892970ec4a15baa32594ffc0db582754f2f7972d4a38f220b0cfd07fc",
+  "start_monotonic_ns": 740072387851715,
+  "writer_active": false,
+  "writer_exit": 137
+}

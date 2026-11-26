@@ -1,0 +1,248 @@
+diff --git a/crates/foundry/src/isolation.rs b/crates/foundry/src/isolation.rs
+index defa6806cebe71209f731da5116d8e1e328884f9..b0f3b6efa4f9884549fb68ef1dec60d749f04e4b 100644
+--- a/crates/foundry/src/isolation.rs
++++ b/crates/foundry/src/isolation.rs
+@@ -300,8 +300,24 @@ impl StageExecutor for ProductLauncher {
+             "timeout":timeout.as_secs(),"lease_end_ms":self.deadline.map(|t|t.timestamp_millis()),"task":self.producer_task,"inputs":files, "manifest":manifest,"previous":previous,
+             "stage":{"version":1,"role":task.role,"stage_id":task.stage_id,"artifact_commit":task.artifact_commit,
+             "lens_bytes":task.lens_bytes,"inputs":inputs}});
+-        let mut child = Command::new("/usr/bin/python3")
+-            .args(["-I", "-c", LAUNCHER])
++        let mut python = Command::new("/usr/bin/python3");
++        python.arg("-I");
++        #[cfg(test)]
++        if let Some(out) = std::env::var_os("W31_WITNESS_DIR") {
++            python
++                .arg(concat!(
++                    env!("CARGO_MANIFEST_DIR"),
++                    "/../../docs/acceptance/w3/w31/witness.py"
++                ))
++                .arg(out)
++                .arg(std::env::var_os("W31_FIXTURE").ok_or_else(reject)?)
++                .arg(LAUNCHER);
++        } else {
++            python.args(["-c", LAUNCHER]);
++        }
++        #[cfg(not(test))]
++        python.args(["-c", LAUNCHER]);
++        let mut child = python
+             .env_clear()
+             .stdin(Stdio::piped())
+             .stdout(Stdio::piped())
+diff --git a/crates/foundry/src/isolation/dispatch.rs b/crates/foundry/src/isolation/dispatch.rs
+index bd23b14139b43b9e462cd1d933b5f7c2dc47a1c0..9e48f5ba95fdad302d13398d3ec46b6273bfa1d8 100644
+--- a/crates/foundry/src/isolation/dispatch.rs
++++ b/crates/foundry/src/isolation/dispatch.rs
+@@ -286,3 +286,7 @@ mod tests {
+         assert!(!root.exists());
+     }
+ }
++
++#[cfg(test)]
++#[path = "w31_test.rs"]
++mod w31;
+diff --git a/crates/foundry/tests/w2.rs b/crates/foundry/tests/w2.rs
+index e501499924ffc7cfba6a45def3439f3b93bc74b5..d7c861acc87745fd3e91bf987f9e80dc4d0d21ca 100644
+--- a/crates/foundry/tests/w2.rs
++++ b/crates/foundry/tests/w2.rs
+@@ -1449,3 +1449,96 @@ fn w30b_launcher_reads_exact_reserved_task() {
+             .is_err()
+     );
+ }
++
++#[test]
++#[ignore = "host W31 witness or explicit fixture-only verification"]
++fn w31_private_fixture() {
++    let mut f = Fixture::new();
++    // The frozen worker checks this tracked name before it can invoke Die.
++    fs::write(
++        f.repo.join("die-output.json"),
++        b"deliberate pre-Die refusal\n",
++    )
++    .unwrap();
++    git(&f.repo, &["add", "die-output.json"]);
++    git(&f.repo, &["commit", "-qm", "W31 inert base"]);
++    f.base = oid(&f.repo);
++    let order = "w31-subject";
++    f.approved("w31-other");
++    // The last --issue-snapshot read by product-intake belongs to this order.
++    f.approved(order);
++    let root = &f.f.root.0;
++    for name in ["artifacts", "sessions", "claims", ".foundry-work"] {
++        fs::create_dir(root.join(name)).unwrap();
++    }
++    let other = root.join(".foundry-work/w31-other");
++    let other_receipt =
++        f.f.store()
++            .code_change_for_producer(&f.f.service, "w31-other")
++            .unwrap();
++    git(
++        &f.repo,
++        &[
++            "worktree",
++            "add",
++            "--detach",
++            other.to_str().unwrap(),
++            &other_receipt.base_commit,
++        ],
++    );
++    assert_eq!(oid(&other), other_receipt.base_commit);
++    assert_eq!(
++        fs::read(root.join("input")).unwrap(),
++        f.delivery(order, "first", &f.task()).payload.as_bytes()
++    );
++    let receipt =
++        f.f.store()
++            .code_change_for_producer(&f.f.service, order)
++            .unwrap();
++    let image = "sha256:949511f82f9d8723b68f85c6c23c213a8b9ee0a3aaa5f78cbfce2ab950520a60";
++    let req = json!({"order": order, "lifecycle":receipt.lifecycle, "admission_hash":receipt.admission_hash,
++        "connector":"github-primary","repository_id":"repo:1","api_origin":"https://api.github.com",
++        "request_key":"w31-inert","operation":{"action":"produce","task_sha256":receipt.task_sha256,"image":image}});
++    fs::write(root.join("request.json"), req.to_string()).unwrap();
++    assert_eq!(
++        git(&f.repo, &["show", &format!("{}:die-output.json", f.base)]),
++        b"deliberate pre-Die refusal\n"
++    );
++    if std::env::var("W31_CASE").as_deref() == Ok("fixture-only") {
++        return;
++    }
++    assert_eq!(std::env::var("FOUNDRY_W3_IMAGE").unwrap(), image);
++    let case = std::env::var("W31_CASE").unwrap();
++    assert!(matches!(case.as_str(), "default" | "timeout"));
++    let mut test = Command::new(std::env::var_os("W31_UNIT_BINARY").unwrap());
++    test.env_clear()
++        .env("PATH", "/usr/bin:/bin")
++        .env("HOME", root)
++        .env("TMPDIR", root)
++        .env("W31_FIXTURE", root)
++        .env(
++            "W31_WITNESS_DIR",
++            std::env::var_os("W31_WITNESS_DIR").unwrap(),
++        )
++        .env("FOUNDRY_W3_IMAGE", image)
++        .env("FOUNDRY_PRODUCT_REVIEW_SOURCE", SOURCE)
++        .env("FOUNDRY_REPO_PATH", &f.repo)
++        .env("FOUNDRY_REVIEW_PACK", &f.f.pack)
++        .env("FOUNDRY_PRODUCT_ARTIFACT_ROOT", root.join("artifacts"))
++        .env("FOUNDRY_PRODUCT_SESSION_ROOT", root.join("sessions"))
++        .env("FOUNDRY_PRODUCT_CLAIM_ROOT", root.join("claims"));
++    if case == "timeout" {
++        test.env("FOUNDRY_DIE_TIMEOUT", "20");
++    }
++    assert!(
++        test.args([
++            "--exact",
++            "isolation::dispatch::w31::owned_producer",
++            "--ignored",
++            "--nocapture"
++        ])
++        .status()
++        .unwrap()
++        .success()
++    );
++}
+diff --git a/deploy/launcher.py b/deploy/launcher.py
+index 79bb6e31db766b2e25e2109516e9a69146fe1285..409a1ae96a36134b3c7f2c8d5bc1b8bf89005a11 100644
+--- a/deploy/launcher.py
++++ b/deploy/launcher.py
+@@ -12,11 +12,20 @@ import threading
+ import time
+ 
+ DOCKER = ["/usr/bin/docker", "--host", "unix:///var/run/docker.sock"]
++PYTHON_IMAGE_ENV = ("LANG", "GPG_KEY", "PYTHON_VERSION", "PYTHON_SHA256")
+ ENV = {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_NO_LAZY_FETCH": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1", "GIT_ALLOW_PROTOCOL": ""}
+ 
+ 
++def feed_stdin(pipe, data):
++    try:
++        with pipe:
++            pipe.write(data)
++    except BrokenPipeError:
++        pass
++
++
+ def command(argv, until, data=b"", limit=1 << 20):
+     # Drain stdout concurrently with stdin; never buffer arbitrary child logs.
+     if time.monotonic() >= until:
+@@ -24,13 +33,7 @@ def command(argv, until, data=b"", limit=1 << 20):
+     with subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, env=ENV) as proc:
+         try:
+-            def feed():
+-                try:
+-                    with proc.stdin:
+-                        proc.stdin.write(data)
+-                except BrokenPipeError:
+-                    pass
+-            writer = threading.Thread(target=feed)
++            writer = threading.Thread(target=feed_stdin, args=(proc.stdin, data))
+             writer.start()
+             out = bytearray()
+             with selectors.DefaultSelector() as selector:
+@@ -40,7 +43,9 @@ def command(argv, until, data=b"", limit=1 << 20):
+                     if not chunk:
+                         break
+                     out.extend(chunk)
+-                    if len(out) > limit or time.monotonic() >= until:
++                    if time.monotonic() >= until:
++                        raise TimeoutError("command deadline")
++                    if len(out) > limit:
+                         raise ValueError("command limit")
+                 else:
+                     raise TimeoutError()
+@@ -59,6 +64,7 @@ def fingerprint(info, service, cid):
+                "rw": m["RW"], "propagation": m["Propagation"]} for m in info["Mounts"]]
+     expected = service["volumes"][0]
+     if (info["Id"] != cid or info["Image"] != service["image"] or cfg["User"] != service["user"]
++        or not cfg["OpenStdin"] or cfg["Tty"]
+         or cfg["WorkingDir"] != "/work" or cfg["Entrypoint"] != ENTRY[:1] or cfg["Cmd"] != ENTRY[1:]
+         or hc["ReadonlyRootfs"] is not True or hc["Privileged"] or hc["CapAdd"]
+         or hc["CapDrop"] != ["ALL"] or hc["SecurityOpt"] != service["security_opt"]
+@@ -67,7 +73,7 @@ def fingerprint(info, service, cid):
+         or hc["Tmpfs"] != {"/work": TMPFS.split(":", 1)[1]}
+         or hc["PidsLimit"] != 64 or hc["Memory"] != 512 << 20
+         or cfg.get("Healthcheck", {}).get("Test") != ["NONE"]
+-        or any(not v.startswith("PATH=") for v in cfg["Env"] or [])
++        or any(not v.startswith("PATH=") and v not in PYTHON_IMAGE_ENV for v in cfg["Env"] or [])
+         or mounts != [{"type": "bind", "source": expected["source"], "target": expected["target"],
+                        "rw": False, "propagation": "rprivate"}]):
+         raise ValueError("container differs from render")
+@@ -94,6 +100,10 @@ def launch(service, job, root, until, run, image_files):
+             "--no-healthcheck", "--ipc=private", "--log-driver=none", "--pids-limit=64", "--memory=512m", "--workdir=/work",
+             "--tmpfs", TMPFS, "--mount", f"type=bind,source={socket},target=/run/foundry-model.sock,readonly",
+             "--entrypoint", ENTRY[0], service["image"], *ENTRY[1:]]
++    # Unset official Python image metadata in the clean client environment.
++    # Docker's bare --env NAME drops an inherited value when NAME is unset.
++    args[1:1] = [arg for key in PYTHON_IMAGE_ENV
++                 for arg in ("--env", key)]
+     # A random ownership label + name allow cleanup after a lost create reply.
+     owner = os.urandom(24).hex()
+     args[1:1] = ["--label", "foundry.w3.owner=" + owner, "--name", "foundry-w3-" + owner]
+@@ -111,16 +121,24 @@ def launch(service, job, root, until, run, image_files):
+                 or info["Name"] != "/foundry-w3-" + owner):
+             raise ValueError("ownership mismatch")
+         cid = raw
++        record["container"] = cid
++        path.write_text(json.dumps(record))
+         record.update(fingerprint(info, service, cid))
+         verify_image_files(cid, image_files, until)
+         record["image_files_sha256"] = image_files
+         path.write_text(json.dumps(record))
++        record["start_requested"] = True
++        path.write_text(json.dumps(record))
+         result = command(DOCKER + ["start", "--attach", "--interactive", cid], until,
+                          json.dumps(job).encode(), 32 << 20)
+         status = json.loads(command(DOCKER + ["inspect", "--format", "{{json .State}}", cid], until))
++        record["exit_state"] = {k: status[k] for k in ("Status", "ExitCode", "OOMKilled")}
+         if status["Status"] != "exited" or status["ExitCode"] != 0 or status["OOMKilled"]:
+             raise ValueError("worker did not complete")
+         return json.loads(result)
++    except (TimeoutError, subprocess.TimeoutExpired):
++        record["deadline_expired"] = time.monotonic() >= until
++        raise
+     finally:
+         deadline = time.monotonic() + 10
+         if cid is None:

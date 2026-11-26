@@ -1,0 +1,88 @@
+{
+  "base": {
+    "archive": "/home/cosmo/foundry/.hermes/evidence/w30b-base-image-20261126/base-oci.tar",
+    "index_sha256": "sha256:37acb1c1983ec48445183efc67d1aef12e9d7ff0856c73a4ac001c4beee47c22",
+    "manifest": "sha256:c353734f0b9194bbb18395c7c17041ec1b47811cfd8647369b1ce61823af0289",
+    "config_digest": "sha256:e6d7dc8c46a4205a4a475832490d038210d8dfa0da3f81c8c7f294342efaa0c3",
+    "layers_verified": 10,
+    "diff_ids": [
+      "sha256:5a13ab4fd379b4a5b3e5e0b199e5ebc916896237a7b3775975b960743d34373d",
+      "sha256:659e96a3451280f2aaa6413e0719cbc261683886e44409b9c023244aa7785432",
+      "sha256:0cb57ba75d8944a94e4da61cfa72bef30f7f39526d228e0993ca575f9a4ac012",
+      "sha256:eb48e6d293c47c956dcefef857bd52fda8631857a9dc63073377662b485fbe2a",
+      "sha256:a45b9dec78ded920cea3a419c98f9bfcd059f275224d4bf1199b2243316d9453",
+      "sha256:948c453d8caf82ca3c558a830ffdda7494f77d0604e7f1a896800a9469531a3b",
+      "sha256:86850ec45231d44f7d6c3216771a0107bf0049da3c2e6a979fa1fec637350d4f",
+      "sha256:1baffb29e57f86f0110c16eee52f0b03f34a7a0de5b91ed74cfa425997a55334",
+      "sha256:25b54110f83ec420e1f427cae09d9a7271701eb04a8af22f9d137e1090a97126",
+      "sha256:ee11964707746f7d31f5f7580310ba139384e367f4ae20e4cf8778ee8ba09ed2"
+    ],
+    "platform": {
+      "architecture": "amd64",
+      "os": "linux"
+    },
+    "image_config": {
+      "User": null,
+      "WorkingDir": null,
+      "Entrypoint": null,
+      "Cmd": [
+        "python3"
+      ]
+    },
+    "env_keys": [
+      "PATH",
+      "LANG",
+      "GPG_KEY",
+      "PYTHON_VERSION",
+      "PYTHON_SHA256"
+    ],
+    "copy_files": {}
+  },
+  "product": {
+    "archive": "/home/cosmo/foundry/.hermes/evidence/w30b-base-image-20261126/product-oci.tar",
+    "index_sha256": "sha256:d7d78e0ca2d48343b9fe154bc87a009871833f04d77f9e73ffa9968c5a9ae713",
+    "manifest": "sha256:aee05a2557a0d69ce07641152cdaa287cc68821417fd4c3315e81b1056046b12",
+    "config_digest": "sha256:a10e98c2fc9925744506c72a8650f3828a11814b00fb663e77a0ccba1af9ed1a",
+    "layers_verified": 13,
+    "diff_ids": [
+      "sha256:5a13ab4fd379b4a5b3e5e0b199e5ebc916896237a7b3775975b960743d34373d",
+      "sha256:659e96a3451280f2aaa6413e0719cbc261683886e44409b9c023244aa7785432",
+      "sha256:0cb57ba75d8944a94e4da61cfa72bef30f7f39526d228e0993ca575f9a4ac012",
+      "sha256:eb48e6d293c47c956dcefef857bd52fda8631857a9dc63073377662b485fbe2a",
+      "sha256:a45b9dec78ded920cea3a419c98f9bfcd059f275224d4bf1199b2243316d9453",
+      "sha256:948c453d8caf82ca3c558a830ffdda7494f77d0604e7f1a896800a9469531a3b",
+      "sha256:86850ec45231d44f7d6c3216771a0107bf0049da3c2e6a979fa1fec637350d4f",
+      "sha256:1baffb29e57f86f0110c16eee52f0b03f34a7a0de5b91ed74cfa425997a55334",
+      "sha256:25b54110f83ec420e1f427cae09d9a7271701eb04a8af22f9d137e1090a97126",
+      "sha256:ee11964707746f7d31f5f7580310ba139384e367f4ae20e4cf8778ee8ba09ed2",
+      "sha256:85d1a9867829ebb8922b78e021393f00755a01a7a3bfd2e4126d0f3657822040",
+      "sha256:246d7fdb9acb5bf8e60353a9242a2feb0e4dae6fe03f4dd77515d99b4fd2ef6d",
+      "sha256:75417c2ebbd67f9ba2c6f4caaae392136cef599965386329d883e45797edfdec"
+    ],
+    "platform": {
+      "architecture": "amd64",
+      "os": "linux"
+    },
+    "image_config": {
+      "User": "65534:65534",
+      "WorkingDir": "/work",
+      "Entrypoint": [
+        "/usr/bin/python3",
+        "-I",
+        "/opt/foundry/worker.py"
+      ],
+      "Cmd": null
+    },
+    "env_keys": [
+      "PATH",
+      "LANG",
+      "GPG_KEY",
+      "PYTHON_VERSION",
+      "PYTHON_SHA256"
+    ],
+    "copy_files": {
+      "opt/foundry/worker.py": "sha256:65fcdfe92db3c602c06755bb244fd7589a2c21274c7168b347edae672607fe2e",
+      "opt/foundry/model-client": "sha256:7775105b91d1b25a0cc792444a89e62459588620165e30b51517f0662a89fa69"
+    }
+  }
+}

@@ -1449,3 +1449,96 @@ fn w30b_launcher_reads_exact_reserved_task() {
             .is_err()
     );
 }
+
+#[test]
+#[ignore = "host W31 witness or explicit fixture-only verification"]
+fn w31_private_fixture() {
+    let mut f = Fixture::new();
+    // The frozen worker checks this tracked name before it can invoke Die.
+    fs::write(
+        f.repo.join("die-output.json"),
+        b"deliberate pre-Die refusal\n",
+    )
+    .unwrap();
+    git(&f.repo, &["add", "die-output.json"]);
+    git(&f.repo, &["commit", "-qm", "W31 inert base"]);
+    f.base = oid(&f.repo);
+    let order = "w31-subject";
+    f.approved("w31-other");
+    // The last --issue-snapshot read by product-intake belongs to this order.
+    f.approved(order);
+    let root = &f.f.root.0;
+    for name in ["artifacts", "sessions", "claims", ".foundry-work"] {
+        fs::create_dir(root.join(name)).unwrap();
+    }
+    let other = root.join(".foundry-work/w31-other");
+    let other_receipt =
+        f.f.store()
+            .code_change_for_producer(&f.f.service, "w31-other")
+            .unwrap();
+    git(
+        &f.repo,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            other.to_str().unwrap(),
+            &other_receipt.base_commit,
+        ],
+    );
+    assert_eq!(oid(&other), other_receipt.base_commit);
+    assert_eq!(
+        fs::read(root.join("input")).unwrap(),
+        f.delivery(order, "first", &f.task()).payload.as_bytes()
+    );
+    let receipt =
+        f.f.store()
+            .code_change_for_producer(&f.f.service, order)
+            .unwrap();
+    let image = "sha256:949511f82f9d8723b68f85c6c23c213a8b9ee0a3aaa5f78cbfce2ab950520a60";
+    let req = json!({"order": order, "lifecycle":receipt.lifecycle, "admission_hash":receipt.admission_hash,
+        "connector":"github-primary","repository_id":"repo:1","api_origin":"https://api.github.com",
+        "request_key":"w31-inert","operation":{"action":"produce","task_sha256":receipt.task_sha256,"image":image}});
+    fs::write(root.join("request.json"), req.to_string()).unwrap();
+    assert_eq!(
+        git(&f.repo, &["show", &format!("{}:die-output.json", f.base)]),
+        b"deliberate pre-Die refusal\n"
+    );
+    if std::env::var("W31_CASE").as_deref() == Ok("fixture-only") {
+        return;
+    }
+    assert_eq!(std::env::var("FOUNDRY_W3_IMAGE").unwrap(), image);
+    let case = std::env::var("W31_CASE").unwrap();
+    assert!(matches!(case.as_str(), "default" | "timeout"));
+    let mut test = Command::new(std::env::var_os("W31_UNIT_BINARY").unwrap());
+    test.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", root)
+        .env("TMPDIR", root)
+        .env("W31_FIXTURE", root)
+        .env(
+            "W31_WITNESS_DIR",
+            std::env::var_os("W31_WITNESS_DIR").unwrap(),
+        )
+        .env("FOUNDRY_W3_IMAGE", image)
+        .env("FOUNDRY_PRODUCT_REVIEW_SOURCE", SOURCE)
+        .env("FOUNDRY_REPO_PATH", &f.repo)
+        .env("FOUNDRY_REVIEW_PACK", &f.f.pack)
+        .env("FOUNDRY_PRODUCT_ARTIFACT_ROOT", root.join("artifacts"))
+        .env("FOUNDRY_PRODUCT_SESSION_ROOT", root.join("sessions"))
+        .env("FOUNDRY_PRODUCT_CLAIM_ROOT", root.join("claims"));
+    if case == "timeout" {
+        test.env("FOUNDRY_DIE_TIMEOUT", "20");
+    }
+    assert!(
+        test.args([
+            "--exact",
+            "isolation::dispatch::w31::owned_producer",
+            "--ignored",
+            "--nocapture"
+        ])
+        .status()
+        .unwrap()
+        .success()
+    );
+}

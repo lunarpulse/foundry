@@ -1,0 +1,16 @@
+{"case": "user", "operand": "0", "layer": "offline dispatch before any command", "error": "child profile differs from the supported boundary", "commands": [], "starts": 0}
+{"case": "privileged", "operand": true, "layer": "offline dispatch before any command", "error": "child profile differs from the supported boundary", "commands": [], "starts": 0}
+{"case": "cap_add", "operand": ["ALL"], "layer": "offline dispatch before any command", "error": "child profile differs from the supported boundary", "commands": [], "starts": 0}
+{"case": "network_mode", "operand": "host", "layer": "offline dispatch before any command", "error": "child profile differs from the supported boundary", "commands": [], "starts": 0}
+{"case": "read_only", "operand": false, "layer": "offline dispatch before any command", "error": "child profile differs from the supported boundary", "commands": [], "starts": 0}
+{"case": "volumes", "operand": [], "layer": "offline dispatch before any command", "error": "child profile differs from the supported boundary", "commands": [], "starts": 0}
+{"case": "entrypoint", "operand": ["sh"], "layer": "offline dispatch before any command", "error": "child profile differs from the supported boundary", "commands": [], "starts": 0}
+{"case": "environment", "operand": {"HOME": "/root"}, "layer": "offline dispatch before any command", "error": "child profile differs from the supported boundary", "commands": [], "starts": 0}
+{"case": "security_opt", "operand": [], "layer": "offline dispatch before any command", "error": "child profile differs from the supported boundary", "commands": [], "starts": 0}
+{"case": "pull_policy", "operand": "always", "layer": "offline dispatch before any command", "error": "child profile differs from the supported boundary", "commands": [], "starts": 0}
+{"case": "tmpfs", "operand": [], "layer": "offline dispatch before any command", "error": "child profile differs from the supported boundary", "commands": [], "starts": 0}
+{"case": "pid", "operand": "host", "layer": "offline dispatch before any command", "error": "child profile differs from the supported boundary", "commands": [], "starts": 0}
+{"case": "image", "operand": "${FOUNDRY_W3_IMAGE:?local image ID required}", "layer": "offline dispatch before any command", "error": "expected immutable local image ID", "commands": [], "starts": 0}
+{"case": "image", "operand": "${FOUNDRY_W3_IMAGE:?local image ID required}", "layer": "offline dispatch before any command", "error": "expected immutable local image ID", "commands": [], "starts": 0}
+{"case": "image", "operand": "${FOUNDRY_W3_IMAGE:?local image ID required}", "layer": "offline dispatch before any command", "error": "expected immutable local image ID", "commands": [], "starts": 0}
+{"case": "socket", "operand": "/tmp/../bad/model.sock", "layer": "offline dispatch before any command", "error": "invalid socket operand", "commands": [], "starts": 0}

@@ -286,3 +286,7 @@ mod tests {
         assert!(!root.exists());
     }
 }
+
+#[cfg(test)]
+#[path = "w31_test.rs"]
+mod w31;

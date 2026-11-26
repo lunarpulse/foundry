@@ -1,0 +1,22 @@
+{
+  "argv": [
+    "/home/cosmo/worktrees/foundry-w3-integration/target/w31/debug/deps/w2-6c3992339f29af01",
+    "--exact",
+    "w31_private_fixture",
+    "--ignored",
+    "--nocapture"
+  ],
+  "env": {
+    "PATH": "/usr/bin:/bin",
+    "HOME": "/tmp/w31-fkikv1ds",
+    "TMPDIR": "/tmp/w31-fkikv1ds",
+    "FOUNDRY_W3_IMAGE": "sha256:949511f82f9d8723b68f85c6c23c213a8b9ee0a3aaa5f78cbfce2ab950520a60",
+    "W31_CASE": "default",
+    "W31_WITNESS_DIR": "/home/cosmo/worktrees/foundry-w3-integration/docs/acceptance/w3/w31-host/default",
+    "W31_UNIT_BINARY": "/home/cosmo/worktrees/foundry-w3-integration/target/w31/debug/deps/foundry-ad88af93b1442e04"
+  },
+  "binary_sha256": {
+    "/home/cosmo/worktrees/foundry-w3-integration/target/w31/debug/deps/w2-6c3992339f29af01": "8735b1da1ad561f6fcfaa7ee55e864c1bb1fbf787570d7aaf5d0ede8a8adf4db",
+    "/home/cosmo/worktrees/foundry-w3-integration/target/w31/debug/deps/foundry-ad88af93b1442e04": "a59988a998dc354732c6b4575ea00154007631f32533d6b2861bb391fe0f58a0"
+  }
+}

@@ -12,9 +12,18 @@ import threading
 import time
 
 DOCKER = ["/usr/bin/docker", "--host", "unix:///var/run/docker.sock"]
+PYTHON_IMAGE_ENV = ("LANG", "GPG_KEY", "PYTHON_VERSION", "PYTHON_SHA256")
 ENV = {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "GIT_CONFIG_NOSYSTEM": "1",
        "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_NO_LAZY_FETCH": "1",
        "GIT_NO_REPLACE_OBJECTS": "1", "GIT_ALLOW_PROTOCOL": ""}
+
+
+def feed_stdin(pipe, data):
+    try:
+        with pipe:
+            pipe.write(data)
+    except BrokenPipeError:
+        pass
 
 
 def command(argv, until, data=b"", limit=1 << 20):
@@ -24,13 +33,7 @@ def command(argv, until, data=b"", limit=1 << 20):
     with subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                           stderr=subprocess.DEVNULL, env=ENV) as proc:
         try:
-            def feed():
-                try:
-                    with proc.stdin:
-                        proc.stdin.write(data)
-                except BrokenPipeError:
-                    pass
-            writer = threading.Thread(target=feed)
+            writer = threading.Thread(target=feed_stdin, args=(proc.stdin, data))
             writer.start()
             out = bytearray()
             with selectors.DefaultSelector() as selector:
@@ -40,7 +43,9 @@ def command(argv, until, data=b"", limit=1 << 20):
                     if not chunk:
                         break
                     out.extend(chunk)
-                    if len(out) > limit or time.monotonic() >= until:
+                    if time.monotonic() >= until:
+                        raise TimeoutError("command deadline")
+                    if len(out) > limit:
                         raise ValueError("command limit")
                 else:
                     raise TimeoutError()
@@ -59,6 +64,7 @@ def fingerprint(info, service, cid):
                "rw": m["RW"], "propagation": m["Propagation"]} for m in info["Mounts"]]
     expected = service["volumes"][0]
     if (info["Id"] != cid or info["Image"] != service["image"] or cfg["User"] != service["user"]
+        or not cfg["OpenStdin"] or cfg["Tty"]
         or cfg["WorkingDir"] != "/work" or cfg["Entrypoint"] != ENTRY[:1] or cfg["Cmd"] != ENTRY[1:]
         or hc["ReadonlyRootfs"] is not True or hc["Privileged"] or hc["CapAdd"]
         or hc["CapDrop"] != ["ALL"] or hc["SecurityOpt"] != service["security_opt"]
@@ -67,7 +73,7 @@ def fingerprint(info, service, cid):
         or hc["Tmpfs"] != {"/work": TMPFS.split(":", 1)[1]}
         or hc["PidsLimit"] != 64 or hc["Memory"] != 512 << 20
         or cfg.get("Healthcheck", {}).get("Test") != ["NONE"]
-        or any(not v.startswith("PATH=") for v in cfg["Env"] or [])
+        or any(not v.startswith("PATH=") and v not in PYTHON_IMAGE_ENV for v in cfg["Env"] or [])
         or mounts != [{"type": "bind", "source": expected["source"], "target": expected["target"],
                        "rw": False, "propagation": "rprivate"}]):
         raise ValueError("container differs from render")
@@ -94,6 +100,10 @@ def launch(service, job, root, until, run, image_files):
             "--no-healthcheck", "--ipc=private", "--log-driver=none", "--pids-limit=64", "--memory=512m", "--workdir=/work",
             "--tmpfs", TMPFS, "--mount", f"type=bind,source={socket},target=/run/foundry-model.sock,readonly",
             "--entrypoint", ENTRY[0], service["image"], *ENTRY[1:]]
+    # Unset official Python image metadata in the clean client environment.
+    # Docker's bare --env NAME drops an inherited value when NAME is unset.
+    args[1:1] = [arg for key in PYTHON_IMAGE_ENV
+                 for arg in ("--env", key)]
     # A random ownership label + name allow cleanup after a lost create reply.
     owner = os.urandom(24).hex()
     args[1:1] = ["--label", "foundry.w3.owner=" + owner, "--name", "foundry-w3-" + owner]
@@ -111,16 +121,24 @@ def launch(service, job, root, until, run, image_files):
                 or info["Name"] != "/foundry-w3-" + owner):
             raise ValueError("ownership mismatch")
         cid = raw
+        record["container"] = cid
+        path.write_text(json.dumps(record))
         record.update(fingerprint(info, service, cid))
         verify_image_files(cid, image_files, until)
         record["image_files_sha256"] = image_files
         path.write_text(json.dumps(record))
+        record["start_requested"] = True
+        path.write_text(json.dumps(record))
         result = command(DOCKER + ["start", "--attach", "--interactive", cid], until,
                          json.dumps(job).encode(), 32 << 20)
         status = json.loads(command(DOCKER + ["inspect", "--format", "{{json .State}}", cid], until))
+        record["exit_state"] = {k: status[k] for k in ("Status", "ExitCode", "OOMKilled")}
         if status["Status"] != "exited" or status["ExitCode"] != 0 or status["OOMKilled"]:
             raise ValueError("worker did not complete")
         return json.loads(result)
+    except (TimeoutError, subprocess.TimeoutExpired):
+        record["deadline_expired"] = time.monotonic() >= until
+        raise
     finally:
         deadline = time.monotonic() + 10
         if cid is None:

@@ -1,0 +1,81 @@
+{
+  "config": {
+    "Cmd": [
+      "-I",
+      "/opt/foundry/worker.py"
+    ],
+    "Entrypoint": [
+      "/usr/bin/python3"
+    ],
+    "Healthcheck": {
+      "Test": [
+        "NONE"
+      ]
+    },
+    "OpenStdin": true,
+    "Tty": false,
+    "User": "65534:65534",
+    "WorkingDir": "/work"
+  },
+  "env_keys": [
+    "PATH"
+  ],
+  "host_config": {
+    "Binds": null,
+    "CapAdd": null,
+    "CapDrop": [
+      "ALL"
+    ],
+    "DeviceRequests": null,
+    "Devices": [],
+    "IpcMode": "private",
+    "LogConfig": {
+      "Config": {},
+      "Type": "none"
+    },
+    "Memory": 536870912,
+    "NetworkMode": "none",
+    "PidMode": "",
+    "PidsLimit": 64,
+    "Privileged": false,
+    "ReadonlyRootfs": true,
+    "SecurityOpt": [
+      "no-new-privileges:true"
+    ],
+    "Tmpfs": {
+      "/work": "rw,nosuid,nodev,size=256m,uid=65534,gid=65534,mode=0700"
+    },
+    "VolumesFrom": null
+  },
+  "id": "e782c1d892970ec4a15baa32594ffc0db582754f2f7972d4a38f220b0cfd07fc",
+  "image": "sha256:949511f82f9d8723b68f85c6c23c213a8b9ee0a3aaa5f78cbfce2ab950520a60",
+  "join": {
+    "container": "e782c1d892970ec4a15baa32594ffc0db582754f2f7972d4a38f220b0cfd07fc",
+    "epoch": 1,
+    "fence": 1,
+    "image": "sha256:949511f82f9d8723b68f85c6c23c213a8b9ee0a3aaa5f78cbfce2ab950520a60",
+    "order": "w31-subject",
+    "render_sha256": "f8cdd47ea28b03aa2718a79f55b8e1de88d11f9d6fe6006b1f1b23399fd9a90f",
+    "run": "w3-a96373e911ad89a5d39292be53d124edb2bc337a681f42a93ef9379e9ff8234d",
+    "source_sha256": "9e05a2b619094b44bd431c7289fea7f163f4865fad6644d1d62bc3e6ab9b8251",
+    "stage": "authorized-producer"
+  },
+  "mounts": [
+    {
+      "Destination": "/run/foundry-model.sock",
+      "Mode": "",
+      "Propagation": "rprivate",
+      "RW": false,
+      "Source": "/tmp/foundry-w3-7c052025d296d88bb55f386348d14ab7/model.sock",
+      "Type": "bind"
+    }
+  ],
+  "name": "/foundry-w3-8a528d013fff927f3761beda7c78e694aaf62fc7df4021f2",
+  "owner": "8a528d013fff927f3761beda7c78e694aaf62fc7df4021f2",
+  "unset_env": [
+    "LANG",
+    "GPG_KEY",
+    "PYTHON_VERSION",
+    "PYTHON_SHA256"
+  ]
+}

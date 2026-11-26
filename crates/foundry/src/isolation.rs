@@ -300,8 +300,24 @@ impl StageExecutor for ProductLauncher {
             "timeout":timeout.as_secs(),"lease_end_ms":self.deadline.map(|t|t.timestamp_millis()),"task":self.producer_task,"inputs":files, "manifest":manifest,"previous":previous,
             "stage":{"version":1,"role":task.role,"stage_id":task.stage_id,"artifact_commit":task.artifact_commit,
             "lens_bytes":task.lens_bytes,"inputs":inputs}});
-        let mut child = Command::new("/usr/bin/python3")
-            .args(["-I", "-c", LAUNCHER])
+        let mut python = Command::new("/usr/bin/python3");
+        python.arg("-I");
+        #[cfg(test)]
+        if let Some(out) = std::env::var_os("W31_WITNESS_DIR") {
+            python
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../docs/acceptance/w3/w31/witness.py"
+                ))
+                .arg(out)
+                .arg(std::env::var_os("W31_FIXTURE").ok_or_else(reject)?)
+                .arg(LAUNCHER);
+        } else {
+            python.args(["-c", LAUNCHER]);
+        }
+        #[cfg(not(test))]
+        python.args(["-c", LAUNCHER]);
+        let mut child = python
             .env_clear()
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

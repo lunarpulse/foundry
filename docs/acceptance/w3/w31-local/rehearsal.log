@@ -1,0 +1,7 @@
+default: verified observed fields for subject / run / aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+timeout: verified observed fields for subject / run / bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+synthetic corruption rejected: I06/runtime.json
+synthetic corruption rejected: I06/heartbeat
+synthetic corruption rejected: I02/child-open.jsonl
+synthetic recorder and reader rehearsal only; no Docker CLI or runtime observation
+exit=0

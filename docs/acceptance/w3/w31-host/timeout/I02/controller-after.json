@@ -1,0 +1,79 @@
+{
+  "db_dump_sha256": "fff2b35d70859fdad4e910cbee390faa48d1a0998154b7aae3fc9d18460fe625",
+  "files": {
+    "db": {
+      "inode": 308112,
+      "mode": 33188,
+      "path": "/tmp/w31-goxew1vd/b2-w1-runtime-3744432-0-1795726123025673279/product.sqlite",
+      "sha256": "a1c76fed026fc2c66e30d6e9348b09e63a0e64b08fc9c62942db0bc1a5ac73c7"
+    },
+    "home": {
+      "inode": 308110,
+      "mode": 16832,
+      "path": "/tmp/w31-goxew1vd/b2-w1-runtime-3744432-0-1795726123025673279"
+    },
+    "management": {
+      "inode": 2382,
+      "mode": 49584,
+      "path": "/var/run/docker.sock"
+    },
+    "other": {
+      "inode": 308243,
+      "mode": 33188,
+      "path": "/tmp/w31-goxew1vd/b2-w1-runtime-3744432-0-1795726123025673279/.foundry-work/w31-other/README",
+      "sha256": "dbea9325179efe46ea2add94f7b6b745ca983fabb208dc6d34aa064623d7ee23"
+    },
+    "owner": {
+      "inode": 308200,
+      "mode": 33152,
+      "path": "/tmp/w31-goxew1vd/b2-w1-runtime-3744432-0-1795726123025673279/owner",
+      "sha256": "e8ac30c2b44e5d445eb35d13553137d5b9ae37020c61d7814355993999589435"
+    },
+    "serve": {
+      "inode": 308252,
+      "mode": 49645,
+      "path": "/tmp/w31-goxew1vd/b2-w1-runtime-3744432-0-1795726123025673279/serve.sock"
+    },
+    "service": {
+      "inode": 308201,
+      "mode": 33152,
+      "path": "/tmp/w31-goxew1vd/b2-w1-runtime-3744432-0-1795726123025673279/service",
+      "sha256": "5a7875b46a7ae846ed247a8025d54054134381a95ec6af593fd07c1c740a9544"
+    },
+    "shm": {
+      "inode": 308262,
+      "mode": 33188,
+      "path": "/tmp/w31-goxew1vd/b2-w1-runtime-3744432-0-1795726123025673279/sidecars.sqlite-shm",
+      "sha256": "d2f6b9286dff4ead93aeb098456bf28d53cf5567855b28084743e073dcc8b24c"
+    },
+    "wal": {
+      "inode": 308261,
+      "mode": 33188,
+      "path": "/tmp/w31-goxew1vd/b2-w1-runtime-3744432-0-1795726123025673279/sidecars.sqlite-wal",
+      "sha256": "ad32403c1c009865101060c2db9fc2bc5ad27954a97281dc1475675deb528b24"
+    },
+    "wal_db": {
+      "inode": 308259,
+      "mode": 33188,
+      "path": "/tmp/w31-goxew1vd/b2-w1-runtime-3744432-0-1795726123025673279/sidecars.sqlite",
+      "sha256": "352a9bb23c329c5a9bf235baf56917358b5b64b03f1a11d261fadae9c3cdb721"
+    },
+    "watch": {
+      "inode": 308216,
+      "mode": 33188,
+      "path": "/tmp/w31-goxew1vd/b2-w1-runtime-3744432-0-1795726123025673279/input",
+      "sha256": "4aa8a1be3be635543e049169fb276ce0f5c653b1eddb507eacb32fb5cea739c8"
+    }
+  },
+  "join": {
+    "container": "e782c1d892970ec4a15baa32594ffc0db582754f2f7972d4a38f220b0cfd07fc",
+    "epoch": 1,
+    "fence": 1,
+    "image": "sha256:949511f82f9d8723b68f85c6c23c213a8b9ee0a3aaa5f78cbfce2ab950520a60",
+    "order": "w31-subject",
+    "render_sha256": "f8cdd47ea28b03aa2718a79f55b8e1de88d11f9d6fe6006b1f1b23399fd9a90f",
+    "run": "w3-a96373e911ad89a5d39292be53d124edb2bc337a681f42a93ef9379e9ff8234d",
+    "source_sha256": "9e05a2b619094b44bd431c7289fea7f163f4865fad6644d1d62bc3e6ab9b8251",
+    "stage": "authorized-producer"
+  }
+}

@@ -1,0 +1,173 @@
+{
+  "join": {
+    "container": "0d65c83eb92409bd2145f4b9257814f005478614f5a51cb30a25e5be35a27ce9",
+    "epoch": 1,
+    "fence": 1,
+    "image": "sha256:949511f82f9d8723b68f85c6c23c213a8b9ee0a3aaa5f78cbfce2ab950520a60",
+    "order": "w31-subject",
+    "render_sha256": "97f9bda67e523fca31be6ffd0084546c92cd88c680a2908a8e6496c1bc70ea98",
+    "run": "w3-39bf14f9c9fe65b2afa62936c186f03ccfcb481df66db37e56c7c888b6bc3f7d",
+    "source_sha256": "9e05a2b619094b44bd431c7289fea7f163f4865fad6644d1d62bc3e6ab9b8251",
+    "stage": "authorized-producer"
+  },
+  "observer": {
+    "cmdline": null,
+    "env_keys": [
+      "HOME",
+      "HOSTNAME",
+      "PATH"
+    ],
+    "mountinfo": [
+      "687 631 0:54 / / ro,relatime - overlay overlay rw,lowerdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/3941/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/3936/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/3935/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/3934/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/3916/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/3915/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/3914/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/3901/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/3900/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/3899/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/3898/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/3897/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/3896/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/3895/fs,upperdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/3942/fs,workdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/3942/work,nouserxattr",
+      "689 687 0:78 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw",
+      "690 687 0:79 / /dev rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755,inode64",
+      "691 690 0:80 / /dev/pts rw,nosuid,noexec,relatime - devpts devpts rw,gid=5,mode=620,ptmxmode=666",
+      "692 687 0:81 / /sys ro,nosuid,nodev,noexec,relatime - sysfs sysfs ro",
+      "693 692 0:29 / /sys/fs/cgroup ro,nosuid,nodev,noexec,relatime - cgroup2 cgroup rw,nsdelegate,memory_recursiveprot",
+      "694 690 0:76 / /dev/mqueue rw,nosuid,nodev,noexec,relatime - mqueue mqueue rw",
+      "695 690 0:82 / /dev/shm rw,nosuid,nodev,noexec,relatime - tmpfs shm rw,size=65536k,inode64",
+      "696 687 0:83 / /work rw,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=262144k,mode=700,uid=65534,gid=65534,inode64",
+      "697 687 0:42 /foundry-w3-407cc496b1ac60edb88a8b7e4659c224/model.sock /run/foundry-model.sock ro,nosuid,nodev - tmpfs tmpfs rw,size=4064244k,nr_inodes=1048576,inode64",
+      "698 687 8:1 /var/lib/docker/containers/0d65c83eb92409bd2145f4b9257814f005478614f5a51cb30a25e5be35a27ce9/resolv.conf /etc/resolv.conf ro,relatime - ext4 /dev/sda1 rw",
+      "699 687 8:1 /var/lib/docker/containers/0d65c83eb92409bd2145f4b9257814f005478614f5a51cb30a25e5be35a27ce9/hostname /etc/hostname ro,relatime - ext4 /dev/sda1 rw",
+      "700 687 8:1 /var/lib/docker/containers/0d65c83eb92409bd2145f4b9257814f005478614f5a51cb30a25e5be35a27ce9/hosts /etc/hosts ro,relatime - ext4 /dev/sda1 rw",
+      "632 689 0:78 /bus /proc/bus ro,nosuid,nodev,noexec,relatime - proc proc rw",
+      "633 689 0:78 /fs /proc/fs ro,nosuid,nodev,noexec,relatime - proc proc rw",
+      "634 689 0:78 /irq /proc/irq ro,nosuid,nodev,noexec,relatime - proc proc rw",
+      "635 689 0:78 /sys /proc/sys ro,nosuid,nodev,noexec,relatime - proc proc rw",
+      "636 689 0:78 /sysrq-trigger /proc/sysrq-trigger ro,nosuid,nodev,noexec,relatime - proc proc rw",
+      "637 689 0:84 / /proc/acpi ro,relatime - tmpfs tmpfs ro,inode64",
+      "638 689 0:85 / /proc/asound ro,relatime - tmpfs tmpfs ro,inode64",
+      "639 689 0:79 /null /proc/interrupts rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755,inode64",
+      "640 689 0:79 /null /proc/kcore rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755,inode64",
+      "641 689 0:79 /null /proc/keys rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755,inode64",
+      "642 689 0:79 /null /proc/latency_stats rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755,inode64",
+      "643 689 0:86 / /proc/scsi ro,relatime - tmpfs tmpfs ro,inode64",
+      "644 689 0:79 /null /proc/timer_list rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755,inode64",
+      "645 692 0:87 / /sys/firmware ro,relatime - tmpfs tmpfs ro,inode64"
+    ],
+    "namespace": {
+      "mnt": "mnt:[4026532437]",
+      "net": "net:[4026532448]",
+      "pid": "pid:[4026532443]",
+      "user": "user:[4026531837]"
+    },
+    "net_devices": [
+      "lo"
+    ],
+    "status": {
+      "CapAmb": [
+        "0000000000000000"
+      ],
+      "CapBnd": [
+        "0000000000000000"
+      ],
+      "CapEff": [
+        "0000000000000000"
+      ],
+      "CapInh": [
+        "0000000000000000"
+      ],
+      "CapPrm": [
+        "0000000000000000"
+      ],
+      "Gid": [
+        "65534",
+        "65534",
+        "65534",
+        "65534"
+      ],
+      "NoNewPrivs": [
+        "1"
+      ],
+      "Uid": [
+        "65534",
+        "65534",
+        "65534",
+        "65534"
+      ]
+    }
+  },
+  "worker": {
+    "cmdline": [
+      "/usr/bin/python3",
+      "-I",
+      "/opt/foundry/worker.py"
+    ],
+    "env_keys": [
+      "HOME",
+      "HOSTNAME",
+      "PATH"
+    ],
+    "mountinfo": [
+      "687 631 0:54 / / ro,relatime - overlay overlay rw,lowerdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/3941/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/3936/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/3935/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/3934/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/3916/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/3915/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/3914/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/3901/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/3900/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/3899/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/3898/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/3897/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/3896/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/3895/fs,upperdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/3942/fs,workdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/3942/work,nouserxattr",
+      "689 687 0:78 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw",
+      "690 687 0:79 / /dev rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755,inode64",
+      "691 690 0:80 / /dev/pts rw,nosuid,noexec,relatime - devpts devpts rw,gid=5,mode=620,ptmxmode=666",
+      "692 687 0:81 / /sys ro,nosuid,nodev,noexec,relatime - sysfs sysfs ro",
+      "693 692 0:29 / /sys/fs/cgroup ro,nosuid,nodev,noexec,relatime - cgroup2 cgroup rw,nsdelegate,memory_recursiveprot",
+      "694 690 0:76 / /dev/mqueue rw,nosuid,nodev,noexec,relatime - mqueue mqueue rw",
+      "695 690 0:82 / /dev/shm rw,nosuid,nodev,noexec,relatime - tmpfs shm rw,size=65536k,inode64",
+      "696 687 0:83 / /work rw,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=262144k,mode=700,uid=65534,gid=65534,inode64",
+      "697 687 0:42 /foundry-w3-407cc496b1ac60edb88a8b7e4659c224/model.sock /run/foundry-model.sock ro,nosuid,nodev - tmpfs tmpfs rw,size=4064244k,nr_inodes=1048576,inode64",
+      "698 687 8:1 /var/lib/docker/containers/0d65c83eb92409bd2145f4b9257814f005478614f5a51cb30a25e5be35a27ce9/resolv.conf /etc/resolv.conf ro,relatime - ext4 /dev/sda1 rw",
+      "699 687 8:1 /var/lib/docker/containers/0d65c83eb92409bd2145f4b9257814f005478614f5a51cb30a25e5be35a27ce9/hostname /etc/hostname ro,relatime - ext4 /dev/sda1 rw",
+      "700 687 8:1 /var/lib/docker/containers/0d65c83eb92409bd2145f4b9257814f005478614f5a51cb30a25e5be35a27ce9/hosts /etc/hosts ro,relatime - ext4 /dev/sda1 rw",
+      "632 689 0:78 /bus /proc/bus ro,nosuid,nodev,noexec,relatime - proc proc rw",
+      "633 689 0:78 /fs /proc/fs ro,nosuid,nodev,noexec,relatime - proc proc rw",
+      "634 689 0:78 /irq /proc/irq ro,nosuid,nodev,noexec,relatime - proc proc rw",
+      "635 689 0:78 /sys /proc/sys ro,nosuid,nodev,noexec,relatime - proc proc rw",
+      "636 689 0:78 /sysrq-trigger /proc/sysrq-trigger ro,nosuid,nodev,noexec,relatime - proc proc rw",
+      "637 689 0:84 / /proc/acpi ro,relatime - tmpfs tmpfs ro,inode64",
+      "638 689 0:85 / /proc/asound ro,relatime - tmpfs tmpfs ro,inode64",
+      "639 689 0:79 /null /proc/interrupts rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755,inode64",
+      "640 689 0:79 /null /proc/kcore rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755,inode64",
+      "641 689 0:79 /null /proc/keys rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755,inode64",
+      "642 689 0:79 /null /proc/latency_stats rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755,inode64",
+      "643 689 0:86 / /proc/scsi ro,relatime - tmpfs tmpfs ro,inode64",
+      "644 689 0:79 /null /proc/timer_list rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755,inode64",
+      "645 692 0:87 / /sys/firmware ro,relatime - tmpfs tmpfs ro,inode64"
+    ],
+    "namespace": {
+      "mnt": "mnt:[4026532437]",
+      "net": "net:[4026532448]",
+      "pid": "pid:[4026532443]",
+      "user": "user:[4026531837]"
+    },
+    "net_devices": [
+      "lo"
+    ],
+    "status": {
+      "CapAmb": [
+        "0000000000000000"
+      ],
+      "CapBnd": [
+        "0000000000000000"
+      ],
+      "CapEff": [
+        "0000000000000000"
+      ],
+      "CapInh": [
+        "0000000000000000"
+      ],
+      "CapPrm": [
+        "0000000000000000"
+      ],
+      "Gid": [
+        "65534",
+        "65534",
+        "65534",
+        "65534"
+      ],
+      "NoNewPrivs": [
+        "1"
+      ],
+      "Uid": [
+        "65534",
+        "65534",
+        "65534",
+        "65534"
+      ]
+    }
+  }
+}

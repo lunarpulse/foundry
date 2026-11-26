@@ -1,0 +1,48 @@
++ rustfmt --edition 2024 --check crates/foundry/src/isolation.rs crates/foundry/tests/w2.rs
++ git diff --check
++ sha256sum -c docs/acceptance/w3/w31-freeze.sha256 docs/acceptance/w3/w31/source.sha256
+docs/acceptance/w3/w31-oracle.md: OK
+Cargo.lock: OK
+Cargo.toml: OK
+crates/foundry-exec/src/review_run.rs: OK
+crates/foundry-ledger/src/product/code_change.rs: OK
+crates/foundry-ledger/src/product/review.rs: OK
+crates/foundry-line/src/review_host.rs: OK
+crates/foundry-watch/src/model_proxy.rs: OK
+crates/foundry/Cargo.toml: OK
+crates/foundry/src/isolation.rs: OK
+crates/foundry/src/isolation/dispatch.rs: OK
+crates/foundry/src/isolation/listener.rs: OK
+crates/foundry/src/isolation/w31_test.rs: OK
+crates/foundry/src/main.rs: OK
+crates/foundry/src/selected_review.rs: OK
+crates/foundry/tests/support/b2_w1.rs: OK
+crates/foundry/tests/w2.rs: OK
+deploy/Dockerfile: OK
+deploy/compose.yaml: OK
+deploy/launcher.py: OK
+deploy/model-client.py: OK
+deploy/profile.py: OK
+deploy/worker.py: OK
+docs/acceptance/w3/base-image.md: OK
+docs/acceptance/w3/host-measure-w31.md: OK
+docs/acceptance/w3/verify_wiring.py: OK
+docs/acceptance/w3/w31-local/tracked.patch: OK
+docs/acceptance/w3/w31-oracle.md: OK
+docs/acceptance/w3/w31/archive.py: OK
+docs/acceptance/w3/w31/cargo: OK
+docs/acceptance/w3/w31/child.py: OK
+docs/acceptance/w3/w31/host_case.py: OK
+docs/acceptance/w3/w31/offline.py: OK
+docs/acceptance/w3/w31/rehearse.py: OK
+docs/acceptance/w3/w31/verify.py: OK
+docs/acceptance/w3/w31/witness.py: OK
+scripts/check-deploy.py: OK
++ bash -n docs/acceptance/w3/w31/cargo
++ /usr/bin/python3 -I -
+8735b1da1ad561f6fcfaa7ee55e864c1bb1fbf787570d7aaf5d0ede8a8adf4db /home/cosmo/worktrees/foundry-w3-integration/target/w31/debug/deps/w2-6c3992339f29af01
+a59988a998dc354732c6b4575ea00154007631f32533d6b2861bb391fe0f58a0 /home/cosmo/worktrees/foundry-w3-integration/target/w31/debug/deps/foundry-ad88af93b1442e04
+1632ad0fb492240ca8c79422abb8aacc1c9ec8f950528a1356c65f850e3b86d3 /home/cosmo/worktrees/foundry-w3-integration/target/w31/debug/foundry
+Candidate source manifest sha256 9e05a2b619094b44bd431c7289fea7f163f4865fad6644d1d62bc3e6ab9b8251
+Syntax, links, private opens, own-process proc, 16 early refusals, host test names and new-file whitespace verified.
+exit=0

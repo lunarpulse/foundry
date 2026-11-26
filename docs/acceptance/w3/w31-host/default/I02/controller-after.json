@@ -1,0 +1,79 @@
+{
+  "db_dump_sha256": "bc39fded773d531aad6276c18acc71b361e0c1c96dbf29b3396709c7df85be30",
+  "files": {
+    "db": {
+      "inode": 307949,
+      "mode": 33188,
+      "path": "/tmp/w31-fkikv1ds/b2-w1-runtime-3743785-0-1795726109124770538/product.sqlite",
+      "sha256": "9ef53e9d88a3a9ab4672d3bc2c0289d55b1649db0f496dd0dc96815c3991b313"
+    },
+    "home": {
+      "inode": 307947,
+      "mode": 16832,
+      "path": "/tmp/w31-fkikv1ds/b2-w1-runtime-3743785-0-1795726109124770538"
+    },
+    "management": {
+      "inode": 2382,
+      "mode": 49584,
+      "path": "/var/run/docker.sock"
+    },
+    "other": {
+      "inode": 308080,
+      "mode": 33188,
+      "path": "/tmp/w31-fkikv1ds/b2-w1-runtime-3743785-0-1795726109124770538/.foundry-work/w31-other/README",
+      "sha256": "dbea9325179efe46ea2add94f7b6b745ca983fabb208dc6d34aa064623d7ee23"
+    },
+    "owner": {
+      "inode": 308037,
+      "mode": 33152,
+      "path": "/tmp/w31-fkikv1ds/b2-w1-runtime-3743785-0-1795726109124770538/owner",
+      "sha256": "dbb3558d69dcd553afd3f58384ee22a62c1c762beccb9bcbec1bec15c7429a74"
+    },
+    "serve": {
+      "inode": 308089,
+      "mode": 49645,
+      "path": "/tmp/w31-fkikv1ds/b2-w1-runtime-3743785-0-1795726109124770538/serve.sock"
+    },
+    "service": {
+      "inode": 308038,
+      "mode": 33152,
+      "path": "/tmp/w31-fkikv1ds/b2-w1-runtime-3743785-0-1795726109124770538/service",
+      "sha256": "e1a46617c5c08a81d022aef541901836d31dc429fd6f0c431e8691c069c2ef2d"
+    },
+    "shm": {
+      "inode": 308099,
+      "mode": 33188,
+      "path": "/tmp/w31-fkikv1ds/b2-w1-runtime-3743785-0-1795726109124770538/sidecars.sqlite-shm",
+      "sha256": "191a3de3b230b8750879ac62c4143295dfffba96a7f312934a89f4df02ba5804"
+    },
+    "wal": {
+      "inode": 308098,
+      "mode": 33188,
+      "path": "/tmp/w31-fkikv1ds/b2-w1-runtime-3743785-0-1795726109124770538/sidecars.sqlite-wal",
+      "sha256": "aa8014ea456e0710960a14e66ba2e6aca12bcc6156302ed1f16a18ff483af105"
+    },
+    "wal_db": {
+      "inode": 308096,
+      "mode": 33188,
+      "path": "/tmp/w31-fkikv1ds/b2-w1-runtime-3743785-0-1795726109124770538/sidecars.sqlite",
+      "sha256": "352a9bb23c329c5a9bf235baf56917358b5b64b03f1a11d261fadae9c3cdb721"
+    },
+    "watch": {
+      "inode": 308053,
+      "mode": 33188,
+      "path": "/tmp/w31-fkikv1ds/b2-w1-runtime-3743785-0-1795726109124770538/input",
+      "sha256": "a8901b8cfaadd0de5d64b7840c50dc2707433cc5d29b31e9fbc57eeca49231e8"
+    }
+  },
+  "join": {
+    "container": "0d65c83eb92409bd2145f4b9257814f005478614f5a51cb30a25e5be35a27ce9",
+    "epoch": 1,
+    "fence": 1,
+    "image": "sha256:949511f82f9d8723b68f85c6c23c213a8b9ee0a3aaa5f78cbfce2ab950520a60",
+    "order": "w31-subject",
+    "render_sha256": "97f9bda67e523fca31be6ffd0084546c92cd88c680a2908a8e6496c1bc70ea98",
+    "run": "w3-39bf14f9c9fe65b2afa62936c186f03ccfcb481df66db37e56c7c888b6bc3f7d",
+    "source_sha256": "9e05a2b619094b44bd431c7289fea7f163f4865fad6644d1d62bc3e6ab9b8251",
+    "stage": "authorized-producer"
+  }
+}

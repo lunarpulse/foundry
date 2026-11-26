@@ -1,0 +1,146 @@
++ rustfmt --edition 2024 --check crates/foundry/src/isolation.rs crates/foundry/tests/w2.rs
++ git diff --check
++ cargo test --locked --offline -j1 -p foundry --features product-pack-pins --test selected_review_cli
+warning: function `nothing` is never used
+ --> crates/foundry-furnace/src/lib.rs:2:4
+  |
+2 | fn nothing() {}
+  |    ^^^^^^^
+  |
+  = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `foundry-furnace` (lib) generated 1 warning
+warning: unused import: `CostFields`
+  --> crates/foundry-watch/src/benchmark.rs:22:37
+   |
+22 | use crate::corpus::{CorpusManifest, CostFields};
+   |                                     ^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `foundry_domain::OrderState`
+  --> crates/foundry-watch/src/corpus_emit.rs:15:5
+   |
+15 | use foundry_domain::OrderState;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `Sha256`
+   --> crates/foundry-watch/src/dry_die.rs:101:28
+    |
+101 |         use sha2::{Digest, Sha256};
+    |                            ^^^^^^
+
+warning: unused import: `Sha256`
+   --> crates/foundry-watch/src/dry_die.rs:145:24
+    |
+145 |     use sha2::{Digest, Sha256};
+    |                        ^^^^^^
+
+warning: unused import: `std::os::unix::ffi::OsStrExt`
+  --> crates/foundry-watch/src/gc.rs:58:9
+   |
+58 |     use std::os::unix::ffi::OsStrExt;
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `foundry-watch` (lib) generated 5 warnings (run `cargo fix --lib -p foundry-watch` to apply 4 suggestions)
+warning: unused imports: `IdentityError` and `Role`
+  --> crates/foundry-serve/src/scope.rs:16:54
+   |
+16 | use crate::identity::{AuthenticatedUser, Capability, IdentityError, Role};
+   |                                                      ^^^^^^^^^^^^^  ^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `foundry-serve` (lib) generated 1 warning (run `cargo fix --lib -p foundry-serve` to apply 1 suggestion)
+warning: unused import: `foundry_domain::order as _`
+ --> crates/foundry-blueprint/src/lib.rs:3:5
+  |
+3 | use foundry_domain::order as _; // reserve: line→Order factory comes in T7
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `foundry-blueprint` (lib) generated 1 warning (run `cargo fix --lib -p foundry-blueprint` to apply 1 suggestion)
+   Compiling foundry v0.1.0 (/home/cosmo/worktrees/foundry-w3-integration/crates/foundry)
+    Finished `test` profile [unoptimized] target(s) in 6.29s
+     Running tests/selected_review_cli.rs (target/w31/debug/deps/selected_review_cli-56cc872e90deeb2b)
+
+running 1 test
+[
+  {
+    "order": "order-a",
+    "run_id": "order-a:1:1:1",
+    "selection_revision": 1,
+    "approval_revision": 1,
+    "epoch": 1,
+    "fence": 1,
+    "status": "passed",
+    "provenance": {
+      "executable": "/home/cosmo/worktrees/foundry-w3-integration/target/w31/debug/foundry",
+      "sha256": "d9972907bbe49432d4adf42911096e1c139065862625ed6741b627f36e272d68",
+      "source_commit": "7ce910d47e563d0ae1fb4cfc2b56f7fe96cbc9ee",
+      "pack_digest": "322b9059c0f7131a121ddb40ec6cc8c97e4c5c45945b8502e0235d1ea3dfb605"
+    },
+    "registry_sha256": "bf7bec69b9fc302b2cfaa58f700b49811187a058da25635c09191107913309a0",
+    "snapshot": "/tmp/w31.wmzOtaHK/tmp46bg6fo8/artifacts/4ca905bc54ed26ad993ca71fb0d3f85772d9425e197a250ee6e1b135919d1851/pack-snapshot",
+    "inspection": {
+      "commit": "74b52eed2be9f4e6b38547b1ed6aa85dc46c04a4",
+      "blob_sha256": "a7aa8e0904e84e5f74e94ffcd18ae3d3bbcfdc7b7ebb10300c96f2b1ae1cca4b",
+      "lens_sha256": "49538fa51f36320ddd4d19acf823513604de678055746485e1d806862f16ec80",
+      "matched": true
+    },
+    "result": {
+      "commit": "74b52eed2be9f4e6b38547b1ed6aa85dc46c04a4",
+      "exit_code": 0,
+      "hold": null,
+      "lifecycle": 1,
+      "order_id": "order-a",
+      "pack_digest": "322b9059c0f7131a121ddb40ec6cc8c97e4c5c45945b8502e0235d1ea3dfb605",
+      "selection_revision": 1
+    }
+  },
+  {
+    "order": "order-b",
+    "run_id": "order-b:1:1:1",
+    "selection_revision": 2,
+    "approval_revision": 1,
+    "epoch": 1,
+    "fence": 2,
+    "status": "held",
+    "provenance": {
+      "executable": "/home/cosmo/worktrees/foundry-w3-integration/target/w31/debug/foundry",
+      "sha256": "d9972907bbe49432d4adf42911096e1c139065862625ed6741b627f36e272d68",
+      "source_commit": "7ce910d47e563d0ae1fb4cfc2b56f7fe96cbc9ee",
+      "pack_digest": "79ba9a386206a216bb2d7287317c95eab5cbc94614206e4cf692a478883f334a"
+    },
+    "registry_sha256": "bf7bec69b9fc302b2cfaa58f700b49811187a058da25635c09191107913309a0",
+    "snapshot": "/tmp/w31.wmzOtaHK/tmp46bg6fo8/artifacts/298f42ae3191697c18b220c031a3de700394d5204b8cb885528feb2e6d467982/pack-snapshot",
+    "inspection": {
+      "commit": "74b52eed2be9f4e6b38547b1ed6aa85dc46c04a4",
+      "blob_sha256": "a7aa8e0904e84e5f74e94ffcd18ae3d3bbcfdc7b7ebb10300c96f2b1ae1cca4b",
+      "lens_sha256": "75d445badd354f995e3e4fca720bc8661ae8e13716b39ad384716bba73dd6d72",
+      "matched": true
+    },
+    "result": {
+      "commit": "74b52eed2be9f4e6b38547b1ed6aa85dc46c04a4",
+      "exit_code": 1,
+      "hold": {
+        "deadline_secs": 0,
+        "hold_instance_id": "f7839bb01f7e40e687d1d7ed08ea09e2",
+        "reason": "end_hold",
+        "resume_targets": [
+          "confirm"
+        ]
+      },
+      "lifecycle": 1,
+      "order_id": "order-b",
+      "pack_digest": "79ba9a386206a216bb2d7287317c95eab5cbc94614206e4cf692a478883f334a",
+      "selection_revision": 2
+    }
+  }
+]
+test two_orders_consume_their_selected_packs ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 41.48s
+
+exit=0
